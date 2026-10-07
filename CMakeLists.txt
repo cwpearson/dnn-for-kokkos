@@ -48,11 +48,9 @@ configure_file(cmake/KokkosDNN_config.h.in
   ${CMAKE_CURRENT_BINARY_DIR}/KokkosDNN_config.h @ONLY)
 
 # ---------------------------------------------------------------------------
-# Library: one compiled target (IO + tokenizer + model helpers) + headers
+# Library: core DNN operators only (no model-specific code) + headers
 # ---------------------------------------------------------------------------
 add_library(kokkosdnn
-  src/llama/KokkosDNN_LlamaWeights.cpp
-  src/llama/KokkosDNN_Tokenizer.cpp
   src/KokkosDNN_PrintConfiguration.cpp
 )
 add_library(KokkosDNN::kokkosdnn ALIAS kokkosdnn)

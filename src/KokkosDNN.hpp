@@ -12,10 +12,6 @@
 #include "KokkosDNN_Embedding.hpp"
 #include "KokkosDNN_Attention.hpp"
 #include "KokkosDNN_Sampler.hpp"
-#include "llama/KokkosDNN_LlamaConfig.hpp"
-#include "llama/KokkosDNN_LlamaWeights.hpp"
-#include "llama/KokkosDNN_Tokenizer.hpp"
-#include "llama/KokkosDNN_LlamaModel.hpp"
 
 #include <iosfwd>
 

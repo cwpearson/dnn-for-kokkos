@@ -1,3 +1,1 @@
-add_executable(llama_generate llama_generate.cpp)
-target_link_libraries(llama_generate PRIVATE KokkosDNN::kokkosdnn)
-set_target_properties(llama_generate PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+add_subdirectory(llama)

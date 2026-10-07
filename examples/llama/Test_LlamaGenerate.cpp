@@ -3,6 +3,9 @@
 #include <cstdio>
 #include <vector>
 #include "KokkosDNN.hpp"
+#include "KokkosDNN_LlamaConfig.hpp"
+#include "KokkosDNN_LlamaModel.hpp"
+#include "KokkosDNN_LlamaWeights.hpp"
 
 int main(int argc, char** argv) {
   Kokkos::initialize(argc, argv);

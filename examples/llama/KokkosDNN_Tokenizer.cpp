@@ -1,4 +1,4 @@
-#include "llama/KokkosDNN_Tokenizer.hpp"
+#include "KokkosDNN_Tokenizer.hpp"
 
 #include <cctype>
 #include <fstream>

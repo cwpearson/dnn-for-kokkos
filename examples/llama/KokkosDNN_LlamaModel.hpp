@@ -11,8 +11,8 @@
 #include "KokkosDNN_RoPE.hpp"
 #include "KokkosDNN_Sampler.hpp"
 #include "KokkosDNN_SwiGLU.hpp"
-#include "llama/KokkosDNN_LlamaConfig.hpp"
-#include "llama/KokkosDNN_LlamaWeights.hpp"
+#include "KokkosDNN_LlamaConfig.hpp"
+#include "KokkosDNN_LlamaWeights.hpp"
 
 namespace KokkosDNN {
 namespace Llama {

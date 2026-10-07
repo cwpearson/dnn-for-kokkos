@@ -6,7 +6,7 @@
 #include <map>
 #include <string>
 #include <vector>
-#include "llama/KokkosDNN_LlamaConfig.hpp"
+#include "KokkosDNN_LlamaConfig.hpp"
 
 namespace KokkosDNN {
 namespace Llama {

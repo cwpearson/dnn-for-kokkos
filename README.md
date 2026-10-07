@@ -12,7 +12,7 @@ It provides:
 
 - Native Kokkos implementations of every operator the model needs (GEMM/GEMV, RMSNorm, softmax, RoPE, SwiGLU, embedding gather, grouped-query causal attention, greedy sampler).
 - Optional dispatch to CUDA libraries when enabled at configure time: GEMM to **cuBLAS**, attention to **cuDNN SDPA** (currently a documented stub that falls back to the native kernel).
-- A Llama model layer: 3.3 8B config defaults, a safetensors checkpoint loader (on-disk F32/F16/BF16 are converted to FP32 compute), a minimal Hugging Face `tokenizer.json` loader, a KV-cache autoregressive model, and a `llama_generate` driver.
+- A Llama example (`examples/llama/`): 3.3 8B config defaults, a safetensors checkpoint loader (on-disk F32/F16/BF16 are converted to FP32 compute), a minimal Hugging Face `tokenizer.json` loader, a KV-cache autoregressive model, and a `llama_generate` driver.
 - Unit tests and a tiny-random-weights end-to-end path so the full pipeline runs without downloading a 16 GB checkpoint.
 
 Scope is deliberately narrow: **FP32 compute only**, **inference only** (prefill + greedy decode), no training, no quantization.
@@ -34,13 +34,15 @@ src/
   KokkosDNN_Embedding.hpp
   KokkosDNN_Attention.hpp (+ _CuDNN dispatch point)
   KokkosDNN_Sampler.hpp   greedy argmax
-  llama/
-    KokkosDNN_LlamaConfig.hpp    3.3 8B defaults + tiny_test()
-    KokkosDNN_LlamaWeights.{hpp,cpp}
-    KokkosDNN_Tokenizer.{hpp,cpp}
-    KokkosDNN_LlamaModel.hpp     KV-cache Model::forward/generate
-examples/llama_generate.cpp
-tests/                    one executable per op + model + safetensors
+  KokkosDNN_PrintConfiguration.cpp
+examples/llama/           Llama 3 example (not part of the library)
+  KokkosDNN_LlamaConfig.hpp    3.3 8B defaults + tiny_test()
+  KokkosDNN_LlamaWeights.{hpp,cpp}
+  KokkosDNN_Tokenizer.{hpp,cpp}
+  KokkosDNN_LlamaModel.hpp     KV-cache Model::forward/generate
+  llama_generate.cpp      driver
+  Test_LlamaGenerate.cpp / Test_Safetensors.cpp (example-level tests)
+tests/                    one executable per core op
 ```
 
 ## Requirements
@@ -64,7 +66,7 @@ Options:
 | Option | Default | Effect |
 | --- | --- | --- |
 | `KokkosDNN_ENABLE_TESTS` | ON | build `tests/` |
-| `KokkosDNN_ENABLE_EXAMPLES` | ON | build `examples/llama_generate` |
+| `KokkosDNN_ENABLE_EXAMPLES` | ON | build `examples/llama/llama_generate` (+ example Llama tests) |
 | `KokkosDNN_ENABLE_CUBLAS` | OFF | GEMM via cuBLAS on CUDA spaces |
 | `KokkosDNN_ENABLE_CUDNN` | OFF | attention via cuDNN SDPA (stub → native fallback until wired) |
 
@@ -73,13 +75,13 @@ Options:
 Tiny random model (no downloads, runs anywhere):
 
 ```bash
-./build/examples/llama_generate --tiny --prompt "Hello" --max-new 8
+./build/examples/llama/llama_generate --tiny --prompt "Hello" --max-new 8
 ```
 
 Real checkpoint (needs weights + tokenizer from `meta-llama/Llama-3.3-8B-Instruct` or equivalent):
 
 ```bash
-./build/examples/llama_generate \
+./build/examples/llama/llama_generate \
   --weights model-00001-of-00004.safetensors model-00002-of-00004.safetensors ... \
   --tokenizer tokenizer.json \
   --prompt "Explain Kokkos in one sentence." \

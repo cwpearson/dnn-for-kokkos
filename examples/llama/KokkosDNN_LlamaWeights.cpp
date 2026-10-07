@@ -1,4 +1,4 @@
-#include "llama/KokkosDNN_LlamaWeights.hpp"
+#include "KokkosDNN_LlamaWeights.hpp"
 
 #include <cctype>
 #include <cstring>

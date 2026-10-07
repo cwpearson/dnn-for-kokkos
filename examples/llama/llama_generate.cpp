@@ -4,6 +4,10 @@
 #include <string>
 #include <vector>
 #include "KokkosDNN.hpp"
+#include "KokkosDNN_LlamaConfig.hpp"
+#include "KokkosDNN_LlamaModel.hpp"
+#include "KokkosDNN_LlamaWeights.hpp"
+#include "KokkosDNN_Tokenizer.hpp"
 
 // PoC driver: tiny random model by default; real weights via flags.
 //   llama_generate [--tiny] [--weights a.safetensors ...]

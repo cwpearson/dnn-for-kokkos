@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 #include "KokkosDNN.hpp"
+#include "KokkosDNN_LlamaConfig.hpp"
+#include "KokkosDNN_LlamaWeights.hpp"
 
 static uint16_t fp32_to_bf16(float x) {
   uint32_t u;
