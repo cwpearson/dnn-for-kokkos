@@ -8,7 +8,7 @@
 #include "KokkosDNN.hpp"
 
 template <class Scalar>
-void check_rope(float tol) {
+void check_rope(float abs_tol, float rel_tol) {
   using Exec = Kokkos::DefaultExecutionSpace;
   const int T = 2, H = 2, D = 8;
   Kokkos::View<Scalar***, Exec> q("q", T, H, D), k("k", T, H, D);
@@ -50,13 +50,18 @@ void check_rope(float tol) {
         m0 += c * c;
         m1 += e * e;
       }
-      EXPECT_NEAR(n1, n0, tol) << "rope q norm changed at (" << t << "," << h
-                               << ")";
-      EXPECT_NEAR(m1, m0, tol) << "rope k norm changed at (" << t << "," << h
-                               << ")";
+      // Rotation is orthogonal, so sums of squares are preserved up to
+      // scalar rounding. bhalf_t quantization alone moves these sums by
+      // ~1e-3 relative, and host vs device libm (cosf/sinf) agree only to
+      // a few ulps — enough to flip bhalf rounding on some elements. So
+      // bhalf needs a relative check; an absolute tol is backend-fragile.
+      EXPECT_NEAR(n1, n0, abs_tol + rel_tol * std::abs(n0))
+          << "rope q norm changed at (" << t << "," << h << ")";
+      EXPECT_NEAR(m1, m0, abs_tol + rel_tol * std::abs(m0))
+          << "rope k norm changed at (" << t << "," << h << ")";
     }
 }
 
-TEST(RoPE, Float) { check_rope<float>(1e-3f); }
+TEST(RoPE, Float) { check_rope<float>(1e-3f, 0.0f); }
 
-TEST(RoPE, BHalf) { check_rope<Kokkos::Experimental::bhalf_t>(5e-1f); }
+TEST(RoPE, BHalf) { check_rope<Kokkos::Experimental::bhalf_t>(0.0f, 1e-2f); }
