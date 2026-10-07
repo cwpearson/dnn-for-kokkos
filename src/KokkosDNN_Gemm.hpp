@@ -2,6 +2,7 @@
 #define KOKKOSDNN_GEMM_HPP
 
 #include <Kokkos_Core.hpp>
+#include <Kokkos_Half.hpp>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -16,9 +17,11 @@ namespace Impl {
 // CUDA tiled fallback GEMM: design notes (breadcrumbs for future tuners).
 //
 // Dispatch ladder for gemm() below:
-//   1. cuBLAS sgemm (float on CUDA, handle.use_cublas) -- fastest, TPL.
-//   2. Tiled TeamPolicy kernel here (CUDA fallback, ALL scalars incl.
-//      bhalf_t, which has no TPL path) -- ~70% of cuBLAS on Llama shapes.
+//   1. cuBLAS on CUDA with handle.use_cublas: sgemm for float,
+//      cublasGemmEx (R_16BF I/O, FP32 accumulate) for bhalf_t -- TPL.
+//   2. Tiled TeamPolicy kernel here (CUDA fallback for other scalars and
+//      when cuBLAS is disabled/fails; also the bhalf_t path's safety net
+//      on arches without BF16 support) -- ~70% of cuBLAS on Llama shapes.
 //   3. Naive MDRange kernel (non-CUDA backends) -- simple, memory-bound.
 //
 // Why tiling: the naive kernel gives every (i,j) output thread its own
@@ -251,9 +254,10 @@ void gemm_tiled(const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& X,
 //   Y : [M, N]
 // This is the only GEMM form the Llama PoC needs (no transposes at call
 // sites). Scalar-agnostic (float, bhalf_t); accumulation is FP32 and the
-// result is cast back to Scalar. Dispatch ladder on CUDA: float with an
-// enabled handle goes to cuBLAS sgemm; everything else (incl. all bhalf_t)
-// uses the shared-memory tiled kernel in Impl (design notes there);
+// result is cast back to Scalar. Dispatch ladder on CUDA: float goes to
+// cuBLAS sgemm and bhalf_t to cublasGemmEx (BF16 I/O, FP32 accumulate)
+// with an enabled handle; anything else (or a cuBLAS failure) uses the
+// shared-memory tiled kernel in Impl (design notes there);
 // non-CUDA backends use the naive MDRange kernel (correct, memory-bound).
 template <class ExecSpace, class Scalar>
 void gemm(const DNNHandle<ExecSpace>& handle, Scalar alpha,
@@ -271,15 +275,25 @@ void gemm(const DNNHandle<ExecSpace>& handle, Scalar alpha,
       std::is_same_v<typename ExecSpace::memory_space, Kokkos::CudaSpace> ||
       std::is_same_v<typename ExecSpace::memory_space, Kokkos::CudaUVMSpace>;
   if constexpr (is_cuda) {
-    if constexpr (std::is_same_v<Scalar, float>) {
-      if (handle.use_cublas) {
-        Kokkos::fence();  // ensure prior Kokkos kernels completed
-        bool ok = Impl::cublas_gemm_nt(
+    if (handle.use_cublas) {
+      Kokkos::fence();  // ensure prior Kokkos kernels completed
+      bool ok = false;
+      if constexpr (std::is_same_v<Scalar, float>) {
+        ok = Impl::cublas_gemm_nt(
             static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
             alpha, X.data(), W.data(), beta, Y.data());
-        if (ok) return;
-        // else fall through to native (e.g. cuBLAS failure)
+      } else if constexpr (std::is_same_v<
+                               Scalar, Kokkos::Experimental::bhalf_t>) {
+        // FP32 alpha/beta: cublasGemmEx with CUBLAS_COMPUTE_32F matches
+        // the native kernel's FP32 accumulation.
+        ok = Impl::cublas_gemm_nt_bf16(
+            static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+            static_cast<float>(alpha), X.data(), W.data(),
+            static_cast<float>(beta), Y.data());
       }
+      if (ok) return;
+      // else fall through to native (unsupported scalar or cuBLAS failure,
+      // e.g. no BF16 tensor support on the arch)
     }
   }
 #else

@@ -2,11 +2,12 @@
 //
 //   Y[M,N] = X[M,K] * W[N,K]^T  (W row-major [out_features, in_features])
 //
-// Two variants per float case:
+// Two variants per GEMM case:
 //   Native     — handle with use_cublas=false, always the Kokkos kernel.
-//   Dispatched — default handle, routes float GEMM to cuBLAS when built with
-//                KokkosDNN_ENABLE_CUBLAS on a CUDA space; otherwise native.
-// bhalf_t has no TPL path (falls back to native), so only Native is registered.
+//   Dispatched — default handle, routes GEMM to cuBLAS when built with
+//                KokkosDNN_ENABLE_CUBLAS on a CUDA space (float via sgemm,
+//                bhalf_t via cublasGemmEx); otherwise native.
+// GEMV has no TPL path, so only Native is registered there.
 //
 // Run e.g.:
 //   ./kokkosdnn_bench --benchmark_filter='Gemm.*'
@@ -120,6 +121,9 @@ static void BM_Gemm_Float_Dispatched(benchmark::State& state) {
 static void BM_Gemm_BHalf_Native(benchmark::State& state) {
   run_gemm<bhalf_t>(state, true);
 }
+static void BM_Gemm_BHalf_Dispatched(benchmark::State& state) {
+  run_gemm<bhalf_t>(state, false);
+}
 static void BM_Gemv_Float_Native(benchmark::State& state) {
   run_gemv<float>(state, true);
 }
@@ -142,6 +146,7 @@ static void BM_Gemv_BHalf_Native(benchmark::State& state) {
 KOKKOSDNN_GEMM_ARGS(BENCHMARK(BM_Gemm_Float_Native)->Unit(benchmark::kMillisecond)->ArgNames({"M", "N", "K"}));
 KOKKOSDNN_GEMM_ARGS(BENCHMARK(BM_Gemm_Float_Dispatched)->Unit(benchmark::kMillisecond)->ArgNames({"M", "N", "K"}));
 KOKKOSDNN_GEMM_ARGS(BENCHMARK(BM_Gemm_BHalf_Native)->Unit(benchmark::kMillisecond)->ArgNames({"M", "N", "K"}));
+KOKKOSDNN_GEMM_ARGS(BENCHMARK(BM_Gemm_BHalf_Dispatched)->Unit(benchmark::kMillisecond)->ArgNames({"M", "N", "K"}));
 
 BENCHMARK(BM_Gemm_Float_Native)
     ->Args({1, 128256, 4096})
@@ -152,6 +157,10 @@ BENCHMARK(BM_Gemm_Float_Dispatched)
     ->Unit(benchmark::kMillisecond)
     ->ArgNames({"M", "N", "K"});
 BENCHMARK(BM_Gemm_BHalf_Native)
+    ->Args({1, 128256, 4096})
+    ->Unit(benchmark::kMillisecond)
+    ->ArgNames({"M", "N", "K"});
+BENCHMARK(BM_Gemm_BHalf_Dispatched)
     ->Args({1, 128256, 4096})
     ->Unit(benchmark::kMillisecond)
     ->ArgNames({"M", "N", "K"});

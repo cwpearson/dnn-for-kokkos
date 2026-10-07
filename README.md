@@ -11,11 +11,11 @@ KokkosDNN is a small, Kokkos-compatible DNN library built as a proof-of-concept 
 It provides:
 
 - Native Kokkos implementations of every operator the model needs (GEMM/GEMV, RMSNorm, softmax, RoPE, SwiGLU, embedding gather, grouped-query causal attention, greedy sampler).
-- Optional dispatch to CUDA libraries when enabled at configure time: GEMM to **cuBLAS** (FP32 only; BF16 falls back to native), attention to **cuDNN SDPA** (currently a documented stub that falls back to the native kernel).
+- Optional dispatch to CUDA libraries when enabled at configure time: GEMM to **cuBLAS** (FP32 via `sgemm`, BF16 via `cublasGemmEx` with FP32 accumulation), attention to **cuDNN SDPA** (currently a documented stub that falls back to the native kernel).
 - A Llama example (`examples/llama/`): 3.3 8B config defaults, a safetensors checkpoint loader (on-disk F32/F16/BF16 are converted to the model scalar), a minimal Hugging Face `tokenizer.json` loader, a KV-cache autoregressive model, and a `llama_generate` driver.
 - Unit tests and a tiny-random-weights end-to-end path so the full pipeline runs without downloading a 16 GB checkpoint.
 
-Scope is deliberately narrow: **bfloat16 storage/compute by default** (`--fp32` opts in), **inference only** (prefill + greedy decode), no training, no quantization. All ops are templated on the scalar type (`float`, `Kokkos::Experimental::bhalf_t`) with FP32 accumulation; TPL paths apply to FP32 and fall back to native otherwise.
+Scope is deliberately narrow: **bfloat16 storage/compute by default** (`--fp32` opts in), **inference only** (prefill + greedy decode), no training, no quantization. All ops are templated on the scalar type (`float`, `Kokkos::Experimental::bhalf_t`) with FP32 accumulation; TPL paths cover GEMM for both scalars and fall back to native otherwise.
 
 ## Layout
 
@@ -97,11 +97,11 @@ Expected tensor names are the Hugging Face ones (`model.embed_tokens.weight`, `m
 `benchmarks/kokkosdnn_bench` (Google Benchmark, opt-in via
 `-DKokkosDNN_ENABLE_BENCHMARKS=ON`) times the core ops at Llama
 3.3 8B shapes and reports `GFLOPS` (GEMM/GEMV/attention) or `GBps`
-(elementwise) counters. GEMM and attention register `Native` vs `Dispatched`
-variants: `Native` forces the Kokkos kernel (`use_cublas/use_cudnn = false`),
-`Dispatched` uses the default handle, so on a CUDA build with
-`KokkosDNN_ENABLE_CUBLAS`/`KokkosDNN_ENABLE_CUDNN` it exercises the TPL path
-(float only; `bhalf_t` always runs native, so only `Native` is registered).
+(elementwise) counters. GEMM registers `Native` vs `Dispatched`
+variants for both `float` and `bhalf_t`: `Native` forces the Kokkos kernel
+(`use_cublas/use_cudnn = false`), `Dispatched` uses the default handle, so
+on a CUDA build with `KokkosDNN_ENABLE_CUBLAS` it exercises the cuBLAS
+path. GEMV has no TPL path, so only `Native` is registered there.
 
 ```bash
 ./build/benchmarks/kokkosdnn_bench --benchmark_list_tests

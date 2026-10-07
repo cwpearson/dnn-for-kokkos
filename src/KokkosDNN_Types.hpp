@@ -9,8 +9,8 @@ namespace KokkosDNN {
 // Scalar-agnostic PoC: core ops and the Llama example are templated on the
 // scalar type. Supported: float and Kokkos::Experimental::bhalf_t (BF16,
 // the Llama 3.3 8B checkpoint dtype). Accumulation inside kernels stays in
-// FP32; TPL paths (cuBLAS/cuDNN) are used only for float and fall back to
-// the native Kokkos kernel otherwise.
+// FP32; the cuBLAS GEMM path covers both scalars, other TPL paths (cuDNN)
+// are float-only and fall back to the native Kokkos kernel otherwise.
 using value_type = float;
 using bhalf_t = Kokkos::Experimental::bhalf_t;
 using half_t = Kokkos::Experimental::half_t;
