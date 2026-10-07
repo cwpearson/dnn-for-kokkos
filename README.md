@@ -43,6 +43,7 @@ examples/llama/           Llama 3 example (not part of the library)
   llama_generate.cpp      driver
   Test_LlamaGenerate.cpp / Test_Safetensors.cpp (example-level tests)
 tests/                    one executable per core op
+benchmarks/               Google Benchmark micros (native vs TPL dispatch)
 ```
 
 ## Requirements
@@ -67,6 +68,7 @@ Options:
 | --- | --- | --- |
 | `KokkosDNN_ENABLE_TESTS` | ON | build `tests/` |
 | `KokkosDNN_ENABLE_EXAMPLES` | ON | build `examples/llama/llama_generate` (+ example Llama tests) |
+| `KokkosDNN_ENABLE_BENCHMARKS` | OFF | build `benchmarks/kokkosdnn_bench` (Google Benchmark, fetched if needed) |
 | `KokkosDNN_ENABLE_CUBLAS` | OFF | GEMM via cuBLAS on CUDA spaces |
 | `KokkosDNN_ENABLE_CUDNN` | OFF | attention via cuDNN SDPA (stub → native fallback until wired) |
 
@@ -89,6 +91,30 @@ Real checkpoint (needs weights + tokenizer from `meta-llama/Llama-3.3-8B-Instruc
 ```
 
 Expected tensor names are the Hugging Face ones (`model.embed_tokens.weight`, `model.layers.N.self_attn.q_proj.weight`, …, `lm_head.weight`).
+
+## Benchmarks
+
+`benchmarks/kokkosdnn_bench` (Google Benchmark, opt-in via
+`-DKokkosDNN_ENABLE_BENCHMARKS=ON`) times the core ops at Llama
+3.3 8B shapes and reports `GFLOPS` (GEMM/GEMV/attention) or `GBps`
+(elementwise) counters. GEMM and attention register `Native` vs `Dispatched`
+variants: `Native` forces the Kokkos kernel (`use_cublas/use_cudnn = false`),
+`Dispatched` uses the default handle, so on a CUDA build with
+`KokkosDNN_ENABLE_CUBLAS`/`KokkosDNN_ENABLE_CUDNN` it exercises the TPL path
+(float only; `bhalf_t` always runs native, so only `Native` is registered).
+
+```bash
+./build/benchmarks/kokkosdnn_bench --benchmark_list_tests
+./build/benchmarks/kokkosdnn_bench --benchmark_filter='Gemm.*' --benchmark_counters_tabular=true
+./build/benchmarks/kokkosdnn_bench --benchmark_filter='Attention.*' --benchmark_counters_tabular=true
+./build/benchmarks/kokkosdnn_bench --benchmark_filter='BM_Gemm_Float_(Native|Dispatched)/M:16.*' \
+  --benchmark_min_time=0.5s --benchmark_format=json > gemm.json
+```
+
+Without the TPL options (e.g. CPU-only CI) `Native == Dispatched` by
+construction. Large prefill rows (`M=64`, `T=128`, lm-head vocab) are
+GPU-oriented: the naive native kernel takes seconds per iteration on Serial,
+so subset with `--benchmark_filter` or lower `--benchmark_min_time` there.
 
 ## Memory note
 
