@@ -45,6 +45,20 @@ endif()
 # ---------------------------------------------------------------------------
 # Generated config header
 # ---------------------------------------------------------------------------
+# Options are mixed-case (KokkosDNN_ENABLE_*) but the config header and
+# compile definitions use ALL_CAPS (KOKKOSDNN_ENABLE_*). CMake variables are
+# case-sensitive, so #cmakedefine KOKKOSDNN_ENABLE_* would otherwise always
+# see an undefined variable and emit /* #undef ... */ even when the option
+# is ON. Bridge explicitly. Also accept the all-caps -D spelling (a common
+# mistake given the macro name) by promoting it to the canonical option.
+if(KOKKOSDNN_ENABLE_CUBLAS AND NOT KokkosDNN_ENABLE_CUBLAS)
+  set(KokkosDNN_ENABLE_CUBLAS ON)
+endif()
+if(KOKKOSDNN_ENABLE_CUDNN AND NOT KokkosDNN_ENABLE_CUDNN)
+  set(KokkosDNN_ENABLE_CUDNN ON)
+endif()
+set(KOKKOSDNN_ENABLE_CUBLAS ${KokkosDNN_ENABLE_CUBLAS})
+set(KOKKOSDNN_ENABLE_CUDNN ${KokkosDNN_ENABLE_CUDNN})
 configure_file(cmake/KokkosDNN_config.h.in
   ${CMAKE_CURRENT_BINARY_DIR}/KokkosDNN_config.h @ONLY)
 
@@ -65,7 +79,6 @@ target_link_libraries(kokkosdnn PUBLIC Kokkos::kokkos)
 
 if(KokkosDNN_ENABLE_CUBLAS)
   target_link_libraries(kokkosdnn PUBLIC CUDA::cublas)
-  target_compile_definitions(kokkosdnn PUBLIC KOKKOSDNN_ENABLE_CUBLAS)
 endif()
 if(KokkosDNN_ENABLE_CUDNN)
   if(TARGET CUDNN::cudnn)
@@ -74,7 +87,6 @@ if(KokkosDNN_ENABLE_CUDNN)
     target_include_directories(kokkosdnn PUBLIC ${CUDNN_INCLUDE_DIR})
     target_link_libraries(kokkosdnn PUBLIC ${CUDNN_LIBRARY})
   endif()
-  target_compile_definitions(kokkosdnn PUBLIC KOKKOSDNN_ENABLE_CUDNN)
 endif()
 
 if(KokkosDNN_ENABLE_COMPILER_WARNINGS)
