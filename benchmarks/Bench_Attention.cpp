@@ -88,8 +88,9 @@ static void BM_Attention_BHalf_Native(benchmark::State& state) {
   run_attention<bhalf_t>(state, true);
 }
 
-// (T, Ktot): decode T=1 plus short prefills. T=128/Ktot=512 materializes a
-// 2M-float score tensor and is GPU-oriented on the naive kernel.
+// (T, Ktot): decode T=1 plus short prefills. T=128/Ktot=512 is
+// GPU-oriented on the naive kernel (4*T*Hq*Ktot*D FLOPs with one thread per
+// (t, h)); the kernel itself holds no score tensor (streaming softmax).
 #define KOKKOSDNN_ATTN_ARGS(BM) \
   BM->Args({1, 128})->Args({1, 512})->Args({16, 128})->Args({64, 256})->Args({128, 512})
 

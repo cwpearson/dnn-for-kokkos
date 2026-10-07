@@ -125,7 +125,14 @@ large-GPU or CPU-Kokkos build for the real checkpoint.
 
 ## Limitations
 
-- Attention materializes a `[T, Hq, K]` score tensor — correct for short PoC contexts, not suitable for 128k sequences without tiling.
+- Attention uses a streaming online-softmax kernel (FlashAttention-style):
+  one thread per `(query token, query head)` streams over keys with O(1)
+  extra memory, so no `[T, Hq, K]` score tensor is ever materialized and
+  128k contexts are feasible. The model additionally passes KV-cache
+  prefixes as subviews (no per-layer repack copy).
+  Remaining 128k considerations: the BF16 KV cache itself is ~256 MiB per
+  layer (~8 GiB for 32 layers at 128k), and single-shot prefill holds
+  O(T·dim) activations — chunked prefill is future work.
 - The tokenizer is a minimal byte-level BPE loader; text quality should be validated against the real `tokenizer.json` before trusting output.
 - The cuDNN SDPA path is a stub interface, not a working kernel yet.
 - Only greedy sampling is implemented; no temperature / top-p / batching.

@@ -3,6 +3,7 @@
 
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
+#include <utility>
 #include <vector>
 #include "KokkosDNN_Attention.hpp"
 #include "KokkosDNN_Embedding.hpp"
@@ -128,20 +129,16 @@ class Model {
             v_cache[l](pos0 + t, hh, d) = v3(t, hh, d);
           });
       Kokkos::View<Scalar***, ExecSpace> attn_out("attn_out", T, NH, HD);
-      Kokkos::View<Scalar***, ExecSpace> kp("kp", pos0 + T, NKV, HD);
-      Kokkos::View<Scalar***, ExecSpace> vp("vp", pos0 + T, NKV, HD);
-      auto kcl = k_cache[l];
-      auto vcl = v_cache[l];
-      Kokkos::parallel_for(
-          "kcache_read",
-          Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<3>>(
-              {0, 0, 0}, {pos0 + T, (size_t)NKV, (size_t)HD}),
-          KOKKOS_LAMBDA(size_t s, size_t hh, size_t d) {
-            kp(s, hh, d) = kcl(s, hh, d);
-            vp(s, hh, d) = vcl(s, hh, d);
-          });
+      // Pass the valid KV prefix as subviews: no repack/copy, and no extra
+      // [K, Hkv, D] temporaries per layer. The attention kernel is
+      // layout-agnostic and streams over keys, so 128k prefixes stay O(1)
+      // in extra memory here too.
+      auto kp = Kokkos::subview(k_cache[l], std::make_pair(size_t(0), pos0 + T),
+                                Kokkos::ALL, Kokkos::ALL);
+      auto vp = Kokkos::subview(v_cache[l], std::make_pair(size_t(0), pos0 + T),
+                                Kokkos::ALL, Kokkos::ALL);
       attention_gqa_single<ExecSpace, Scalar>(handle, q3, kp, vp, pos0,
-                                               attn_out, SCALE);
+                                                attn_out, SCALE);
       MatR attn_flat("attn_flat", T, HqD);
       Kokkos::parallel_for(
           "flatten",
