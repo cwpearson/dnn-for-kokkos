@@ -6,12 +6,12 @@
 
 namespace KokkosDNN {
 
-// Gather rows: out[t,:] = table[token[t],:].
-template <class ExecSpace>
+// Gather rows: out[t,:] = table[token[t],:]. Scalar-agnostic.
+template <class ExecSpace, class Scalar>
 void embedding_gather(
-    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& table,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& table,
     const Kokkos::View<int*, ExecSpace>& tokens,
-    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& out,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& out,
     const std::string& label = "KokkosDNN::embed") {
   const size_t T = tokens.extent(0), D = table.extent(1);
   Kokkos::parallel_for(

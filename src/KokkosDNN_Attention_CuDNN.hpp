@@ -17,6 +17,9 @@
 // To complete the TPL path: implement try_cudnn_sdpa_gqa() with
 // cudnn_frontend::graph built from Q/K/V descriptors, call
 // graph.build()/execute(), and return true on success.
+// NOTE: the TPL path is only attempted for float; bhalf_t (and other
+// scalars) always run the native kernel (cuDNN BF16 would need
+// CUDNN_DATA_BFLOAT16 tensor descriptors).
 #include "KokkosDNN_config.h"
 
 namespace KokkosDNN {

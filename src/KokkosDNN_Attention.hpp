@@ -4,6 +4,7 @@
 #include <Kokkos_Core.hpp>
 #include <cmath>
 #include <string>
+#include <type_traits>
 #include "KokkosDNN_Handle.hpp"
 #include "KokkosDNN_Attention_CuDNN.hpp"
 
@@ -17,19 +18,25 @@ namespace KokkosDNN {
 //           offset; 0 for full-prompt prefill, seq_len for decode step)
 // Causal mask: query t attends to keys [0, q_off + t].
 // GQA: head h uses kv head h * Hkv / Hq. Scale = 1/sqrt(D).
+// Scalar-agnostic (float, bhalf_t); scores/softmax accumulate in FP32.
 //
-// When KokkosDNN_ENABLE_CUDNN and ExecSpace is CUDA, dispatch to cuDNN
-// SDPA first (see Attention_CuDNN for contract); otherwise run native.
-template <class ExecSpace>
+// When KokkosDNN_ENABLE_CUDNN and ExecSpace is CUDA, float dispatches to
+// cuDNN SDPA first (see Attention_CuDNN for contract); other scalars run
+// the native kernel. Otherwise run native.
+template <class ExecSpace, class Scalar>
 void attention_gqa_single(
     const DNNHandle<ExecSpace>& handle,
-    const Kokkos::View<float***, ExecSpace>& q,
-    const Kokkos::View<float***, ExecSpace>& k,
-    const Kokkos::View<float***, ExecSpace>& v, size_t q_off,
-    const Kokkos::View<float***, ExecSpace>& out, float scale,
+    const Kokkos::View<Scalar***, ExecSpace>& q,
+    const Kokkos::View<Scalar***, ExecSpace>& k,
+    const Kokkos::View<Scalar***, ExecSpace>& v, size_t q_off,
+    const Kokkos::View<Scalar***, ExecSpace>& out, float scale,
     const std::string& label = "KokkosDNN::attn_gqa") {
 #if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)
-  if (handle.use_cudnn && Impl::try_cudnn_sdpa_gqa_stub()) return;
+  if constexpr (std::is_same_v<Scalar, float>) {
+    if (handle.use_cudnn && Impl::try_cudnn_sdpa_gqa_stub()) return;
+  } else {
+    (void)handle;
+  }
 #else
   (void)handle;
 #endif
@@ -39,7 +46,8 @@ void attention_gqa_single(
 
   // scores[t,h,kk] transient: T*Hq*Kmax floats. For PoC context lengths
   // (<= a few k tokens in tests/examples) this is acceptable; production
-  // would tile over kk (FlashAttention-style) instead.
+  // would tile over kk (FlashAttention-style) instead. FP32 regardless of
+  // Scalar for softmax accuracy.
   const size_t Ktot = k.extent(0);
   Kokkos::View<float***, ExecSpace> scores("attn_scores", T, Hq, Ktot);
 
@@ -55,7 +63,9 @@ void attention_gqa_single(
         }
         size_t hkv = (h * Hkv) / Hq;
         float acc  = 0;
-        for (size_t d = 0; d < D; ++d) acc += q(t, h, d) * k(kk, hkv, d);
+        for (size_t d = 0; d < D; ++d)
+          acc += static_cast<float>(q(t, h, d)) *
+                 static_cast<float>(k(kk, hkv, d));
         scores(t, h, kk) = acc * scale;
       });
 
@@ -80,8 +90,8 @@ void attention_gqa_single(
         for (size_t d = 0; d < D; ++d) {
           float acc = 0;
           for (size_t kk = 0; kk < klen; ++kk)
-            acc += scores(t, h, kk) * v(kk, hkv, d);
-          out(t, h, d) = acc * inv;
+            acc += scores(t, h, kk) * static_cast<float>(v(kk, hkv, d));
+          out(t, h, d) = static_cast<Scalar>(acc * inv);
         }
       });
 }

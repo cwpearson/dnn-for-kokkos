@@ -11,11 +11,11 @@ KokkosDNN is a small, Kokkos-compatible DNN library built as a proof-of-concept 
 It provides:
 
 - Native Kokkos implementations of every operator the model needs (GEMM/GEMV, RMSNorm, softmax, RoPE, SwiGLU, embedding gather, grouped-query causal attention, greedy sampler).
-- Optional dispatch to CUDA libraries when enabled at configure time: GEMM to **cuBLAS**, attention to **cuDNN SDPA** (currently a documented stub that falls back to the native kernel).
-- A Llama example (`examples/llama/`): 3.3 8B config defaults, a safetensors checkpoint loader (on-disk F32/F16/BF16 are converted to FP32 compute), a minimal Hugging Face `tokenizer.json` loader, a KV-cache autoregressive model, and a `llama_generate` driver.
+- Optional dispatch to CUDA libraries when enabled at configure time: GEMM to **cuBLAS** (FP32 only; BF16 falls back to native), attention to **cuDNN SDPA** (currently a documented stub that falls back to the native kernel).
+- A Llama example (`examples/llama/`): 3.3 8B config defaults, a safetensors checkpoint loader (on-disk F32/F16/BF16 are converted to the model scalar), a minimal Hugging Face `tokenizer.json` loader, a KV-cache autoregressive model, and a `llama_generate` driver.
 - Unit tests and a tiny-random-weights end-to-end path so the full pipeline runs without downloading a 16 GB checkpoint.
 
-Scope is deliberately narrow: **FP32 compute only**, **inference only** (prefill + greedy decode), no training, no quantization.
+Scope is deliberately narrow: **bfloat16 storage/compute by default** (`--fp32` opts in), **inference only** (prefill + greedy decode), no training, no quantization. All ops are templated on the scalar type (`float`, `Kokkos::Experimental::bhalf_t`) with FP32 accumulation; TPL paths apply to FP32 and fall back to native otherwise.
 
 ## Layout
 
@@ -92,8 +92,10 @@ Expected tensor names are the Hugging Face ones (`model.embed_tokens.weight`, `m
 
 ## Memory note
 
-FP32 8B weights are ~32 GiB, so a full 8B run does **not** fit on a 24 GiB card such as an RTX 3090.
-Use the tiny config for local smoke tests and a large-GPU or CPU-Kokkos build for the real checkpoint.
+BF16 8B weights are ~16 GiB, so a full 8B BF16 run fits on a 24 GiB card
+such as an RTX 3090. FP32 (`llama_generate --fp32`) needs ~32 GiB and does
+**not** fit there. Use the tiny config for local smoke tests and a
+large-GPU or CPU-Kokkos build for the real checkpoint.
 
 ## Limitations
 

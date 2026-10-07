@@ -12,17 +12,62 @@
 // PoC driver: tiny random model by default; real weights via flags.
 //   llama_generate [--tiny] [--weights a.safetensors ...]
 //                  [--tokenizer tok.json] [--prompt "text"] [--max-new N]
+//                  [--fp32]
 //
-// FP32 8B needs ~32 GiB; RTX 3090 (24 GiB) cannot hold it — use --tiny or
+// Default compute/storage is bfloat16 (Llama 3.3 8B checkpoint dtype);
+// --fp32 opts into FP32 for comparison. BF16 8B needs ~16 GiB (FP32
+// ~32 GiB); RTX 3090 (24 GiB) fits BF16 but not FP32 — use --tiny or
 // a big-GPU/CPU build for real checkpoints.
+template <class Scalar>
+int run_model(KokkosDNN::Llama::Config cfg,
+              const std::vector<std::string>& wfiles, bool tiny,
+              const std::string& tok_path, const std::string& prompt,
+              int max_new) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  KokkosDNN::Llama::Weights<Exec, Scalar> w;
+  if (tiny || wfiles.empty()) {
+    KokkosDNN::Llama::random_init(cfg, w);
+    std::printf("[tiny random weights] dim=%d layers=%d\n", cfg.dim,
+                cfg.n_layers);
+  } else {
+    KokkosDNN::Llama::load_safetensors(cfg, wfiles, w);
+    std::printf("[loaded %zu shard(s)]\n", wfiles.size());
+  }
+
+  std::vector<int> prompt_ids;
+  if (!tok_path.empty()) {
+    KokkosDNN::Llama::Tokenizer tok(tok_path);
+    prompt_ids = tok.encode(prompt);
+    std::printf("prompt tokens: %zu\n", prompt_ids.size());
+  } else {
+    // byte-fallback prompt (no tokenizer file): deterministic ids
+    prompt_ids.push_back(cfg.bos_token % cfg.vocab_size);
+    for (unsigned char c : prompt) prompt_ids.push_back(c % cfg.vocab_size);
+    std::printf("[no tokenizer] byte-fallback prompt tokens: %zu\n",
+                prompt_ids.size());
+  }
+
+  KokkosDNN::Llama::Model<Exec, Scalar> model(cfg, w);
+  auto out = model.generate(prompt_ids, max_new);
+  std::printf("generated %zu ids:", out.size());
+  for (auto id : out) std::printf(" %d", id);
+  std::printf("\n");
+  if (!tok_path.empty()) {
+    KokkosDNN::Llama::Tokenizer tok(tok_path);
+    std::printf("decoded: %s\n", tok.decode(out).c_str());
+  }
+  Kokkos::fence();
+  return 0;
+}
+
 int main(int argc, char** argv) {
   Kokkos::initialize(argc, argv);
   {
-    using Exec = Kokkos::DefaultExecutionSpace;
     std::vector<std::string> wfiles;
     std::string tok_path, prompt = "Hello, I am";
     int max_new = 16;
     bool tiny = true;
+    bool fp32 = false;
 
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
@@ -39,6 +84,8 @@ int main(int argc, char** argv) {
         max_new = std::stoi(argv[++i]);
       } else if (a == "--tiny") {
         tiny = true;
+      } else if (a == "--fp32") {
+        fp32 = true;
       }
     }
 
@@ -48,41 +95,16 @@ int main(int argc, char** argv) {
       cfg = KokkosDNN::Llama::Config::tiny_test();
       cfg.max_seq_len = 64;
     }
-    KokkosDNN::Llama::Weights<Exec> w;
-    if (tiny || wfiles.empty()) {
-      KokkosDNN::Llama::random_init(cfg, w);
-      std::printf("[tiny random weights] dim=%d layers=%d\n", cfg.dim,
-                  cfg.n_layers);
+    int rc;
+    if (fp32) {
+      std::printf("[dtype fp32]\n");
+      rc = run_model<float>(cfg, wfiles, tiny, tok_path, prompt, max_new);
     } else {
-      KokkosDNN::Llama::load_safetensors(cfg, wfiles, w);
-      std::printf("[loaded %zu shard(s)]\n", wfiles.size());
+      std::printf("[dtype bfloat16]\n");
+      rc = run_model<KokkosDNN::Llama::DefaultScalar>(cfg, wfiles, tiny,
+                                                     tok_path, prompt, max_new);
     }
-
-    std::vector<int> prompt_ids;
-    if (!tok_path.empty()) {
-      KokkosDNN::Llama::Tokenizer tok(tok_path);
-      prompt_ids = tok.encode(prompt);
-      std::printf("prompt tokens: %zu\n", prompt_ids.size());
-    } else {
-      // byte-fallback prompt (no tokenizer file): deterministic ids
-      prompt_ids.push_back(cfg.bos_token % cfg.vocab_size);
-      for (unsigned char c : prompt)
-        prompt_ids.push_back(c % cfg.vocab_size);
-      std::printf("[no tokenizer] byte-fallback prompt tokens: %zu\n",
-                  prompt_ids.size());
-    }
-
-    KokkosDNN::Llama::Model<Exec> model(cfg, w);
-    auto out = model.generate(prompt_ids, max_new);
-    std::printf("generated %zu ids:", out.size());
-    for (auto id : out) std::printf(" %d", id);
-    std::printf("\n");
-    if (!tok_path.empty()) {
-      KokkosDNN::Llama::Tokenizer tok(tok_path);
-      std::printf("decoded: %s\n", tok.decode(out).c_str());
-    }
-    Kokkos::fence();
+    Kokkos::finalize();
+    return rc;
   }
-  Kokkos::finalize();
-  return 0;
 }

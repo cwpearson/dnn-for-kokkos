@@ -19,6 +19,10 @@ namespace Impl {
 // Y[M,N] = alpha * X[M,K] * W[N,K]^T + beta * Y[M,N], all row-major.
 // Uses the col-major identity Yc = Wc^T * Xc where Yc/Wc/Xc share the
 // same buffers interpreted column-major.
+//
+// FP32 only (cublasSgemm). BF16 (and other scalars) intentionally fall
+// back to the native Kokkos kernel in KokkosDNN_Gemm.hpp; wiring BF16
+// would use cublasGemmEx with CUDA_R_16BF compute.
 inline bool cublas_gemm_nt(int M, int N, int K, float alpha,
                             const float* X, const float* W, float beta,
                             float* Y) {

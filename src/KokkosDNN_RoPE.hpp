@@ -25,10 +25,12 @@ Kokkos::View<float*, ExecSpace> rope_inv_freq(int head_dim, float theta,
 // for each head, pairs (d, d+half) rotate by angle = pos * inv_freq[d].
 // q, k: [tokens, n_heads, head_dim] (flattened last two dims as [T, H*D]).
 // This matches HF `apply_rotary_pos_emb` (cat(freqs,freqs) convention).
-template <class ExecSpace>
+// Scalar-agnostic over q/k (float, bhalf_t); inv_freq stays FP32 and the
+// rotation is computed in FP32.
+template <class ExecSpace, class Scalar>
 void rope_neoX_inplace(
-    const Kokkos::View<float***, ExecSpace>& q,  // [T, Hq, D]
-    const Kokkos::View<float***, ExecSpace>& k,  // [T, Hkv, D]
+    const Kokkos::View<Scalar***, ExecSpace>& q,  // [T, Hq, D]
+    const Kokkos::View<Scalar***, ExecSpace>& k,  // [T, Hkv, D]
     const Kokkos::View<float*, ExecSpace>& inv_freq, int head_dim,
     const Kokkos::View<int*, ExecSpace>& positions,  // [T] absolute pos
     const std::string& label = "KokkosDNN::rope") {
@@ -42,9 +44,10 @@ void rope_neoX_inplace(
         for (size_t d = 0; d < Hd; ++d) {
           float ang = pos * inv_freq(d);
           float c = cosf(ang), s = sinf(ang);
-          float a = q(t, h, d), b = q(t, h, d + Hd);
-          q(t, h, d)      = a * c - b * s;
-          q(t, h, d + Hd) = a * s + b * c;
+          float a = static_cast<float>(q(t, h, d)),
+                b = static_cast<float>(q(t, h, d + Hd));
+          q(t, h, d)      = static_cast<Scalar>(a * c - b * s);
+          q(t, h, d + Hd) = static_cast<Scalar>(a * s + b * c);
         }
       });
   Kokkos::parallel_for(
@@ -55,9 +58,10 @@ void rope_neoX_inplace(
         for (size_t d = 0; d < Hd; ++d) {
           float ang = pos * inv_freq(d);
           float c = cosf(ang), s = sinf(ang);
-          float a = k(t, h, d), b = k(t, h, d + Hd);
-          k(t, h, d)      = a * c - b * s;
-          k(t, h, d + Hd) = a * s + b * c;
+          float a = static_cast<float>(k(t, h, d)),
+                b = static_cast<float>(k(t, h, d + Hd));
+          k(t, h, d)      = static_cast<Scalar>(a * c - b * s);
+          k(t, h, d + Hd) = static_cast<Scalar>(a * s + b * c);
         }
       });
   (void)head_dim;

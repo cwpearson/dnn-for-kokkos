@@ -217,43 +217,48 @@ std::vector<float> read_tensor(std::ifstream& f, size_t data_start,
 
 }  // namespace
 
-template <class ExecSpace>
+template <class ExecSpace, class Scalar>
 void copy_host_to_device(
     const std::vector<float>& host, size_t rows, size_t cols,
-    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& dst) {
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& dst) {
   if (dst.extent(0) != rows || dst.extent(1) != cols)
     throw std::runtime_error("copy_host_to_device: shape mismatch");
   auto h = Kokkos::create_mirror_view(dst);
   for (size_t i = 0; i < rows; ++i)
-    for (size_t j = 0; j < cols; ++j) h(i, j) = host[i * cols + j];
+    for (size_t j = 0; j < cols; ++j)
+      h(i, j) = static_cast<Scalar>(host[i * cols + j]);
   Kokkos::deep_copy(dst, h);
 }
 
-template <class ExecSpace>
+template <class ExecSpace, class Scalar>
 void copy_host_vec_to_device(
     const std::vector<float>& host,
-    const Kokkos::View<float*, ExecSpace>& dst) {
+    const Kokkos::View<Scalar*, ExecSpace>& dst) {
   if (dst.extent(0) != host.size())
     throw std::runtime_error("copy_host_vec_to_device: shape mismatch");
   auto h = Kokkos::create_mirror_view(dst);
-  for (size_t i = 0; i < host.size(); ++i) h(i) = host[i];
+  for (size_t i = 0; i < host.size(); ++i)
+    h(i) = static_cast<Scalar>(host[i]);
   Kokkos::deep_copy(dst, h);
 }
 
-template <class ExecSpace>
-void random_init(const Config& cfg, Weights<ExecSpace>& w, uint64_t seed) {
+template <class ExecSpace, class Scalar>
+void random_init(const Config& cfg, Weights<ExecSpace, Scalar>& w,
+                 uint64_t seed) {
   w.allocate(cfg);
   std::mt19937_64 rng(seed);
   std::normal_distribution<float> dist(0.0f, 0.02f);
   auto fill_mat = [&](auto& v) {
     auto h = Kokkos::create_mirror_view(v);
     for (size_t i = 0; i < h.extent(0); ++i)
-      for (size_t j = 0; j < h.extent(1); ++j) h(i, j) = dist(rng);
+      for (size_t j = 0; j < h.extent(1); ++j)
+        h(i, j) = static_cast<Scalar>(dist(rng));
     Kokkos::deep_copy(v, h);
   };
   auto fill_vec = [&](auto& v) {
     auto h = Kokkos::create_mirror_view(v);
-    for (size_t i = 0; i < h.extent(0); ++i) h(i) = 1.0f;
+    for (size_t i = 0; i < h.extent(0); ++i)
+      h(i) = static_cast<Scalar>(1.0f);
     Kokkos::deep_copy(v, h);
   };
   fill_mat(w.embed);
@@ -272,10 +277,10 @@ void random_init(const Config& cfg, Weights<ExecSpace>& w, uint64_t seed) {
   }
 }
 
-template <class ExecSpace>
+template <class ExecSpace, class Scalar>
 void load_safetensors(const Config& cfg,
                       const std::vector<std::string>& files,
-                      Weights<ExecSpace>& w) {
+                      Weights<ExecSpace, Scalar>& w) {
   w.allocate(cfg);
   // Gather metas across shards.
   struct Loc {
@@ -310,13 +315,13 @@ void load_safetensors(const Config& cfg,
       throw std::runtime_error("shape mismatch for " + name);
   };
 
-  copy_host_to_device<ExecSpace>(
+  copy_host_to_device<ExecSpace, Scalar>(
       need("model.embed_tokens.weight"),
       cfg.vocab_size, cfg.dim, w.embed);
   {
     auto v = need("model.norm.weight");
     expect_shape(v, {(size_t)cfg.dim}, "model.norm.weight");
-    copy_host_vec_to_device<ExecSpace>(v, w.final_norm);
+    copy_host_vec_to_device<ExecSpace, Scalar>(v, w.final_norm);
   }
   // lm_head may be named "lm_head.weight" (HF) — accept both.
   {
@@ -326,59 +331,78 @@ void load_safetensors(const Config& cfg,
     } catch (...) {
       v = need("model.lm_head.weight");
     }
-    copy_host_to_device<ExecSpace>(v, cfg.vocab_size, cfg.dim, w.lm_head);
+    copy_host_to_device<ExecSpace, Scalar>(v, cfg.vocab_size, cfg.dim, w.lm_head);
   }
   const int hq  = cfg.n_heads * cfg.head_dim;
   const int hkv = cfg.n_kv_heads * cfg.head_dim;
   for (int l = 0; l < cfg.n_layers; ++l) {
     std::string p = "model.layers." + std::to_string(l) + ".";
     auto& b = w.blocks[l];
-    copy_host_to_device<ExecSpace>(need(p + "self_attn.q_proj.weight"), hq,
-                                   cfg.dim, b.wq);
-    copy_host_to_device<ExecSpace>(need(p + "self_attn.k_proj.weight"), hkv,
-                                   cfg.dim, b.wk);
-    copy_host_to_device<ExecSpace>(need(p + "self_attn.v_proj.weight"), hkv,
-                                   cfg.dim, b.wv);
-    copy_host_to_device<ExecSpace>(need(p + "self_attn.o_proj.weight"),
-                                   cfg.dim, hq, b.wo);
-    copy_host_to_device<ExecSpace>(need(p + "mlp.gate_proj.weight"),
-                                   cfg.ffn_dim, cfg.dim, b.wgate);
-    copy_host_to_device<ExecSpace>(need(p + "mlp.up_proj.weight"),
-                                   cfg.ffn_dim, cfg.dim, b.wup);
-    copy_host_to_device<ExecSpace>(need(p + "mlp.down_proj.weight"), cfg.dim,
-                                   cfg.ffn_dim, b.wdown);
+    copy_host_to_device<ExecSpace, Scalar>(need(p + "self_attn.q_proj.weight"),
+                                           hq, cfg.dim, b.wq);
+    copy_host_to_device<ExecSpace, Scalar>(need(p + "self_attn.k_proj.weight"),
+                                           hkv, cfg.dim, b.wk);
+    copy_host_to_device<ExecSpace, Scalar>(need(p + "self_attn.v_proj.weight"),
+                                           hkv, cfg.dim, b.wv);
+    copy_host_to_device<ExecSpace, Scalar>(
+        need(p + "self_attn.o_proj.weight"), cfg.dim, hq, b.wo);
+    copy_host_to_device<ExecSpace, Scalar>(need(p + "mlp.gate_proj.weight"),
+                                           cfg.ffn_dim, cfg.dim, b.wgate);
+    copy_host_to_device<ExecSpace, Scalar>(need(p + "mlp.up_proj.weight"),
+                                           cfg.ffn_dim, cfg.dim, b.wup);
+    copy_host_to_device<ExecSpace, Scalar>(
+        need(p + "mlp.down_proj.weight"), cfg.dim, cfg.ffn_dim, b.wdown);
     {
       auto v = need(p + "input_layernorm.weight");
       expect_shape(v, {(size_t)cfg.dim}, p + "input_layernorm.weight");
-      copy_host_vec_to_device<ExecSpace>(v, b.attn_norm);
+      copy_host_vec_to_device<ExecSpace, Scalar>(v, b.attn_norm);
     }
     {
       auto v = need(p + "post_attention_layernorm.weight");
       expect_shape(v, {(size_t)cfg.dim}, p + "post_attention_layernorm");
-      copy_host_vec_to_device<ExecSpace>(v, b.ffn_norm);
+      copy_host_vec_to_device<ExecSpace, Scalar>(v, b.ffn_norm);
     }
   }
 }
 
-// Explicit instantiation declarations for common spaces (defined here so
-// the .cpp compiles them; other ExecSpaces instantiate implicitly from
-// the header since functions are templates — the definitions below force
-// Serial emit for faster test linking).
-template void random_init<Kokkos::Serial>(const Config&, Weights<Kokkos::Serial>&, uint64_t);
-template void load_safetensors<Kokkos::Serial>(const Config&, const std::vector<std::string>&, Weights<Kokkos::Serial>&);
-template void copy_host_to_device<Kokkos::Serial>(const std::vector<float>&, size_t, size_t,
+// Explicit instantiations for common spaces (defined here so the .cpp
+// compiles them; other ExecSpaces instantiate implicitly from the header).
+// On builds without a native bhalf type Kokkos aliases bhalf_t to float
+// (KOKKOS_BHALF_T_IS_FLOAT), so the bhalf_t lines are skipped there to
+// avoid duplicate explicit instantiations.
+template void random_init<Kokkos::Serial, float>(const Config&, Weights<Kokkos::Serial, float>&, uint64_t);
+template void load_safetensors<Kokkos::Serial, float>(const Config&, const std::vector<std::string>&, Weights<Kokkos::Serial, float>&);
+template void copy_host_to_device<Kokkos::Serial, float>(const std::vector<float>&, size_t, size_t,
     const Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::Serial>&);
+#if !KOKKOS_BHALF_T_IS_FLOAT
+template void random_init<Kokkos::Serial, Kokkos::Experimental::bhalf_t>(const Config&, Weights<Kokkos::Serial, Kokkos::Experimental::bhalf_t>&, uint64_t);
+template void load_safetensors<Kokkos::Serial, Kokkos::Experimental::bhalf_t>(const Config&, const std::vector<std::string>&, Weights<Kokkos::Serial, Kokkos::Experimental::bhalf_t>&);
+template void copy_host_to_device<Kokkos::Serial, Kokkos::Experimental::bhalf_t>(const std::vector<float>&, size_t, size_t,
+    const Kokkos::View<Kokkos::Experimental::bhalf_t**, Kokkos::LayoutRight, Kokkos::Serial>&);
+#endif
 #ifdef KOKKOS_ENABLE_OPENMP
-template void random_init<Kokkos::OpenMP>(const Config&, Weights<Kokkos::OpenMP>&, uint64_t);
-template void load_safetensors<Kokkos::OpenMP>(const Config&, const std::vector<std::string>&, Weights<Kokkos::OpenMP>&);
-template void copy_host_to_device<Kokkos::OpenMP>(const std::vector<float>&, size_t, size_t,
+template void random_init<Kokkos::OpenMP, float>(const Config&, Weights<Kokkos::OpenMP, float>&, uint64_t);
+template void load_safetensors<Kokkos::OpenMP, float>(const Config&, const std::vector<std::string>&, Weights<Kokkos::OpenMP, float>&);
+template void copy_host_to_device<Kokkos::OpenMP, float>(const std::vector<float>&, size_t, size_t,
     const Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::OpenMP>&);
+#if !KOKKOS_BHALF_T_IS_FLOAT
+template void random_init<Kokkos::OpenMP, Kokkos::Experimental::bhalf_t>(const Config&, Weights<Kokkos::OpenMP, Kokkos::Experimental::bhalf_t>&, uint64_t);
+template void load_safetensors<Kokkos::OpenMP, Kokkos::Experimental::bhalf_t>(const Config&, const std::vector<std::string>&, Weights<Kokkos::OpenMP, Kokkos::Experimental::bhalf_t>&);
+template void copy_host_to_device<Kokkos::OpenMP, Kokkos::Experimental::bhalf_t>(const std::vector<float>&, size_t, size_t,
+    const Kokkos::View<Kokkos::Experimental::bhalf_t**, Kokkos::LayoutRight, Kokkos::OpenMP>&);
+#endif
 #endif
 #ifdef KOKKOS_ENABLE_CUDA
-template void random_init<Kokkos::Cuda>(const Config&, Weights<Kokkos::Cuda>&, uint64_t);
-template void load_safetensors<Kokkos::Cuda>(const Config&, const std::vector<std::string>&, Weights<Kokkos::Cuda>&);
-template void copy_host_to_device<Kokkos::Cuda>(const std::vector<float>&, size_t, size_t,
+template void random_init<Kokkos::Cuda, float>(const Config&, Weights<Kokkos::Cuda, float>&, uint64_t);
+template void load_safetensors<Kokkos::Cuda, float>(const Config&, const std::vector<std::string>&, Weights<Kokkos::Cuda, float>&);
+template void copy_host_to_device<Kokkos::Cuda, float>(const std::vector<float>&, size_t, size_t,
     const Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::Cuda>&);
+#if !KOKKOS_BHALF_T_IS_FLOAT
+template void random_init<Kokkos::Cuda, Kokkos::Experimental::bhalf_t>(const Config&, Weights<Kokkos::Cuda, Kokkos::Experimental::bhalf_t>&, uint64_t);
+template void load_safetensors<Kokkos::Cuda, Kokkos::Experimental::bhalf_t>(const Config&, const std::vector<std::string>&, Weights<Kokkos::Cuda, Kokkos::Experimental::bhalf_t>&);
+template void copy_host_to_device<Kokkos::Cuda, Kokkos::Experimental::bhalf_t>(const std::vector<float>&, size_t, size_t,
+    const Kokkos::View<Kokkos::Experimental::bhalf_t**, Kokkos::LayoutRight, Kokkos::Cuda>&);
+#endif
 #endif
 
 }  // namespace Llama
