@@ -12,7 +12,7 @@ It provides:
 
 - Native Kokkos implementations of every operator the model needs (GEMM/GEMV, RMSNorm, softmax, RoPE, SwiGLU, embedding gather, grouped-query causal attention, greedy sampler).
 - Optional dispatch to CUDA libraries when enabled at configure time: GEMM to **cuBLAS** (FP32 via `sgemm`, BF16 via `cublasGemmEx` with FP32 accumulation), attention to **cuDNN SDPA** (currently a documented stub that falls back to the native kernel).
-- A Llama example (`examples/llama/`): 3.3 8B config defaults, a safetensors checkpoint loader (on-disk F32/F16/BF16 are converted to the model scalar), a minimal Hugging Face `tokenizer.json` loader, a KV-cache autoregressive model, and a `llama_generate` driver.
+- A Llama example (`examples/llama/`): 3.3 8B config defaults, a safetensors checkpoint loader (on-disk F32/F16/BF16 are converted to the model scalar), a faithful Hugging Face `tokenizer.json` loader (special-token split, tiktoken Split pre-tokenizer, GPT-2 byte mapping, per-piece BPE; validated ID-for-ID against `tokenizers`), a KV-cache autoregressive model, and a `llama_generate` driver.
 - Unit tests and a tiny-random-weights end-to-end path so the full pipeline runs without downloading a 16 GB checkpoint.
 
 Scope is deliberately narrow: **bfloat16 storage/compute by default** (`--fp32` opts in), **inference only** (prefill + greedy decode), no training, no quantization. All ops are templated on the scalar type (`float`, `Kokkos::Experimental::bhalf_t`) with FP32 accumulation; TPL paths cover GEMM for both scalars and fall back to native otherwise.
@@ -133,6 +133,13 @@ large-GPU or CPU-Kokkos build for the real checkpoint.
   Remaining 128k considerations: the BF16 KV cache itself is ~256 MiB per
   layer (~8 GiB for 32 layers at 128k), and single-shot prefill holds
   O(T·dim) activations — chunked prefill is future work.
-- The tokenizer is a minimal byte-level BPE loader; text quality should be validated against the real `tokenizer.json` before trusting output.
+- The tokenizer implements the full HF `tokenizers` pipeline for the Llama 3
+  `tokenizer.json` (special-token longest-match split, the tiktoken Split
+  regex with Unicode `\p{L}`/`\p{N}`, GPT-2 byte mapping, per-piece BPE,
+  byte-level decode that skips specials by default). It is validated ID-for-ID
+  against Python `tokenizers` on the real file: `Test_Tokenizer.RealFileOracle`
+  (runs when `KOKKOSDNN_TOKENIZER_JSON` points at a Llama 3 `tokenizer.json`;
+  92 targeted + 2000 fuzz differential cases pass). Re-validate a new file with
+  `KOKKOSDNN_TOKENIZER_JSON=tokenizer.json ./build/examples/llama/test_tokenizer`.
 - The cuDNN SDPA path is a stub interface, not a working kernel yet.
 - Only greedy sampling is implemented; no temperature / top-p / batching.
