@@ -1,12 +1,14 @@
 // RMSNorm vs host reference (float + bfloat16).
+#include <gtest/gtest.h>
+
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
 #include <cmath>
-#include <cstdio>
+
 #include "KokkosDNN.hpp"
 
 template <class Scalar>
-int run_rmsnorm(float tol) {
+void check_rmsnorm(float tol) {
   using Exec = Kokkos::DefaultExecutionSpace;
   const int T = 3, D = 8;
   Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> x("x", T, D), y("y", T, D);
@@ -44,10 +46,8 @@ int run_rmsnorm(float tol) {
     for (int d = 0; d < D; ++d) {
       float want =
           static_cast<float>(hx(t, d)) * inv * static_cast<float>(hw(d));
-      if (std::fabs(static_cast<float>(got(t, d)) - want) > tol) {
-        std::printf("FAIL rmsnorm\n");
-        return 1;
-      }
+      EXPECT_NEAR(static_cast<float>(got(t, d)), want, tol)
+          << "rmsnorm mismatch at (" << t << "," << d << ")";
     }
   }
   {
@@ -60,22 +60,12 @@ int run_rmsnorm(float tol) {
     for (int d = 0; d < D; ++d) {
       float want =
           static_cast<float>(hx(0, d)) * inv * static_cast<float>(hw(d));
-      if (std::fabs(static_cast<float>(gotr(d)) - want) > tol) {
-        std::printf("FAIL rmsnorm_row\n");
-        return 1;
-      }
+      EXPECT_NEAR(static_cast<float>(gotr(d)), want, tol)
+          << "rmsnorm_row mismatch at (" << d << ")";
     }
   }
-  return 0;
 }
 
-int main(int argc, char** argv) {
-  Kokkos::initialize(argc, argv);
-  {
-    if (run_rmsnorm<float>(1e-5f)) return 1;
-    if (run_rmsnorm<Kokkos::Experimental::bhalf_t>(5e-2f)) return 1;
-    std::printf("PASS test_rmsnorm\n");
-  }
-  Kokkos::finalize();
-  return 0;
-}
+TEST(RMSNorm, Float) { check_rmsnorm<float>(1e-5f); }
+
+TEST(RMSNorm, BHalf) { check_rmsnorm<Kokkos::Experimental::bhalf_t>(5e-2f); }

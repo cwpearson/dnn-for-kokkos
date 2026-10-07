@@ -1,25 +1,32 @@
 // Safetensors round-trip: write a tiny F32/BF16 checkpoint, load it back
 // into both fp32 and bfloat16 weights.
+#include <gtest/gtest.h>
+
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
+
 #include "KokkosDNN.hpp"
 #include "KokkosDNN_LlamaConfig.hpp"
 #include "KokkosDNN_LlamaModel.hpp"
 #include "KokkosDNN_LlamaWeights.hpp"
 
-static uint16_t fp32_to_bf16(float x) {
+namespace {
+
+uint16_t fp32_to_bf16(float x) {
   uint32_t u;
   std::memcpy(&u, &x, 4);
   return (uint16_t)(u >> 16);
 }
 
-static void write_safetensors_tiny(const std::string& path) {
+void write_safetensors_tiny(const std::string& path) {
   // Tensors for tiny_test with dim=8 to keep file small (override shapes).
   // We write only the tensors that loader expects for a custom cfg below.
   // For simplicity this test uses dim=8,n_layers=1,n_heads=4,n_kv=2,
@@ -74,7 +81,7 @@ static void write_safetensors_tiny(const std::string& path) {
        f32(ones_D)},
   };
   std::string js = "{";
-  size_t off = 0;
+  size_t off     = 0;
   for (size_t i = 0; i < es.size(); ++i) {
     char buf[512];
     std::snprintf(buf, sizeof(buf),
@@ -96,85 +103,73 @@ static void write_safetensors_tiny(const std::string& path) {
   for (auto& e : es) f.write(e.data.data(), e.data.size());
 }
 
-int main(int argc, char** argv) {
-  Kokkos::initialize(argc, argv);
+KokkosDNN::Llama::Config tiny_safetensors_config() {
+  KokkosDNN::Llama::Config cfg;
+  cfg.dim        = 8;
+  cfg.n_layers   = 1;
+  cfg.n_heads    = 4;
+  cfg.n_kv_heads = 2;
+  cfg.vocab_size = 16;
+  cfg.ffn_dim    = 16;
+  cfg.head_dim   = 2;
+  cfg.max_seq_len = 16;
+  return cfg;
+}
+
+const char* tiny_safetensors_path() {
+  return "/tmp/opencode_test_tiny.safetensors";
+}
+
+}  // namespace
+
+TEST(Safetensors, Fp32) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  write_safetensors_tiny(tiny_safetensors_path());
+  auto cfg = tiny_safetensors_config();
+  KokkosDNN::Llama::Weights<Exec, float> w;
+  KokkosDNN::Llama::load_safetensors(cfg, {tiny_safetensors_path()}, w);
+  // Spot-check: embed[0,0] == 0.06, q[0,0] ~= 0.01 (BF16 rounds to ~0.00999)
+  auto he = Kokkos::create_mirror_view(w.embed);
+  Kokkos::deep_copy(he, w.embed);
+  EXPECT_NEAR(he(0, 0), 0.06f, 1e-3f);
+  auto hq = Kokkos::create_mirror_view(w.blocks[0].wq);
+  Kokkos::deep_copy(hq, w.blocks[0].wq);
+  EXPECT_NEAR(hq(0, 0), 0.01f, 2e-3f);
+}
+
+TEST(Safetensors, BHalf) {
+  using Exec   = Kokkos::DefaultExecutionSpace;
+  using Scalar = Kokkos::Experimental::bhalf_t;
+  write_safetensors_tiny(tiny_safetensors_path());
+  auto cfg = tiny_safetensors_config();
+  // BF16 weights: native storage, no FP32 upcast.
+  KokkosDNN::Llama::Weights<Exec, Scalar> wb;
+  KokkosDNN::Llama::load_safetensors(cfg, {tiny_safetensors_path()}, wb);
+  auto heb = Kokkos::create_mirror_view(wb.embed);
+  Kokkos::deep_copy(heb, wb.embed);
+  EXPECT_NEAR(static_cast<float>(heb(0, 0)), 0.06f, 1e-2f);
+  auto hqb = Kokkos::create_mirror_view(wb.blocks[0].wq);
+  Kokkos::deep_copy(hqb, wb.blocks[0].wq);
+  EXPECT_NEAR(static_cast<float>(hqb(0, 0)), 0.01f, 1e-2f);
+  // BF16 forward smoke: prefill tokens through the loaded weights.
+  KokkosDNN::Llama::Model<Exec, Scalar> model(cfg, wb);
+  Kokkos::View<int*, Exec> toks("toks", 2);
   {
-    using Exec = Kokkos::DefaultExecutionSpace;
-    const std::string path = "/tmp/opencode_test_tiny.safetensors";
-    write_safetensors_tiny(path);
-    KokkosDNN::Llama::Config cfg;
-    cfg.dim = 8;
-    cfg.n_layers = 1;
-    cfg.n_heads = 4;
-    cfg.n_kv_heads = 2;
-    cfg.vocab_size = 16;
-    cfg.ffn_dim = 16;
-    cfg.head_dim = 2;
-    cfg.max_seq_len = 16;
-    KokkosDNN::Llama::Weights<Exec, float> w;
-    KokkosDNN::Llama::load_safetensors(cfg, {path}, w);
-    // Spot-check: embed[0,0] == 0.06, q[0,0] ~= 0.01 (BF16 rounds to ~0.00999)
-    auto he = Kokkos::create_mirror_view(w.embed);
-    Kokkos::deep_copy(he, w.embed);
-    if (std::abs(he(0, 0) - 0.06f) > 1e-3f) {
-      std::printf("FAIL safetensors[fp32] embed %f\n", he(0, 0));
-      return 1;
-    }
-    auto hq = Kokkos::create_mirror_view(w.blocks[0].wq);
-    Kokkos::deep_copy(hq, w.blocks[0].wq);
-    if (std::abs(hq(0, 0) - 0.01f) > 2e-3f) {
-      std::printf("FAIL safetensors[fp32] bf16 %f\n", hq(0, 0));
-      return 1;
-    }
-    // BF16 weights: native storage, no FP32 upcast.
-    {
-      using Scalar = Kokkos::Experimental::bhalf_t;
-      KokkosDNN::Llama::Weights<Exec, Scalar> wb;
-      KokkosDNN::Llama::load_safetensors(cfg, {path}, wb);
-      auto heb = Kokkos::create_mirror_view(wb.embed);
-      Kokkos::deep_copy(heb, wb.embed);
-      if (std::abs(static_cast<float>(heb(0, 0)) - 0.06f) > 1e-2f) {
-        std::printf("FAIL safetensors[bf16] embed %f\n",
-                    static_cast<float>(heb(0, 0)));
-        return 1;
-      }
-      auto hqb = Kokkos::create_mirror_view(wb.blocks[0].wq);
-      Kokkos::deep_copy(hqb, wb.blocks[0].wq);
-      if (std::abs(static_cast<float>(hqb(0, 0)) - 0.01f) > 1e-2f) {
-        std::printf("FAIL safetensors[bf16] bf16 %f\n",
-                    static_cast<float>(hqb(0, 0)));
-        return 1;
-      }
-      // BF16 forward smoke: prefill tokens through the loaded weights.
-      KokkosDNN::Llama::Model<Exec, Scalar> model(cfg, wb);
-      Kokkos::View<int*, Exec> toks("toks", 2);
-      {
-        auto ht = Kokkos::create_mirror_view(toks);
-        ht(0) = 1;
-        ht(1) = 2;
-        Kokkos::deep_copy(toks, ht);
-      }
-      auto logits = model.forward(toks);
-      if (logits.extent(0) != (size_t)cfg.vocab_size) {
-        std::printf("FAIL safetensors[bf16] forward shape\n");
-        return 1;
-      }
-    }
-    // Missing tensor must throw.
-    bool threw = false;
-    try {
-      KokkosDNN::Llama::Weights<Exec, float> w2;
-      KokkosDNN::Llama::load_safetensors(cfg, {"/nonexistent.safetensors"},
-                                         w2);
-    } catch (...) {
-      threw = true;
-    }
-    if (!threw) {
-      std::printf("FAIL safetensors missing-file\n");
-      return 1;
-    }
-    std::printf("PASS test_safetensors\n");
+    auto ht = Kokkos::create_mirror_view(toks);
+    ht(0)   = 1;
+    ht(1)   = 2;
+    Kokkos::deep_copy(toks, ht);
   }
-  Kokkos::finalize();
-  return 0;
+  auto logits = model.forward(toks);
+  EXPECT_EQ(logits.extent(0), (size_t)cfg.vocab_size);
+}
+
+TEST(Safetensors, MissingFileThrows) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  auto cfg   = tiny_safetensors_config();
+  KokkosDNN::Llama::Weights<Exec, float> w2;
+  EXPECT_THROW(
+      KokkosDNN::Llama::load_safetensors(cfg, {"/nonexistent.safetensors"},
+                                         w2),
+      std::runtime_error);
 }

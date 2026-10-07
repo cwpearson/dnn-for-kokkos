@@ -1,12 +1,14 @@
 // GEMM: Y = X * W^T vs host reference (float + bfloat16).
+#include <gtest/gtest.h>
+
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
 #include <cmath>
-#include <cstdio>
+
 #include "KokkosDNN.hpp"
 
 template <class Scalar>
-int run_gemm(float tol) {
+void check_gemm(float tol) {
   using Exec = Kokkos::DefaultExecutionSpace;
   KokkosDNN::DNNHandle<Exec> h;
   const int M = 5, K = 7, N = 4;
@@ -36,11 +38,8 @@ int run_gemm(float tol) {
       for (int k = 0; k < K; ++k)
         acc += static_cast<float>(hx(i, k)) * static_cast<float>(hw(j, k));
       float want = 2 * acc + 1;
-      if (std::fabs(static_cast<float>(got(i, j)) - want) > tol) {
-        std::printf("FAIL gemm (%d,%d) got %f want %f\n", i, j,
-                    static_cast<float>(got(i, j)), want);
-        return 1;
-      }
+      EXPECT_NEAR(static_cast<float>(got(i, j)), want, tol)
+          << "gemm mismatch at (" << i << "," << j << ")";
     }
   // gemv path as well (decode shape).
   {
@@ -56,23 +55,12 @@ int run_gemm(float tol) {
       float acc = 0;
       for (int k = 0; k < K; ++k)
         acc += static_cast<float>(hxv(k)) * static_cast<float>(hw(j, k));
-      if (std::fabs(static_cast<float>(gotv(j)) - acc) > tol) {
-        std::printf("FAIL gemv (%d) got %f want %f\n", j,
-                    static_cast<float>(gotv(j)), acc);
-        return 1;
-      }
+      EXPECT_NEAR(static_cast<float>(gotv(j)), acc, tol)
+          << "gemv mismatch at (" << j << ")";
     }
   }
-  return 0;
 }
 
-int main(int argc, char** argv) {
-  Kokkos::initialize(argc, argv);
-  {
-    if (run_gemm<float>(1e-4f)) return 1;
-    if (run_gemm<Kokkos::Experimental::bhalf_t>(5e-2f)) return 1;
-    std::printf("PASS test_gemm\n");
-  }
-  Kokkos::finalize();
-  return 0;
-}
+TEST(Gemm, Float) { check_gemm<float>(1e-4f); }
+
+TEST(Gemm, BHalf) { check_gemm<Kokkos::Experimental::bhalf_t>(5e-2f); }

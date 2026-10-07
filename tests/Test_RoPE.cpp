@@ -1,12 +1,14 @@
 // RoPE preserves per-head norm (rotation is orthogonal, float + bfloat16).
+#include <gtest/gtest.h>
+
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
 #include <cmath>
-#include <cstdio>
+
 #include "KokkosDNN.hpp"
 
 template <class Scalar>
-int run_rope(float tol) {
+void check_rope(float tol) {
   using Exec = Kokkos::DefaultExecutionSpace;
   const int T = 2, H = 2, D = 8;
   Kokkos::View<Scalar***, Exec> q("q", T, H, D), k("k", T, H, D);
@@ -48,21 +50,13 @@ int run_rope(float tol) {
         m0 += c * c;
         m1 += e * e;
       }
-      if (std::fabs(n0 - n1) > tol || std::fabs(m0 - m1) > tol) {
-        std::printf("FAIL rope norm %f %f\n", n0, n1);
-        return 1;
-      }
+      EXPECT_NEAR(n1, n0, tol) << "rope q norm changed at (" << t << "," << h
+                               << ")";
+      EXPECT_NEAR(m1, m0, tol) << "rope k norm changed at (" << t << "," << h
+                               << ")";
     }
-  return 0;
 }
 
-int main(int argc, char** argv) {
-  Kokkos::initialize(argc, argv);
-  {
-    if (run_rope<float>(1e-3f)) return 1;
-    if (run_rope<Kokkos::Experimental::bhalf_t>(5e-1f)) return 1;
-    std::printf("PASS test_rope\n");
-  }
-  Kokkos::finalize();
-  return 0;
-}
+TEST(RoPE, Float) { check_rope<float>(1e-3f); }
+
+TEST(RoPE, BHalf) { check_rope<Kokkos::Experimental::bhalf_t>(5e-1f); }

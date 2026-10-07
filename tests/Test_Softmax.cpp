@@ -1,12 +1,14 @@
 // Softmax rows sum to 1 and match host reference (float + bfloat16).
+#include <gtest/gtest.h>
+
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
 #include <cmath>
-#include <cstdio>
+
 #include "KokkosDNN.hpp"
 
 template <class Scalar>
-int run_softmax(float tol) {
+void check_softmax(float tol) {
   using Exec = Kokkos::DefaultExecutionSpace;
   const int R = 4, C = 6;
   Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> x("x", R, C), y("y", R, C);
@@ -24,32 +26,18 @@ int run_softmax(float tol) {
     for (int c = 1; c < C; ++c)
       m = fmaxf(m, static_cast<float>(hx(r, c)));
     float s = 0;
-    for (int c = 0; c < C; ++c)
-      s += expf(static_cast<float>(hx(r, c)) - m);
+    for (int c = 0; c < C; ++c) s += expf(static_cast<float>(hx(r, c)) - m);
     float sum = 0;
     for (int c = 0; c < C; ++c) {
       float want = expf(static_cast<float>(hx(r, c)) - m) / s;
       sum += static_cast<float>(got(r, c));
-      if (std::fabs(static_cast<float>(got(r, c)) - want) > tol) {
-        std::printf("FAIL softmax\n");
-        return 1;
-      }
+      EXPECT_NEAR(static_cast<float>(got(r, c)), want, tol)
+          << "softmax mismatch at (" << r << "," << c << ")";
     }
-    if (std::fabs(sum - 1.0f) > tol) {
-      std::printf("FAIL softmax sum\n");
-      return 1;
-    }
+    EXPECT_NEAR(sum, 1.0f, tol) << "softmax row " << r << " does not sum to 1";
   }
-  return 0;
 }
 
-int main(int argc, char** argv) {
-  Kokkos::initialize(argc, argv);
-  {
-    if (run_softmax<float>(1e-5f)) return 1;
-    if (run_softmax<Kokkos::Experimental::bhalf_t>(5e-2f)) return 1;
-    std::printf("PASS test_softmax\n");
-  }
-  Kokkos::finalize();
-  return 0;
-}
+TEST(Softmax, Float) { check_softmax<float>(1e-5f); }
+
+TEST(Softmax, BHalf) { check_softmax<Kokkos::Experimental::bhalf_t>(5e-2f); }

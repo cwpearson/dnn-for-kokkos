@@ -1,12 +1,14 @@
 // SwiGLU vs host reference (float + bfloat16).
+#include <gtest/gtest.h>
+
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
 #include <cmath>
-#include <cstdio>
+
 #include "KokkosDNN.hpp"
 
 template <class Scalar>
-int run_swiglu(float tol) {
+void check_swiglu(float tol) {
   using Exec = Kokkos::DefaultExecutionSpace;
   const int T = 2, F = 16;
   Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> g("g", T, F), u("u", T, F),
@@ -29,32 +31,19 @@ int run_swiglu(float tol) {
     hl(3) = static_cast<Scalar>(5.0f);
     Kokkos::deep_copy(logits, hl);
   }
-  if (KokkosDNN::sample_greedy<Exec, Scalar>(logits) != 3) {
-    std::printf("FAIL sampler\n");
-    return 1;
-  }
+  EXPECT_EQ((KokkosDNN::sample_greedy<Exec, Scalar>(logits)), 3);
   Kokkos::fence();
   auto got = Kokkos::create_mirror_view(o);
   Kokkos::deep_copy(got, o);
   for (int t = 0; t < T; ++t)
     for (int f = 0; f < F; ++f) {
-      float gg = static_cast<float>(hg(t, f));
+      float gg   = static_cast<float>(hg(t, f));
       float want = (gg / (1 + expf(-gg))) * static_cast<float>(hu(t, f));
-      if (std::fabs(static_cast<float>(got(t, f)) - want) > tol) {
-        std::printf("FAIL swiglu\n");
-        return 1;
-      }
+      EXPECT_NEAR(static_cast<float>(got(t, f)), want, tol)
+          << "swiglu mismatch at (" << t << "," << f << ")";
     }
-  return 0;
 }
 
-int main(int argc, char** argv) {
-  Kokkos::initialize(argc, argv);
-  {
-    if (run_swiglu<float>(1e-5f)) return 1;
-    if (run_swiglu<Kokkos::Experimental::bhalf_t>(5e-2f)) return 1;
-    std::printf("PASS test_swiglu\n");
-  }
-  Kokkos::finalize();
-  return 0;
-}
+TEST(SwiGLU, Float) { check_swiglu<float>(1e-5f); }
+
+TEST(SwiGLU, BHalf) { check_swiglu<Kokkos::Experimental::bhalf_t>(5e-2f); }

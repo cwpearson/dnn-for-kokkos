@@ -1,13 +1,15 @@
 // Attention: single query attending to a single key must return its value
 // (float + bfloat16). Also covers embedding_gather on both scalars.
+#include <gtest/gtest.h>
+
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
 #include <cmath>
-#include <cstdio>
+
 #include "KokkosDNN.hpp"
 
 template <class Scalar>
-int run_attention(float tol) {
+void check_attention(float tol) {
   using Exec = Kokkos::DefaultExecutionSpace;
   KokkosDNN::DNNHandle<Exec> h;
   const int Hq = 4, Hkv = 2, D = 8;
@@ -51,32 +53,22 @@ int run_attention(float tol) {
   for (int hh = 0; hh < Hq; ++hh) {
     int hkv = (hh * Hkv) / Hq;
     for (int d = 0; d < D; ++d)
-      if (std::fabs(static_cast<float>(got(0, hh, d)) -
-                    static_cast<float>(hv(0, hkv, d))) > tol) {
-        std::printf("FAIL attention single-key\n");
-        return 1;
-      }
+      EXPECT_NEAR(static_cast<float>(got(0, hh, d)),
+                  static_cast<float>(hv(0, hkv, d)), tol)
+          << "attention single-key mismatch at (" << hh << "," << d << ")";
   }
   auto ge = Kokkos::create_mirror_view(emb);
   Kokkos::deep_copy(ge, emb);
   auto gt = Kokkos::create_mirror_view(tab);
   Kokkos::deep_copy(gt, tab);
-  for (int d = 0; d < D; ++d)
-    if (static_cast<float>(ge(0, d)) != static_cast<float>(gt(3, d)) ||
-        static_cast<float>(ge(1, d)) != static_cast<float>(gt(1, d))) {
-      std::printf("FAIL embedding_gather\n");
-      return 1;
-    }
-  return 0;
+  for (int d = 0; d < D; ++d) {
+    EXPECT_EQ(static_cast<float>(ge(0, d)), static_cast<float>(gt(3, d)))
+        << "embedding_gather mismatch at (" << d << ")";
+    EXPECT_EQ(static_cast<float>(ge(1, d)), static_cast<float>(gt(1, d)))
+        << "embedding_gather mismatch at (" << d << ")";
+  }
 }
 
-int main(int argc, char** argv) {
-  Kokkos::initialize(argc, argv);
-  {
-    if (run_attention<float>(1e-4f)) return 1;
-    if (run_attention<Kokkos::Experimental::bhalf_t>(5e-2f)) return 1;
-    std::printf("PASS test_attention\n");
-  }
-  Kokkos::finalize();
-  return 0;
-}
+TEST(Attention, Float) { check_attention<float>(1e-4f); }
+
+TEST(Attention, BHalf) { check_attention<Kokkos::Experimental::bhalf_t>(5e-2f); }
