@@ -704,6 +704,7 @@ void Tokenizer::load(const std::string& path) {
   };
   bos_id_ = resolve("<|begin_of_text|>", 128000);
   eos_id_ = resolve("<|end_of_text|>", 128001);
+  eom_id_ = resolve("<|eom_id|>", 128008);
   eot_id_ = resolve("<|eot_id|>", 128009);
 }
 

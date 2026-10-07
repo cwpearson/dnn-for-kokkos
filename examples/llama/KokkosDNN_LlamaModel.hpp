@@ -3,6 +3,7 @@
 
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
+#include <algorithm>
 #include <utility>
 #include <vector>
 #include "KokkosDNN_Attention.hpp"
@@ -195,12 +196,23 @@ class Model {
   }
 
   // Host convenience: prefill + greedy decode loop.
-  // Returns all ids (prompt + generated). Stops at eos or max_new.
+  // Returns all ids (prompt + generated). Stops at any id in stop_ids
+  // (the stop token itself is included) or max_new. An empty stop_ids
+  // means the Instruct defaults {eos_token, eom_token, eot_token}.
   std::vector<int> generate(const std::vector<int>& prompt, int max_new,
-                            int eos = -1) {
+                            const std::vector<int>& stop_ids) {
     reset();
     std::vector<int> out = prompt;
-    if (eos < 0) eos = cfg.eos_token;
+    std::vector<int> stops = stop_ids.empty()
+                                 ? std::vector<int>{cfg.eos_token,
+                                                    cfg.eom_token,
+                                                    cfg.eot_token}
+                                 : stop_ids;
+    std::sort(stops.begin(), stops.end());
+    stops.erase(std::unique(stops.begin(), stops.end()), stops.end());
+    auto is_stop = [&](int id) {
+      return std::binary_search(stops.begin(), stops.end(), id);
+    };
     const int max_seq = cfg.max_seq_len;
     Kokkos::View<int*, ExecSpace> toks("toks", prompt.size());
     {
@@ -212,7 +224,7 @@ class Model {
     int nxt = sample_greedy<ExecSpace, Scalar>(logits);
     if ((int)out.size() < max_seq) out.push_back(nxt);
     for (int s = 1; s < max_new; ++s) {
-      if (nxt == eos) break;
+      if (is_stop(nxt)) break;
       if ((int)out.size() >= max_seq) break;
       Kokkos::View<int*, ExecSpace> one("one", 1);
       {
@@ -225,6 +237,14 @@ class Model {
       out.push_back(nxt);
     }
     return out;
+  }
+
+  // Back-compatible single-eos overload: eos >= 0 stops on that id only,
+  // eos < 0 (default) uses the Instruct default stop set above.
+  std::vector<int> generate(const std::vector<int>& prompt, int max_new,
+                            int eos = -1) {
+    if (eos < 0) return generate(prompt, max_new, std::vector<int>{});
+    return generate(prompt, max_new, std::vector<int>{eos});
   }
 };
 

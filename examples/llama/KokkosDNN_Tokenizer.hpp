@@ -25,7 +25,8 @@ namespace Llama {
 //      asked otherwise.
 //
 // Special tokens (Llama 3): BOS <|begin_of_text|> = 128000,
-// EOS <|end_of_text|> = 128001, EOT <|eot_id|> = 128009 (the actual stop
+// EOS <|end_of_text|> = 128001, EOM <|eom_id|> = 128008,
+// EOT <|eot_id|> = 128009 (the actual stop
 // token of the Instruct chat template), plus <|start_header_id|> /
 // <|end_header_id|> and reserved tokens in 128002..128255. Ids are
 // resolved by content from `added_tokens`, falling back to the
@@ -48,6 +49,7 @@ class Tokenizer {
 
   int bos() const { return bos_id_; }
   int eos() const { return eos_id_; }
+  int eom() const { return eom_id_; }
   int eot() const { return eot_id_; }
   bool is_special(int id) const { return special_ids_.count(id) != 0; }
 
@@ -60,7 +62,7 @@ class Tokenizer {
 
   std::string path_;
   int vocab_size_ = 128256;
-  int bos_id_ = 128000, eos_id_ = 128001, eot_id_ = 128009;
+  int bos_id_ = 128000, eos_id_ = 128001, eom_id_ = 128008, eot_id_ = 128009;
   std::vector<std::string> id_to_token_;
   std::unordered_map<std::string, int> token_to_id_;
   std::unordered_map<std::string, int> merge_rank_;

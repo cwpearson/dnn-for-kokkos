@@ -12,17 +12,21 @@
 // PoC driver: tiny random model by default; real weights via flags.
 //   llama_generate [--tiny] [--weights a.safetensors ...]
 //                  [--tokenizer tok.json] [--prompt "text"] [--max-new N]
-//                  [--fp32]
+//                  [--stop <id> ...] [--fp32]
 //
 // Default compute/storage is bfloat16 (Llama 3.3 8B checkpoint dtype);
 // --fp32 opts into FP32 for comparison. BF16 8B needs ~16 GiB (FP32
 // ~32 GiB); RTX 3090 (24 GiB) fits BF16 but not FP32 — use --tiny or
 // a big-GPU/CPU build for real checkpoints.
+//
+// Stopping: by default the Instruct stop set {eos, eom, eot} from the
+// tokenizer (or Config fallback without --tokenizer); --stop appends
+// extra ids.
 template <class Scalar>
 int run_model(KokkosDNN::Llama::Config cfg,
               const std::vector<std::string>& wfiles, bool tiny,
               const std::string& tok_path, const std::string& prompt,
-              int max_new) {
+              int max_new, const std::vector<int>& extra_stops) {
   using Exec = Kokkos::DefaultExecutionSpace;
   KokkosDNN::Llama::Weights<Exec, Scalar> w;
   if (tiny || wfiles.empty()) {
@@ -35,20 +39,27 @@ int run_model(KokkosDNN::Llama::Config cfg,
   }
 
   std::vector<int> prompt_ids;
+  std::vector<int> stops;
   if (!tok_path.empty()) {
     KokkosDNN::Llama::Tokenizer tok(tok_path);
     prompt_ids = tok.encode(prompt);
     std::printf("prompt tokens: %zu\n", prompt_ids.size());
+    stops = {tok.eos(), tok.eom(), tok.eot()};
   } else {
     // byte-fallback prompt (no tokenizer file): deterministic ids
     prompt_ids.push_back(cfg.bos_token % cfg.vocab_size);
     for (unsigned char c : prompt) prompt_ids.push_back(c % cfg.vocab_size);
     std::printf("[no tokenizer] byte-fallback prompt tokens: %zu\n",
                 prompt_ids.size());
+    stops = {cfg.eos_token, cfg.eom_token, cfg.eot_token};
   }
+  stops.insert(stops.end(), extra_stops.begin(), extra_stops.end());
+  std::printf("stop ids:");
+  for (auto id : stops) std::printf(" %d", id);
+  std::printf("\n");
 
   KokkosDNN::Llama::Model<Exec, Scalar> model(cfg, w);
-  auto out = model.generate(prompt_ids, max_new);
+  auto out = model.generate(prompt_ids, max_new, stops);
   std::printf("generated %zu ids:", out.size());
   for (auto id : out) std::printf(" %d", id);
   std::printf("\n");
@@ -68,6 +79,7 @@ int main(int argc, char** argv) {
     int max_new = 16;
     bool tiny = true;
     bool fp32 = false;
+    std::vector<int> extra_stops;
 
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
@@ -82,6 +94,9 @@ int main(int argc, char** argv) {
         prompt = argv[++i];
       } else if (a == "--max-new" && i + 1 < argc) {
         max_new = std::stoi(argv[++i]);
+      } else if (a == "--stop" && i + 1 < argc) {
+        while (i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0)
+          extra_stops.push_back(std::stoi(argv[++i]));
       } else if (a == "--tiny") {
         tiny = true;
       } else if (a == "--fp32") {
@@ -98,11 +113,13 @@ int main(int argc, char** argv) {
     int rc;
     if (fp32) {
       std::printf("[dtype fp32]\n");
-      rc = run_model<float>(cfg, wfiles, tiny, tok_path, prompt, max_new);
+      rc = run_model<float>(cfg, wfiles, tiny, tok_path, prompt, max_new,
+                            extra_stops);
     } else {
       std::printf("[dtype bfloat16]\n");
       rc = run_model<KokkosDNN::Llama::DefaultScalar>(cfg, wfiles, tiny,
-                                                     tok_path, prompt, max_new);
+                                                      tok_path, prompt, max_new,
+                                                      extra_stops);
     }
     Kokkos::finalize();
     return rc;

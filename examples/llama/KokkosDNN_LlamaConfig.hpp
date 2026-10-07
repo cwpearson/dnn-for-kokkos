@@ -24,6 +24,10 @@ struct Config {
   int max_seq_len    = 8192;           // PoC runtime cap (arch supports 128k)
   int bos_token      = 128000;
   int eos_token      = 128001;
+  // Instruct stop tokens (HF generation_config eos_token_id
+  // [128001, 128008, 128009]): <|eom_id|> and <|eot_id|>.
+  int eom_token      = 128008;
+  int eot_token      = 128009;
 
   static Config llama_3_3_8b() { return Config{}; }
 

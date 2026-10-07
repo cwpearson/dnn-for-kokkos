@@ -92,6 +92,10 @@ Real checkpoint (needs weights + tokenizer from `meta-llama/Llama-3.3-8B-Instruc
 
 Expected tensor names are the Hugging Face ones (`model.embed_tokens.weight`, `model.layers.N.self_attn.q_proj.weight`, …, `lm_head.weight`).
 
+Stopping defaults to the Instruct set `{eos 128001, eom 128008, eot 128009}`
+(from `tokenizer.json` when `--tokenizer` is given, else `Config`); append
+extra ids with `--stop <id> ...`.
+
 ## Benchmarks
 
 `benchmarks/kokkosdnn_bench` (Google Benchmark, opt-in via
@@ -142,3 +146,33 @@ large-GPU or CPU-Kokkos build for the real checkpoint.
   92 targeted + 2000 fuzz differential cases pass). Re-validate a new file with
   `KOKKOSDNN_TOKENIZER_JSON=tokenizer.json ./build/examples/llama/test_tokenizer`.
 - Only greedy sampling is implemented; no temperature / top-p / batching.
+
+## TODO — toward real Llama 3.3 8B inference
+
+Minimum checklist for a faithful, usable 8B run (ordered by priority):
+
+- Real-weight validation: add a golden `logits`/perplexity check against HF
+  `transformers` on 1–2 prompts (today only tiny-random shape/determinism in
+  `Test_LlamaGenerate.cpp`). Cover 8B shapes/dtypes, including the
+  `FP32 T=1 GQA` cuDNN `<=9.27` fallback path noted in `KokkosDNN_Attention.hpp`.
+- Model config: parse `config.json` instead of trusting hardcoded
+  `KokkosDNN_LlamaConfig.hpp` (`rope_theta`, `eps`, `tie_word_embeddings`,
+  `rope_scaling`); raise/validate `max_seq_len` (PoC caps at 8192, arch supports 128k).
+- Generation: multi-stop `{eos 128001, eom 128008, eot 128009}` is implemented
+  (`Model::generate()` takes a stop set, empty means the Instruct defaults;
+  `--stop` appends ids). Remaining: Instruct chat template
+  (`<|begin_of_text|><|start_header_id|>...`), `add_bos` wiring, stop-strings.
+- Sampling: `temperature` / `top-k` / `top-p` / `min-p`, repetition penalty,
+  seeded RNG, streaming decode (today `sample_greedy` only: `deep_copy(128256)`
+  + linear scan per token).
+- Checkpoint loader (`KokkosDNN_LlamaWeights.cpp`): avoid the host-`F32`
+  expansion (`16 GiB BF16` -> `~32 GiB` host spike); `mmap`/streaming zero-copy
+  `BF16`->device, sharded lazy load, tied-`lm_head` handling.
+- Long context: chunked prefill (single-shot prefill holds `O(T·dim)`
+  activations), persistent scratch (no per-layer/per-token `View` alloc in
+  `Model::forward()`), `reset()` without full-cache `deep_copy` zero;
+  later: paged / quantized KV (`~8 GiB` at 128k BF16).
+- Performance: `lm_head` via `gemm`/`gemv` (today naive `parallel_for(vocab)`),
+  cached TPL handles (today created per-call, i.e. `~224` cuBLAS setups/token),
+  no per-token host-mirror + `deep_copy` (`pos`/`toks`/`one`/`logits`);
+  CPU TPL path (no `OpenBLAS`/`MKL` dispatch); quantization out of scope per above.
