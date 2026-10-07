@@ -2,6 +2,7 @@
 #define KOKKOSDNN_ATTENTION_HPP
 
 #include <Kokkos_Core.hpp>
+#include <Kokkos_Half.hpp>
 #include <cmath>
 #include <string>
 #include <type_traits>
@@ -21,8 +22,11 @@ void attention_gqa_streaming(const DNNHandle<ExecSpace>& handle, const QView& q,
                              const OView& out, float scale,
                              const std::string& label) {
 #if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)
-  if constexpr (std::is_same_v<Scalar, float>) {
-    if (handle.use_cudnn && try_cudnn_sdpa_gqa_stub()) return;
+  if constexpr (std::is_same_v<Scalar, float> ||
+                std::is_same_v<Scalar, Kokkos::Experimental::bhalf_t>) {
+    if (handle.use_cudnn &&
+        try_cudnn_sdpa_gqa<Scalar>(q, k, v, q_off, out, scale))
+      return;
   } else {
     (void)handle;
   }
@@ -103,9 +107,13 @@ void attention_gqa_streaming(const DNNHandle<ExecSpace>& handle, const QView& q,
 // Element order matches a left-to-right softmax reference up to FP32
 // rounding (verified in tests/Test_Attention.cpp against a host reference).
 //
-// When KokkosDNN_ENABLE_CUDNN and ExecSpace is CUDA, float dispatches to
-// cuDNN SDPA first (see Attention_CuDNN for contract); other scalars run
-// the native kernel. Otherwise run native.
+// When KokkosDNN_ENABLE_CUDNN and ExecSpace is CUDA, float and bhalf_t
+// dispatch to cuDNN SDPA first (see KokkosDNN_Attention_CuDNN.hpp for
+// contract). One narrow, version-gated exception lives in
+// cudnn_sdpa_forward: FP32 single-token GQA decode (T=1, Hq != Hkv) falls
+// back to native on cuDNN <= 9.27.0, where the composite path computes
+// only the first query head per KV group while reporting success.
+// Other scalars run the native kernel. Otherwise native.
 //
 // Two overloads: explicit <ExecSpace, Scalar> (tests, Llama model) and a
 // deduction overload taking Scalar from the query view (benchmarks). Both

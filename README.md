@@ -11,7 +11,7 @@ KokkosDNN is a small, Kokkos-compatible DNN library built as a proof-of-concept 
 It provides:
 
 - Native Kokkos implementations of every operator the model needs (GEMM/GEMV, RMSNorm, softmax, RoPE, SwiGLU, embedding gather, grouped-query causal attention, greedy sampler).
-- Optional dispatch to CUDA libraries when enabled at configure time: GEMM to **cuBLAS** (FP32 via `sgemm`, BF16 via `cublasGemmEx` with FP32 accumulation), attention to **cuDNN SDPA** (currently a documented stub that falls back to the native kernel).
+- Optional dispatch to CUDA libraries when enabled at configure time: GEMM to **cuBLAS** (FP32 via `sgemm`, BF16 via `cublasGemmEx` with FP32 accumulation), attention to **cuDNN SDPA** (with automatic fallback to the native kernel where cuDNN has no suitable path).
 - A Llama example (`examples/llama/`): 3.3 8B config defaults, a safetensors checkpoint loader (on-disk F32/F16/BF16 are converted to the model scalar), a faithful Hugging Face `tokenizer.json` loader (special-token split, tiktoken Split pre-tokenizer, GPT-2 byte mapping, per-piece BPE; validated ID-for-ID against `tokenizers`), a KV-cache autoregressive model, and a `llama_generate` driver.
 - Unit tests and a tiny-random-weights end-to-end path so the full pipeline runs without downloading a 16 GB checkpoint.
 
@@ -32,7 +32,7 @@ src/
   KokkosDNN_RoPE.hpp      NeoX-style rotary, rope_theta = 500000
   KokkosDNN_SwiGLU.hpp
   KokkosDNN_Embedding.hpp
-  KokkosDNN_Attention.hpp (+ _CuDNN dispatch point)
+  KokkosDNN_Attention.hpp (+ _CuDNN: working SDPA dispatch, _CuDNN.cpp TU)
   KokkosDNN_Sampler.hpp   greedy argmax
   KokkosDNN_PrintConfiguration.cpp
 examples/llama/           Llama 3 example (not part of the library)
@@ -70,7 +70,7 @@ Options:
 | `KokkosDNN_ENABLE_EXAMPLES` | ON | build `examples/llama/llama_generate` (+ example Llama tests) |
 | `KokkosDNN_ENABLE_BENCHMARKS` | OFF | build `benchmarks/kokkosdnn_bench` (Google Benchmark, fetched if needed) |
 | `KokkosDNN_ENABLE_CUBLAS` | OFF | GEMM via cuBLAS on CUDA spaces |
-| `KokkosDNN_ENABLE_CUDNN` | OFF | attention via cuDNN SDPA (stub → native fallback until wired) |
+| `KokkosDNN_ENABLE_CUDNN` | OFF | attention via cuDNN SDPA (with automatic native fallback; needs `<cudnn.h>` + `cudnn-frontend`, fetched automatically) |
 
 ## Run the PoC
 
@@ -141,5 +141,4 @@ large-GPU or CPU-Kokkos build for the real checkpoint.
   (runs when `KOKKOSDNN_TOKENIZER_JSON` points at a Llama 3 `tokenizer.json`;
   92 targeted + 2000 fuzz differential cases pass). Re-validate a new file with
   `KOKKOSDNN_TOKENIZER_JSON=tokenizer.json ./build/examples/llama/test_tokenizer`.
-- The cuDNN SDPA path is a stub interface, not a working kernel yet.
 - Only greedy sampling is implemented; no temperature / top-p / batching.

@@ -221,3 +221,133 @@ TEST(Attention, FloatLongKeys) {
     }
   }
 }
+
+#if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)
+#include <cudnn_version.h>
+// cuDNN engagement: the entry point must report success on D-contiguous
+// inputs (guards against silent-fallback regressions where every test
+// above would still pass via the native kernel), and the dispatched
+// public path must agree with the forced-native path on shapes that route
+// to cuDNN (bf16 decode T=1 via flash, float prefill T>=2 via composite,
+// float MHA decode T=1 via composite). Float T=1 decode with GQA falls
+// back on cuDNN <= 9.27.0 (narrow version-gated exclusion: the composite
+// path computes only the first query head per KV group there while
+// reporting success), so dispatched-vs-native agreement there proves the
+// guard engaged — without it, non-leading group heads would come back zero.
+TEST(Attention, CudnnEngagesAndMatchesNative) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  {
+    Kokkos::View<float***, Kokkos::LayoutRight, Exec> q("q", 2, 4, 8),
+        k("k", 2, 2, 8), v("v", 2, 2, 8), o("o", 2, 4, 8);
+    EXPECT_TRUE(KokkosDNN::Impl::cudnn_sdpa_forward(
+        KokkosDNN::Impl::CudnnSdpaScalar::Float, q.data(), k.data(), v.data(),
+        o.data(), 2, 2, 4, 2, 8, q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2), v.stride(0), v.stride(1),
+        v.stride(2), o.stride(0), o.stride(1), o.stride(2), 0.35f));
+  }
+  {
+    Kokkos::View<Kokkos::Experimental::bhalf_t***, Kokkos::LayoutRight, Exec>
+        q("q", 1, 4, 8), k("k", 5, 2, 8), v("v", 5, 2, 8), o("o", 1, 4, 8);
+    EXPECT_TRUE(KokkosDNN::Impl::cudnn_sdpa_forward(
+        KokkosDNN::Impl::CudnnSdpaScalar::BFloat16, q.data(), k.data(),
+        v.data(), o.data(), 1, 5, 4, 2, 8, q.stride(0), q.stride(1),
+        q.stride(2), k.stride(0), k.stride(1), k.stride(2), v.stride(0),
+        v.stride(1), v.stride(2), o.stride(0), o.stride(1), o.stride(2),
+        0.35f));
+  }
+  {
+    // Float MHA s_q == 1 is outside the narrow exclusion and must engage.
+    Kokkos::View<float***, Kokkos::LayoutRight, Exec> q("q", 1, 2, 8),
+        k("k", 9, 2, 8), v("v", 9, 2, 8), o("o", 1, 2, 8);
+    EXPECT_TRUE(KokkosDNN::Impl::cudnn_sdpa_forward(
+        KokkosDNN::Impl::CudnnSdpaScalar::Float, q.data(), k.data(), v.data(),
+        o.data(), 1, 9, 2, 2, 8, q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2), v.stride(0), v.stride(1),
+        v.stride(2), o.stride(0), o.stride(1), o.stride(2), 1.0f / 8.0f));
+  }
+  {
+    // Float s_q == 1 with GQA is the excluded combination: the guard must
+    // decline (return false) on cuDNN <= 9.27.0 so the caller falls back.
+    Kokkos::View<float***, Kokkos::LayoutRight, Exec> q("q", 1, 4, 8),
+        k("k", 9, 2, 8), v("v", 9, 2, 8), o("o", 1, 4, 8);
+    const bool ran = KokkosDNN::Impl::cudnn_sdpa_forward(
+        KokkosDNN::Impl::CudnnSdpaScalar::Float, q.data(), k.data(), v.data(),
+        o.data(), 1, 9, 4, 2, 8, q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2), v.stride(0), v.stride(1),
+        v.stride(2), o.stride(0), o.stride(1), o.stride(2), 1.0f / 8.0f);
+#if CUDNN_VERSION <= 92700
+    EXPECT_FALSE(ran);
+#else
+    // Newer cuDNN may have fixed the composite path; either outcome is
+    // correct as long as dispatched-vs-native agrees below.
+    (void)ran;
+#endif
+  }
+
+  auto check_dispatched_vs_native = [](auto tag, int T, int Hq, int Hkv,
+                                       int D, int Ktot, size_t q_off,
+                                       float scale, float tol) {
+    using Scalar = typename decltype(tag)::type;
+    KokkosDNN::DNNHandle<Exec> h_on;
+    EXPECT_TRUE(h_on.use_cudnn);
+    KokkosDNN::DNNHandle<Exec> h_off;
+    h_off.use_cudnn = false;
+    Kokkos::View<Scalar***, Exec> q("q", T, Hq, D), o_cu("ocu", T, Hq, D),
+        o_nat("onat", T, Hq, D);
+    Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec> k("k", Ktot, Hkv, D),
+        v("v", Ktot, Hkv, D);
+    auto hq = Kokkos::create_mirror_view(q);
+    auto hk = Kokkos::create_mirror_view(k);
+    auto hv = Kokkos::create_mirror_view(v);
+    for (int t = 0; t < T; ++t)
+      for (int hh = 0; hh < Hq; ++hh)
+        for (int d = 0; d < D; ++d)
+          hq(t, hh, d) = static_cast<Scalar>(0.05f * ((t * 7 + hh * 13 + d * 3) %
+                                                       17) -
+                                             0.2f);
+    for (int n = 0; n < Ktot; ++n)
+      for (int hh = 0; hh < Hkv; ++hh)
+        for (int d = 0; d < D; ++d) {
+          hk(n, hh, d) = static_cast<Scalar>(0.05f * ((n * 5 + hh * 11 + d) %
+                                                       19) -
+                                             0.2f);
+          hv(n, hh, d) = static_cast<Scalar>(0.05f * ((n * 3 + hh * 17 + d * 2) %
+                                                       23) -
+                                             0.3f);
+        }
+    Kokkos::deep_copy(q, hq);
+    Kokkos::deep_copy(k, hk);
+    Kokkos::deep_copy(v, hv);
+    KokkosDNN::attention_gqa_single<Exec, Scalar>(h_on, q, k, v, q_off, o_cu,
+                                                  scale);
+    KokkosDNN::attention_gqa_single<Exec, Scalar>(h_off, q, k, v, q_off, o_nat,
+                                                  scale);
+    Kokkos::fence();
+    auto gcu = Kokkos::create_mirror_view(o_cu);
+    auto gnat = Kokkos::create_mirror_view(o_nat);
+    Kokkos::deep_copy(gcu, o_cu);
+    Kokkos::deep_copy(gnat, o_nat);
+    for (int t = 0; t < T; ++t)
+      for (int hh = 0; hh < Hq; ++hh)
+        for (int d = 0; d < D; ++d)
+          EXPECT_NEAR(static_cast<float>(gcu(t, hh, d)),
+                      static_cast<float>(gnat(t, hh, d)), tol)
+              << "dispatched/native mismatch at (" << t << "," << hh << ","
+              << d << ")";
+  };
+  struct FloatTag {
+    using type = float;
+  };
+  struct BhalfTag {
+    using type = Kokkos::Experimental::bhalf_t;
+  };
+  check_dispatched_vs_native(FloatTag{}, 4, 4, 2, 8, 7, 3, 1.0f / 8.0f, 1e-5f);
+  check_dispatched_vs_native(BhalfTag{}, 1, 4, 2, 8, 9, 8, 1.0f / 8.0f, 2e-2f);
+  // Float MHA decode engages cuDNN and must match native; float GQA decode
+  // exercises the exclusion guard (falls back on cuDNN <= 9.27.0) and must
+  // still match native — without the guard the composite path would zero
+  // the non-leading group heads here.
+  check_dispatched_vs_native(FloatTag{}, 1, 2, 2, 8, 9, 8, 1.0f / 8.0f, 1e-5f);
+  check_dispatched_vs_native(FloatTag{}, 1, 4, 2, 8, 9, 8, 1.0f / 8.0f, 1e-5f);
+}
+#endif

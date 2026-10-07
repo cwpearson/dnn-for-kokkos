@@ -40,6 +40,23 @@ if(KokkosDNN_ENABLE_CUDNN)
     include(FindPackageHandleStandardArgs)
     find_package_handle_standard_args(CUDNN DEFAULT_MSG CUDNN_LIBRARY CUDNN_INCLUDE_DIR)
   endif()
+  # cudnn-frontend (header-only graph API) builds the SDPA node used by
+  # src/KokkosDNN_Attention_CuDNN.cpp. Pinned to a commit tested against
+  # cuDNN 9.x; override offline with -DFETCHCONTENT_SOURCE_DIR_CUDNN_FRONTEND=<path>.
+  include(FetchContent)
+  if(POLICY CMP0135)
+    cmake_policy(SET CMP0135 NEW)
+  endif()
+  set(CUDNN_FRONTEND_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
+  set(CUDNN_FRONTEND_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(
+    cudnn_frontend
+    GIT_REPOSITORY https://github.com/NVIDIA/cudnn-frontend.git
+    GIT_TAG b8e39555bbcc64b030dc7ea8d8f01c43ff88f483
+  )
+  FetchContent_MakeAvailable(cudnn_frontend)
+  # The frontend's experimental engines need NVRTC at link time.
+  find_package(CUDAToolkit REQUIRED)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -67,6 +84,7 @@ configure_file(cmake/KokkosDNN_config.h.in
 # ---------------------------------------------------------------------------
 add_library(kokkosdnn
   src/KokkosDNN_PrintConfiguration.cpp
+  src/KokkosDNN_Attention_CuDNN.cpp
 )
 add_library(KokkosDNN::kokkosdnn ALIAS kokkosdnn)
 
@@ -87,6 +105,10 @@ if(KokkosDNN_ENABLE_CUDNN)
     target_include_directories(kokkosdnn PUBLIC ${CUDNN_INCLUDE_DIR})
     target_link_libraries(kokkosdnn PUBLIC ${CUDNN_LIBRARY})
   endif()
+  target_link_libraries(kokkosdnn PUBLIC cudnn_frontend)
+  # The frontend's experimental engines call NVRTC; link it so consumers
+  # of libkokkosdnn (tests, examples, benchmarks) resolve nvrtc* symbols.
+  target_link_libraries(kokkosdnn PUBLIC CUDA::nvrtc CUDA::cudart)
 endif()
 
 if(KokkosDNN_ENABLE_COMPILER_WARNINGS)
