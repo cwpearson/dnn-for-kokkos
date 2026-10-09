@@ -13,6 +13,7 @@
 //   llama_generate [--tiny] [--weights a.safetensors ...]
 //                  [--tokenizer tok.json] [--prompt "text"] [--max-new N]
 //                  [--stop <id> ...] [--fp32] [--prefill-chunk N]
+//                  [--config config.json] [--max-seq-len N]
 //
 // Default compute/storage is bfloat16 (Llama 3.3 8B checkpoint dtype);
 // --fp32 opts in. --prefill-chunk N caps prefill activations to
@@ -22,6 +23,10 @@
 // --fp32 opts into FP32 for comparison. BF16 8B needs ~16 GiB (FP32
 // ~32 GiB); RTX 3090 (24 GiB) fits BF16 but not FP32 — use --tiny or
 // a big-GPU/CPU build for real checkpoints.
+//
+// --config overlays an HF config.json onto the selected base config
+// (present keys win, missing keys keep hardcoded defaults); --max-seq-len
+// caps the KV-cache context (validated against [1, 131072]).
 //
 // Stopping: by default the Instruct stop set {eos, eom, eot} from the
 // tokenizer (or Config fallback without --tokenizer); --stop appends
@@ -83,11 +88,13 @@ int main(int argc, char** argv) {
   {
     std::vector<std::string> wfiles;
     std::string tok_path, prompt = "Hello, I am";
+    std::string config_path;
     int max_new = 16;
     bool tiny = true;
     bool fp32 = false;
     std::vector<int> extra_stops;
     int prefill_chunk_override = -1;
+    int max_seq_len_override = -1;
 
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
@@ -109,6 +116,10 @@ int main(int argc, char** argv) {
         tiny = true;
       } else if (a == "--prefill-chunk" && i + 1 < argc) {
         prefill_chunk_override = std::stoi(argv[++i]);
+      } else if (a == "--config" && i + 1 < argc) {
+        config_path = argv[++i];
+      } else if (a == "--max-seq-len" && i + 1 < argc) {
+        max_seq_len_override = std::stoi(argv[++i]);
       } else if (a == "--fp32") {
         fp32 = true;
       }
@@ -119,6 +130,30 @@ int main(int argc, char** argv) {
     if (tiny) {
       cfg = KokkosDNN::Llama::Config::tiny_test();
       cfg.max_seq_len = 64;
+    }
+    if (!config_path.empty()) {
+      try {
+        cfg = KokkosDNN::Llama::Config::from_json_file(config_path, cfg);
+      } catch (const std::exception& e) {
+        std::fprintf(stderr, "error: --config '%s': %s\n",
+                     config_path.c_str(), e.what());
+        Kokkos::finalize();
+        return 1;
+      }
+      std::printf("[config %s] dim=%d layers=%d heads=%d kv=%d ffn=%d "
+                  "vocab=%d eps=%g theta=%g max_seq=%d tie=%d\n",
+                  config_path.c_str(), cfg.dim, cfg.n_layers, cfg.n_heads,
+                  cfg.n_kv_heads, cfg.ffn_dim, cfg.vocab_size,
+                  (double)cfg.rms_norm_eps, (double)cfg.rope_theta,
+                  cfg.max_seq_len, (int)cfg.tie_word_embeddings);
+    }
+    if (max_seq_len_override > 0) cfg.max_seq_len = max_seq_len_override;
+    try {
+      cfg.validate();
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "error: invalid model config: %s\n", e.what());
+      Kokkos::finalize();
+      return 1;
     }
     int rc;
     if (fp32) {

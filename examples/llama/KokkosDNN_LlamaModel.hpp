@@ -71,6 +71,10 @@ class Model {
   Model() = default;
   Model(const Config& c, const Weights<ExecSpace, Scalar>& w)
       : cfg(c), weights(w) {
+    // Validate before renting the [max_seq_len, n_kv, head_dim] KV cache:
+    // incompatible dims or an out-of-range context fail here, not in a
+    // device kernel or a multi-GiB allocation.
+    cfg.validate();
     inv_freq = rope_inv_freq<ExecSpace>(cfg.head_dim, cfg.rope_theta);
     k_cache.resize(cfg.n_layers);
     v_cache.resize(cfg.n_layers);

@@ -153,9 +153,6 @@ large-GPU or CPU-Kokkos build for the real checkpoint.
 
 Minimum checklist for a faithful, usable 8B run (ordered by priority):
 
-- Model config: parse `config.json` instead of trusting hardcoded
-  `KokkosDNN_LlamaConfig.hpp` (`rope_theta`, `eps`, `tie_word_embeddings`,
-  `rope_scaling`); raise/validate `max_seq_len` (PoC caps at 8192, arch supports 128k).
 - Instruct chat template
   (`<|begin_of_text|><|start_header_id|>...`), `add_bos` wiring, stop-strings.
 - Sampling: `temperature` / `top-k` / `top-p` / `min-p`, repetition penalty,

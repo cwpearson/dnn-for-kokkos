@@ -323,15 +323,32 @@ void load_safetensors(const Config& cfg,
     expect_shape(v, {(size_t)cfg.dim}, "model.norm.weight");
     copy_host_vec_to_device<ExecSpace, Scalar>(v, w.final_norm);
   }
-  // lm_head may be named "lm_head.weight" (HF) — accept both.
+  // lm_head may be named "lm_head.weight" (HF) — accept both. With
+  // tie_word_embeddings=true a missing lm_head tensor shares the embedding
+  // table instead of throwing (tied weights); otherwise the missing tensor
+  // is an error.
   {
     std::vector<float> v;
+    bool found = false;
     try {
       v = need("lm_head.weight");
-    } catch (...) {
-      v = need("model.lm_head.weight");
+      found = true;
+    } catch (const std::runtime_error&) {
+      try {
+        v = need("model.lm_head.weight");
+        found = true;
+      } catch (const std::runtime_error&) {
+        found = false;
+      }
     }
-    copy_host_to_device<ExecSpace, Scalar>(v, cfg.vocab_size, cfg.dim, w.lm_head);
+    if (found) {
+      copy_host_to_device<ExecSpace, Scalar>(v, cfg.vocab_size, cfg.dim,
+                                             w.lm_head);
+    } else if (cfg.tie_word_embeddings) {
+      w.lm_head = w.embed;  // tied: alias the embedding table
+    } else {
+      need("lm_head.weight");  // rethrow the informative missing-tensor error
+    }
   }
   const int hq  = cfg.n_heads * cfg.head_dim;
   const int hkv = cfg.n_kv_heads * cfg.head_dim;
