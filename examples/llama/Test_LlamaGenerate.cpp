@@ -73,3 +73,30 @@ TEST(LlamaGenerateMultiStop, Float) { check_multi_stop<float>(); }
 TEST(LlamaGenerateMultiStop, BHalf) {
   check_multi_stop<Kokkos::Experimental::bhalf_t>();
 }
+
+// Persistent scratch: reusing one model across generate() calls (reset +
+// scratch reuse, growth when a later prefill is longer) reproduces fresh
+// models exactly.
+template <class Scalar>
+void check_scratch_reuse() {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  auto cfg = KokkosDNN::Llama::Config::tiny_test();
+  KokkosDNN::Llama::Weights<Exec, Scalar> w;
+  KokkosDNN::Llama::random_init(cfg, w, 1234);
+  KokkosDNN::Llama::Model<Exec, Scalar> model(cfg, w);
+  std::vector<int> prompt = {1, 2, 3, 4};
+  auto first              = model.generate(prompt, 4);
+  auto second             = model.generate(prompt, 4);
+  EXPECT_EQ(first, second);
+  // Longer prefill after short runs grows scratch; must still agree with
+  // a fresh model.
+  KokkosDNN::Llama::Model<Exec, Scalar> fresh(cfg, w);
+  std::vector<int> long_prompt = {5, 6, 7, 8, 9, 10, 11, 12};
+  EXPECT_EQ(model.generate(long_prompt, 3), fresh.generate(long_prompt, 3));
+}
+
+TEST(LlamaScratchReuse, Float) { check_scratch_reuse<float>(); }
+
+TEST(LlamaScratchReuse, BHalf) {
+  check_scratch_reuse<Kokkos::Experimental::bhalf_t>();
+}

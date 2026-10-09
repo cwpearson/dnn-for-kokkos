@@ -158,9 +158,7 @@ Minimum checklist for a faithful, usable 8B run (ordered by priority):
 - Model config: parse `config.json` instead of trusting hardcoded
   `KokkosDNN_LlamaConfig.hpp` (`rope_theta`, `eps`, `tie_word_embeddings`,
   `rope_scaling`); raise/validate `max_seq_len` (PoC caps at 8192, arch supports 128k).
-- Generation: multi-stop `{eos 128001, eom 128008, eot 128009}` is implemented
-  (`Model::generate()` takes a stop set, empty means the Instruct defaults;
-  `--stop` appends ids). Remaining: Instruct chat template
+- Instruct chat template
   (`<|begin_of_text|><|start_header_id|>...`), `add_bos` wiring, stop-strings.
 - Sampling: `temperature` / `top-k` / `top-p` / `min-p`, repetition penalty,
   seeded RNG, streaming decode (today `sample_greedy` only: `deep_copy(128256)`
@@ -169,8 +167,7 @@ Minimum checklist for a faithful, usable 8B run (ordered by priority):
   expansion (`16 GiB BF16` -> `~32 GiB` host spike); `mmap`/streaming zero-copy
   `BF16`->device, sharded lazy load, tied-`lm_head` handling.
 - Long context: chunked prefill (single-shot prefill holds `O(T·dim)`
-  activations), persistent scratch (no per-layer/per-token `View` alloc in
-  `Model::forward()`), `reset()` without full-cache `deep_copy` zero;
+  activations), `reset()` without full-cache `deep_copy` zero;
   later: paged / quantized KV (`~8 GiB` at 128k BF16).
 - Performance: `lm_head` via `gemm`/`gemv` (today naive `parallel_for(vocab)`),
   cached TPL handles (today created per-call, i.e. `~224` cuBLAS setups/token),

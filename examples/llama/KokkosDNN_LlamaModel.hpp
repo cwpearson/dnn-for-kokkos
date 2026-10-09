@@ -4,6 +4,7 @@
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
 #include <algorithm>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 #include "KokkosDNN_Attention.hpp"
@@ -33,6 +34,12 @@ namespace Llama {
 template <class ExecSpace, class Scalar = DefaultScalar>
 class Model {
  public:
+  using MatR = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
+  using View3 = Kokkos::View<Scalar***, ExecSpace>;
+  using View1 = Kokkos::View<Scalar*, ExecSpace>;
+  using ViewInt = Kokkos::View<int*, ExecSpace>;
+  using HostInt = typename ViewInt::host_mirror_type;
+
   Config cfg;
   Weights<ExecSpace, Scalar> weights;
   DNNHandle<ExecSpace> handle;
@@ -40,6 +47,26 @@ class Model {
   std::vector<Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>> k_cache,
       v_cache;
   size_t seq_len = 0;
+
+  // Persistent scratch: all T-sized temporaries are carved (via subview,
+  // which allocates nothing) out of these capacity buffers. Buffers grow
+  // on demand in ensure_scratch() and are never shrunk, so the steady
+  // decode state (T=1 after prefill) performs zero View allocations.
+  // Fixed-size state (last/logits) is allocated once in the constructor.
+  MatR h_buf_, tmp_buf_, tmp2_buf_, proj_buf_, down_buf_, hn_buf_;
+  MatR q2_buf_, k2_buf_, v2_buf_, attn_flat_buf_;
+  MatR gate_buf_, up_buf_, act_buf_;
+  View3 q3_buf_, k3_buf_, v3_buf_, attn_out_buf_;
+  ViewInt pos_buf_;
+  View1 last_buf_, logits_buf_;
+  size_t scratch_cap_ = 0;
+  // Persistent input staging for generate(): prefill staging grows on
+  // demand, the single-token decode slot is fixed at 1.
+  ViewInt tok_buf_;
+  HostInt tok_host_;
+  size_t tok_cap_ = 0;
+  ViewInt one_buf_;
+  HostInt one_host_;
 
   Model() = default;
   Model(const Config& c, const Weights<ExecSpace, Scalar>& w)
@@ -53,6 +80,10 @@ class Model {
       v_cache[l] = Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>(
           "v_cache", cfg.max_seq_len, cfg.n_kv_heads, cfg.head_dim);
     }
+    last_buf_ = View1("last", cfg.dim);
+    logits_buf_ = View1("logits", cfg.vocab_size);
+    one_buf_ = ViewInt("one", 1);
+    one_host_ = HostInt("one_host", 1);
   }
 
   void reset() {
@@ -62,39 +93,133 @@ class Model {
     for (auto& v : v_cache) Kokkos::deep_copy(v, zero);
   }
 
+ private:
+  // Grow T-sized scratch to hold at least T rows (exact-size growth; the
+  // first, largest prefill sizes everything, later T=1 decodes reuse it).
+  // Also repairs buffers if cfg dims changed under us.
+  void ensure_scratch(size_t T) {
+    const size_t DIM = (size_t)cfg.dim;
+    const size_t HqD = (size_t)cfg.n_heads * (size_t)cfg.head_dim;
+    const size_t HkvD = (size_t)cfg.n_kv_heads * (size_t)cfg.head_dim;
+    const size_t FFN = (size_t)cfg.ffn_dim;
+    const size_t NH = (size_t)cfg.n_heads, NKV = (size_t)cfg.n_kv_heads,
+                 HD = (size_t)cfg.head_dim;
+    if (T <= scratch_cap_ && h_buf_.extent(0) >= T &&
+        h_buf_.extent(1) == DIM && tmp_buf_.extent(1) == DIM &&
+        tmp2_buf_.extent(1) == DIM && proj_buf_.extent(1) == DIM &&
+        down_buf_.extent(1) == DIM && hn_buf_.extent(1) == DIM &&
+        q2_buf_.extent(1) == HqD && attn_flat_buf_.extent(1) == HqD &&
+        k2_buf_.extent(1) == HkvD && v2_buf_.extent(1) == HkvD &&
+        gate_buf_.extent(1) == FFN && up_buf_.extent(1) == FFN &&
+        act_buf_.extent(1) == FFN && q3_buf_.extent(1) == NH &&
+        q3_buf_.extent(2) == HD && k3_buf_.extent(1) == NKV &&
+        k3_buf_.extent(2) == HD && v3_buf_.extent(1) == NKV &&
+        v3_buf_.extent(2) == HD && attn_out_buf_.extent(1) == NH &&
+        attn_out_buf_.extent(2) == HD && pos_buf_.extent(0) >= T)
+      return;
+    h_buf_ = MatR("h", T, DIM);
+    tmp_buf_ = MatR("tmp", T, DIM);
+    tmp2_buf_ = MatR("tmp2", T, DIM);
+    proj_buf_ = MatR("proj", T, DIM);
+    down_buf_ = MatR("down", T, DIM);
+    hn_buf_ = MatR("hn", T, DIM);
+    q2_buf_ = MatR("q2", T, HqD);
+    k2_buf_ = MatR("k2", T, HkvD);
+    v2_buf_ = MatR("v2", T, HkvD);
+    attn_flat_buf_ = MatR("attn_flat", T, HqD);
+    gate_buf_ = MatR("gate", T, FFN);
+    up_buf_ = MatR("up", T, FFN);
+    act_buf_ = MatR("act", T, FFN);
+    q3_buf_ = View3("q", T, NH, HD);
+    k3_buf_ = View3("k", T, NKV, HD);
+    v3_buf_ = View3("v", T, NKV, HD);
+    attn_out_buf_ = View3("attn_out", T, NH, HD);
+    pos_buf_ = ViewInt("pos", T);
+    scratch_cap_ = T;
+  }
+
+  void ensure_tok(size_t n) {
+    if (n <= tok_cap_ && tok_buf_.extent(0) >= n && tok_host_.extent(0) >= n)
+      return;
+    tok_buf_ = ViewInt("toks", n);
+    tok_host_ = HostInt("toks_host", n);
+    tok_cap_ = n;
+  }
+
+ public:
   // Forward T prompt tokens starting at absolute position seq_len.
   // Returns logits [vocab] for the LAST token. Updates KV caches and
   // advances seq_len by T.
+  //
+  // The returned view aliases persistent scratch: it is valid until the
+  // next forward() call, which overwrites it. Consume it (e.g. via
+  // sample_greedy) before the next call. No View allocation happens here
+  // once scratch has grown to T (steady decode: zero allocations).
   Kokkos::View<Scalar*, ExecSpace> forward(
       const Kokkos::View<int*, ExecSpace>& tokens) {
     const size_t T = tokens.extent(0);
+    if (T == 0) throw std::invalid_argument("Model::forward: empty tokens");
     const size_t pos0 = seq_len;
+    if (pos0 + T > (size_t)cfg.max_seq_len)
+      throw std::runtime_error("Model::forward: sequence exceeds max_seq_len");
     // Hoisted (device lambdas must not capture `this`/`cfg`).
     const int DIM = cfg.dim, HD = cfg.head_dim, NH = cfg.n_heads,
-              NKV = cfg.n_kv_heads, FFN = cfg.ffn_dim, VS = cfg.vocab_size,
-              NL = cfg.n_layers;
+              NKV = cfg.n_kv_heads, VS = cfg.vocab_size, NL = cfg.n_layers;
     const float EPS = cfg.rms_norm_eps, SCALE = cfg.attn_scale;
-    using MatR = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
+    ensure_scratch(T);
+    if (last_buf_.extent(0) != (size_t)DIM) last_buf_ = View1("last", DIM);
+    if (logits_buf_.extent(0) != (size_t)VS)
+      logits_buf_ = View1("logits", VS);
 
-    MatR h("h", T, DIM);
+    // Carve T-row working views out of the capacity buffers. Subviews
+    // share the allocation, so none of this allocates.
+    auto h = Kokkos::subview(h_buf_, std::make_pair(size_t(0), T), Kokkos::ALL);
+    auto tmp =
+        Kokkos::subview(tmp_buf_, std::make_pair(size_t(0), T), Kokkos::ALL);
+    auto tmp2 =
+        Kokkos::subview(tmp2_buf_, std::make_pair(size_t(0), T), Kokkos::ALL);
+    auto q2 =
+        Kokkos::subview(q2_buf_, std::make_pair(size_t(0), T), Kokkos::ALL);
+    auto k2 =
+        Kokkos::subview(k2_buf_, std::make_pair(size_t(0), T), Kokkos::ALL);
+    auto v2 =
+        Kokkos::subview(v2_buf_, std::make_pair(size_t(0), T), Kokkos::ALL);
+    auto gate =
+        Kokkos::subview(gate_buf_, std::make_pair(size_t(0), T), Kokkos::ALL);
+    auto up =
+        Kokkos::subview(up_buf_, std::make_pair(size_t(0), T), Kokkos::ALL);
+    auto act =
+        Kokkos::subview(act_buf_, std::make_pair(size_t(0), T), Kokkos::ALL);
+    auto q3 = Kokkos::subview(q3_buf_, std::make_pair(size_t(0), T),
+                              Kokkos::ALL, Kokkos::ALL);
+    auto k3 = Kokkos::subview(k3_buf_, std::make_pair(size_t(0), T),
+                              Kokkos::ALL, Kokkos::ALL);
+    auto v3 = Kokkos::subview(v3_buf_, std::make_pair(size_t(0), T),
+                              Kokkos::ALL, Kokkos::ALL);
+    auto pos = Kokkos::subview(pos_buf_, std::make_pair(size_t(0), T));
+    auto attn_out = Kokkos::subview(attn_out_buf_, std::make_pair(size_t(0), T),
+                                    Kokkos::ALL, Kokkos::ALL);
+    auto attn_flat = Kokkos::subview(attn_flat_buf_,
+                                     std::make_pair(size_t(0), T), Kokkos::ALL);
+    auto proj =
+        Kokkos::subview(proj_buf_, std::make_pair(size_t(0), T), Kokkos::ALL);
+    auto down =
+        Kokkos::subview(down_buf_, std::make_pair(size_t(0), T), Kokkos::ALL);
+    auto hn =
+        Kokkos::subview(hn_buf_, std::make_pair(size_t(0), T), Kokkos::ALL);
+    // Hoisted member views: device lambdas below must capture these
+    // locals, never `this`.
+    auto last = last_buf_;
+    auto logits = logits_buf_;
+
     embedding_gather<ExecSpace, Scalar>(weights.embed, tokens, h);
 
-    Kokkos::View<int*, ExecSpace> pos("pos", T);
-    {
-      auto hm = Kokkos::create_mirror_view(pos);
-      for (size_t t = 0; t < T; ++t) hm(t) = (int)(pos0 + t);
-      Kokkos::deep_copy(pos, hm);
-    }
+    Kokkos::parallel_for(
+        "pos_fill", Kokkos::RangePolicy<ExecSpace>(0, T),
+        KOKKOS_LAMBDA(size_t t) { pos(t) = (int)(pos0 + t); });
 
-    MatR tmp("tmp", T, DIM), tmp2("tmp2", T, DIM);
     const int HqD = NH * HD;
     const int HkvD = NKV * HD;
-
-    Kokkos::View<Scalar***, ExecSpace> q3("q", T, NH, HD);
-    Kokkos::View<Scalar***, ExecSpace> k3("k", T, NKV, HD);
-    Kokkos::View<Scalar***, ExecSpace> v3("v", T, NKV, HD);
-    MatR q2("q2", T, HqD), k2("k2", T, HkvD), v2("v2", T, HkvD);
-    MatR gate("gate", T, FFN), up("up", T, FFN), act("act", T, FFN);
 
     for (int l = 0; l < NL; ++l) {
       auto& b = weights.blocks[l];
@@ -121,26 +246,29 @@ class Model {
             v3(t, i / HD, i % HD) = v2(t, i);
           });
       rope_neoX_inplace<ExecSpace, Scalar>(q3, k3, inv_freq, HD, pos);
+      // Hoist cache layers to locals: indexing the member vector inside
+      // a device lambda would capture `this` (host vector, illegal on
+      // CUDA); the copied View handles are device-safe.
+      auto kc = k_cache[l];
+      auto vc = v_cache[l];
       Kokkos::parallel_for(
           "kcache_write",
           Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<3>>(
               {0, 0, 0}, {T, (size_t)NKV, (size_t)HD}),
           KOKKOS_LAMBDA(size_t t, size_t hh, size_t d) {
-            k_cache[l](pos0 + t, hh, d) = k3(t, hh, d);
-            v_cache[l](pos0 + t, hh, d) = v3(t, hh, d);
+            kc(pos0 + t, hh, d) = k3(t, hh, d);
+            vc(pos0 + t, hh, d) = v3(t, hh, d);
           });
-      Kokkos::View<Scalar***, ExecSpace> attn_out("attn_out", T, NH, HD);
       // Pass the valid KV prefix as subviews: no repack/copy, and no extra
       // [K, Hkv, D] temporaries per layer. The attention kernel is
       // layout-agnostic and streams over keys, so 128k prefixes stay O(1)
       // in extra memory here too.
-      auto kp = Kokkos::subview(k_cache[l], std::make_pair(size_t(0), pos0 + T),
+      auto kp = Kokkos::subview(kc, std::make_pair(size_t(0), pos0 + T),
                                 Kokkos::ALL, Kokkos::ALL);
-      auto vp = Kokkos::subview(v_cache[l], std::make_pair(size_t(0), pos0 + T),
+      auto vp = Kokkos::subview(vc, std::make_pair(size_t(0), pos0 + T),
                                 Kokkos::ALL, Kokkos::ALL);
       attention_gqa_single<ExecSpace, Scalar>(handle, q3, kp, vp, pos0,
-                                                attn_out, SCALE);
-      MatR attn_flat("attn_flat", T, HqD);
+                                              attn_out, SCALE);
       Kokkos::parallel_for(
           "flatten",
           Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0},
@@ -148,7 +276,6 @@ class Model {
           KOKKOS_LAMBDA(size_t t, size_t i) {
             attn_flat(t, i) = attn_out(t, i / HD, i % HD);
           });
-      MatR proj("proj", T, DIM);
       gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), attn_flat, b.wo,
                               static_cast<Scalar>(0), proj);
       Kokkos::parallel_for(
@@ -162,7 +289,6 @@ class Model {
       gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), tmp2, b.wup,
                               static_cast<Scalar>(0), up);
       swiglu<ExecSpace, Scalar>(gate, up, act);
-      MatR down("down", T, DIM);
       gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), act, b.wdown,
                               static_cast<Scalar>(0), down);
       Kokkos::parallel_for(
@@ -172,13 +298,10 @@ class Model {
           KOKKOS_LAMBDA(size_t t, size_t d) { h(t, d) += down(t, d); });
     }
 
-    MatR hn("hn", T, DIM);
     rmsnorm<ExecSpace, Scalar>(h, weights.final_norm, EPS, hn);
-    Kokkos::View<Scalar*, ExecSpace> last("last", DIM);
     Kokkos::parallel_for(
         "gather_last", Kokkos::RangePolicy<ExecSpace>(0, (size_t)DIM),
         KOKKOS_LAMBDA(size_t d) { last(d) = hn(T - 1, d); });
-    Kokkos::View<Scalar*, ExecSpace> logits("logits", VS);
     {
       auto W = weights.lm_head;
       Kokkos::parallel_for(
@@ -214,25 +337,26 @@ class Model {
       return std::binary_search(stops.begin(), stops.end(), id);
     };
     const int max_seq = cfg.max_seq_len;
-    Kokkos::View<int*, ExecSpace> toks("toks", prompt.size());
+    ensure_tok(prompt.size());
+    auto toks = Kokkos::subview(tok_buf_, std::make_pair(size_t(0), prompt.size()));
     {
-      auto h = Kokkos::create_mirror_view(toks);
+      auto h = Kokkos::subview(tok_host_, std::make_pair(size_t(0), prompt.size()));
       for (size_t i = 0; i < prompt.size(); ++i) h(i) = prompt[i];
       Kokkos::deep_copy(toks, h);
     }
     auto logits = forward(toks);
     int nxt = sample_greedy<ExecSpace, Scalar>(logits);
     if ((int)out.size() < max_seq) out.push_back(nxt);
+    if (one_buf_.extent(0) != 1 || one_host_.extent(0) != 1) {
+      one_buf_ = ViewInt("one", 1);
+      one_host_ = HostInt("one_host", 1);
+    }
     for (int s = 1; s < max_new; ++s) {
       if (is_stop(nxt)) break;
       if ((int)out.size() >= max_seq) break;
-      Kokkos::View<int*, ExecSpace> one("one", 1);
-      {
-        auto h = Kokkos::create_mirror_view(one);
-        h(0) = nxt;
-        Kokkos::deep_copy(one, h);
-      }
-      logits = forward(one);
+      one_host_(0) = nxt;
+      Kokkos::deep_copy(one_buf_, one_host_);
+      logits = forward(one_buf_);
       nxt = sample_greedy<ExecSpace, Scalar>(logits);
       out.push_back(nxt);
     }
