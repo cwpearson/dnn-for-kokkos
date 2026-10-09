@@ -100,3 +100,55 @@ TEST(LlamaScratchReuse, Float) { check_scratch_reuse<float>(); }
 TEST(LlamaScratchReuse, BHalf) {
   check_scratch_reuse<Kokkos::Experimental::bhalf_t>();
 }
+
+// Chunked prefill: splitting a prompt into chunks matches single-shot
+// (prefill_chunk_size <= 0) logits/generate exactly, while scratch stays
+// O(chunk·dim) instead of O(T·dim).
+template <class Scalar>
+void check_chunked_prefill() {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  auto cfg   = KokkosDNN::Llama::Config::tiny_test();
+  cfg.max_seq_len = 32;
+  KokkosDNN::Llama::Weights<Exec, Scalar> w;
+  KokkosDNN::Llama::random_init(cfg, w, 1234);
+  std::vector<int> prompt = {1, 2, 3, 4, 5, 6, 7, 8};
+
+  auto forward_logits = [&](int chunk) {
+    KokkosDNN::Llama::Model<Exec, Scalar> m(cfg, w);
+    m.cfg.prefill_chunk_size = chunk;
+    Kokkos::View<int*, Exec> toks("toks", prompt.size());
+    auto ht = Kokkos::create_mirror_view(toks);
+    for (size_t i = 0; i < prompt.size(); ++i) ht(i) = prompt[i];
+    Kokkos::deep_copy(toks, ht);
+    auto lg = m.forward(toks);
+    auto hl = Kokkos::create_mirror_view(lg);
+    Kokkos::deep_copy(hl, lg);
+    std::vector<float> out(hl.extent(0));
+    for (size_t i = 0; i < hl.extent(0); ++i)
+      out[i] = static_cast<float>(hl(i));
+    return std::make_pair(out, m.scratch_cap_);
+  };
+
+  auto ref = forward_logits(0);  // single-shot reference
+  for (int chunk : {1, 2, 3}) {
+    auto got = forward_logits(chunk);
+    ASSERT_EQ(got.first.size(), ref.first.size());
+    for (size_t i = 0; i < ref.first.size(); ++i)
+      EXPECT_FLOAT_EQ(got.first[i], ref.first[i]);
+    // Scratch never exceeds the chunk size (decode slot is 1).
+    EXPECT_LE(got.second, (size_t)chunk);
+  }
+  EXPECT_EQ(ref.second, prompt.size());  // single-shot sizes to T
+
+  // End-to-end generate() agrees across chunkings.
+  KokkosDNN::Llama::Model<Exec, Scalar> m1(cfg, w), m2(cfg, w);
+  m1.cfg.prefill_chunk_size = 0;
+  m2.cfg.prefill_chunk_size = 2;
+  EXPECT_EQ(m2.generate(prompt, 4), m1.generate(prompt, 4));
+}
+
+TEST(LlamaChunkedPrefill, Float) { check_chunked_prefill<float>(); }
+
+TEST(LlamaChunkedPrefill, BHalf) {
+  check_chunked_prefill<Kokkos::Experimental::bhalf_t>();
+}

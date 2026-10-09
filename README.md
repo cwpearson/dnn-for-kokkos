@@ -135,8 +135,10 @@ large-GPU or CPU-Kokkos build for the real checkpoint.
   128k contexts are feasible. The model additionally passes KV-cache
   prefixes as subviews (no per-layer repack copy).
   Remaining 128k considerations: the BF16 KV cache itself is ~256 MiB per
-  layer (~8 GiB for 32 layers at 128k), and single-shot prefill holds
-  O(T·dim) activations — chunked prefill is future work.
+  layer (~8 GiB for 32 layers at 128k). Prefill activations are bounded by
+  chunked prefill (`Config::prefill_chunk_size`, default 2048):
+  `forward()` processes long prompts in chunks, so scratch stays
+  O(chunk·dim) regardless of context length (exact match to single-shot).
 - The tokenizer implements the full HF `tokenizers` pipeline for the Llama 3
   `tokenizer.json` (special-token longest-match split, the tiktoken Split
   regex with Unicode `\p{L}`/`\p{N}`, GPT-2 byte mapping, per-piece BPE,
@@ -166,8 +168,7 @@ Minimum checklist for a faithful, usable 8B run (ordered by priority):
 - Checkpoint loader (`KokkosDNN_LlamaWeights.cpp`): avoid the host-`F32`
   expansion (`16 GiB BF16` -> `~32 GiB` host spike); `mmap`/streaming zero-copy
   `BF16`->device, sharded lazy load, tied-`lm_head` handling.
-- Long context: chunked prefill (single-shot prefill holds `O(T·dim)`
-  activations), `reset()` without full-cache `deep_copy` zero;
+- Long context: `reset()` without full-cache `deep_copy` zero;
   later: paged / quantized KV (`~8 GiB` at 128k BF16).
 - Performance: `lm_head` via `gemm`/`gemv` (today naive `parallel_for(vocab)`),
   cached TPL handles (today created per-call, i.e. `~224` cuBLAS setups/token),

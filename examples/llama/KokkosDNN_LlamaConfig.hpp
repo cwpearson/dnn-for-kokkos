@@ -24,6 +24,11 @@ struct Config {
   int max_seq_len    = 8192;           // PoC runtime cap (arch supports 128k)
   int bos_token      = 128000;
   int eos_token      = 128001;
+  // Chunked prefill: forward() processes prompts in chunks of this many
+  // tokens so activations stay O(chunk·dim) instead of O(T·dim). <= 0
+  // means single-shot (one chunk of T). Default 2048 bounds a full 8B
+  // prefill to ~360 MiB of BF16 activations regardless of context length.
+  int prefill_chunk_size = 2048;
   // Instruct stop tokens (HF generation_config eos_token_id
   // [128001, 128008, 128009]): <|eom_id|> and <|eot_id|>.
   int eom_token      = 128008;
