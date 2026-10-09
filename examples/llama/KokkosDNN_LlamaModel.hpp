@@ -91,12 +91,12 @@ class Model {
     one_host_ = HostInt("one_host", 1);
   }
 
-  void reset() {
-    seq_len = 0;
-    const Scalar zero = static_cast<Scalar>(0);
-    for (auto& v : k_cache) Kokkos::deep_copy(v, zero);
-    for (auto& v : v_cache) Kokkos::deep_copy(v, zero);
-  }
+  // O(1) reset: just rewinds the position counter. No cache wipe.
+  // Correctness invariant: forward() writes KV at [cpos, cpos+C) before
+  // reading prefix [0, cpos+C), with absolute positions and q_off=cpos,
+  // so entries at/after seq_len are always overwritten before they are
+  // read. Stale tail data from a previous sequence is never observed.
+  void reset() { seq_len = 0; }
 
  private:
   // Grow chunk-sized scratch to hold at least C rows (exact-size growth;

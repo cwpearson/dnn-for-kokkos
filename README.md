@@ -153,8 +153,7 @@ large-GPU or CPU-Kokkos build for the real checkpoint.
 
 Minimum checklist for a faithful, usable 8B run (ordered by priority):
 
-- Long context: `reset()` without full-cache `deep_copy` zero;
-  later: paged / quantized KV (`~8 GiB` at 128k BF16).
+- Long context (future): paged / quantized KV (`~8 GiB` at 128k BF16).
 - Performance: `lm_head` via `gemm`/`gemv` (today naive `parallel_for(vocab)`),
   cached TPL handles (today created per-call, i.e. `~224` cuBLAS setups/token),
   no per-token host-mirror + `deep_copy` (`pos`/`toks`/`one`/`logits`);

@@ -162,6 +162,196 @@ TEST(LlamaChunkedPrefill, BHalf) {
   check_chunked_prefill<Kokkos::Experimental::bhalf_t>();
 }
 
+// ---- O(1) reset(): rewind position counter, no cache wipe ----
+// forward() overwrites KV at [cpos, cpos+C) before reading prefix
+// [0, cpos+C), so stale entries are never observed after reset().
+// Always-on tiny-config tests (no weight downloads).
+namespace {
+
+template <class Exec, class Scalar>
+Kokkos::View<int*, Exec> make_tok_view(
+    KokkosDNN::Llama::Model<Exec, Scalar>& m, const std::vector<int>& ids) {
+  (void)m;
+  Kokkos::View<int*, Exec> toks("toks", ids.size());
+  auto h = Kokkos::create_mirror_view(toks);
+  for (size_t i = 0; i < ids.size(); ++i) h(i) = ids[i];
+  Kokkos::deep_copy(toks, h);
+  return toks;
+}
+
+template <class Exec, class Scalar>
+std::vector<float> logits_vec(
+    const Kokkos::View<Scalar*, Exec>& lg) {
+  auto h = Kokkos::create_mirror_view(lg);
+  Kokkos::deep_copy(h, lg);
+  std::vector<float> out(h.extent(0));
+  for (size_t i = 0; i < h.extent(0); ++i)
+    out[i] = static_cast<float>(h(i));
+  return out;
+}
+
+template <class Scalar>
+void expect_logits_eq(const std::vector<float>& a,
+                      const std::vector<float>& b) {
+  ASSERT_EQ(a.size(), b.size());
+  for (size_t i = 0; i < a.size(); ++i) EXPECT_FLOAT_EQ(a[i], b[i]);
+}
+
+// Prefill + two greedy decode steps, returning per-step logits. Drives
+// forward() directly so the KV cache (not generate()'s own reset) is
+// exercised.
+template <class Scalar>
+std::vector<std::vector<float>> run_prefill_decode(
+    KokkosDNN::Llama::Model<Kokkos::DefaultExecutionSpace, Scalar>& m,
+    const std::vector<int>& prompt) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  std::vector<std::vector<float>> all;
+  auto toks = make_tok_view(m, prompt);
+  auto lg   = m.forward(toks);
+  all.push_back(logits_vec(lg));
+  int nxt = KokkosDNN::sample_greedy<Exec, Scalar>(lg);
+  // Decode two steps from single-token slots (argmax on device).
+  for (int s = 0; s < 2; ++s) {
+    Kokkos::View<int*, Exec> one("one", 1);
+    auto h = Kokkos::create_mirror_view(one);
+    h(0) = nxt;
+    Kokkos::deep_copy(one, h);
+    auto lg2 = m.forward(one);
+    all.push_back(logits_vec(lg2));
+    nxt = KokkosDNN::sample_greedy<Exec, Scalar>(lg2);
+  }
+  return all;
+}
+
+}  // namespace
+
+template <class Scalar>
+void check_reset_determinism() {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  using namespace KokkosDNN::Llama;
+  auto cfg = Config::tiny_test();
+  Weights<Exec, Scalar> w;
+  random_init(cfg, w, 1234);
+  Model<Exec, Scalar> m(cfg, w);
+  std::vector<int> prompt = {1, 2, 3, 4};
+
+  auto first = run_prefill_decode(m, prompt);
+  EXPECT_EQ(m.seq_len, prompt.size() + 2);
+  m.reset();
+  EXPECT_EQ(m.seq_len, 0u);
+  auto second = run_prefill_decode(m, prompt);
+  ASSERT_EQ(first.size(), second.size());
+  for (size_t i = 0; i < first.size(); ++i)
+    expect_logits_eq<Scalar>(first[i], second[i]);
+
+  // Fresh model agrees bit-for-bit.
+  Model<Exec, Scalar> fresh(cfg, w);
+  auto ref = run_prefill_decode(fresh, prompt);
+  ASSERT_EQ(ref.size(), second.size());
+  for (size_t i = 0; i < ref.size(); ++i)
+    expect_logits_eq<Scalar>(ref[i], second[i]);
+}
+
+TEST(LlamaReset, DeterminismVsFreshFloat) { check_reset_determinism<float>(); }
+
+TEST(LlamaReset, DeterminismVsFreshBHalf) {
+  check_reset_determinism<Kokkos::Experimental::bhalf_t>();
+}
+
+template <class Scalar>
+void check_reset_multiple() {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  using namespace KokkosDNN::Llama;
+  auto cfg = Config::tiny_test();
+  Weights<Exec, Scalar> w;
+  random_init(cfg, w, 1234);
+  Model<Exec, Scalar> m(cfg, w);
+  std::vector<int> prompt = {1, 2, 3, 4};
+  // Interleave different-length sequences between resets.
+  std::vector<int> other = {9, 10, 11, 12, 13, 14};
+  Model<Exec, Scalar> fresh(cfg, w);
+  auto expect_a = run_prefill_decode(fresh, prompt);
+  for (int i = 0; i < 3; ++i) {
+    auto got_other = run_prefill_decode(m, other);
+    Model<Exec, Scalar> f2(cfg, w);
+    expect_logits_eq<Scalar>(got_other[0], logits_vec(f2.forward(
+                                                 make_tok_view(f2, other))));
+    m.reset();
+    auto got = run_prefill_decode(m, prompt);
+    ASSERT_EQ(got.size(), expect_a.size());
+    for (size_t k = 0; k < got.size(); ++k)
+      expect_logits_eq<Scalar>(got[k], expect_a[k]);
+    m.reset();
+  }
+}
+
+TEST(LlamaReset, MultipleResetsFloat) { check_reset_multiple<float>(); }
+
+TEST(LlamaReset, MultipleResetsBHalf) {
+  check_reset_multiple<Kokkos::Experimental::bhalf_t>();
+}
+
+template <class Scalar>
+void check_reset_after_partial() {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  using namespace KokkosDNN::Llama;
+  auto cfg = Config::tiny_test();
+  Weights<Exec, Scalar> w;
+  random_init(cfg, w, 1234);
+  Model<Exec, Scalar> m(cfg, w);
+  // Partial fill then reset: stale prefix must not leak into the rerun.
+  auto part = make_tok_view(m, std::vector<int>{7, 8});
+  (void)logits_vec(m.forward(part));
+  EXPECT_EQ(m.seq_len, 2u);
+  m.reset();
+  EXPECT_EQ(m.seq_len, 0u);
+  std::vector<int> prompt = {1, 2, 3, 4};
+  auto got = run_prefill_decode(m, prompt);
+  Model<Exec, Scalar> fresh(cfg, w);
+  auto ref = run_prefill_decode(fresh, prompt);
+  ASSERT_EQ(got.size(), ref.size());
+  for (size_t i = 0; i < got.size(); ++i)
+    expect_logits_eq<Scalar>(got[i], ref[i]);
+}
+
+TEST(LlamaReset, AfterPartialFillFloat) {
+  check_reset_after_partial<float>();
+}
+
+TEST(LlamaReset, AfterPartialFillBHalf) {
+  check_reset_after_partial<Kokkos::Experimental::bhalf_t>();
+}
+
+template <class Scalar>
+void check_reset_chunked() {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  using namespace KokkosDNN::Llama;
+  auto cfg = Config::tiny_test();
+  Weights<Exec, Scalar> w;
+  random_init(cfg, w, 1234);
+  std::vector<int> prompt = {1, 2, 3, 4, 5, 6, 7, 8};
+
+  Model<Exec, Scalar> m(cfg, w);
+  m.cfg.prefill_chunk_size = 2;
+  auto toks = make_tok_view(m, prompt);
+  auto first = logits_vec(m.forward(toks));
+  m.reset();
+  auto second = logits_vec(m.forward(make_tok_view(m, prompt)));
+  expect_logits_eq<Scalar>(first, second);
+
+  // Chunked-after-reset matches single-shot fresh reference.
+  Model<Exec, Scalar> ref(cfg, w);
+  ref.cfg.prefill_chunk_size = 0;
+  auto expect = logits_vec(ref.forward(make_tok_view(ref, prompt)));
+  expect_logits_eq<Scalar>(second, expect);
+}
+
+TEST(LlamaReset, ChunkedPathFloat) { check_reset_chunked<float>(); }
+
+TEST(LlamaReset, ChunkedPathBHalf) {
+  check_reset_chunked<Kokkos::Experimental::bhalf_t>();
+}
+
 // ---- Instruct chat template + BOS wiring + stop-strings (README TODO) ----
 // Always-on unit tests over golden strings and a tiny inline tokenizer
 // fixture (no weight downloads). Deterministic: pure string/id logic,
