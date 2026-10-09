@@ -153,9 +153,6 @@ large-GPU or CPU-Kokkos build for the real checkpoint.
 
 Minimum checklist for a faithful, usable 8B run (ordered by priority):
 
-- Checkpoint loader (`KokkosDNN_LlamaWeights.cpp`): avoid the host-`F32`
-  expansion (`16 GiB BF16` -> `~32 GiB` host spike); `mmap`/streaming zero-copy
-  `BF16`->device, sharded lazy load, tied-`lm_head` handling.
 - Long context: `reset()` without full-cache `deep_copy` zero;
   later: paged / quantized KV (`~8 GiB` at 128k BF16).
 - Performance: `lm_head` via `gemm`/`gemv` (today naive `parallel_for(vocab)`),
