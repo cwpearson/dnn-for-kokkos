@@ -18,6 +18,7 @@
 #include "KokkosDNN_LlamaConfig.hpp"
 #include "KokkosDNN_LlamaModel.hpp"
 #include "KokkosDNN_LlamaWeights.hpp"
+#include "KokkosDNN_Tokenizer.hpp"
 
 template <class Scalar>
 void check_generate() {
@@ -159,6 +160,154 @@ TEST(LlamaChunkedPrefill, Float) { check_chunked_prefill<float>(); }
 
 TEST(LlamaChunkedPrefill, BHalf) {
   check_chunked_prefill<Kokkos::Experimental::bhalf_t>();
+}
+
+// ---- Instruct chat template + BOS wiring + stop-strings (README TODO) ----
+// Always-on unit tests over golden strings and a tiny inline tokenizer
+// fixture (no weight downloads). Deterministic: pure string/id logic,
+// no sampling.
+namespace {
+
+std::string chat_fixture_json() {
+  return R"({
+  "model": {"type": "BPE", "vocab": {
+    "a": 0, "b": 1, "H": 2, "i": 3, "\u0120": 4, "S": 5, "y": 6, "s": 7,
+    "e": 8, "m": 9, "u": 10, "r": 11, "t": 12, "o": 13, "n": 14, "A": 15,
+    "\u010a": 16
+  }, "merges": []},
+  "added_tokens": [
+    {"id": 100, "content": "<|begin_of_text|>", "special": true},
+    {"id": 101, "content": "<|end_of_text|>", "special": true},
+    {"id": 102, "content": "<|start_header_id|>", "special": true},
+    {"id": 103, "content": "<|end_header_id|>", "special": true},
+    {"id": 104, "content": "<|eot_id|>", "special": true},
+    {"id": 105, "content": "<|eom_id|>", "special": true}
+  ]
+})";
+}
+
+std::string write_chat_fixture() {
+  const std::string p = "/tmp/kokkosdnn_chat_fixture.json";
+  std::ofstream f(p, std::ios::binary | std::ios::trunc);
+  if (!f) throw std::runtime_error("cannot write " + p);
+  f << chat_fixture_json();
+  f.close();
+  return p;
+}
+
+}  // namespace
+
+TEST(LlamaChatTemplate, GoldenStrings) {
+  using KokkosDNN::Llama::ChatMessage;
+  using KokkosDNN::Llama::make_chat_messages;
+  using KokkosDNN::Llama::render_chat_template;
+
+  // User-only single turn + generation prompt.
+  EXPECT_EQ(render_chat_template({{"user", "Hi"}}, true),
+            "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
+            "Hi<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n");
+
+  // System + user via helper.
+  auto msgs = make_chat_messages("Hello", "Be brief.", "user");
+  ASSERT_EQ(msgs.size(), 2u);
+  EXPECT_EQ(msgs[0].role, "system");
+  EXPECT_EQ(render_chat_template(msgs, true),
+            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+            "Be brief.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
+            "Hello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n");
+
+  // Multi-turn without generation prompt ends with <|eot_id|>.
+  std::vector<ChatMessage> multi = {{"user", "Hi"},
+                                    {"assistant", "Hello!"},
+                                    {"user", "Bye"}};
+  EXPECT_EQ(render_chat_template(multi, false),
+            "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
+            "Hi<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+            "Hello!<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
+            "Bye<|eot_id|>");
+
+  // Empty role defaults to user; empty message list renders BOS only
+  // (+ optional generation prompt).
+  EXPECT_EQ(make_chat_messages("Hi", "", "").front().role, "user");
+  EXPECT_EQ(render_chat_template({}, true),
+            "<|begin_of_text|>"
+            "<|start_header_id|>assistant<|end_header_id|>\n\n");
+  EXPECT_EQ(render_chat_template({}, false), "<|begin_of_text|>");
+}
+
+TEST(LlamaChatBos, ExactlyOneBos) {
+  using KokkosDNN::Llama::encode_chat;
+  using KokkosDNN::Llama::encode_rendered_chat;
+  using KokkosDNN::Llama::ensure_bos;
+  using KokkosDNN::Llama::render_chat_template;
+
+  // Pure id-level helper: collapse runs / strip / empty edge.
+  EXPECT_EQ(ensure_bos({100, 100, 5}, 100, true), (std::vector<int>{100, 5}));
+  EXPECT_EQ(ensure_bos({5, 100}, 100, true), (std::vector<int>{100, 5, 100}));
+  EXPECT_EQ(ensure_bos({100, 100}, 100, true), (std::vector<int>{100}));
+  EXPECT_EQ(ensure_bos({}, 100, true), (std::vector<int>{100}));
+  EXPECT_EQ(ensure_bos({100, 100, 5}, 100, false), (std::vector<int>{5}));
+  EXPECT_EQ(ensure_bos({5}, 100, false), (std::vector<int>{5}));
+
+  // Through the fixture tokenizer (BOS id 100): chat render already
+  // starts with the BOS literal, so naive encode(add_bos=true) would
+  // double it; encode_chat must yield exactly one.
+  KokkosDNN::Llama::Tokenizer tok(write_chat_fixture());
+  EXPECT_EQ(tok.bos(), 100);
+  std::vector<KokkosDNN::Llama::ChatMessage> msgs = {{"user", "Hi"}};
+  auto rendered = render_chat_template(msgs, true);
+  ASSERT_TRUE(rendered.rfind("<|begin_of_text|>", 0) == 0);
+
+  auto naive = tok.encode(rendered, true);  // double-BOS guard check
+  ASSERT_GE(naive.size(), 2u);
+  EXPECT_EQ(naive[0], 100);
+  EXPECT_EQ(naive[1], 100);  // proves the double-count exists without fix
+
+  auto fixed = encode_chat(tok, msgs, true, true);
+  ASSERT_FALSE(fixed.empty());
+  EXPECT_EQ(fixed[0], 100);
+  size_t lead = 0;
+  while (lead < fixed.size() && fixed[lead] == 100) ++lead;
+  EXPECT_EQ(lead, 1u);  // exactly one BOS
+  // Same body as encode(add_bos=false) plus one BOS.
+  auto no_bos = encode_chat(tok, msgs, true, false);
+  EXPECT_EQ(fixed.size(), no_bos.size() + 1u);
+  EXPECT_EQ(std::vector<int>(fixed.begin() + 1, fixed.end()), no_bos);
+
+  // Raw text starting with the BOS literal is also collapsed to one.
+  auto dup = encode_rendered_chat(tok, "<|begin_of_text|>Hi", true);
+  EXPECT_EQ(dup.front(), 100);
+  size_t d = 0;
+  while (d < dup.size() && dup[d] == 100) ++d;
+  EXPECT_EQ(d, 1u);
+  // add_bos=false strips the literal's BOS entirely.
+  auto stripped = tok.encode("<|begin_of_text|>Hi", false);
+  EXPECT_EQ(ensure_bos(stripped, tok.bos(), false)[0], 2);  // 'H'
+}
+
+TEST(LlamaStopStrings, Truncation) {
+  using KokkosDNN::Llama::find_stop_string;
+  using KokkosDNN::Llama::truncate_at_stop_strings;
+
+  EXPECT_EQ(truncate_at_stop_strings("hello world", {}), "hello world");
+  EXPECT_EQ(truncate_at_stop_strings("hello world", {""}), "hello world");
+  EXPECT_EQ(truncate_at_stop_strings("hello world", {"zzz"}), "hello world");
+  // Earliest match wins across the list.
+  EXPECT_EQ(truncate_at_stop_strings("aaSTOPbbENDcc", {"END", "STOP"}),
+            "aa");
+  EXPECT_EQ(truncate_at_stop_strings("foo<|eot_id|>bar", {"<|eot_id|>"}),
+            "foo");
+  // Match at position 0 truncates to empty; matched string reported.
+  EXPECT_EQ(truncate_at_stop_strings("STOPnow", {"STOP"}), "");
+  std::string hit;
+  EXPECT_EQ(find_stop_string("abCDcd", {"cd", "CD"}, &hit), 2u);
+  EXPECT_EQ(hit, "CD");
+  EXPECT_EQ(find_stop_string("nothing", {"x"}, &hit), std::string::npos);
+  EXPECT_TRUE(hit.empty());
+  // Decoded-text scenario: generation suffix truncated, prompt untouched.
+  // (Driver decodes gen ids only; here the pure-string equivalent.)
+  std::string gen = "Paris is great. User: hi";
+  EXPECT_EQ(truncate_at_stop_strings(gen, {"User:"}), "Paris is great. ");
 }
 
 // ---- config.json parsing (README TODO "Model config") ----

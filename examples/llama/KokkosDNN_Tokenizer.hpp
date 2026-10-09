@@ -52,7 +52,6 @@ class Tokenizer {
   int eom() const { return eom_id_; }
   int eot() const { return eot_id_; }
   bool is_special(int id) const { return special_ids_.count(id) != 0; }
-
  private:
   struct AddedToken {
     int id = -1;
@@ -73,6 +72,69 @@ class Tokenizer {
   // BPE over one byte-mapped pre-token piece; appends resulting ids.
   void bpe_piece(const std::string& piece, std::vector<int>& out) const;
 };
+
+// ---------------------------------------------------------------------------
+// Llama 3.x Instruct chat template (README TODO "Instruct chat template").
+//
+// Renders the Meta format used by Llama-3.3-8B-Instruct:
+//
+//   <|begin_of_text|>
+//   <|start_header_id|>system<|end_header_id|>\n\n{system}<|eot_id|>
+//   <|start_header_id|>user<|end_header_id|>\n\n{user}<|eot_id|>
+//   <|start_header_id|>assistant<|end_header_id|>\n\n          <- generation prompt
+//
+// Each message contributes one header/content/<|eot_id|> block; with
+// add_generation_prompt=true an open assistant header (no <|eot_id|>) is
+// appended so the model continues as assistant. Content is used verbatim
+// (no trimming); callers that want HF `| trim` semantics trim beforehand.
+// The rendered string is plain text containing literal special tokens, so
+// Tokenizer::encode handles it via the existing special-token split path
+// (faithful BPE path untouched).
+// ---------------------------------------------------------------------------
+struct ChatMessage {
+  std::string role;     // "system" | "user" | "assistant"
+  std::string content;
+};
+
+std::string render_chat_template(const std::vector<ChatMessage>& messages,
+                                 bool add_generation_prompt = true);
+
+// Build the standard single-turn messages for a raw prompt: optional
+// system message first, then one `role` (default "user") turn.
+std::vector<ChatMessage> make_chat_messages(const std::string& prompt,
+                                            const std::string& system = "",
+                                            const std::string& role = "user");
+
+// BOS handling: collapse any run of leading `bos_id` to exactly one when
+// want_bos (or strip all leading copies when !want_bos). Guarantees the
+// "exactly one BOS" invariant even when a chat-rendered string already
+// starts with <|begin_of_text|> and encode(add_bos=true) would prepend a
+// second copy, or when raw text itself starts with the BOS literal.
+std::vector<int> ensure_bos(const std::vector<int>& ids, int bos_id,
+                            bool want_bos);
+
+// Encode an already-rendered chat string with exactly-one-BOS semantics:
+// encodes with add_bos=false (the literal <|begin_of_text|> in `rendered`
+// flows through the special-token path), then applies ensure_bos().
+std::vector<int> encode_rendered_chat(const Tokenizer& tok,
+                                      const std::string& rendered,
+                                      bool add_bos = true);
+
+// Render + encode in one step (same BOS semantics as encode_rendered_chat).
+std::vector<int> encode_chat(const Tokenizer& tok,
+                             const std::vector<ChatMessage>& messages,
+                             bool add_generation_prompt = true,
+                             bool add_bos = true);
+
+// ---------------------------------------------------------------------------
+// Stop-strings (checked on decoded text): truncate the generated text
+// before the earliest occurrence of any non-empty stop string.
+// ---------------------------------------------------------------------------
+size_t find_stop_string(const std::string& text,
+                        const std::vector<std::string>& stop_strings,
+                        std::string* matched = nullptr);
+std::string truncate_at_stop_strings(
+    const std::string& text, const std::vector<std::string>& stop_strings);
 
 }  // namespace Llama
 }  // namespace KokkosDNN

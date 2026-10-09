@@ -153,8 +153,6 @@ large-GPU or CPU-Kokkos build for the real checkpoint.
 
 Minimum checklist for a faithful, usable 8B run (ordered by priority):
 
-- Instruct chat template
-  (`<|begin_of_text|><|start_header_id|>...`), `add_bos` wiring, stop-strings.
 - Sampling: `temperature` / `top-k` / `top-p` / `min-p`, repetition penalty,
   seeded RNG, streaming decode (today `sample_greedy` only: `deep_copy(128256)`
   + linear scan per token).

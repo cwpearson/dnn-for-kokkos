@@ -816,5 +816,82 @@ std::string Tokenizer::decode(const std::vector<int>& ids,
   return out;
 }
 
+std::string render_chat_template(const std::vector<ChatMessage>& messages,
+                                 bool add_generation_prompt) {
+  std::string out = "<|begin_of_text|>";
+  for (const auto& m : messages) {
+    out += "<|start_header_id|>" + m.role + "<|end_header_id|>\n\n";
+    out += m.content;
+    out += "<|eot_id|>";
+  }
+  if (add_generation_prompt)
+    out += "<|start_header_id|>assistant<|end_header_id|>\n\n";
+  return out;
+}
+
+std::vector<ChatMessage> make_chat_messages(const std::string& prompt,
+                                            const std::string& system,
+                                            const std::string& role) {
+  std::vector<ChatMessage> msgs;
+  if (!system.empty()) msgs.push_back({"system", system});
+  msgs.push_back({role.empty() ? "user" : role, prompt});
+  return msgs;
+}
+
+std::vector<int> ensure_bos(const std::vector<int>& ids, int bos_id,
+                            bool want_bos) {
+  size_t k = 0;
+  while (k < ids.size() && ids[k] == bos_id) ++k;
+  if (want_bos) {
+    std::vector<int> out;
+    out.reserve(ids.size() - k + 1);
+    out.push_back(bos_id);
+    out.insert(out.end(), ids.begin() + (long)k, ids.end());
+    return out;
+  }
+  return std::vector<int>(ids.begin() + (long)k, ids.end());
+}
+
+std::vector<int> encode_rendered_chat(const Tokenizer& tok,
+                                      const std::string& rendered,
+                                      bool add_bos) {
+  // add_bos=false here: the literal BOS in `rendered` (if any) is picked
+  // up by the special-token split; ensure_bos() then enforces the
+  // exactly-one (or zero) invariant on top.
+  std::vector<int> body = tok.encode(rendered, false);
+  return ensure_bos(body, tok.bos(), add_bos);
+}
+
+std::vector<int> encode_chat(const Tokenizer& tok,
+                             const std::vector<ChatMessage>& messages,
+                             bool add_generation_prompt, bool add_bos) {
+  return encode_rendered_chat(
+      tok, render_chat_template(messages, add_generation_prompt), add_bos);
+}
+
+size_t find_stop_string(const std::string& text,
+                        const std::vector<std::string>& stop_strings,
+                        std::string* matched) {
+  size_t best = std::string::npos;
+  const std::string* which = nullptr;
+  for (const auto& s : stop_strings) {
+    if (s.empty()) continue;
+    size_t p = text.find(s);
+    if (p != std::string::npos && (best == std::string::npos || p < best)) {
+      best  = p;
+      which = &s;
+    }
+  }
+  if (matched) *matched = (which ? *which : std::string());
+  return best;
+}
+
+std::string truncate_at_stop_strings(
+    const std::string& text, const std::vector<std::string>& stop_strings) {
+  size_t p = find_stop_string(text, stop_strings);
+  if (p == std::string::npos) return text;
+  return text.substr(0, p);
+}
+
 }  // namespace Llama
 }  // namespace KokkosDNN
