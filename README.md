@@ -153,10 +153,6 @@ large-GPU or CPU-Kokkos build for the real checkpoint.
 
 Minimum checklist for a faithful, usable 8B run (ordered by priority):
 
-- Real-weight validation: add a golden `logits`/perplexity check against HF
-  `transformers` on 1–2 prompts (today only tiny-random shape/determinism in
-  `Test_LlamaGenerate.cpp`). Cover 8B shapes/dtypes, including the
-  `FP32 T=1 GQA` cuDNN `<=9.27` fallback path noted in `KokkosDNN_Attention.hpp`.
 - Model config: parse `config.json` instead of trusting hardcoded
   `KokkosDNN_LlamaConfig.hpp` (`rope_theta`, `eps`, `tie_word_embeddings`,
   `rope_scaling`); raise/validate `max_seq_len` (PoC caps at 8192, arch supports 128k).
