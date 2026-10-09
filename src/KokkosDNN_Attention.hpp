@@ -25,7 +25,7 @@ void attention_gqa_streaming(const DNNHandle<ExecSpace>& handle, const QView& q,
   if constexpr (std::is_same_v<Scalar, float> ||
                 std::is_same_v<Scalar, Kokkos::Experimental::bhalf_t>) {
     if (handle.use_cudnn &&
-        try_cudnn_sdpa_gqa<Scalar>(q, k, v, q_off, out, scale))
+        try_cudnn_sdpa_gqa<Scalar>(handle, q, k, v, q_off, out, scale))
       return;
   } else {
     (void)handle;

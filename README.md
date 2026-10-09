@@ -105,7 +105,8 @@ extra ids with `--stop <id> ...`.
 variants for both `float` and `bhalf_t`: `Native` forces the Kokkos kernel
 (`use_cublas/use_cudnn = false`), `Dispatched` uses the default handle, so
 on a CUDA build with `KokkosDNN_ENABLE_CUBLAS` it exercises the cuBLAS
-path. GEMV has no TPL path, so only `Native` is registered there.
+path. GEMV (decode/lm_head shape) shares the same cuBLAS dispatch, so it
+also registers both variants.
 
 ```bash
 ./build/benchmarks/kokkosdnn_bench --benchmark_list_tests
@@ -147,14 +148,13 @@ large-GPU or CPU-Kokkos build for the real checkpoint.
   (runs when `KOKKOSDNN_TOKENIZER_JSON` points at a Llama 3 `tokenizer.json`;
   92 targeted + 2000 fuzz differential cases pass). Re-validate a new file with
   `KOKKOSDNN_TOKENIZER_JSON=tokenizer.json ./build/examples/llama/test_tokenizer`.
-- Only greedy sampling is implemented; no temperature / top-p / batching.
+- Sampling supports greedy, `temperature` / `top-k` / `top-p` / `min-p`,
+  repetition penalty, and seeded RNG; no batching.
 
 ## TODO — toward real Llama 3.3 8B inference
 
 Minimum checklist for a faithful, usable 8B run (ordered by priority):
 
 - Long context (future): paged / quantized KV (`~8 GiB` at 128k BF16).
-- Performance: `lm_head` via `gemm`/`gemv` (today naive `parallel_for(vocab)`),
-  cached TPL handles (today created per-call, i.e. `~224` cuBLAS setups/token),
-  no per-token host-mirror + `deep_copy` (`pos`/`toks`/`one`/`logits`);
-  CPU TPL path (no `OpenBLAS`/`MKL` dispatch); quantization out of scope per above.
+- Performance (future): CPU TPL path (no `OpenBLAS`/`MKL` dispatch);
+  quantization out of scope per above.

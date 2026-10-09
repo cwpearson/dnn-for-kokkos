@@ -62,12 +62,16 @@ class Model {
   View1 last_buf_, logits_buf_;
   size_t scratch_cap_ = 0;
   // Persistent input staging for generate(): prefill staging grows on
-  // demand, the single-token decode slot is fixed at 1.
+  // demand, the single-token decode slot is fixed at 1. The prompt copy is
+  // a single host->device deep_copy per generate() (unavoidable staging of
+  // host ids); decode steps never touch the host -- the next id is written
+  // by a device kernel (see generate()).
   ViewInt tok_buf_;
   HostInt tok_host_;
   size_t tok_cap_ = 0;
+  // Persistent single-token decode slot. Written on-device each step (no
+  // host mirror + deep_copy per token).
   ViewInt one_buf_;
-  HostInt one_host_;
 
   Model() = default;
   Model(const Config& c, const Weights<ExecSpace, Scalar>& w)
@@ -88,7 +92,6 @@ class Model {
     last_buf_ = View1("last", cfg.dim);
     logits_buf_ = View1("logits", cfg.vocab_size);
     one_buf_ = ViewInt("one", 1);
-    one_host_ = HostInt("one_host", 1);
   }
 
   // O(1) reset: just rewinds the position counter. No cache wipe.
@@ -338,18 +341,11 @@ class Model {
       Kokkos::parallel_for(
           "gather_last", Kokkos::RangePolicy<ExecSpace>(0, (size_t)DIM),
           KOKKOS_LAMBDA(size_t d) { last(d) = hn(C - 1, d); });
-      {
-        auto W = weights.lm_head;
-        Kokkos::parallel_for(
-            "lm_head", Kokkos::RangePolicy<ExecSpace>(0, (size_t)VS),
-            KOKKOS_LAMBDA(size_t v) {
-              float acc = 0;
-              for (int d = 0; d < DIM; ++d)
-                acc += static_cast<float>(last(d)) *
-                       static_cast<float>(W(v, d));
-              logits(v) = static_cast<Scalar>(acc);
-            });
-      }
+      // lm_head through the shared gemv dispatch (cuBLAS M=1 on CUDA,
+      // native kernel otherwise): same FP32 accumulation as the old naive
+      // parallel_for(vocab), routed via the cached TPL handle.
+      gemv<ExecSpace, Scalar>(handle, last, weights.lm_head, logits,
+                              "lm_head");
     }
     seq_len += T;
     return logits;
@@ -398,15 +394,24 @@ class Model {
     int nxt = sample_token<ExecSpace, Scalar>(logits, opt, out, r);
     if ((int)out.size() < max_seq) out.push_back(nxt);
     if (on_token) on_token(nxt);
-    if (one_buf_.extent(0) != 1 || one_host_.extent(0) != 1) {
+    if (one_buf_.extent(0) != 1) {
       one_buf_ = ViewInt("one", 1);
-      one_host_ = HostInt("one_host", 1);
     }
     for (int s = 1; s < max_new; ++s) {
       if (is_stop(nxt)) break;
       if ((int)out.size() >= max_seq) break;
-      one_host_(0) = nxt;
-      Kokkos::deep_copy(one_buf_, one_host_);
+      // Device-side single-token staging: no host mirror + deep_copy per
+      // token. Hoisted to a local: device lambdas must not capture `this`.
+      // Logits likewise stay on device until sampling needs them (greedy
+      // argmax runs on-device; only non-greedy sampling mirrors once).
+      auto one = one_buf_;
+      const int tok = nxt;
+      Kokkos::parallel_for(
+          "fill_one", Kokkos::RangePolicy<ExecSpace>(0, 1),
+          KOKKOS_LAMBDA(int i) {
+            (void)i;
+            one(0) = tok;
+          });
       logits = forward(one_buf_);
       nxt = sample_token<ExecSpace, Scalar>(logits, opt, out, r);
       out.push_back(nxt);

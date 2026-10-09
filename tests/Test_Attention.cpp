@@ -236,20 +236,27 @@ TEST(Attention, FloatLongKeys) {
 // guard engaged — without it, non-leading group heads would come back zero.
 TEST(Attention, CudnnEngagesAndMatchesNative) {
   using Exec = Kokkos::DefaultExecutionSpace;
+  // One shared handle: the raw entry point runs on its cached cuDNN handle
+  // (created once here, not per call), mirroring the dispatched path.
+  KokkosDNN::DNNHandle<Exec> h_raw;
+  EXPECT_TRUE(h_raw.use_cudnn);
+  void* raw = h_raw.cudnn_raw();
+  EXPECT_NE(raw, nullptr);
   {
     Kokkos::View<float***, Kokkos::LayoutRight, Exec> q("q", 2, 4, 8),
         k("k", 2, 2, 8), v("v", 2, 2, 8), o("o", 2, 4, 8);
     EXPECT_TRUE(KokkosDNN::Impl::cudnn_sdpa_forward(
-        KokkosDNN::Impl::CudnnSdpaScalar::Float, q.data(), k.data(), v.data(),
-        o.data(), 2, 2, 4, 2, 8, q.stride(0), q.stride(1), q.stride(2),
-        k.stride(0), k.stride(1), k.stride(2), v.stride(0), v.stride(1),
-        v.stride(2), o.stride(0), o.stride(1), o.stride(2), 0.35f));
+        raw, KokkosDNN::Impl::CudnnSdpaScalar::Float, q.data(), k.data(),
+        v.data(), o.data(), 2, 2, 4, 2, 8, q.stride(0), q.stride(1),
+        q.stride(2), k.stride(0), k.stride(1), k.stride(2), v.stride(0),
+        v.stride(1), v.stride(2), o.stride(0), o.stride(1), o.stride(2),
+        0.35f));
   }
   {
     Kokkos::View<Kokkos::Experimental::bhalf_t***, Kokkos::LayoutRight, Exec>
         q("q", 1, 4, 8), k("k", 5, 2, 8), v("v", 5, 2, 8), o("o", 1, 4, 8);
     EXPECT_TRUE(KokkosDNN::Impl::cudnn_sdpa_forward(
-        KokkosDNN::Impl::CudnnSdpaScalar::BFloat16, q.data(), k.data(),
+        raw, KokkosDNN::Impl::CudnnSdpaScalar::BFloat16, q.data(), k.data(),
         v.data(), o.data(), 1, 5, 4, 2, 8, q.stride(0), q.stride(1),
         q.stride(2), k.stride(0), k.stride(1), k.stride(2), v.stride(0),
         v.stride(1), v.stride(2), o.stride(0), o.stride(1), o.stride(2),
@@ -260,10 +267,11 @@ TEST(Attention, CudnnEngagesAndMatchesNative) {
     Kokkos::View<float***, Kokkos::LayoutRight, Exec> q("q", 1, 2, 8),
         k("k", 9, 2, 8), v("v", 9, 2, 8), o("o", 1, 2, 8);
     EXPECT_TRUE(KokkosDNN::Impl::cudnn_sdpa_forward(
-        KokkosDNN::Impl::CudnnSdpaScalar::Float, q.data(), k.data(), v.data(),
-        o.data(), 1, 9, 2, 2, 8, q.stride(0), q.stride(1), q.stride(2),
-        k.stride(0), k.stride(1), k.stride(2), v.stride(0), v.stride(1),
-        v.stride(2), o.stride(0), o.stride(1), o.stride(2), 1.0f / 8.0f));
+        raw, KokkosDNN::Impl::CudnnSdpaScalar::Float, q.data(), k.data(),
+        v.data(), o.data(), 1, 9, 2, 2, 8, q.stride(0), q.stride(1),
+        q.stride(2), k.stride(0), k.stride(1), k.stride(2), v.stride(0),
+        v.stride(1), v.stride(2), o.stride(0), o.stride(1), o.stride(2),
+        1.0f / 8.0f));
   }
   {
     // Float s_q == 1 with GQA is the excluded combination: the guard must
@@ -271,10 +279,11 @@ TEST(Attention, CudnnEngagesAndMatchesNative) {
     Kokkos::View<float***, Kokkos::LayoutRight, Exec> q("q", 1, 4, 8),
         k("k", 9, 2, 8), v("v", 9, 2, 8), o("o", 1, 4, 8);
     const bool ran = KokkosDNN::Impl::cudnn_sdpa_forward(
-        KokkosDNN::Impl::CudnnSdpaScalar::Float, q.data(), k.data(), v.data(),
-        o.data(), 1, 9, 4, 2, 8, q.stride(0), q.stride(1), q.stride(2),
-        k.stride(0), k.stride(1), k.stride(2), v.stride(0), v.stride(1),
-        v.stride(2), o.stride(0), o.stride(1), o.stride(2), 1.0f / 8.0f);
+        raw, KokkosDNN::Impl::CudnnSdpaScalar::Float, q.data(), k.data(),
+        v.data(), o.data(), 1, 9, 4, 2, 8, q.stride(0), q.stride(1),
+        q.stride(2), k.stride(0), k.stride(1), k.stride(2), v.stride(0),
+        v.stride(1), v.stride(2), o.stride(0), o.stride(1), o.stride(2),
+        1.0f / 8.0f);
 #if CUDNN_VERSION <= 92700
     EXPECT_FALSE(ran);
 #else

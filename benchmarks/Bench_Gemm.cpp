@@ -7,7 +7,8 @@
 //   Dispatched — default handle, routes GEMM to cuBLAS when built with
 //                KokkosDNN_ENABLE_CUBLAS on a CUDA space (float via sgemm,
 //                bhalf_t via cublasGemmEx); otherwise native.
-// GEMV has no TPL path, so only Native is registered there.
+// GEMV (decode/lm_head shape, M=1) shares the same cuBLAS dispatch via the
+// handle's cached handle, so both Native and Dispatched are registered.
 //
 // Run e.g.:
 //   ./kokkosdnn_bench --benchmark_filter='Gemm.*'
@@ -133,6 +134,9 @@ static void BM_Gemv_Float_Dispatched(benchmark::State& state) {
 static void BM_Gemv_BHalf_Native(benchmark::State& state) {
   run_gemv<bhalf_t>(state, true);
 }
+static void BM_Gemv_BHalf_Dispatched(benchmark::State& state) {
+  run_gemv<bhalf_t>(state, false);
+}
 
 // Llama 3.3 8B GEMM shapes (M tokens, N out_features, K in_features):
 // attn proj 4096x4096, FFN up/gate 14336x4096, FFN down 4096x14336,
@@ -172,5 +176,6 @@ BENCHMARK(BM_Gemm_BHalf_Dispatched)
 KOKKOSDNN_GEMV_ARGS(BENCHMARK(BM_Gemv_Float_Native)->Unit(benchmark::kMillisecond)->ArgNames({"N", "K"}));
 KOKKOSDNN_GEMV_ARGS(BENCHMARK(BM_Gemv_Float_Dispatched)->Unit(benchmark::kMillisecond)->ArgNames({"N", "K"}));
 KOKKOSDNN_GEMV_ARGS(BENCHMARK(BM_Gemv_BHalf_Native)->Unit(benchmark::kMillisecond)->ArgNames({"N", "K"}));
+KOKKOSDNN_GEMV_ARGS(BENCHMARK(BM_Gemv_BHalf_Dispatched)->Unit(benchmark::kMillisecond)->ArgNames({"N", "K"}));
 
 }  // namespace

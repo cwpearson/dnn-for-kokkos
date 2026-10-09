@@ -33,6 +33,7 @@
 #include <Kokkos_Half.hpp>
 
 #include "KokkosDNN_config.h"
+#include "KokkosDNN_Handle.hpp"
 
 namespace KokkosDNN {
 namespace Impl {
@@ -40,20 +41,26 @@ namespace Impl {
 enum class CudnnSdpaScalar : int { Float = 0, BFloat16 = 1 };
 
 // Raw-pointer entry point, implemented in KokkosDNN_Attention_CuDNN.cpp.
+// cached_handle is the DNNHandle's cached cudnnHandle_t (opaque void*;
+// nullptr declines and the caller falls back to native). The callee
+// re-selects the Kokkos CUDA stream on it per call, so the one cached
+// handle stays ordered with surrounding Kokkos kernels instead of being
+// created/destroyed per call.
 // Strides are in elements for (token, head, dim) indexing, i.e. the
 // Kokkos View strides: q_sT = q.stride(0), q_sH = q.stride(1), etc.
 // Returns true on success, false to fall back to native. Never throws.
-bool cudnn_sdpa_forward(CudnnSdpaScalar dtype, const void* q, const void* k,
-                        const void* v, void* out, int64_t T, int64_t Ktot,
-                        int64_t Hq, int64_t Hkv, int64_t D, int64_t q_sT,
-                        int64_t q_sH, int64_t q_sD, int64_t k_sT, int64_t k_sH,
-                        int64_t k_sD, int64_t v_sT, int64_t v_sH,
-                        int64_t v_sD, int64_t o_sT, int64_t o_sH,
+bool cudnn_sdpa_forward(void* cached_handle, CudnnSdpaScalar dtype,
+                        const void* q, const void* k, const void* v, void* out,
+                        int64_t T, int64_t Ktot, int64_t Hq, int64_t Hkv,
+                        int64_t D, int64_t q_sT, int64_t q_sH, int64_t q_sD,
+                        int64_t k_sT, int64_t k_sH, int64_t k_sD, int64_t v_sT,
+                        int64_t v_sH, int64_t v_sD, int64_t o_sT, int64_t o_sH,
                         int64_t o_sD, float scale);
 
 #if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)
 // Layout-agnostic template over Kokkos views. Performs the cheap shape
-// checks, maps the scalar type, and forwards raw pointers/strides.
+// checks, maps the scalar type, and forwards raw pointers/strides along
+// with the handle's cached cuDNN handle (created once per DNNHandle).
 //
 // cuDNN needs the head-dim axis innermost (element stride 1). Q/O are
 // small ([T, Hq, D]) and often LayoutLeft on CUDA, so they are repacked
@@ -61,9 +68,11 @@ bool cudnn_sdpa_forward(CudnnSdpaScalar dtype, const void* q, const void* k,
 // KV-cache prefix and pass through zero-copy when already D-contiguous
 // (the Llama model stores caches LayoutRight); otherwise they are
 // repacked as well. Any cuDNN failure still falls back to native.
-template <class Scalar, class QView, class KView, class VView, class OView>
-inline bool try_cudnn_sdpa_gqa(const QView& q, const KView& k, const VView& v,
-                               size_t q_off, const OView& out, float scale) {
+template <class Scalar, class Exec, class QView, class KView, class VView,
+          class OView>
+inline bool try_cudnn_sdpa_gqa(const DNNHandle<Exec>& handle, const QView& q,
+                               const KView& k, const VView& v, size_t q_off,
+                               const OView& out, float scale) {
   const int64_t T   = static_cast<int64_t>(q.extent(0));
   const int64_t Hq  = static_cast<int64_t>(q.extent(1));
   const int64_t D   = static_cast<int64_t>(q.extent(2));
@@ -168,9 +177,9 @@ inline bool try_cudnn_sdpa_gqa(const QView& q, const KView& k, const VView& v,
   }
 
   const bool ok =
-      cudnn_sdpa_forward(dtype, qp, kp, vp, op, T, Ktot, Hq, Hkv, D, q_sT,
-                         q_sH, q_sD, k_sT, k_sH, k_sD, v_sT, v_sH, v_sD, o_sT,
-                         o_sH, o_sD, scale);
+      cudnn_sdpa_forward(handle.cudnn_raw(), dtype, qp, kp, vp, op, T, Ktot,
+                         Hq, Hkv, D, q_sT, q_sH, q_sD, k_sT, k_sH, k_sD, v_sT,
+                         v_sH, v_sD, o_sT, o_sH, o_sD, scale);
   if (ok && repack_out) Kokkos::deep_copy(out, o_tmp);
   return ok;
 }

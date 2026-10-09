@@ -33,13 +33,14 @@ namespace fe = cudnn_frontend;
 namespace KokkosDNN {
 namespace Impl {
 
-bool cudnn_sdpa_forward(CudnnSdpaScalar dtype, const void* q, const void* k,
-                        const void* v, void* out, int64_t T, int64_t Ktot,
-                        int64_t Hq, int64_t Hkv, int64_t D, int64_t q_sT,
-                        int64_t q_sH, int64_t q_sD, int64_t k_sT, int64_t k_sH,
-                        int64_t k_sD, int64_t v_sT, int64_t v_sH,
-                        int64_t v_sD, int64_t o_sT, int64_t o_sH,
+bool cudnn_sdpa_forward(void* cached_handle, CudnnSdpaScalar dtype,
+                        const void* q, const void* k, const void* v, void* out,
+                        int64_t T, int64_t Ktot, int64_t Hq, int64_t Hkv,
+                        int64_t D, int64_t q_sT, int64_t q_sH, int64_t q_sD,
+                        int64_t k_sT, int64_t k_sH, int64_t k_sD, int64_t v_sT,
+                        int64_t v_sH, int64_t v_sD, int64_t o_sT, int64_t o_sH,
                         int64_t o_sD, float scale) {
+  if (cached_handle == nullptr) return false;
   if (q == nullptr || k == nullptr || v == nullptr || out == nullptr)
     return false;
   if (T <= 0 || Ktot <= 0 || Hq <= 0 || Hkv <= 0 || D <= 0) return false;
@@ -74,15 +75,13 @@ bool cudnn_sdpa_forward(CudnnSdpaScalar dtype, const void* q, const void* k,
   // Kokkos kernels have completed before cuDNN reads them.
   Kokkos::fence();
 
-  cudnnHandle_t cudnn_handle = nullptr;
-  if (cudnnCreate(&cudnn_handle) != CUDNN_STATUS_SUCCESS) return false;
-  // Run on the Kokkos CUDA stream so ordering with surrounding Kokkos
-  // kernels is preserved without extra synchronization.
+  // Cached handle owned by the DNNHandle (created once per handle, not per
+  // call). Re-select the Kokkos CUDA stream every call so ordering with
+  // surrounding Kokkos kernels is preserved without extra synchronization.
+  cudnnHandle_t cudnn_handle = static_cast<cudnnHandle_t>(cached_handle);
   const cudaStream_t kokkos_stream = Kokkos::Cuda().cuda_stream();
-  if (cudnnSetStream(cudnn_handle, kokkos_stream) != CUDNN_STATUS_SUCCESS) {
-    cudnnDestroy(cudnn_handle);
+  if (cudnnSetStream(cudnn_handle, kokkos_stream) != CUDNN_STATUS_SUCCESS)
     return false;
-  }
 
   bool ok = false;
   void* workspace = nullptr;
@@ -119,7 +118,6 @@ bool cudnn_sdpa_forward(CudnnSdpaScalar dtype, const void* q, const void* k,
                                .set_dim(v_dim)
                                .set_stride(v_stride));
     if (Q == nullptr || K == nullptr || V == nullptr) {
-      cudnnDestroy(cudnn_handle);
       return false;
     }
 
@@ -141,31 +139,26 @@ bool cudnn_sdpa_forward(CudnnSdpaScalar dtype, const void* q, const void* k,
 
     auto [O, Stats] = graph->sdpa(Q, K, V, sdpa_options);
     if (O == nullptr) {
-      cudnnDestroy(cudnn_handle);
       return false;
     }
     O->set_output(true).set_dim(o_dim).set_stride(o_stride);
 
     if (!graph->validate().is_good()) {
-      cudnnDestroy(cudnn_handle);
       return false;
     }
     if (!graph->build(cudnn_handle,
                       {fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK})
              .is_good()) {
-      cudnnDestroy(cudnn_handle);
       return false;
     }
 
     int64_t workspace_size = 0;
     if (!graph->get_workspace_size(workspace_size).is_good()) {
-      cudnnDestroy(cudnn_handle);
       return false;
     }
     if (workspace_size > 0) {
       if (cudaMalloc(&workspace, static_cast<size_t>(workspace_size)) !=
           cudaSuccess) {
-        cudnnDestroy(cudnn_handle);
         return false;
       }
     }
@@ -181,7 +174,7 @@ bool cudnn_sdpa_forward(CudnnSdpaScalar dtype, const void* q, const void* k,
   }
 
   if (workspace != nullptr) cudaFree(workspace);
-  cudnnDestroy(cudnn_handle);
+  // NOTE: cudnn_handle is cached by the DNNHandle -- never destroyed here.
   return ok;
 }
 
@@ -193,7 +186,7 @@ bool cudnn_sdpa_forward(CudnnSdpaScalar dtype, const void* q, const void* k,
 namespace KokkosDNN {
 namespace Impl {
 
-bool cudnn_sdpa_forward(CudnnSdpaScalar, const void*, const void*,
+bool cudnn_sdpa_forward(void*, CudnnSdpaScalar, const void*, const void*,
                         const void*, void*, int64_t, int64_t, int64_t,
                         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
