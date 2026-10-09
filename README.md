@@ -153,9 +153,6 @@ large-GPU or CPU-Kokkos build for the real checkpoint.
 
 Minimum checklist for a faithful, usable 8B run (ordered by priority):
 
-- Sampling: `temperature` / `top-k` / `top-p` / `min-p`, repetition penalty,
-  seeded RNG, streaming decode (today `sample_greedy` only: `deep_copy(128256)`
-  + linear scan per token).
 - Checkpoint loader (`KokkosDNN_LlamaWeights.cpp`): avoid the host-`F32`
   expansion (`16 GiB BF16` -> `~32 GiB` host spike); `mmap`/streaming zero-copy
   `BF16`->device, sharded lazy load, tied-`lm_head` handling.

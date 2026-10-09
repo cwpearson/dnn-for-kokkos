@@ -4,6 +4,7 @@
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
 #include <algorithm>
+#include <functional>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -354,12 +355,23 @@ class Model {
     return logits;
   }
 
-  // Host convenience: prefill + greedy decode loop.
+  // Host convenience: prefill + sampled decode loop.
   // Returns all ids (prompt + generated). Stops at any id in stop_ids
   // (the stop token itself is included) or max_new. An empty stop_ids
   // means the Instruct defaults {eos_token, eom_token, eot_token}.
+  //
+  // Sampling: `opt` selects greedy (temperature <= 0 or top_k == 1) vs
+  // temperature / top-k / top-p / min-p sampling; `rng` supplies the draws
+  // (a null rng with a non-greedy `opt` constructs HostRNG(opt.seed), so a
+  // fixed seed reproduces the run). The repetition penalty looks at every
+  // prior token (prompt + tokens generated so far, deduped). `on_token` is
+  // the streaming hook: invoked once per generated token, in order,
+  // immediately after it is sampled (before the next forward()).
+  using TokenCallback = std::function<void(int)>;
   std::vector<int> generate(const std::vector<int>& prompt, int max_new,
-                            const std::vector<int>& stop_ids) {
+                            const std::vector<int>& stop_ids,
+                            const SampleOptions& opt, HostRNG* rng = nullptr,
+                            TokenCallback on_token = nullptr) {
     reset();
     std::vector<int> out = prompt;
     std::vector<int> stops = stop_ids.empty()
@@ -373,6 +385,8 @@ class Model {
       return std::binary_search(stops.begin(), stops.end(), id);
     };
     const int max_seq = cfg.max_seq_len;
+    HostRNG local_rng(opt.seed);
+    HostRNG& r = rng ? *rng : local_rng;
     ensure_tok(prompt.size());
     auto toks = Kokkos::subview(tok_buf_, std::make_pair(size_t(0), prompt.size()));
     {
@@ -381,8 +395,9 @@ class Model {
       Kokkos::deep_copy(toks, h);
     }
     auto logits = forward(toks);
-    int nxt = sample_greedy<ExecSpace, Scalar>(logits);
+    int nxt = sample_token<ExecSpace, Scalar>(logits, opt, out, r);
     if ((int)out.size() < max_seq) out.push_back(nxt);
+    if (on_token) on_token(nxt);
     if (one_buf_.extent(0) != 1 || one_host_.extent(0) != 1) {
       one_buf_ = ViewInt("one", 1);
       one_host_ = HostInt("one_host", 1);
@@ -393,10 +408,24 @@ class Model {
       one_host_(0) = nxt;
       Kokkos::deep_copy(one_buf_, one_host_);
       logits = forward(one_buf_);
-      nxt = sample_greedy<ExecSpace, Scalar>(logits);
+      nxt = sample_token<ExecSpace, Scalar>(logits, opt, out, r);
       out.push_back(nxt);
+      if (on_token) on_token(nxt);
     }
     return out;
+  }
+
+  std::vector<int> generate(const std::vector<int>& prompt, int max_new,
+                            const std::vector<int>& stop_ids,
+                            TokenCallback on_token) {
+    return generate(prompt, max_new, stop_ids, SampleOptions{}, nullptr,
+                    std::move(on_token));
+  }
+
+  std::vector<int> generate(const std::vector<int>& prompt, int max_new,
+                            const std::vector<int>& stop_ids) {
+    return generate(prompt, max_new, stop_ids, SampleOptions{}, nullptr,
+                    nullptr);
   }
 
   // Back-compatible single-eos overload: eos >= 0 stops on that id only,

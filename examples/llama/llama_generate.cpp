@@ -16,6 +16,8 @@
 //                  [--config config.json] [--max-seq-len N]
 //                  [--chat] [--system "text"] [--role user]
 //                  [--add-bos | --no-add-bos] [--stop-string "str" ...]
+//                  [--temperature T] [--top-k K] [--top-p P] [--min-p P]
+//                  [--repetition-penalty R] [--seed S]
 //
 // Default compute/storage is bfloat16 (Llama 3.3 8B checkpoint dtype);
 // --fp32 opts in. --prefill-chunk N caps prefill activations to
@@ -50,7 +52,8 @@ int run_model(KokkosDNN::Llama::Config cfg,
               int max_new, const std::vector<int>& extra_stops,
               int prefill_chunk_override, bool chat_mode,
               const std::string& system_prompt, const std::string& role,
-              bool want_bos, const std::vector<std::string>& stop_strings) {
+              bool want_bos, const std::vector<std::string>& stop_strings,
+              KokkosDNN::SampleOptions samp_opt) {
   using Exec = Kokkos::DefaultExecutionSpace;
   KokkosDNN::Llama::Weights<Exec, Scalar> w;
   if (tiny || wfiles.empty()) {
@@ -121,7 +124,37 @@ int run_model(KokkosDNN::Llama::Config cfg,
   }
 
   KokkosDNN::Llama::Model<Exec, Scalar> model(cfg, w);
-  auto out = model.generate(prompt_ids, max_new, stops);
+  std::printf("sampling: temp=%g top_k=%d top_p=%g min_p=%g rep_pen=%g seed=%llu%s\n",
+              (double)samp_opt.temperature, samp_opt.top_k,
+              (double)samp_opt.top_p, (double)samp_opt.min_p,
+              (double)samp_opt.repetition_penalty,
+              (unsigned long long)samp_opt.seed,
+              samp_opt.is_greedy() ? " [greedy]" : "");
+  KokkosDNN::HostRNG rng(samp_opt.seed);
+  std::vector<int> out;
+  if (!tok_path.empty()) {
+    // Tokenizer for streaming decode: constructed once, reused per token.
+    KokkosDNN::Llama::Tokenizer stok(tok_path);
+    std::printf("decoded (streaming): ");
+    std::fflush(stdout);
+    auto on_token = [&](int id) {
+      std::string piece = stok.decode(std::vector<int>{id});
+      std::fputs(piece.c_str(), stdout);
+      std::fflush(stdout);
+    };
+    out = model.generate(prompt_ids, max_new, stops, samp_opt, &rng, on_token);
+    std::printf("\n");
+    std::fflush(stdout);
+  } else {
+    std::printf("generated (streaming):");
+    std::fflush(stdout);
+    auto on_token = [&](int id) {
+      std::printf(" %d", id);
+      std::fflush(stdout);
+    };
+    out = model.generate(prompt_ids, max_new, stops, samp_opt, &rng, on_token);
+    std::printf("\n");
+  }
   std::printf("generated %zu ids:", out.size());
   for (auto id : out) std::printf(" %d", id);
   std::printf("\n");
@@ -171,6 +204,7 @@ int main(int argc, char** argv) {
     std::string role = "user";
     bool want_bos = true;  // --add-bos default (matches tokenizer TemplateProcessing)
     std::vector<std::string> stop_strings;
+    KokkosDNN::SampleOptions samp_opt;  // greedy defaults (temp=0)
 
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
@@ -215,6 +249,18 @@ int main(int argc, char** argv) {
         max_seq_len_override = std::stoi(argv[++i]);
       } else if (a == "--fp32") {
         fp32 = true;
+      } else if (a == "--temperature" && i + 1 < argc) {
+        samp_opt.temperature = std::stof(argv[++i]);
+      } else if (a == "--top-k" && i + 1 < argc) {
+        samp_opt.top_k = std::stoi(argv[++i]);
+      } else if (a == "--top-p" && i + 1 < argc) {
+        samp_opt.top_p = std::stof(argv[++i]);
+      } else if (a == "--min-p" && i + 1 < argc) {
+        samp_opt.min_p = std::stof(argv[++i]);
+      } else if (a == "--repetition-penalty" && i + 1 < argc) {
+        samp_opt.repetition_penalty = std::stof(argv[++i]);
+      } else if (a == "--seed" && i + 1 < argc) {
+        samp_opt.seed = (uint64_t)std::stoull(argv[++i]);
       }
     }
 
@@ -253,7 +299,8 @@ int main(int argc, char** argv) {
       std::printf("[dtype fp32]\n");
       rc = run_model<float>(cfg, wfiles, tiny, tok_path, prompt, max_new,
                             extra_stops, prefill_chunk_override, chat_mode,
-                            system_prompt, role, want_bos, stop_strings);
+                            system_prompt, role, want_bos, stop_strings,
+                            samp_opt);
     } else {
       std::printf("[dtype bfloat16]\n");
       rc = run_model<KokkosDNN::Llama::DefaultScalar>(cfg, wfiles, tiny,
@@ -262,7 +309,7 @@ int main(int argc, char** argv) {
                                                       prefill_chunk_override,
                                                       chat_mode, system_prompt,
                                                       role, want_bos,
-                                                      stop_strings);
+                                                      stop_strings, samp_opt);
     }
     Kokkos::finalize();
     return rc;

@@ -700,3 +700,83 @@ TEST(LlamaConfig, TiedLmHeadLoader) {
   }
   std::remove(path.c_str());
 }
+
+// ---- Sampling (temperature / top-k / top-p / min-p, penalty, seed) + ----
+// ---- streaming decode: always-on, no weight downloads. ----
+template <class Scalar>
+void check_sampled_generate() {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  auto cfg = KokkosDNN::Llama::Config::tiny_test();
+  KokkosDNN::Llama::Weights<Exec, Scalar> w;
+  KokkosDNN::Llama::random_init(cfg, w, 1234);
+  std::vector<int> prompt = {1, 2, 3, 4};
+
+  // Default options stay greedy: identical to the legacy greedy path.
+  KokkosDNN::Llama::Model<Exec, Scalar> m0(cfg, w);
+  auto greedy_out = m0.generate(prompt, 4);
+  KokkosDNN::Llama::Model<Exec, Scalar> m1(cfg, w);
+  KokkosDNN::SampleOptions gopt;  // temp=0
+  KokkosDNN::HostRNG r0(0);
+  auto via_opt = m1.generate(prompt, 4, std::vector<int>{}, gopt, &r0);
+  EXPECT_EQ(via_opt, greedy_out);
+
+  // Fixed seed reproduces: same seed + same prompt => identical output.
+  KokkosDNN::SampleOptions sopt;
+  sopt.temperature = 1.0f;
+  sopt.top_k = 8;
+  sopt.seed = 777;
+  KokkosDNN::Llama::Model<Exec, Scalar> ma(cfg, w), mb(cfg, w);
+  KokkosDNN::HostRNG ra(sopt.seed), rb(sopt.seed);
+  auto oa = ma.generate(prompt, 4, std::vector<int>{}, sopt, &ra);
+  auto ob = mb.generate(prompt, 4, std::vector<int>{}, sopt, &rb);
+  EXPECT_EQ(oa, ob);
+  ASSERT_EQ(oa.size(), prompt.size() + 4);
+
+  // Null RNG with a fixed seed is equally deterministic.
+  KokkosDNN::Llama::Model<Exec, Scalar> mc(cfg, w), md(cfg, w);
+  auto oc = mc.generate(prompt, 4, std::vector<int>{}, sopt, nullptr);
+  auto od = md.generate(prompt, 4, std::vector<int>{}, sopt, nullptr);
+  EXPECT_EQ(oc, od);
+
+  // Streaming callback: invoked once per new token, in order, matching the
+  // returned suffix.
+  KokkosDNN::Llama::Model<Exec, Scalar> ms(cfg, w);
+  KokkosDNN::HostRNG rs(sopt.seed);
+  std::vector<int> streamed;
+  auto full =
+      ms.generate(prompt, 4, std::vector<int>{}, sopt, &rs,
+                  [&](int id) { streamed.push_back(id); });
+  ASSERT_EQ(streamed.size(), 4u);
+  EXPECT_EQ(streamed,
+            std::vector<int>(full.begin() + (long)prompt.size(), full.end()));
+
+  // Greedy streaming also fires per token (temperature=0 path).
+  KokkosDNN::Llama::Model<Exec, Scalar> mg(cfg, w);
+  std::vector<int> gstream;
+  auto gfull = mg.generate(prompt, 4, std::vector<int>{}, gopt, nullptr,
+                           [&](int id) { gstream.push_back(id); });
+  EXPECT_EQ(gfull, greedy_out);
+  ASSERT_EQ(gstream.size(), 4u);
+  EXPECT_EQ(gstream,
+            std::vector<int>(gfull.begin() + (long)prompt.size(), gfull.end()));
+
+  // Repetition penalty flows through generate (smoke: valid ids, full len).
+  KokkosDNN::SampleOptions popt;
+  popt.temperature = 1.0f;
+  popt.repetition_penalty = 1.5f;
+  popt.seed = 11;
+  KokkosDNN::Llama::Model<Exec, Scalar> mp(cfg, w);
+  KokkosDNN::HostRNG rp(popt.seed);
+  auto op = mp.generate(prompt, 4, std::vector<int>{}, popt, &rp);
+  ASSERT_EQ(op.size(), prompt.size() + 4);
+  for (auto id : op) {
+    EXPECT_GE(id, 0);
+    EXPECT_LT(id, cfg.vocab_size);
+  }
+}
+
+TEST(LlamaSampledGenerate, Float) { check_sampled_generate<float>(); }
+
+TEST(LlamaSampledGenerate, BHalf) {
+  check_sampled_generate<Kokkos::Experimental::bhalf_t>();
+}
