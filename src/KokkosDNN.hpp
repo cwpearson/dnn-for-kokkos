@@ -13,6 +13,10 @@
 #include "KokkosDNN_Attention.hpp"
 #include "KokkosDNN_KVCache.hpp"
 #include "KokkosDNN_Sampler.hpp"
+#include "KokkosDNN_Activation.hpp"
+#include "KokkosDNN_Dense.hpp"
+#include "KokkosDNN_Loss.hpp"
+#include "KokkosDNN_Optimizer.hpp"
 
 #include <iosfwd>
 
