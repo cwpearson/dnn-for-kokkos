@@ -12,6 +12,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "KokkosDNN.hpp"
@@ -111,11 +112,17 @@ TEST(LlamaScratchReuse, BHalf) {
 }
 
 // Chunked prefill: splitting a prompt into chunks matches single-shot
-// (prefill_chunk_size <= 0) logits/generate exactly, while scratch stays
-// O(chunk·dim) instead of O(T·dim).
+// (prefill_chunk_size <= 0) logits/generate, while scratch stays
+// O(chunk·dim) instead of O(T·dim). Native kernels are bit-exact across
+// chunkings (each output row is an independent K-loop); cuBLAS GEMMs are
+// not: the kernel/tiling chosen depends on M, so chunked (M=C) vs
+// single-shot (M=T) sgemm/cublasGemmEx differ by ~1e-7 in FP32. Compare
+// with a small tolerance (1e-5 float, 1e-2 bhalf) instead of FLOAT_EQ.
 template <class Scalar>
 void check_chunked_prefill() {
   using Exec = Kokkos::DefaultExecutionSpace;
+  constexpr float tol =
+      std::is_same_v<Scalar, float> ? 1e-5f : 1e-2f;
   auto cfg   = KokkosDNN::Llama::Config::tiny_test();
   cfg.max_seq_len = 32;
   KokkosDNN::Llama::Weights<Exec, Scalar> w;
@@ -143,7 +150,8 @@ void check_chunked_prefill() {
     auto got = forward_logits(chunk);
     ASSERT_EQ(got.first.size(), ref.first.size());
     for (size_t i = 0; i < ref.first.size(); ++i)
-      EXPECT_FLOAT_EQ(got.first[i], ref.first[i]);
+      EXPECT_NEAR(got.first[i], ref.first[i], tol)
+          << "logit " << i << " chunk " << chunk;
     // Scratch never exceeds the chunk size (decode slot is 1).
     EXPECT_LE(got.second, (size_t)chunk);
   }

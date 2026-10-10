@@ -318,10 +318,13 @@ class Model {
   //
   // Chunked prefill: prompts longer than cfg.prefill_chunk_size (> 0) are
   // processed in chunks of that many tokens, so activations stay
-  // O(chunk·dim) instead of O(T·dim). Chunking is exact: each chunk runs
-  // all layers for its tokens, reading previously written KV (earlier
-  // chunks) plus its own prefix via the causal mask (q_off = chunk start),
-  // which matches single-shot prefill token-for-token. Only the last
+  // O(chunk·dim) instead of O(T·dim). Chunking is exact with native
+  // kernels: each chunk runs all layers for its tokens, reading previously
+  // written KV (earlier chunks) plus its own prefix via the causal mask
+  // (q_off = chunk start), which matches single-shot prefill token-for-
+  // token. With cuBLAS dispatch the match is within GEMM tolerance
+  // (~1e-7 FP32): cuBLAS picks kernels by M, so M=C chunks round
+  // differently than an M=T single shot. Only the last
   // chunk runs the final norm + lm_head. cfg.prefill_chunk_size <= 0
   // disables chunking (single-shot). Decode (T=1) is always one chunk.
   //

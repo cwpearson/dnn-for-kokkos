@@ -160,7 +160,9 @@ large-GPU or CPU-Kokkos build for the real checkpoint.
   full-window figure). Prefill activations are bounded by
   chunked prefill (`Config::prefill_chunk_size`, default 2048):
   `forward()` processes long prompts in chunks, so scratch stays
-  O(chunk·dim) regardless of context length (exact match to single-shot).
+  O(chunk·dim) regardless of context length (bit-exact vs single-shot
+  with native kernels; within ~1e-7 FP32 with cuBLAS, whose kernels vary
+  with M).
 - The tokenizer implements the full HF `tokenizers` pipeline for the Llama 3
   `tokenizer.json` (special-token longest-match split, the tiktoken Split
   regex with Unicode `\p{L}`/`\p{N}`, GPT-2 byte mapping, per-piece BPE,
