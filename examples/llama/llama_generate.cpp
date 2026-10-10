@@ -1,4 +1,5 @@
 #include <Kokkos_Core.hpp>
+#include <cctype>
 #include <cstdio>
 #include <iostream>
 #include <string>
@@ -10,7 +11,8 @@
 #include "KokkosDNN_Tokenizer.hpp"
 
 // PoC driver: tiny random model by default; real weights via flags.
-//   llama_generate [--tiny] [--weights a.safetensors ...]
+//   llama_generate [--tiny] [--model 3.1-8b|3.2-1b]
+//                  [--weights a.safetensors ...]
 //                  [--tokenizer tok.json] [--prompt "text"] [--max-new N]
 //                  [--stop <id> ...] [--fp32] [--prefill-chunk N]
 //                  [--config config.json] [--max-seq-len N]
@@ -20,8 +22,17 @@
 //                  [--temperature T] [--top-k K] [--top-p P] [--min-p P]
 //                  [--repetition-penalty R] [--seed S]
 //
+// --model selects the base Config: 3.1-8b (default, preserves behavior;
+// aliases llama-3.1-8b, 8b) or 3.2-1b (aliases llama-3.2-1b, 1b;
+// case-insensitive). Passing --model explicitly opts out of the tiny
+// default, so `--model 3.2-1b` alone runs the full-size base with random
+// weights (no downloads); --tiny still forces tiny_test dims. --config
+// overlays on top of the selected base (see below).
+//
 // Sampling defaults to Meta's recommended Llama 3.1 Instruct settings
 // (temperature=0.6, top_p=0.9 via SampleOptions::llama_3_1_8b_instruct());
+// the 3.2-1B base keeps the same preset (Meta recommends the same
+// temp/top-p for the 3.2 instruct models), so the sampler is unchanged.
 // --temperature 0 restores greedy decode. Every sampling flag overrides
 // the preset; seed defaults to 0 so runs repeat unless --seed is given.
 //
@@ -69,8 +80,8 @@ int run_model(KokkosDNN::Llama::Config cfg,
   KokkosDNN::Llama::Weights<Exec, Scalar> w;
   if (tiny || wfiles.empty()) {
     KokkosDNN::Llama::random_init(cfg, w);
-    std::printf("[tiny random weights] dim=%d layers=%d\n", cfg.dim,
-                cfg.n_layers);
+    std::printf("[%srandom weights] dim=%d layers=%d\n", tiny ? "tiny " : "",
+                cfg.dim, cfg.n_layers);
   } else {
     KokkosDNN::Llama::load_safetensors(cfg, wfiles, w);
     std::printf("[loaded %zu shard(s)]\n", wfiles.size());
@@ -219,6 +230,9 @@ int main(int argc, char** argv) {
     std::vector<std::string> wfiles;
     std::string tok_path, prompt = "Hello, I am";
     std::string config_path;
+    std::string model_name = "llama-3.1-8b";  // --model base (default 8B)
+    bool model_touched = false;  // explicit --model opts out of tiny default
+    bool tiny_explicit = false;  // explicit --tiny still forces tiny_test
     int max_new = 16;
     bool tiny = true;
     bool fp32 = false;
@@ -253,6 +267,25 @@ int main(int argc, char** argv) {
           extra_stops.push_back(std::stoi(argv[++i]));
       } else if (a == "--tiny") {
         tiny = true;
+        tiny_explicit = true;
+      } else if (a == "--model" && i + 1 < argc) {
+        std::string m = argv[++i];
+        for (auto& ch : m) ch = (char)std::tolower((unsigned char)ch);
+        if (m.rfind("llama-", 0) == 0) m = m.substr(6);  // optional prefix
+        if (m == "3.1-8b" || m == "8b") {
+          model_name = "llama-3.1-8b";
+        } else if (m == "3.2-1b" || m == "1b") {
+          model_name = "llama-3.2-1b";
+        } else {
+          std::fprintf(stderr,
+                       "error: --model '%s': expected 3.1-8b|3.2-1b "
+                       "(aliases llama-3.1-8b, llama-3.2-1b, 8b, 1b, "
+                       "case-insensitive)\n",
+                       argv[i]);
+          Kokkos::finalize();
+          return 1;
+        }
+        model_touched = true;
       } else if (a == "--chat") {
         chat_mode = true;
       } else if (a == "--system" && i + 1 < argc) {
@@ -302,7 +335,14 @@ int main(int argc, char** argv) {
     }
 
     KokkosDNN::print_configuration(std::cout);
-    KokkosDNN::Llama::Config cfg = KokkosDNN::Llama::Config::llama_3_1_8b();
+    // Explicit --model opts out of the tiny default so `--model 3.2-1b`
+    // alone runs the full-size base with random weights; explicit --tiny
+    // still forces tiny_test dims below.
+    if (model_touched && !tiny_explicit) tiny = false;
+    KokkosDNN::Llama::Config cfg = (model_name == "llama-3.2-1b")
+                                       ? KokkosDNN::Llama::Config::llama_3_2_1b()
+                                       : KokkosDNN::Llama::Config::llama_3_1_8b();
+    std::printf("[model %s]\n", model_name.c_str());
     if (tiny) {
       cfg = KokkosDNN::Llama::Config::tiny_test();
       cfg.max_seq_len = 64;

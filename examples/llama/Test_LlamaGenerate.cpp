@@ -720,6 +720,140 @@ TEST(LlamaConfig, IncompatibleDimsRejected) {
                std::exception);
 }
 
+TEST(LlamaConfig, Llama_3_2_1BFactory) {
+  auto m = Config::llama_3_2_1b();
+  EXPECT_EQ(m.dim, 2048);
+  EXPECT_EQ(m.n_layers, 16);
+  EXPECT_EQ(m.n_heads, 32);
+  EXPECT_EQ(m.n_kv_heads, 8);
+  EXPECT_EQ(m.vocab_size, 128256);
+  EXPECT_EQ(m.ffn_dim, 8192);
+  EXPECT_EQ(m.head_dim, 64);
+  EXPECT_FLOAT_EQ(m.attn_scale, 0.125f);  // 1/sqrt(64)
+  EXPECT_FLOAT_EQ(m.rms_norm_eps, 1e-5f);
+  EXPECT_FLOAT_EQ(m.rope_theta, 500000.0f);
+  EXPECT_EQ(m.max_seq_len, 8192);  // PoC cap; arch max is 131072
+  EXPECT_EQ(m.bos_token, 128000);
+  EXPECT_EQ(m.eos_token, 128001);
+  EXPECT_EQ(m.eom_token, 128008);
+  EXPECT_EQ(m.eot_token, 128009);
+  EXPECT_TRUE(m.tie_word_embeddings);
+  EXPECT_EQ(m.hidden_act, "silu");
+  EXPECT_FALSE(m.attention_bias);
+  EXPECT_FALSE(m.mlp_bias);
+  EXPECT_EQ(m.rope_scaling_type, "llama3");
+  EXPECT_DOUBLE_EQ(m.rope_scaling_factor, 32.0);
+  EXPECT_DOUBLE_EQ(m.rope_scaling_low_freq_factor, 1.0);
+  EXPECT_DOUBLE_EQ(m.rope_scaling_high_freq_factor, 4.0);
+  EXPECT_EQ(m.rope_scaling_original_max, 8192);
+  EXPECT_NO_THROW(m.validate());
+}
+
+TEST(LlamaConfig, Llama_3_2_1BFromJsonRoundTrip) {
+  // 1B-like HF config.json (max_seq_len capped to the 8192 PoC default).
+  const std::string js = R"({
+    "model_type": "llama",
+    "hidden_size": 2048,
+    "num_hidden_layers": 16,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 8,
+    "intermediate_size": 8192,
+    "vocab_size": 128256,
+    "rms_norm_eps": 1e-05,
+    "rope_theta": 500000.0,
+    "head_dim": 64,
+    "hidden_act": "silu",
+    "attention_bias": false,
+    "mlp_bias": false,
+    "max_position_embeddings": 8192,
+    "tie_word_embeddings": true,
+    "bos_token_id": 128000,
+    "eos_token_id": 128001,
+    "rope_scaling": {"rope_type": "llama3", "factor": 32.0,
+      "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+      "original_max_position_embeddings": 8192}
+  })";
+  Config got = Config::from_json_string(js);
+  EXPECT_EQ(got.dim, 2048);
+  EXPECT_EQ(got.n_layers, 16);
+  EXPECT_EQ(got.n_heads, 32);
+  EXPECT_EQ(got.n_kv_heads, 8);
+  EXPECT_EQ(got.ffn_dim, 8192);
+  EXPECT_EQ(got.vocab_size, 128256);
+  EXPECT_EQ(got.head_dim, 64);
+  EXPECT_FLOAT_EQ(got.attn_scale, 0.125f);
+  EXPECT_EQ(got.hidden_act, "silu");
+  EXPECT_FALSE(got.attention_bias);
+  EXPECT_FALSE(got.mlp_bias);
+  EXPECT_EQ(got.max_seq_len, 8192);
+  EXPECT_TRUE(got.tie_word_embeddings);
+  EXPECT_EQ(got.bos_token, 128000);
+  EXPECT_EQ(got.eos_token, 128001);
+  EXPECT_EQ(got.rope_scaling_type, "llama3");
+  EXPECT_DOUBLE_EQ(got.rope_scaling_factor, 32.0);
+  EXPECT_DOUBLE_EQ(got.rope_scaling_low_freq_factor, 1.0);
+  EXPECT_DOUBLE_EQ(got.rope_scaling_high_freq_factor, 4.0);
+  EXPECT_EQ(got.rope_scaling_original_max, 8192);
+  EXPECT_NO_THROW(got.validate());
+
+  // Case-insensitive spellings of the new string keys are accepted.
+  EXPECT_NO_THROW(Config::from_json_string(R"({"hidden_act": "SiLU"})",
+                                          Config::tiny_test()));
+  EXPECT_NO_THROW(Config::from_json_string(R"({"model_type": "LLaMA"})",
+                                          Config::tiny_test()));
+  // Matching explicit head_dim is accepted (scale recomputed from it).
+  Config hd = Config::from_json_string(R"({"head_dim": 8})",
+                                       Config::tiny_test());
+  EXPECT_EQ(hd.head_dim, 8);
+  EXPECT_FLOAT_EQ(hd.attn_scale, 1.0f / std::sqrt(8.0f));
+}
+
+TEST(LlamaConfig, NewKeysRejected) {
+  // hidden_act other than silu: Model hardcodes SwiGLU.
+  EXPECT_THROW(Config::from_json_string(R"({"hidden_act": "gelu"})",
+                                        Config::tiny_test()),
+               std::runtime_error);
+  // Bias projections: Model has no bias path (message names the flag).
+  try {
+    Config::from_json_string(R"({"attention_bias": true})",
+                             Config::tiny_test());
+    FAIL() << "expected attention_bias=true to throw";
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string(e.what()).find("attention_bias"),
+              std::string::npos);
+  }
+  try {
+    Config::from_json_string(R"({"mlp_bias": true})", Config::tiny_test());
+    FAIL() << "expected mlp_bias=true to throw";
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string(e.what()).find("mlp_bias"), std::string::npos);
+  }
+  // Mismatched head_dim (64/8 wants 8, not 16).
+  EXPECT_THROW(Config::from_json_string(R"({"head_dim": 16})",
+                                        Config::tiny_test()),
+               std::exception);
+  // Non-llama model_type.
+  EXPECT_THROW(Config::from_json_string(R"({"model_type": "gpt2"})",
+                                        Config::tiny_test()),
+               std::runtime_error);
+  // Programmatic configs fail fast in validate() too.
+  {
+    Config c = Config::tiny_test();
+    c.hidden_act = "gelu";
+    EXPECT_THROW(c.validate(), std::exception);
+  }
+  {
+    Config c = Config::tiny_test();
+    c.attention_bias = true;
+    EXPECT_THROW(c.validate(), std::exception);
+  }
+  {
+    Config c = Config::tiny_test();
+    c.mlp_bias = true;
+    EXPECT_THROW(c.validate(), std::exception);
+  }
+}
+
 TEST(LlamaConfig, FromJsonFile) {
   const std::string path = "/tmp/kokkosdnn_test_llama_config.json";
   write_tmp_json(path, kTinyJson);

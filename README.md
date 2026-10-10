@@ -113,6 +113,38 @@ prompt on a long-context config only rents the pages it touches;
 int8). Paged dense is bit-exact vs dense; int8 trades small numerical
 drift for the smaller footprint (see `Test_LlamaKVCache.cpp`).
 
+### Llama 3.2 1B
+
+The driver also supports the 1B base via `--model 3.2-1b` (aliases
+`llama-3.2-1b`, `1b`; case-insensitive; the default stays `3.1-8b`).
+Passing `--model` opts out of the tiny default, so this runs the 1B-shaped
+model with random weights and no downloads:
+
+```bash
+./build/examples/llama/llama_generate --model 3.2-1b --prompt "Hello" --max-new 8
+```
+
+(`--tiny` still forces `tiny_test` dims, so don't combine it with
+`--model` when you want the 1B shape.)
+
+With a real `meta-llama/Llama-3.2-1B` checkpoint, add the weights,
+tokenizer, and the faithful config fixture
+(`examples/llama/config-llama-3-2-1b.json`, a copy of the HF
+`config.json` values that also documents the 1B hyperparameters):
+
+```bash
+./build/examples/llama/llama_generate \
+  --model 3.2-1b --config examples/llama/config-llama-3-2-1b.json \
+  --weights model.safetensors --tokenizer tokenizer.json \
+  --prompt "Hello" --max-new 64
+```
+
+Notes: `tie_word_embeddings=true` means the checkpoint has no separate
+`lm_head.weight` — the loader aliases the embedding table instead; rope
+scaling is `llama3`-type with factor 32 (vs 8 for 3.1 8B); BF16 weights
+are ~2.5 GiB plus the KV cache (see `Config::kv_cache_bytes()`; the
+driver prints the full-window figure).
+
 ## Benchmarks
 
 `benchmarks/kokkosdnn_bench` (Google Benchmark, opt-in via
