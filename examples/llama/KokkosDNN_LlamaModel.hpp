@@ -24,7 +24,7 @@ namespace Llama {
 
 // Autoregressive Llama model. Owns KV caches and scratch.
 // Template on ExecSpace so the same code runs on Serial/OpenMP/CUDA, and
-// on Scalar (float or bhalf_t; default bhalf_t matches the 3.3 8B
+// on Scalar (float or bhalf_t; default bhalf_t matches the 3.1 8B-Instruct
 // checkpoint). All weights/activations/KV are Scalar; reductions/scales
 // stay FP32; inv_freq stays FP32.
 //

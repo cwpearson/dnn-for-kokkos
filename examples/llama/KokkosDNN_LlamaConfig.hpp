@@ -15,7 +15,7 @@ namespace Llama {
 
 // Supported KV-cache context window. The attention kernel streams over keys
 // with O(1) extra memory and prefill is chunked, so the architecture
-// supports 128k contexts (Llama 3.3 8B advertises max_position_embeddings =
+// supports 128k contexts (Llama 3.1 8B-Instruct advertises max_position_embeddings =
 // 131072); the bound below is on the rented KV-cache allocation, not on the
 // kernel. The PoC *default* stays at 8192 so a plain 8B run does not rent a
 // ~17 GiB BF16 KV cache by accident; raise via config.json or --max-seq-len.
@@ -271,10 +271,11 @@ inline int checked_int(long long v, const std::string& key) {
 
 }  // namespace config_detail
 
-// Hyperparameters for Llama 3.3 8B (Meta, Dec 2024; same arch as 3.1 8B).
-// Reference: HF meta-llama/Llama-3.3-70B-Instruct config pattern scaled to
-// 8B + llama3 paper. Values below match config.json of
-// meta-llama/Llama-3.3-8B-Instruct.
+// Hyperparameters for Llama 3.1 8B-Instruct (Meta, July 2024).
+// Reference: HF meta-llama/Llama-3.1-8B-Instruct config.json: dim 4096,
+// 32 layers, 32 heads, 8 kv heads, 14336 ffn dim, 128256 vocab,
+// rms_norm_eps 1e-5, rope_theta 500000, max_position_embeddings 131072,
+// tie_word_embeddings false, BF16 checkpoint dtype.
 struct Config {
   int dim            = 4096;    // hidden size
   int n_layers       = 32;
@@ -298,7 +299,7 @@ struct Config {
   // [128001, 128008, 128009]): <|eom_id|> and <|eot_id|>.
   int eom_token      = 128008;
   int eot_token      = 128009;
-  // HF config.json: tie_word_embeddings (Llama 3.3 8B: false). When true
+  // HF config.json: tie_word_embeddings (Llama 3.1 8B-Instruct: false). When true
   // and the checkpoint has no lm_head tensor, the loader shares the
   // embedding table as lm_head instead of throwing.
   bool tie_word_embeddings = false;
@@ -310,7 +311,10 @@ struct Config {
   double rope_scaling_factor     = 1.0;
   int rope_scaling_original_max  = 0;
 
-  static Config llama_3_3_8b() { return Config{}; }
+  static Config llama_3_1_8b() { return Config{}; }
+  // Deprecated alias: retained so pre-rename call sites still compile.
+  // New code should use llama_3_1_8b(). (Step 2/3 agents will remove usages.)
+  static Config llama_3_3_8b() { return llama_3_1_8b(); }
 
   // Tiny config for unit tests (no 16GB download needed).
   static Config tiny_test() {
@@ -382,11 +386,11 @@ struct Config {
   }
 
   // Parse an HF config.json object. Keys present override `base`; missing
-  // keys keep base values (HF defaults via llama_3_3_8b()). Unknown keys
+  // keys keep base values (HF defaults via llama_3_1_8b()). Unknown keys
   // are ignored. Throws on malformed JSON, incompatible dims, or
   // non-null rope_scaling (unsupported).
   static Config from_json_string(const std::string& text,
-                                const Config& base = llama_3_3_8b()) {
+                                 const Config& base = llama_3_1_8b()) {
     using namespace config_detail;
     Config c = base;
     long long iv = 0;
@@ -467,7 +471,7 @@ struct Config {
             "config: rope_scaling type '" + rtype + "' (factor " +
             std::to_string(factor) +
             ") is not supported: this PoC implements plain NeoX RoPE only; "
-            "use a checkpoint with rope_scaling=null (e.g. Llama 3.3 8B)");
+            "use a checkpoint with rope_scaling=null (e.g. Llama 3.1 8B-Instruct)");
       }
       c.rope_scaling_type   = "";
       c.rope_scaling_factor = 1.0;
@@ -478,7 +482,7 @@ struct Config {
   }
 
   static Config from_json_file(const std::string& path,
-                              const Config& base = llama_3_3_8b()) {
+                               const Config& base = llama_3_1_8b()) {
     std::ifstream f(path, std::ios::binary);
     if (!f)
       throw std::runtime_error("config: cannot open config file '" + path +

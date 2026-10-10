@@ -13,7 +13,7 @@ namespace KokkosDNN {
 namespace Llama {
 
 // Default compute/storage scalar for the Llama example: bfloat16, the
-// Llama 3.3 8B checkpoint dtype (Kokkos::Experimental::bhalf_t).
+// Llama 3.1 8B-Instruct checkpoint dtype (Kokkos::Experimental::bhalf_t).
 using DefaultScalar = Kokkos::Experimental::bhalf_t;
 
 // One transformer block's weights (all row-major, device views).

@@ -19,11 +19,11 @@
 //                  [--temperature T] [--top-k K] [--top-p P] [--min-p P]
 //                  [--repetition-penalty R] [--seed S]
 //
-// Default compute/storage is bfloat16 (Llama 3.3 8B checkpoint dtype);
+// Default compute/storage is bfloat16 (Llama 3.1 8B-Instruct checkpoint dtype);
 // --fp32 opts in. --prefill-chunk N caps prefill activations to
 // O(N·dim) (0 = single-shot); default is Config::prefill_chunk_size.
 //
-// Default compute/storage is bfloat16 (Llama 3.3 8B checkpoint dtype);
+// Default compute/storage is bfloat16 (Llama 3.1 8B-Instruct checkpoint dtype);
 // --fp32 opts into FP32 for comparison. BF16 8B needs ~16 GiB (FP32
 // ~32 GiB); RTX 3090 (24 GiB) fits BF16 but not FP32 — use --tiny or
 // a big-GPU/CPU build for real checkpoints.
@@ -33,7 +33,7 @@
 // caps the KV-cache context (validated against [1, 131072]).
 //
 // Chat: --chat wraps --prompt as one `role` (default "user") turn via the
-// Llama 3.3 Instruct template (BOS + header/content/<|eot_id|> blocks +
+// Llama 3.1 8B-Instruct template (BOS + header/content/<|eot_id|> blocks +
 // open assistant header); --system prepends a system turn (implies chat).
 // Raw mode (default) encodes --prompt directly.
 //
@@ -265,7 +265,7 @@ int main(int argc, char** argv) {
     }
 
     KokkosDNN::print_configuration(std::cout);
-    KokkosDNN::Llama::Config cfg = KokkosDNN::Llama::Config::llama_3_3_8b();
+    KokkosDNN::Llama::Config cfg = KokkosDNN::Llama::Config::llama_3_1_8b();
     if (tiny) {
       cfg = KokkosDNN::Llama::Config::tiny_test();
       cfg.max_seq_len = 64;

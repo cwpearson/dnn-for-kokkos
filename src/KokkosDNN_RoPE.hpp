@@ -8,7 +8,7 @@
 namespace KokkosDNN {
 
 // Precompute inverse frequencies: inv_freq[i] = theta^(-2i/head_dim),
-// i in [0, head_dim/2). Matches HF Llama (rope_theta=500000 for 3.3 8B).
+// i in [0, head_dim/2). Matches HF Llama (rope_theta=500000 for 3.1 8B-Instruct).
 template <class ExecSpace>
 Kokkos::View<float*, ExecSpace> rope_inv_freq(int head_dim, float theta,
                                               const std::string& label = "") {
