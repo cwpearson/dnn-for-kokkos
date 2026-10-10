@@ -1,6 +1,7 @@
 #ifndef KOKKOSDNN_LLAMA_CONFIG_HPP
 #define KOKKOSDNN_LLAMA_CONFIG_HPP
 
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <fstream>
@@ -269,6 +270,17 @@ inline int checked_int(long long v, const std::string& key) {
   return (int)v;
 }
 
+// Case-insensitive string compare (for hidden_act / model_type).
+inline std::string to_lower_str(const std::string& t) {
+  std::string out = t;
+  for (auto& ch : out) ch = (char)std::tolower((unsigned char)ch);
+  return out;
+}
+
+inline bool iequals(const std::string& a, const std::string& b) {
+  return to_lower_str(a) == to_lower_str(b);
+}
+
 }  // namespace config_detail
 
 // Hyperparameters for Llama 3.1 8B-Instruct (Meta, July 2024).
@@ -315,6 +327,14 @@ struct Config {
   // and the checkpoint has no lm_head tensor, the loader shares the
   // embedding table as lm_head instead of throwing.
   bool tie_word_embeddings = false;
+  // HF config.json: hidden_act (Llama 3.x: "silu"). The Model hardcodes
+  // SwiGLU, so only "silu" (case-insensitive) is accepted; anything else
+  // throws at parse/validate time.
+  std::string hidden_act = "silu";
+  // HF config.json: attention_bias / mlp_bias (Llama 3.x: false). The Model
+  // has no bias path, so true is rejected: bias projections are unsupported.
+  bool attention_bias = false;
+  bool mlp_bias       = false;
   // rope_scaling bookkeeping. Supports plain NeoX RoPE (null/absent,
   // type "") and Llama 3.1 llama3-type scaling. Other types (linear,
   // dynamic, yarn, ...) are rejected with a clear error at parse/validate
@@ -326,6 +346,46 @@ struct Config {
   int rope_scaling_original_max  = 0;
 
   static Config llama_3_1_8b() { return Config{}; }
+
+  // Hyperparameters for Llama 3.2 1B (Meta, Sept 2024).
+  // Reference: HF meta-llama/Llama-3.2-1B config.json: dim 2048, 16 layers,
+  // 32 heads, 8 kv heads, 8192 ffn dim, 128256 vocab, rms_norm_eps 1e-5,
+  // rope_theta 500000, max_position_embeddings 131072,
+  // tie_word_embeddings true, head_dim 64, hidden_act silu,
+  // attention_bias/mlp_bias false, rope_scaling llama3-type factor 32
+  // (low_freq_factor 1.0, high_freq_factor 4.0,
+  // original_max_position_embeddings 8192).
+  // max_seq_len stays at the 8192 PoC cap (same policy as the 8B default);
+  // the arch max is 131072 via config.json -- raise via config.json or
+  // --max-seq-len.
+  static Config llama_3_2_1b() {
+    Config c;
+    c.dim          = 2048;
+    c.n_layers     = 16;
+    c.n_heads      = 32;
+    c.n_kv_heads   = 8;
+    c.vocab_size   = 128256;
+    c.ffn_dim      = 8192;
+    c.head_dim     = 64;      // dim / n_heads
+    c.rms_norm_eps = 1e-5f;
+    c.rope_theta   = 500000.0f;
+    c.attn_scale   = 0.125f;  // 1/sqrt(64)
+    c.max_seq_len  = 8192;    // PoC runtime cap; arch supports 131072
+    c.bos_token    = 128000;
+    c.eos_token    = 128001;
+    c.eom_token    = 128008;
+    c.eot_token    = 128009;
+    c.tie_word_embeddings = true;
+    c.hidden_act          = "silu";
+    c.attention_bias      = false;
+    c.mlp_bias            = false;
+    c.rope_scaling_type         = "llama3";
+    c.rope_scaling_factor       = 32.0;
+    c.rope_scaling_low_freq_factor  = 1.0;
+    c.rope_scaling_high_freq_factor = 4.0;
+    c.rope_scaling_original_max     = 8192;
+    return c;
+  }
 
   // Tiny config for unit tests (no 16GB download needed).
   static Config tiny_test() {
@@ -405,6 +465,19 @@ struct Config {
       bad("rms_norm_eps must be positive and finite");
     if (!(rope_theta > 0) || !std::isfinite(rope_theta))
       bad("rope_theta must be positive and finite");
+    if (!config_detail::iequals(hidden_act, "silu"))
+      throw std::runtime_error(
+          "Config::validate: hidden_act '" + hidden_act +
+          "' is not supported: only 'silu' is supported (Model hardcodes "
+          "SwiGLU)");
+    if (attention_bias)
+      throw std::runtime_error(
+          "Config::validate: 'attention_bias' must be false: bias "
+          "projections are unsupported (Model has no bias path)");
+    if (mlp_bias)
+      throw std::runtime_error(
+          "Config::validate: 'mlp_bias' must be false: bias projections are "
+          "unsupported (Model has no bias path)");
     if (max_seq_len < kMinSupportedSeqLen ||
         max_seq_len > kMaxSupportedSeqLen)
       bad("max_seq_len (" + std::to_string(max_seq_len) +
@@ -471,6 +544,67 @@ struct Config {
       c.ffn_dim = checked_int(iv, "intermediate_size");
     if (get_int(text, "vocab_size", iv))
       c.vocab_size = checked_int(iv, "vocab_size");
+    // head_dim (explicit opt-in): recorded here, checked against
+    // hidden_size / num_attention_heads at the end (validate instead of
+    // overwrite). When absent, head_dim/attn_scale are recomputed as before.
+    bool have_head_dim = false;
+    if (get_int(text, "head_dim", iv)) {
+      have_head_dim = true;
+      if (iv < 0 || iv > 1000000000LL)
+        throw std::runtime_error("config: 'head_dim' out of range");
+      c.head_dim = (int)iv;
+    }
+    // hidden_act: the Model hardcodes SwiGLU, so only "silu"
+    // (case-insensitive) is accepted.
+    if (get_raw(text, "hidden_act", v)) {
+      std::string t = trim(v);
+      if (is_null(t))
+        throw std::runtime_error("config: 'hidden_act' must not be null");
+      std::string act;
+      if (t.size() >= 2 && t.front() == '"' && t.back() == '"') {
+        size_t p = 0;
+        act      = parse_string(t, p);
+      } else {
+        act = t;
+      }
+      if (!iequals(act, "silu"))
+        throw std::runtime_error(
+            "config: 'hidden_act' '" + act +
+            "' is not supported: only 'silu' is supported (Model hardcodes "
+            "SwiGLU)");
+      c.hidden_act = act;
+    }
+    // attention_bias / mlp_bias: the Model has no bias path, so true is
+    // rejected (message names the flag); false (or absent) is fine.
+    if (get_bool(text, "attention_bias", bv)) {
+      c.attention_bias = bv;
+      if (bv)
+        throw std::runtime_error(
+            "config: 'attention_bias' must be false: bias projections are "
+            "unsupported (Model has no bias path)");
+    }
+    if (get_bool(text, "mlp_bias", bv)) {
+      c.mlp_bias = bv;
+      if (bv)
+        throw std::runtime_error(
+            "config: 'mlp_bias' must be false: bias projections are "
+            "unsupported (Model has no bias path)");
+    }
+    // model_type: accept "llama" (case-insensitive); reject anything else.
+    if (get_raw(text, "model_type", v)) {
+      std::string t = trim(v);
+      std::string mt;
+      if (t.size() >= 2 && t.front() == '"' && t.back() == '"') {
+        size_t p = 0;
+        mt       = parse_string(t, p);
+      } else {
+        mt = t;
+      }
+      if (!iequals(mt, "llama"))
+        throw std::runtime_error(
+            "config: 'model_type' '" + mt +
+            "' is not supported: only 'llama' is supported");
+    }
     if (get_num(text, "rms_norm_eps", dv)) c.rms_norm_eps = (float)dv;
     if (get_num(text, "rope_theta", dv)) c.rope_theta = (float)dv;
     if (get_int(text, "max_position_embeddings", iv))
@@ -581,7 +715,18 @@ struct Config {
         c.rope_scaling_original_max     = 0;
       }
     }
-    c.recompute_derived();
+    if (have_head_dim) {
+      // Explicit head_dim: validate instead of overwrite.
+      if (c.n_heads <= 0 || c.dim <= 0 || c.dim % c.n_heads != 0 ||
+          c.head_dim != c.dim / c.n_heads)
+        throw std::runtime_error(
+            "config: 'head_dim' (" + std::to_string(c.head_dim) +
+            ") must equal hidden_size / num_attention_heads (" +
+            std::to_string(c.dim) + " / " + std::to_string(c.n_heads) + ")");
+      c.attn_scale = 1.0f / std::sqrt((float)c.head_dim);
+    } else {
+      c.recompute_derived();
+    }
     c.validate();
     return c;
   }
