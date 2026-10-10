@@ -11,6 +11,51 @@
 #include "KokkosDNN_Handle.hpp"
 
 namespace KokkosDNN {
+namespace KvDetail {
+
+// Small residency helpers used by the Llama Model's paged pools. These are
+// free functions (not private Model members) on purpose: nvcc extended
+// lambdas cannot appear inside a private/protected member function, so any
+// device kernel must live here or in a public member.
+template <class ExecSpace, class TableView>
+void fill_identity(const TableView& tbl) {
+  const size_t n = tbl.extent(0);
+  if (n == 0) return;
+  Kokkos::parallel_for(
+      "KokkosDNN::kv_table_fill", Kokkos::RangePolicy<ExecSpace>(0, n),
+      KOKKOS_LAMBDA(size_t i) { tbl(i) = (int)i; });
+}
+
+// Copy the full extents of src into the [0, extents) prefix of dst
+// (dst may be larger). Rank-4 variant for KV pools, rank-3 for scales.
+template <class ExecSpace, class DstView, class SrcView>
+void copy_prefix_4(const DstView& dst, const SrcView& src) {
+  const size_t n0 = src.extent(0), n1 = src.extent(1), n2 = src.extent(2),
+               n3 = src.extent(3);
+  if (n0 == 0 || n1 == 0 || n2 == 0 || n3 == 0) return;
+  Kokkos::parallel_for(
+      "KokkosDNN::kv_grow_copy",
+      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<4>>({0, 0, 0, 0},
+                                                        {n0, n1, n2, n3}),
+      KOKKOS_LAMBDA(size_t p, size_t s, size_t h, size_t d) {
+        dst(p, s, h, d) = src(p, s, h, d);
+      });
+}
+
+template <class ExecSpace, class DstView, class SrcView>
+void copy_prefix_3(const DstView& dst, const SrcView& src) {
+  const size_t n0 = src.extent(0), n1 = src.extent(1), n2 = src.extent(2);
+  if (n0 == 0 || n1 == 0 || n2 == 0) return;
+  Kokkos::parallel_for(
+      "KokkosDNN::kv_grow_copy_s",
+      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<3>>({0, 0, 0},
+                                                        {n0, n1, n2}),
+      KOKKOS_LAMBDA(size_t p, size_t s, size_t h) {
+        dst(p, s, h) = src(p, s, h);
+      });
+}
+
+}  // namespace KvDetail
 
 // Paged + int8-quantized KV-cache primitives for long-context inference.
 //
@@ -150,6 +195,60 @@ void kv_write_paged_quantized(
 
 namespace Impl {
 
+// Loaders resolve a logical key position kk to a (k, v) float pair for the
+// streaming core below. Namespace-scope templates (not function-local
+// structs): nvcc extended lambdas cannot capture function-local types.
+template <class KQView, class KSView, class VQView, class VSView>
+struct QuantLoader {
+  KQView kq;
+  KSView ks;
+  VQView vq;
+  VSView vs;
+  size_t ktot;
+  KOKKOS_INLINE_FUNCTION size_t tokens() const { return ktot; }
+  KOKKOS_INLINE_FUNCTION float k(size_t kk, size_t h, size_t d) const {
+    return static_cast<float>(kq(kk, h, d)) * ks(kk, h);
+  }
+  KOKKOS_INLINE_FUNCTION float v(size_t kk, size_t h, size_t d) const {
+    return static_cast<float>(vq(kk, h, d)) * vs(kk, h);
+  }
+};
+
+template <class PoolView, class TableView>
+struct PagedLoader {
+  PoolView kp, vp;
+  TableView tab;
+  size_t ps, cap;
+  KOKKOS_INLINE_FUNCTION size_t tokens() const { return cap; }
+  KOKKOS_INLINE_FUNCTION float k(size_t kk, size_t h, size_t d) const {
+    size_t phys = static_cast<size_t>(tab(kk / ps));
+    return static_cast<float>(kp(phys, kk % ps, h, d));
+  }
+  KOKKOS_INLINE_FUNCTION float v(size_t kk, size_t h, size_t d) const {
+    size_t phys = static_cast<size_t>(tab(kk / ps));
+    return static_cast<float>(vp(phys, kk % ps, h, d));
+  }
+};
+
+template <class KQPoolView, class KSPoolView, class TableView>
+struct PagedQuantLoader {
+  KQPoolView kq, vq;
+  KSPoolView ks, vs;
+  TableView tab;
+  size_t ps, cap;
+  KOKKOS_INLINE_FUNCTION size_t tokens() const { return cap; }
+  KOKKOS_INLINE_FUNCTION float k(size_t kk, size_t h, size_t d) const {
+    size_t phys = static_cast<size_t>(tab(kk / ps));
+    size_t slot = kk % ps;
+    return static_cast<float>(kq(phys, slot, h, d)) * ks(phys, slot, h);
+  }
+  KOKKOS_INLINE_FUNCTION float v(size_t kk, size_t h, size_t d) const {
+    size_t phys = static_cast<size_t>(tab(kk / ps));
+    size_t slot = kk % ps;
+    return static_cast<float>(vq(phys, slot, h, d)) * vs(phys, slot, h);
+  }
+};
+
 // Shared streaming core shape: one thread per (query token, query head),
 // online softmax over keys, O(1) extra memory. Loaders differ per cache
 // kind; each loader resolves logical key kk to a (k, v) float pair.
@@ -208,20 +307,10 @@ void attention_gqa_quantized(
   (void)handle;  // native kernel only (no cuDNN paged/int8 form)
   const size_t Hq = q.extent(1), D = q.extent(2), Hkv = kq.extent(1);
   const size_t Ktot = kq.extent(0);
-  struct Loader {
-    KQView kq; KSView ks; VQView vq; VSView vs; size_t ktot;
-    KOKKOS_INLINE_FUNCTION size_t tokens() const { return ktot; }
-    KOKKOS_INLINE_FUNCTION float k(size_t kk, size_t h, size_t d) const {
-      return static_cast<float>(kq(kk, h, d)) * ks(kk, h);
-    }
-    KOKKOS_INLINE_FUNCTION float v(size_t kk, size_t h, size_t d) const {
-      return static_cast<float>(vq(kk, h, d)) * vs(kk, h);
-    }
-  };
-  Impl::attention_streaming_loader<ExecSpace, Scalar>(q, q_off, out, scale, Hq,
-                                                     D, Hkv,
-                                                     Loader{kq, ks, vq, vs, Ktot},
-                                                     label);
+  Impl::attention_streaming_loader<ExecSpace, Scalar>(
+      q, q_off, out, scale, Hq, D, Hkv,
+      Impl::QuantLoader<KQView, KSView, VQView, VSView>{kq, ks, vq, vs, Ktot},
+      label);
 }
 
 // Paged dense attention. Pools [P, page, Hkv, D]; table maps logical page
@@ -237,20 +326,10 @@ void attention_gqa_paged(const DNNHandle<ExecSpace>& handle, const QView& q,
   (void)handle;
   const size_t Hq = q.extent(1), D = q.extent(2), Hkv = kpool.extent(2);
   const size_t cap = table.extent(0) * page_size;
-  struct Loader {
-    PoolView kp, vp; TableView tab; size_t ps, cap;
-    KOKKOS_INLINE_FUNCTION size_t tokens() const { return cap; }
-    KOKKOS_INLINE_FUNCTION float k(size_t kk, size_t h, size_t d) const {
-      size_t phys = static_cast<size_t>(tab(kk / ps));
-      return static_cast<float>(kp(phys, kk % ps, h, d));
-    }
-    KOKKOS_INLINE_FUNCTION float v(size_t kk, size_t h, size_t d) const {
-      size_t phys = static_cast<size_t>(tab(kk / ps));
-      return static_cast<float>(vp(phys, kk % ps, h, d));
-    }
-  };
   Impl::attention_streaming_loader<ExecSpace, Scalar>(
-      q, q_off, out, scale, Hq, D, Hkv, Loader{kpool, vpool, table, page_size, cap},
+      q, q_off, out, scale, Hq, D, Hkv,
+      Impl::PagedLoader<PoolView, TableView>{kpool, vpool, table, page_size,
+                                             cap},
       label);
 }
 
@@ -267,23 +346,11 @@ void attention_gqa_paged_quantized(
   (void)handle;
   const size_t Hq = q.extent(1), D = q.extent(2), Hkv = kpool.extent(2);
   const size_t cap = table.extent(0) * page_size;
-  struct Loader {
-    KQPoolView kq, vq; KSPoolView ks, vs; TableView tab; size_t ps, cap;
-    KOKKOS_INLINE_FUNCTION size_t tokens() const { return cap; }
-    KOKKOS_INLINE_FUNCTION float k(size_t kk, size_t h, size_t d) const {
-      size_t phys = static_cast<size_t>(tab(kk / ps));
-      size_t slot = kk % ps;
-      return static_cast<float>(kq(phys, slot, h, d)) * ks(phys, slot, h);
-    }
-    KOKKOS_INLINE_FUNCTION float v(size_t kk, size_t h, size_t d) const {
-      size_t phys = static_cast<size_t>(tab(kk / ps));
-      size_t slot = kk % ps;
-      return static_cast<float>(vq(phys, slot, h, d)) * vs(phys, slot, h);
-    }
-  };
   Impl::attention_streaming_loader<ExecSpace, Scalar>(
       q, q_off, out, scale, Hq, D, Hkv,
-      Loader{kpool, vpool, kscales, vscales, table, page_size, cap}, label);
+      Impl::PagedQuantLoader<KQPoolView, KSPoolView, TableView>{
+          kpool, vpool, kscales, vscales, table, page_size, cap},
+      label);
 }
 
 }  // namespace KokkosDNN

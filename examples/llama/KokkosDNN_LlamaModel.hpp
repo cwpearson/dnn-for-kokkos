@@ -191,10 +191,7 @@ class Model {
       kv_pages_alloc_.assign((size_t)NL, 0);
       for (int l = 0; l < NL; ++l) {
         kv_table[l] = ViewInt("kv_table", npages);
-        auto tbl = kv_table[l];
-        Kokkos::parallel_for(
-            "kv_table_fill", Kokkos::RangePolicy<ExecSpace>(0, npages),
-            KOKKOS_LAMBDA(size_t i) { tbl(i) = (int)i; });
+        KvDetail::fill_identity<ExecSpace>(kv_table[l]);
         if (!q) {
           kp_pool.emplace_back("kp_pool", size_t(0), page, NKV, HD);
           vp_pool.emplace_back("vp_pool", size_t(0), page, NKV, HD);
@@ -233,15 +230,8 @@ class Model {
         PagedPool nk("kp_pool", want, page, NKV, HD);
         PagedPool nv("vp_pool", want, page, NKV, HD);
         if (have > 0) {
-          auto ok = kp_pool[(size_t)l], ov = vp_pool[(size_t)l];
-          Kokkos::parallel_for(
-              "kv_grow_copy",
-              Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<4>>(
-                  {0, 0, 0, 0}, {have, page, NKV, HD}),
-              KOKKOS_LAMBDA(size_t p, size_t s, size_t h, size_t d) {
-                nk(p, s, h, d) = ok(p, s, h, d);
-                nv(p, s, h, d) = ov(p, s, h, d);
-              });
+          KvDetail::copy_prefix_4<ExecSpace>(nk, kp_pool[(size_t)l]);
+          KvDetail::copy_prefix_4<ExecSpace>(nv, vp_pool[(size_t)l]);
           Kokkos::fence();
         }
         kp_pool[(size_t)l] = nk;
@@ -252,24 +242,10 @@ class Model {
         SPool sk("ksp_pool", want, page, NKV);
         SPool sv("vsp_pool", want, page, NKV);
         if (have > 0) {
-          auto ok = kqp_pool[(size_t)l], ov = vqp_pool[(size_t)l];
-          auto sk0 = ksp_pool[(size_t)l], sv0 = vsp_pool[(size_t)l];
-          Kokkos::parallel_for(
-              "kv_grow_copy_q",
-              Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<4>>(
-                  {0, 0, 0, 0}, {have, page, NKV, HD}),
-              KOKKOS_LAMBDA(size_t p, size_t s, size_t h, size_t d) {
-                nk(p, s, h, d) = ok(p, s, h, d);
-                nv(p, s, h, d) = ov(p, s, h, d);
-              });
-          Kokkos::parallel_for(
-              "kv_grow_copy_qs",
-              Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<3>>(
-                  {0, 0, 0}, {have, page, NKV}),
-              KOKKOS_LAMBDA(size_t p, size_t s, size_t h) {
-                sk(p, s, h) = sk0(p, s, h);
-                sv(p, s, h) = sv0(p, s, h);
-              });
+          KvDetail::copy_prefix_4<ExecSpace>(nk, kqp_pool[(size_t)l]);
+          KvDetail::copy_prefix_4<ExecSpace>(nv, vqp_pool[(size_t)l]);
+          KvDetail::copy_prefix_3<ExecSpace>(sk, ksp_pool[(size_t)l]);
+          KvDetail::copy_prefix_3<ExecSpace>(sv, vsp_pool[(size_t)l]);
           Kokkos::fence();
         }
         kqp_pool[(size_t)l] = nk;
