@@ -14,6 +14,7 @@
 //                  [--tokenizer tok.json] [--prompt "text"] [--max-new N]
 //                  [--stop <id> ...] [--fp32] [--prefill-chunk N]
 //                  [--config config.json] [--max-seq-len N]
+//                  [--kv-page-size N] [--kv-int8]
 //                  [--chat] [--system "text"] [--role user]
 //                  [--add-bos | --no-add-bos] [--stop-string "str" ...]
 //                  [--temperature T] [--top-k K] [--top-p P] [--min-p P]
@@ -36,6 +37,10 @@
 // --config overlays an HF config.json onto the selected base config
 // (present keys win, missing keys keep hardcoded defaults); --max-seq-len
 // caps the KV-cache context (validated against [1, 131072]).
+// --kv-page-size N selects paged KV with block size N (0 = dense);
+// --kv-int8 enables int8 KV (per-token per-head scales), --kv-fp restores
+// FP. Paged dense is bit-exact vs dense; int8 trades small drift for ~2x
+// fewer KV bytes (paged pools additionally grow on demand).
 //
 // Chat: --chat wraps --prompt as one `role` (default "user") turn via the
 // Llama 3.1 8B-Instruct template (BOS + header/content/<|eot_id|> blocks +
@@ -58,7 +63,8 @@ int run_model(KokkosDNN::Llama::Config cfg,
               int prefill_chunk_override, bool chat_mode,
               const std::string& system_prompt, const std::string& role,
               bool want_bos, const std::vector<std::string>& stop_strings,
-              KokkosDNN::SampleOptions samp_opt) {
+              KokkosDNN::SampleOptions samp_opt, int kv_page_override,
+              bool kv_int8_override, bool kv_int8_touched) {
   using Exec = Kokkos::DefaultExecutionSpace;
   KokkosDNN::Llama::Weights<Exec, Scalar> w;
   if (tiny || wfiles.empty()) {
@@ -119,6 +125,21 @@ int run_model(KokkosDNN::Llama::Config cfg,
   std::printf("\n");
   if (prefill_chunk_override >= 0) cfg.prefill_chunk_size = prefill_chunk_override;
   std::printf("prefill chunk: %d\n", cfg.prefill_chunk_size);
+  if (kv_page_override >= 0) cfg.kv_page_size = kv_page_override;
+  if (kv_int8_touched) cfg.kv_int8 = kv_int8_override;
+  try {
+    cfg.validate();
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "error: invalid KV-cache config: %s\n", e.what());
+    return 1;
+  }
+  {
+    const double mib =
+        (double)cfg.kv_cache_bytes(sizeof(Scalar)) / (1024.0 * 1024.0);
+    std::printf("kv cache: %s (page %d), %s, full-window %.1f MiB\n",
+                cfg.kv_page_size > 0 ? "paged" : "dense", cfg.kv_page_size,
+                cfg.kv_int8 ? "int8" : "fp", mib);
+  }
   if (prompt_ids.size() > (size_t)cfg.max_seq_len) {
     std::fprintf(stderr,
                  "error: prompt is %zu tokens but max_seq_len is %d "
@@ -204,6 +225,8 @@ int main(int argc, char** argv) {
     std::vector<int> extra_stops;
     int prefill_chunk_override = -1;
     int max_seq_len_override = -1;
+    int kv_page_override = -1;
+    bool kv_int8_override = false, kv_int8_touched = false;
     bool chat_mode = false;
     std::string system_prompt;
     std::string role = "user";
@@ -249,6 +272,14 @@ int main(int argc, char** argv) {
           stop_strings.push_back(argv[++i]);
       } else if (a == "--prefill-chunk" && i + 1 < argc) {
         prefill_chunk_override = std::stoi(argv[++i]);
+      } else if (a == "--kv-page-size" && i + 1 < argc) {
+        kv_page_override = std::stoi(argv[++i]);
+      } else if (a == "--kv-int8") {
+        kv_int8_override = true;
+        kv_int8_touched = true;
+      } else if (a == "--kv-fp") {
+        kv_int8_override = false;
+        kv_int8_touched = true;
       } else if (a == "--config" && i + 1 < argc) {
         config_path = argv[++i];
       } else if (a == "--max-seq-len" && i + 1 < argc) {
@@ -306,7 +337,8 @@ int main(int argc, char** argv) {
       rc = run_model<float>(cfg, wfiles, tiny, tok_path, prompt, max_new,
                             extra_stops, prefill_chunk_override, chat_mode,
                             system_prompt, role, want_bos, stop_strings,
-                            samp_opt);
+                            samp_opt, kv_page_override, kv_int8_override,
+                            kv_int8_touched);
     } else {
       std::printf("[dtype bfloat16]\n");
       rc = run_model<KokkosDNN::Llama::DefaultScalar>(cfg, wfiles, tiny,
@@ -315,7 +347,10 @@ int main(int argc, char** argv) {
                                                       prefill_chunk_override,
                                                       chat_mode, system_prompt,
                                                       role, want_bos,
-                                                      stop_strings, samp_opt);
+                                                      stop_strings, samp_opt,
+                                                      kv_page_override,
+                                                      kv_int8_override,
+                                                      kv_int8_touched);
     }
     Kokkos::finalize();
     return rc;

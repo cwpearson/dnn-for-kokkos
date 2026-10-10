@@ -4,6 +4,8 @@
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <stdexcept>
 #include <utility>
@@ -12,6 +14,7 @@
 #include "KokkosDNN_Embedding.hpp"
 #include "KokkosDNN_Gemm.hpp"
 #include "KokkosDNN_Handle.hpp"
+#include "KokkosDNN_KVCache.hpp"
 #include "KokkosDNN_RMSNorm.hpp"
 #include "KokkosDNN_RoPE.hpp"
 #include "KokkosDNN_Sampler.hpp"
@@ -28,10 +31,21 @@ namespace Llama {
 // checkpoint). All weights/activations/KV are Scalar; reductions/scales
 // stay FP32; inv_freq stays FP32.
 //
+// KV-cache modes (Config::kv_page_size / kv_int8, fixed at construction):
+//   * dense FP (defaults): per-layer [max_seq, n_kv, head_dim] rented
+//     upfront, the legacy path.
+//   * dense int8: same shape in int8 plus per-token per-head FP32 scales.
+//   * paged FP / paged int8: per-layer pools of [pages, page, n_kv, head_dim]
+//     addressed through an explicit identity block table, grown on demand so
+//     a short prompt on a long-context config only rents the pages it
+//     touches. Int8 halves KV bytes (plus scales) at the cost of small
+//     numerical drift; paged dense is bit-exact vs dense.
+//
 // Memory note: BF16 8B weights are ~16 GiB (FP32 would be ~32 GiB), so a
 // 24 GiB RTX 3090 can hold BF16 weights but not FP32. tiny_test() configs
 // run anywhere; full 8B BF16 needs a large-GPU or CPU host allocation.
-// KV cache per layer is [max_seq, n_kv, head_dim].
+// KV cache per layer is [max_seq, n_kv, head_dim] (dense) or its paged /
+// int8 equivalent; see Config::kv_cache_bytes().
 template <class ExecSpace, class Scalar = DefaultScalar>
 class Model {
  public:
@@ -40,13 +54,31 @@ class Model {
   using View1 = Kokkos::View<Scalar*, ExecSpace>;
   using ViewInt = Kokkos::View<int*, ExecSpace>;
   using HostInt = typename ViewInt::host_mirror_type;
+  using KQ3 = Kokkos::View<int8_t***, Kokkos::LayoutRight, ExecSpace>;
+  using KS2 = Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>;
+  using PagedPool = Kokkos::View<Scalar****, Kokkos::LayoutRight, ExecSpace>;
+  using QPool = Kokkos::View<int8_t****, Kokkos::LayoutRight, ExecSpace>;
+  using SPool = Kokkos::View<float***, Kokkos::LayoutRight, ExecSpace>;
 
   Config cfg;
   Weights<ExecSpace, Scalar> weights;
   DNNHandle<ExecSpace> handle;
   Kokkos::View<float*, ExecSpace> inv_freq;
+  // Dense FP caches (used iff !paged && !int8).
   std::vector<Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>> k_cache,
       v_cache;
+  // Dense int8 caches + scales (used iff !paged && int8).
+  std::vector<KQ3> kq_cache, vq_cache;
+  std::vector<KS2> ks_cache, vs_cache;
+  // Paged pools + identity block tables (used iff paged). FP pools for the
+  // !int8 case, int8 + scale pools for the int8 case. Pools grow on demand
+  // (kv_pages_alloc_ tracks resident pages per layer); tables are fixed at
+  // the full logical page count.
+  std::vector<PagedPool> kp_pool, vp_pool;
+  std::vector<QPool> kqp_pool, vqp_pool;
+  std::vector<SPool> ksp_pool, vsp_pool;
+  std::vector<ViewInt> kv_table;
+  std::vector<size_t> kv_pages_alloc_;
   size_t seq_len = 0;
 
   // Persistent scratch: all T-sized temporaries are carved (via subview,
@@ -76,25 +108,40 @@ class Model {
   Model() = default;
   Model(const Config& c, const Weights<ExecSpace, Scalar>& w)
       : cfg(c), weights(w) {
-    // Validate before renting the [max_seq_len, n_kv, head_dim] KV cache:
-    // incompatible dims or an out-of-range context fail here, not in a
-    // device kernel or a multi-GiB allocation.
+    // Validate before renting any KV cache: incompatible dims or an
+    // out-of-range context fail here, not in a device kernel or a
+    // multi-GiB allocation.
     cfg.validate();
     inv_freq = rope_inv_freq<ExecSpace>(
         cfg.head_dim, cfg.rope_theta, cfg.rope_scaling_type,
         cfg.rope_scaling_factor, cfg.rope_scaling_low_freq_factor,
         cfg.rope_scaling_high_freq_factor, cfg.rope_scaling_original_max);
-    k_cache.resize(cfg.n_layers);
-    v_cache.resize(cfg.n_layers);
-    for (int l = 0; l < cfg.n_layers; ++l) {
-      k_cache[l] = Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>(
-          "k_cache", cfg.max_seq_len, cfg.n_kv_heads, cfg.head_dim);
-      v_cache[l] = Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>(
-          "v_cache", cfg.max_seq_len, cfg.n_kv_heads, cfg.head_dim);
-    }
+    kv_alloc_fresh();
     last_buf_ = View1("last", cfg.dim);
     logits_buf_ = View1("logits", cfg.vocab_size);
     one_buf_ = ViewInt("one", 1);
+  }
+
+  // Full-window KV bytes for the configured mode (all layers, K+V).
+  size_t kv_cache_bytes() const {
+    return cfg.kv_cache_bytes(sizeof(Scalar));
+  }
+  // Currently resident KV bytes (paged pools only rent touched pages;
+  // dense modes rent the full window upfront).
+  size_t kv_allocated_bytes() const {
+    const bool paged = cfg.kv_page_size > 0;
+    const bool q = cfg.kv_int8;
+    const size_t HD = (size_t)cfg.head_dim, NKV = (size_t)cfg.n_kv_heads;
+    const size_t NL = (size_t)cfg.n_layers;
+    if (!paged) return kv_cache_bytes();
+    size_t bytes = 0;
+    for (size_t l = 0; l < kv_pages_alloc_.size(); ++l) {
+      const size_t toks = kv_pages_alloc_[l] * (size_t)cfg.kv_page_size;
+      bytes += toks * NKV * HD * (q ? 1 : sizeof(Scalar)) * 2;
+      if (q) bytes += toks * NKV * sizeof(float) * 2;
+    }
+    (void)NL;
+    return bytes;
   }
 
   // O(1) reset: just rewinds the position counter. No cache wipe.
@@ -102,9 +149,138 @@ class Model {
   // reading prefix [0, cpos+C), with absolute positions and q_off=cpos,
   // so entries at/after seq_len are always overwritten before they are
   // read. Stale tail data from a previous sequence is never observed.
+  // (Applies to every KV mode: paged pools keep their allocations.)
   void reset() { seq_len = 0; }
 
  private:
+  // (Re)allocate KV caches for the construction-time cfg mode. Dense modes
+  // rent the full window upfront; paged modes rent the identity block
+  // tables upfront and grow the pools on demand in kv_ensure_capacity().
+  void kv_alloc_fresh() {
+    const bool paged = cfg.kv_page_size > 0;
+    const bool q = cfg.kv_int8;
+    const size_t MS = (size_t)cfg.max_seq_len;
+    const size_t NKV = (size_t)cfg.n_kv_heads, HD = (size_t)cfg.head_dim;
+    const int NL = cfg.n_layers;
+    k_cache.clear(); v_cache.clear();
+    kq_cache.clear(); vq_cache.clear(); ks_cache.clear(); vs_cache.clear();
+    kp_pool.clear(); vp_pool.clear();
+    kqp_pool.clear(); vqp_pool.clear(); ksp_pool.clear(); vsp_pool.clear();
+    kv_table.clear(); kv_pages_alloc_.clear();
+    if (!paged && !q) {
+      k_cache.resize(NL); v_cache.resize(NL);
+      for (int l = 0; l < NL; ++l) {
+        k_cache[l] = Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>(
+            "k_cache", MS, NKV, HD);
+        v_cache[l] = Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>(
+            "v_cache", MS, NKV, HD);
+      }
+    } else if (!paged && q) {
+      kq_cache.resize(NL); vq_cache.resize(NL);
+      ks_cache.resize(NL); vs_cache.resize(NL);
+      for (int l = 0; l < NL; ++l) {
+        kq_cache[l] = KQ3("kq_cache", MS, NKV, HD);
+        vq_cache[l] = KQ3("vq_cache", MS, NKV, HD);
+        ks_cache[l] = KS2("ks_cache", MS, NKV);
+        vs_cache[l] = KS2("vs_cache", MS, NKV);
+      }
+    } else {
+      const size_t page = (size_t)cfg.kv_page_size;
+      const size_t npages = cfg.kv_num_pages();
+      kv_table.resize(NL);
+      kv_pages_alloc_.assign((size_t)NL, 0);
+      for (int l = 0; l < NL; ++l) {
+        kv_table[l] = ViewInt("kv_table", npages);
+        auto tbl = kv_table[l];
+        Kokkos::parallel_for(
+            "kv_table_fill", Kokkos::RangePolicy<ExecSpace>(0, npages),
+            KOKKOS_LAMBDA(size_t i) { tbl(i) = (int)i; });
+        if (!q) {
+          kp_pool.emplace_back("kp_pool", size_t(0), page, NKV, HD);
+          vp_pool.emplace_back("vp_pool", size_t(0), page, NKV, HD);
+        } else {
+          kqp_pool.emplace_back("kqp_pool", size_t(0), page, NKV, HD);
+          vqp_pool.emplace_back("vqp_pool", size_t(0), page, NKV, HD);
+          ksp_pool.emplace_back("ksp_pool", size_t(0), page, NKV);
+          vsp_pool.emplace_back("vsp_pool", size_t(0), page, NKV);
+        }
+      }
+      Kokkos::fence();
+    }
+  }
+
+  // Grow paged pools so `tokens_needed` logical tokens are resident.
+  // No-op for dense modes. Never shrinks; resident pages are reused across
+  // reset() boundaries.
+  void kv_ensure_capacity(size_t tokens_needed) {
+    if (cfg.kv_page_size <= 0) return;
+    const size_t page = (size_t)cfg.kv_page_size;
+    const size_t npages = cfg.kv_num_pages();
+    size_t need = (tokens_needed + page - 1) / page;
+    if (need > npages) need = npages;
+    if (need == 0) return;
+    const bool q = cfg.kv_int8;
+    const size_t NKV = (size_t)cfg.n_kv_heads, HD = (size_t)cfg.head_dim;
+    for (int l = 0; l < cfg.n_layers; ++l) {
+      if (kv_pages_alloc_[(size_t)l] >= need) continue;
+      size_t have = kv_pages_alloc_[(size_t)l];
+      size_t want = have == 0 ? need : have;
+      while (want < need) {
+        want *= 2;
+        if (want > npages) { want = npages; break; }
+      }
+      if (!q) {
+        PagedPool nk("kp_pool", want, page, NKV, HD);
+        PagedPool nv("vp_pool", want, page, NKV, HD);
+        if (have > 0) {
+          auto ok = kp_pool[(size_t)l], ov = vp_pool[(size_t)l];
+          Kokkos::parallel_for(
+              "kv_grow_copy",
+              Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<4>>(
+                  {0, 0, 0, 0}, {have, page, NKV, HD}),
+              KOKKOS_LAMBDA(size_t p, size_t s, size_t h, size_t d) {
+                nk(p, s, h, d) = ok(p, s, h, d);
+                nv(p, s, h, d) = ov(p, s, h, d);
+              });
+          Kokkos::fence();
+        }
+        kp_pool[(size_t)l] = nk;
+        vp_pool[(size_t)l] = nv;
+      } else {
+        QPool nk("kqp_pool", want, page, NKV, HD);
+        QPool nv("vqp_pool", want, page, NKV, HD);
+        SPool sk("ksp_pool", want, page, NKV);
+        SPool sv("vsp_pool", want, page, NKV);
+        if (have > 0) {
+          auto ok = kqp_pool[(size_t)l], ov = vqp_pool[(size_t)l];
+          auto sk0 = ksp_pool[(size_t)l], sv0 = vsp_pool[(size_t)l];
+          Kokkos::parallel_for(
+              "kv_grow_copy_q",
+              Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<4>>(
+                  {0, 0, 0, 0}, {have, page, NKV, HD}),
+              KOKKOS_LAMBDA(size_t p, size_t s, size_t h, size_t d) {
+                nk(p, s, h, d) = ok(p, s, h, d);
+                nv(p, s, h, d) = ov(p, s, h, d);
+              });
+          Kokkos::parallel_for(
+              "kv_grow_copy_qs",
+              Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<3>>(
+                  {0, 0, 0}, {have, page, NKV}),
+              KOKKOS_LAMBDA(size_t p, size_t s, size_t h) {
+                sk(p, s, h) = sk0(p, s, h);
+                sv(p, s, h) = sv0(p, s, h);
+              });
+          Kokkos::fence();
+        }
+        kqp_pool[(size_t)l] = nk;
+        vqp_pool[(size_t)l] = nv;
+        ksp_pool[(size_t)l] = sk;
+        vsp_pool[(size_t)l] = sv;
+      }
+      kv_pages_alloc_[(size_t)l] = want;
+    }
+  }
+
   // Grow chunk-sized scratch to hold at least C rows (exact-size growth;
   // the first, largest prefill chunk sizes everything, later T=1 decodes
   // reuse it). Also repairs buffers if cfg dims changed under us.
@@ -189,6 +365,10 @@ class Model {
     const int DIM = cfg.dim, HD = cfg.head_dim, NH = cfg.n_heads,
               NKV = cfg.n_kv_heads, VS = cfg.vocab_size, NL = cfg.n_layers;
     const float EPS = cfg.rms_norm_eps, SCALE = cfg.attn_scale;
+    const bool kv_paged = cfg.kv_page_size > 0;
+    const bool kv_q = cfg.kv_int8;
+    const size_t kv_page =
+        kv_paged ? (size_t)cfg.kv_page_size : 0;
     // Resolve chunk size: <= 0 means single-shot.
     size_t Cmax = cfg.prefill_chunk_size <= 0
                       ? T
@@ -196,6 +376,10 @@ class Model {
     if (Cmax == 0) Cmax = T;
     if (Cmax > T) Cmax = T;
     ensure_scratch(Cmax);
+    // Paged pools grow once per forward so the full [pos0, pos0+T) extent is
+    // resident before the layer loop (dense modes: no-op). Never shrinks;
+    // short prompts on a long-context config only rent touched pages.
+    kv_ensure_capacity(pos0 + T);
     if (last_buf_.extent(0) != (size_t)DIM) last_buf_ = View1("last", DIM);
     if (logits_buf_.extent(0) != (size_t)VS)
       logits_buf_ = View1("logits", VS);
@@ -284,31 +468,63 @@ class Model {
               v3(t, i / HD, i % HD) = v2(t, i);
             });
         rope_neoX_inplace<ExecSpace, Scalar>(q3, k3, inv_freq, HD, pos);
-        // Hoist cache layers to locals: indexing the member vector inside
-        // a device lambda would capture `this` (host vector, illegal on
-        // CUDA); the copied View handles are device-safe.
-        auto kc = k_cache[l];
-        auto vc = v_cache[l];
-        Kokkos::parallel_for(
-            "kcache_write",
-            Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<3>>(
-                {0, 0, 0}, {C, (size_t)NKV, (size_t)HD}),
-            KOKKOS_LAMBDA(size_t t, size_t hh, size_t d) {
-              kc(cpos + t, hh, d) = k3(t, hh, d);
-              vc(cpos + t, hh, d) = v3(t, hh, d);
-            });
-        // Pass the valid KV prefix as subviews: no repack/copy, and no extra
-        // [K, Hkv, D] temporaries per layer. The attention kernel is
-        // layout-agnostic and streams over keys, so 128k prefixes stay O(1)
-        // in extra memory here too. q_off is the chunk start so causal
-        // masking (query t attends to keys [0, cpos + t]) matches
-        // single-shot prefill exactly.
-        auto kp = Kokkos::subview(kc, std::make_pair(size_t(0), cpos + C),
-                                  Kokkos::ALL, Kokkos::ALL);
-        auto vp = Kokkos::subview(vc, std::make_pair(size_t(0), cpos + C),
-                                  Kokkos::ALL, Kokkos::ALL);
-        attention_gqa_single<ExecSpace, Scalar>(handle, q3, kp, vp, cpos,
-                                                attn_out, SCALE);
+        // KV write + attention, branched once per layer on the
+        // construction-time mode (hoisted to locals: indexing the member
+        // vectors inside a device lambda would capture `this`, illegal on
+        // CUDA; the copied View handles are device-safe).
+        //   dense FP: legacy contiguous write + prefix-subview attention.
+        //   dense int8: quantizing write + dequant-on-the-fly attention.
+        //   paged FP / int8: block-table write + paged attention.
+        // Paged dense is bit-exact vs dense; int8 drifts slightly.
+        if (!kv_paged && !kv_q) {
+          auto kc = k_cache[(size_t)l];
+          auto vc = v_cache[(size_t)l];
+          Kokkos::parallel_for(
+              "kcache_write",
+              Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<3>>(
+                  {0, 0, 0}, {C, (size_t)NKV, (size_t)HD}),
+              KOKKOS_LAMBDA(size_t t, size_t hh, size_t d) {
+                kc(cpos + t, hh, d) = k3(t, hh, d);
+                vc(cpos + t, hh, d) = v3(t, hh, d);
+              });
+          // Pass the valid KV prefix as subviews: no repack/copy, and no extra
+          // [K, Hkv, D] temporaries per layer. The attention kernel is
+          // layout-agnostic and streams over keys, so 128k prefixes stay O(1)
+          // in extra memory here too. q_off is the chunk start so causal
+          // masking (query t attends to keys [0, cpos + t]) matches
+          // single-shot prefill exactly.
+          auto kp = Kokkos::subview(kc, std::make_pair(size_t(0), cpos + C),
+                                    Kokkos::ALL, Kokkos::ALL);
+          auto vp = Kokkos::subview(vc, std::make_pair(size_t(0), cpos + C),
+                                    Kokkos::ALL, Kokkos::ALL);
+          attention_gqa_single<ExecSpace, Scalar>(handle, q3, kp, vp, cpos,
+                                                  attn_out, SCALE);
+        } else if (!kv_paged && kv_q) {
+          auto kq = kq_cache[(size_t)l], vq = vq_cache[(size_t)l];
+          auto ksc = ks_cache[(size_t)l], vsc = vs_cache[(size_t)l];
+          kv_write_quantized_contiguous<ExecSpace, Scalar>(
+              k3, v3, cpos, kq, ksc, vq, vsc);
+          attention_gqa_quantized<ExecSpace, Scalar>(handle, q3, kq, ksc, vq,
+                                                     vsc, cpos, attn_out,
+                                                     SCALE);
+        } else if (kv_paged && !kv_q) {
+          auto kpp = kp_pool[(size_t)l], vpp = vp_pool[(size_t)l];
+          auto tab = kv_table[(size_t)l];
+          kv_write_paged_dense<ExecSpace, Scalar>(k3, v3, cpos, kpp, vpp, tab,
+                                                  kv_page);
+          attention_gqa_paged<ExecSpace, Scalar>(handle, q3, kpp, vpp, tab,
+                                                 kv_page, cpos, attn_out,
+                                                 SCALE);
+        } else {
+          auto kpp = kqp_pool[(size_t)l], vpp = vqp_pool[(size_t)l];
+          auto ksp = ksp_pool[(size_t)l], vsp = vsp_pool[(size_t)l];
+          auto tab = kv_table[(size_t)l];
+          kv_write_paged_quantized<ExecSpace, Scalar>(
+              k3, v3, cpos, kpp, ksp, vpp, vsp, tab, kv_page);
+          attention_gqa_paged_quantized<ExecSpace, Scalar>(
+              handle, q3, kpp, ksp, vpp, vsp, tab, kv_page, cpos, attn_out,
+              SCALE);
+        }
         Kokkos::parallel_for(
             "flatten",
             Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0},

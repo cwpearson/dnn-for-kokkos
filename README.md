@@ -15,7 +15,7 @@ It provides:
 - A Llama example (`examples/llama/`): 3.1 8B-Instruct config defaults, a safetensors checkpoint loader (on-disk F32/F16/BF16 are converted to the model scalar), a faithful Hugging Face `tokenizer.json` loader (special-token split, tiktoken Split pre-tokenizer, GPT-2 byte mapping, per-piece BPE; validated ID-for-ID against `tokenizers`), a KV-cache autoregressive model, and a `llama_generate` driver.
 - Unit tests and a tiny-random-weights end-to-end path so the full pipeline runs without downloading a 16 GB checkpoint.
 
-Scope is deliberately narrow: **bfloat16 storage/compute by default** (`--fp32` opts in), **inference only** (prefill + greedy decode), no training, no quantization. All ops are templated on the scalar type (`float`, `Kokkos::Experimental::bhalf_t`) with FP32 accumulation; TPL paths cover GEMM for both scalars and fall back to native otherwise.
+Scope is deliberately narrow: **bfloat16 storage/compute by default** (`--fp32` opts in), **inference only** (prefill + greedy decode), no training, no weight quantization (the KV cache has an optional int8 mode, see below). All ops are templated on the scalar type (`float`, `Kokkos::Experimental::bhalf_t`) with FP32 accumulation; TPL paths cover GEMM for both scalars and fall back to native otherwise.
 
 ## Layout
 
@@ -33,15 +33,18 @@ src/
   KokkosDNN_SwiGLU.hpp
   KokkosDNN_Embedding.hpp
   KokkosDNN_Attention.hpp (+ _CuDNN: working SDPA dispatch, _CuDNN.cpp TU)
+  KokkosDNN_KVCache.hpp   paged / int8 KV (block-table attention,
+                          per-token per-head quant scales)
   KokkosDNN_Sampler.hpp   greedy argmax
   KokkosDNN_PrintConfiguration.cpp
 examples/llama/           Llama 3 example (not part of the library)
   KokkosDNN_LlamaConfig.hpp    3.1 8B-Instruct defaults + tiny_test()
   KokkosDNN_LlamaWeights.{hpp,cpp}
   KokkosDNN_Tokenizer.{hpp,cpp}
-  KokkosDNN_LlamaModel.hpp     KV-cache Model::forward/generate
+  KokkosDNN_LlamaModel.hpp     KV-cache Model::forward/generate (dense /
+                          paged x FP / int8 modes)
   llama_generate.cpp      driver
-  Test_LlamaGenerate.cpp / Test_Safetensors.cpp (example-level tests)
+  Test_LlamaGenerate.cpp / Test_Safetensors.cpp / Test_LlamaKVCache.cpp (example-level tests)
 tests/                    one executable per core op
 benchmarks/               Google Benchmark micros (native vs TPL dispatch)
 ```
@@ -100,6 +103,16 @@ Context defaults to `max_seq_len = 8192` (PoC cap); the arch max `131072`
 is supported, including `llama3`-type rope scaling from the
 Llama 3.1 8B-Instruct `config.json`.
 
+KV-cache modes (`--kv-page-size N`, `--kv-int8` / `--kv-fp`; config.json
+keys `kv_page_size`, `kv_int8` / `kv_quantized`, `kv_quant: "int8"|"none"`):
+dense FP by default; `--kv-page-size 16` pages the cache into blocks
+addressed through an explicit block table and grown on demand, so a short
+prompt on a long-context config only rents the pages it touches;
+`--kv-int8` stores symmetric int8 KV with per-token per-head FP32 scales
+(~2x fewer KV bytes plus a small scale table). The two combine (paged
+int8). Paged dense is bit-exact vs dense; int8 trades small numerical
+drift for the smaller footprint (see `Test_LlamaKVCache.cpp`).
+
 ## Benchmarks
 
 `benchmarks/kokkosdnn_bench` (Google Benchmark, opt-in via
@@ -140,7 +153,11 @@ large-GPU or CPU-Kokkos build for the real checkpoint.
   128k contexts are feasible. The model additionally passes KV-cache
   prefixes as subviews (no per-layer repack copy).
   Remaining 128k considerations: the BF16 KV cache itself is ~256 MiB per
-  layer (~8 GiB for 32 layers at 128k). Prefill activations are bounded by
+  layer (~8 GiB for 32 layers at 128k) in dense FP; `--kv-int8` roughly
+  halves that (plus one FP32 scale per token per KV head), and paged KV
+  (`--kv-page-size 16`) rents only touched pages instead of the full
+  window upfront (see `Config::kv_cache_bytes()`; the driver prints the
+  full-window figure). Prefill activations are bounded by
   chunked prefill (`Config::prefill_chunk_size`, default 2048):
   `forward()` processes long prompts in chunks, so scratch stays
   O(chunk·dim) regardless of context length (exact match to single-shot).
@@ -159,6 +176,5 @@ large-GPU or CPU-Kokkos build for the real checkpoint.
 
 Minimum checklist for a faithful, usable 8B run (ordered by priority):
 
-- Long context (future): paged / quantized KV (`~8 GiB` at 128k BF16).
 - Performance (future): CPU TPL path (no `OpenBLAS`/`MKL` dispatch);
-  quantization out of scope per above.
+  weight quantization out of scope per above.

@@ -1,6 +1,7 @@
 // Performance-TODO regression tests (always-on, tiny config, no downloads).
 //
-// Covers the "Performance" README item (minus quantization, out of scope):
+// Covers the "Performance" README item (minus weight quantization, out of
+// scope):
 //   (a) lm_head through the gemm/gemv dispatch -- gemv-vs-reference parity
 //       (float + bhalf_t) and gemv-vs-gemm(M=1) agreement;
 //   (b) cached/persistent TPL handles -- one handle drives many calls with

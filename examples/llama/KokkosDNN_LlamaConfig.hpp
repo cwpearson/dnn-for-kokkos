@@ -299,6 +299,18 @@ struct Config {
   // [128001, 128008, 128009]): <|eom_id|> and <|eot_id|>.
   int eom_token      = 128008;
   int eot_token      = 128009;
+  // KV-cache layout/precision. kv_page_size == 0 selects the legacy dense
+  // contiguous cache ([max_seq_len, n_kv, head_dim] per layer, rented
+  // upfront); > 0 selects paged KV with that block size (pools are
+  // [n_pages, page, n_kv, head_dim], addressed through an explicit block
+  // table, grown on demand so short prompts on a long-context config only
+  // rent the pages they touch). kv_int8 selects symmetric int8 KV with
+  // per-token per-head FP32 scales (~2x fewer KV bytes plus a small scale
+  // table, small numerical drift); false keeps the model Scalar. The two
+  // options combine (paged int8). JSON keys: "kv_page_size" (int),
+  // "kv_int8" / "kv_quantized" (bool), "kv_quant" ("int8"/"none").
+  int kv_page_size = 0;
+  bool kv_int8     = false;
   // HF config.json: tie_word_embeddings (Llama 3.1 8B-Instruct: false). When true
   // and the checkpoint has no lm_head tensor, the loader shares the
   // embedding table as lm_head instead of throwing.
@@ -331,6 +343,33 @@ struct Config {
       head_dim   = dim / n_heads;
       attn_scale = 1.0f / std::sqrt((float)head_dim);
     }
+  }
+
+  bool use_paged_kv() const { return kv_page_size > 0; }
+  bool use_quant_kv() const { return kv_int8; }
+  // Logical pages covering max_seq_len (paged) or 0 (dense).
+  size_t kv_num_pages() const {
+    if (!use_paged_kv()) return 0;
+    return ((size_t)max_seq_len + (size_t)kv_page_size - 1) /
+           (size_t)kv_page_size;
+  }
+  // Resident token slots (padded up to full pages when paged).
+  size_t kv_padded_tokens() const {
+    if (!use_paged_kv()) return (size_t)max_seq_len;
+    return kv_num_pages() * (size_t)kv_page_size;
+  }
+  // Total K+V bytes across all layers for the full context window, given
+  // the unquantized element size (e.g. sizeof(Scalar)). Quantized caches
+  // store int8 values plus one FP32 scale per token per KV head per K/V.
+  // Block tables (~4 B per page per layer) are negligible and excluded.
+  size_t kv_cache_bytes(size_t elem_bytes) const {
+    const size_t toks = kv_padded_tokens();
+    const size_t per_tok =
+        (size_t)n_kv_heads * (size_t)head_dim * (kv_int8 ? 1 : elem_bytes);
+    size_t bytes = (size_t)n_layers * toks * per_tok * 2;  // K + V
+    if (kv_int8)
+      bytes += (size_t)n_layers * toks * (size_t)n_kv_heads * sizeof(float) * 2;
+    return bytes;
   }
 
   // Throw std::invalid_argument/std::runtime_error on incompatible dims or
@@ -376,6 +415,16 @@ struct Config {
           "layer, so cap it to what fits in memory");
     if (bos_token < 0) bad("bos_token_id must be >= 0");
     if (eos_token < 0) bad("eos_token_id must be >= 0");
+    if (kv_page_size < 0) bad("kv_page_size must be >= 0 (0 selects dense KV)");
+    if (kv_page_size > 0) {
+      if (max_seq_len > 0 && kv_page_size > max_seq_len)
+        bad("kv_page_size (" + std::to_string(kv_page_size) +
+            ") must not exceed max_seq_len (" + std::to_string(max_seq_len) +
+            ")");
+      if (kv_page_size > 1024)
+        bad("kv_page_size (" + std::to_string(kv_page_size) +
+            ") looks excessive (expected 1..1024)");
+    }
     if (rope_scaling_type.empty()) {
       // none: plain NeoX RoPE, no further checks.
     } else if (rope_scaling_type == "llama3") {
@@ -453,6 +502,29 @@ struct Config {
       }
     }
     if (get_bool(text, "tie_word_embeddings", bv)) c.tie_word_embeddings = bv;
+    if (get_int(text, "kv_page_size", iv)) {
+      if (iv < 0 || iv > 1000000000LL)
+        throw std::runtime_error("config: 'kv_page_size' out of range");
+      c.kv_page_size = (int)iv;
+    }
+    if (get_bool(text, "kv_int8", bv)) c.kv_int8 = bv;
+    if (get_bool(text, "kv_quantized", bv)) c.kv_int8 = c.kv_int8 || bv;
+    if (get_raw(text, "kv_quant", v)) {
+      std::string t = trim(v);
+      if (t.size() >= 2 && t.front() == '"' && t.back() == '"') {
+        size_t p = 0;
+        t = parse_string(t, p);
+      }
+      if (t == "int8" || t == "INT8" || t == "kv_int8" || t == "true" ||
+          t == "1")
+        c.kv_int8 = true;
+      else if (t == "none" || t == "fp" || t == "false" || t == "0" ||
+               t == "null")
+        c.kv_int8 = false;
+      else
+        throw std::runtime_error(
+            "config: 'kv_quant' must be \"int8\" or \"none\"");
+    }
     if (get_raw(text, "rope_scaling", v)) {
       if (!is_null(v)) {
         if (v.empty() || v.front() != '{')
