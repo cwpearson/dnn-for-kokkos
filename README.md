@@ -15,7 +15,7 @@ It provides:
 - A Llama example (`examples/llama/`): 3.1 8B-Instruct config defaults, a safetensors checkpoint loader (on-disk F32/F16/BF16 are converted to the model scalar), a faithful Hugging Face `tokenizer.json` loader (special-token split, tiktoken Split pre-tokenizer, GPT-2 byte mapping, per-piece BPE; validated ID-for-ID against `tokenizers`), a KV-cache autoregressive model, and a `llama_generate` driver.
 - Unit tests and a tiny-random-weights end-to-end path so the full pipeline runs without downloading a 16 GB checkpoint.
 
-Scope is deliberately narrow: **bfloat16 storage/compute by default** (`--fp32` opts in), **inference only** (prefill + greedy decode), no training, no weight quantization (the KV cache has an optional int8 mode, see below). All ops are templated on the scalar type (`float`, `Kokkos::Experimental::bhalf_t`) with FP32 accumulation; TPL paths cover GEMM for both scalars and fall back to native otherwise.
+Scope is deliberately narrow: **bfloat16 storage/compute by default** (`--fp32` opts in). The Llama path is **inference only** (prefill + greedy decode), no weight quantization (the KV cache has an optional int8 mode, see below). A small set of training ops (dense forward/backward, sigmoid/tanh/ReLU, BCE-with-logits, SGD/Adam) supports the XOR example (`examples/xor/`: 2-layer MLP trained with full-batch Adam, also wired as a fast CPU unit test). All ops are templated on the scalar type (`float`, `Kokkos::Experimental::bhalf_t`) with FP32 accumulation; TPL paths cover GEMM for both scalars and fall back to native otherwise.
 
 ## Layout
 
