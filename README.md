@@ -212,3 +212,8 @@ Minimum checklist for a faithful, usable 8B run (ordered by priority):
 
 - Performance (future): CPU TPL path (no `OpenBLAS`/`MKL` dispatch);
   weight quantization out of scope per above.
+- Small-model examples: `SmolLM2-135M` (same `llama` + `silu` + no-bias
+  family; needs preset + tokenizer/vocab work; fast CPU/CI download).
+- Small-model examples: `Qwen3-0.6B` / `1.7B` (needs QK-Norm support plus
+  tokenizer/preset work; verify bias and RoPE deltas against their
+  `config.json`).
