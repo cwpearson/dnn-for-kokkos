@@ -12,12 +12,12 @@ No Kokkos dependency — only torch + transformers (install e.g.):
 Usage:
     # gated repo: log in first (huggingface-cli login), then e.g.
     python examples/llama/generate_golden.py \
-        --model meta-llama/Llama-3.3-8B-Instruct \
-        --out /path/to/golden_llama33_8b.json
+        --model meta-llama/Llama-3.1-8B-Instruct \
+        --out /path/to/golden_llama31_8b.json
 
     # local checkpoint dir + CUDA (BF16 8B needs ~16 GiB CPU RAM otherwise):
     python examples/llama/generate_golden.py \
-        --model /path/to/Llama-3.3-8B-Instruct --device cuda --out golden.json
+        --model /path/to/Llama-3.1-8B-Instruct --device cuda --out golden.json
 
     # custom prompts (default: the two below; the C++ test uses the first 2):
     python examples/llama/generate_golden.py --model ... --out golden.json \
@@ -55,7 +55,7 @@ import sys
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--model", default="meta-llama/Llama-3.3-8B-Instruct",
+    p.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct",
                    help="HF model id or local checkpoint dir")
     p.add_argument("--out", required=True, help="output golden JSON path")
     p.add_argument("--prompt", action="append", default=[],

@@ -1,6 +1,6 @@
 // Grouped-query attention benchmarks: Native vs Dispatched (cuDNN SDPA).
 //
-// Shapes mirror Llama 3.3 8B: Hq=32 query heads, Hkv=8 KV heads, D=128.
+// Shapes mirror Llama 3.1 8B-Instruct: Hq=32 query heads, Hkv=8 KV heads, D=128.
 // Args are (T query tokens, Ktot cached keys). q_off = Ktot - T (causal fill
 // at the end of the cache). FLOPs ≈ 4*T*Hq*Klen*D (scores + weighted sum).
 //

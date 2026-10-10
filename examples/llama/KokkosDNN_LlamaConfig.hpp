@@ -314,9 +314,6 @@ struct Config {
   int rope_scaling_original_max  = 0;
 
   static Config llama_3_1_8b() { return Config{}; }
-  // Deprecated alias: retained so pre-rename call sites still compile.
-  // New code should use llama_3_1_8b(). (Step 2/3 agents will remove usages.)
-  static Config llama_3_3_8b() { return llama_3_1_8b(); }
 
   // Tiny config for unit tests (no 16GB download needed).
   static Config tiny_test() {

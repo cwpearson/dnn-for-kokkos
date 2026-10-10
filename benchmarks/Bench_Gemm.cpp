@@ -1,4 +1,4 @@
-// GEMM/GEMV benchmarks: Native vs Dispatched (cuBLAS) on Llama 3.3 8B shapes.
+// GEMM/GEMV benchmarks: Native vs Dispatched (cuBLAS) on Llama 3.1 8B-Instruct shapes.
 //
 //   Y[M,N] = X[M,K] * W[N,K]^T  (W row-major [out_features, in_features])
 //
@@ -138,7 +138,7 @@ static void BM_Gemv_BHalf_Dispatched(benchmark::State& state) {
   run_gemv<bhalf_t>(state, false);
 }
 
-// Llama 3.3 8B GEMM shapes (M tokens, N out_features, K in_features):
+// Llama 3.1 8B-Instruct GEMM shapes (M tokens, N out_features, K in_features):
 // attn proj 4096x4096, FFN up/gate 14336x4096, FFN down 4096x14336,
 // lm_head 128256x4096 (decode M=1 only — full-vocab prefill is OOM-prone).
 // M=64 prefill rows are GPU-oriented; on Serial they take seconds per iter,

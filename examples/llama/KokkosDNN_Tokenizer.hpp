@@ -12,7 +12,7 @@ namespace Llama {
 // Hugging Face `tokenizer.json` loader for Llama 3 (tiktoken BPE, 128k).
 //
 // Faithful to the `tokenizers` Rust library pipeline used by the real
-// `meta-llama/Llama-3.3-8B-Instruct` tokenizer:
+// `meta-llama/Llama-3.1-8B-Instruct` tokenizer:
 //   1. literal special/added tokens are split out first (longest match,
 //      never broken up by BPE);
 //   2. remaining text is pre-tokenized with the tiktoken Split regex
@@ -76,7 +76,7 @@ class Tokenizer {
 // ---------------------------------------------------------------------------
 // Llama 3.x Instruct chat template (README TODO "Instruct chat template").
 //
-// Renders the Meta format used by Llama-3.3-8B-Instruct:
+// Renders the Meta format used by Llama-3.1-8B-Instruct:
 //
 //   <|begin_of_text|>
 //   <|start_header_id|>system<|end_header_id|>\n\n{system}<|eot_id|>

@@ -533,7 +533,7 @@ void write_tmp_json(const std::string& path, const std::string& text) {
 }  // namespace
 
 TEST(LlamaConfig, DefaultsPreserved) {
-  auto full = Config::llama_3_3_8b();
+  auto full = Config::llama_3_1_8b();
   EXPECT_EQ(full.dim, 4096);
   EXPECT_EQ(full.n_layers, 32);
   EXPECT_EQ(full.n_heads, 32);
@@ -628,7 +628,7 @@ TEST(LlamaConfig, TieWordEmbeddingsHonored) {
   // Absent key keeps the base value (both directions).
   Config bt = Config::from_json_string("{}", Config::tiny_test());
   EXPECT_FALSE(bt.tie_word_embeddings);
-  Config base = Config::llama_3_3_8b();
+  Config base = Config::llama_3_1_8b();
   base.tie_word_embeddings = true;
   EXPECT_TRUE(Config::from_json_string("{}", base).tie_word_embeddings);
 }
@@ -638,20 +638,25 @@ TEST(LlamaConfig, RopeScalingRejectedOrNull) {
   EXPECT_NO_THROW(Config::from_json_string("{}", Config::tiny_test()));
   EXPECT_NO_THROW(Config::from_json_string(R"({"rope_scaling": null})",
                                            Config::tiny_test()));
-  // Llama-3-style YaRN object: parsed, then rejected with a clear error.
-  EXPECT_THROW(Config::from_json_string(R"({"rope_scaling": {
+  // Llama-3-style YaRN object: parsed and accepted (llama3 scaling).
+  Config parsed = Config::from_json_string(R"({"rope_scaling": {
       "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0,
-      "original_max_position_embeddings": 8192, "rope_type": "llama3"}})"),
-               std::runtime_error);
-  // Linear variant (alternate "type" key): also rejected.
+      "original_max_position_embeddings": 8192, "rope_type": "llama3"}})");
+  EXPECT_EQ(parsed.rope_scaling_type, "llama3");
+  EXPECT_DOUBLE_EQ(parsed.rope_scaling_factor, 8.0);
+  EXPECT_DOUBLE_EQ(parsed.rope_scaling_low_freq_factor, 1.0);
+  EXPECT_DOUBLE_EQ(parsed.rope_scaling_high_freq_factor, 4.0);
+  EXPECT_EQ(parsed.rope_scaling_original_max, 8192);
+  EXPECT_NO_THROW(parsed.validate());
+  // Linear variant (alternate "type" key): still rejected.
   EXPECT_THROW(
       Config::from_json_string(
           R"({"rope_scaling": {"type": "linear", "factor": 2.0}})"),
       std::runtime_error);
-  // A manually-armed scaling flag fails validation too.
+  // A manually-armed unknown scaling flag fails validation too.
   Config c = Config::tiny_test();
-  c.rope_scaling_type   = "llama3";
-  c.rope_scaling_factor = 8.0;
+  c.rope_scaling_type   = "unknown";
+  c.rope_scaling_factor = 2.0;
   EXPECT_THROW(c.validate(), std::runtime_error);
 }
 
@@ -764,7 +769,7 @@ TEST(LlamaConfig, RealConfigFileGated) {
   const char* p = std::getenv("KOKKOSDNN_LLAMA_CONFIG_JSON");
   if (!p || !*p)
     GTEST_SKIP() << "set KOKKOSDNN_LLAMA_CONFIG_JSON=<config.json> to check "
-                 << "a real HF config (e.g. Llama-3.3-8B-Instruct); skipping.";
+                 << "a real HF config (e.g. Llama-3.1-8B-Instruct); skipping.";
   std::ifstream f(p, std::ios::binary);
   if (!f) GTEST_SKIP() << "config file not readable, skipping: " << p;
   Config cfg = Config::from_json_file(p);  // throws -> FAIL (corrupt file)

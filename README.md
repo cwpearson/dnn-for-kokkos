@@ -7,12 +7,12 @@
 
 ## What this is
 
-KokkosDNN is a small, Kokkos-compatible DNN library built as a proof-of-concept around **Llama 3.3 8B inference**.
+KokkosDNN is a small, Kokkos-compatible DNN library built as a proof-of-concept around **Llama 3.1 8B-Instruct inference**.
 It provides:
 
 - Native Kokkos implementations of every operator the model needs (GEMM/GEMV, RMSNorm, softmax, RoPE, SwiGLU, embedding gather, grouped-query causal attention, greedy sampler).
 - Optional dispatch to CUDA libraries when enabled at configure time: GEMM to **cuBLAS** (FP32 via `sgemm`, BF16 via `cublasGemmEx` with FP32 accumulation), attention to **cuDNN SDPA** (with automatic fallback to the native kernel where cuDNN has no suitable path).
-- A Llama example (`examples/llama/`): 3.3 8B config defaults, a safetensors checkpoint loader (on-disk F32/F16/BF16 are converted to the model scalar), a faithful Hugging Face `tokenizer.json` loader (special-token split, tiktoken Split pre-tokenizer, GPT-2 byte mapping, per-piece BPE; validated ID-for-ID against `tokenizers`), a KV-cache autoregressive model, and a `llama_generate` driver.
+- A Llama example (`examples/llama/`): 3.1 8B-Instruct config defaults, a safetensors checkpoint loader (on-disk F32/F16/BF16 are converted to the model scalar), a faithful Hugging Face `tokenizer.json` loader (special-token split, tiktoken Split pre-tokenizer, GPT-2 byte mapping, per-piece BPE; validated ID-for-ID against `tokenizers`), a KV-cache autoregressive model, and a `llama_generate` driver.
 - Unit tests and a tiny-random-weights end-to-end path so the full pipeline runs without downloading a 16 GB checkpoint.
 
 Scope is deliberately narrow: **bfloat16 storage/compute by default** (`--fp32` opts in), **inference only** (prefill + greedy decode), no training, no quantization. All ops are templated on the scalar type (`float`, `Kokkos::Experimental::bhalf_t`) with FP32 accumulation; TPL paths cover GEMM for both scalars and fall back to native otherwise.
@@ -36,7 +36,7 @@ src/
   KokkosDNN_Sampler.hpp   greedy argmax
   KokkosDNN_PrintConfiguration.cpp
 examples/llama/           Llama 3 example (not part of the library)
-  KokkosDNN_LlamaConfig.hpp    3.3 8B defaults + tiny_test()
+  KokkosDNN_LlamaConfig.hpp    3.1 8B-Instruct defaults + tiny_test()
   KokkosDNN_LlamaWeights.{hpp,cpp}
   KokkosDNN_Tokenizer.{hpp,cpp}
   KokkosDNN_LlamaModel.hpp     KV-cache Model::forward/generate
@@ -80,7 +80,7 @@ Tiny random model (no downloads, runs anywhere):
 ./build/examples/llama/llama_generate --tiny --prompt "Hello" --max-new 8
 ```
 
-Real checkpoint (needs weights + tokenizer from `meta-llama/Llama-3.3-8B-Instruct` or equivalent):
+Real checkpoint (needs weights + tokenizer from `meta-llama/Llama-3.1-8B-Instruct` or equivalent):
 
 ```bash
 ./build/examples/llama/llama_generate \
@@ -96,11 +96,15 @@ Stopping defaults to the Instruct set `{eos 128001, eom 128008, eot 128009}`
 (from `tokenizer.json` when `--tokenizer` is given, else `Config`); append
 extra ids with `--stop <id> ...`.
 
+Context defaults to `max_seq_len = 8192` (PoC cap); the arch max `131072`
+is supported, including `llama3`-type rope scaling from the
+Llama 3.1 8B-Instruct `config.json`.
+
 ## Benchmarks
 
 `benchmarks/kokkosdnn_bench` (Google Benchmark, opt-in via
 `-DKokkosDNN_ENABLE_BENCHMARKS=ON`) times the core ops at Llama
-3.3 8B shapes and reports `GFLOPS` (GEMM/GEMV/attention) or `GBps`
+3.1 8B-Instruct shapes and reports `GFLOPS` (GEMM/GEMV/attention) or `GBps`
 (elementwise) counters. GEMM registers `Native` vs `Dispatched`
 variants for both `float` and `bhalf_t`: `Native` forces the Kokkos kernel
 (`use_cublas/use_cudnn = false`), `Dispatched` uses the default handle, so
@@ -151,7 +155,7 @@ large-GPU or CPU-Kokkos build for the real checkpoint.
 - Sampling supports greedy, `temperature` / `top-k` / `top-p` / `min-p`,
   repetition penalty, and seeded RNG; no batching.
 
-## TODO — toward real Llama 3.3 8B inference
+## TODO — toward real Llama 3.1 8B-Instruct inference
 
 Minimum checklist for a faithful, usable 8B run (ordered by priority):
 

@@ -499,7 +499,7 @@ void check_real_weights(float default_tol, const std::string& tag) {
 
   GoldenFile golden = load_golden_file(genv);  // throws -> FAIL (corrupt file)
   Tokenizer tok(tenv);                         // throws -> FAIL
-  Config cfg = Config::llama_3_3_8b();         // 8B shapes/dtypes coverage
+  Config cfg = Config::llama_3_1_8b();         // 8B shapes/dtypes coverage
   Weights<Exec, Scalar> w;
   load_safetensors(cfg, wfiles, w);  // throws -> FAIL
   Model<Exec, Scalar> model(cfg, w);
@@ -652,7 +652,7 @@ TEST(LlamaGolden, Attention8BDecodeFallbackMatchesNative) {
 // generate_golden.py and parse_golden without needing weights.
 TEST(LlamaGolden, GoldenParserFixture) {
   const std::string js = R"({
-    "model": "meta-llama/Llama-3.3-8B-Instruct",
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
     "dtype": "bfloat16",
     "top_k": 4,
     "entries": [
@@ -672,7 +672,7 @@ TEST(LlamaGolden, GoldenParserFixture) {
   })";
   GoldenFile g = parse_golden(js);
   ASSERT_EQ(g.entries.size(), 2u);
-  EXPECT_EQ(g.model, "meta-llama/Llama-3.3-8B-Instruct");
+  EXPECT_EQ(g.model, "meta-llama/Llama-3.1-8B-Instruct");
   EXPECT_EQ(g.entries[0].prompt, "Hi \"there\"\n");
   EXPECT_EQ(g.entries[0].input_ids, (std::vector<int>{128000, 9906}));
   EXPECT_EQ(g.entries[0].top_ids, (std::vector<int>{1, 2, 3, 4}));
