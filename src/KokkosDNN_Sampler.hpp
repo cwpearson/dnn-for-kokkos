@@ -36,6 +36,18 @@ struct SampleOptions {
   uint64_t seed = 0;
 
   bool is_greedy() const { return temperature <= 0.0f || top_k == 1; }
+
+  // Meta's recommended sampling for Llama 3.1 Instruct (matches the
+  // upstream generation_config.json: do_sample=true, temperature=0.6,
+  // top_p=0.9; no top_k / repetition_penalty specified, so those stay
+  // neutral). Same values appear in Meta's chat-completion docs and the
+  // vLLM Llama 3.1 Instruct examples.
+  static SampleOptions llama_3_1_8b_instruct() {
+    SampleOptions o;
+    o.temperature = 0.6f;
+    o.top_p = 0.9f;
+    return o;
+  }
 };
 
 inline bool is_greedy_sample(const SampleOptions& opt) { return opt.is_greedy(); }

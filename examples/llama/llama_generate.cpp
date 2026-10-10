@@ -19,6 +19,11 @@
 //                  [--temperature T] [--top-k K] [--top-p P] [--min-p P]
 //                  [--repetition-penalty R] [--seed S]
 //
+// Sampling defaults to Meta's recommended Llama 3.1 Instruct settings
+// (temperature=0.6, top_p=0.9 via SampleOptions::llama_3_1_8b_instruct());
+// --temperature 0 restores greedy decode. Every sampling flag overrides
+// the preset; seed defaults to 0 so runs repeat unless --seed is given.
+//
 // Default compute/storage is bfloat16 (Llama 3.1 8B-Instruct checkpoint dtype);
 // --fp32 opts in. --prefill-chunk N caps prefill activations to
 // O(N·dim) (0 = single-shot); default is Config::prefill_chunk_size.
@@ -204,7 +209,8 @@ int main(int argc, char** argv) {
     std::string role = "user";
     bool want_bos = true;  // --add-bos default (matches tokenizer TemplateProcessing)
     std::vector<std::string> stop_strings;
-    KokkosDNN::SampleOptions samp_opt;  // greedy defaults (temp=0)
+    KokkosDNN::SampleOptions samp_opt =
+        KokkosDNN::SampleOptions::llama_3_1_8b_instruct();
 
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];

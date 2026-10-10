@@ -186,3 +186,22 @@ TEST(Sampler, SampledIdInRangeAndUsesSeed) {
     EXPECT_EQ(a, b);
   }
 }
+
+TEST(Sampler, Llama318BInstructPreset) {
+  // Meta's recommended Llama 3.1 Instruct sampling (upstream
+  // generation_config.json: do_sample=true, temperature=0.6, top_p=0.9;
+  // no top_k / repetition_penalty specified). The preset is sampling, not
+  // greedy, and stays valid input for both host and device entries.
+  SampleOptions o = SampleOptions::llama_3_1_8b_instruct();
+  EXPECT_FLOAT_EQ(o.temperature, 0.6f);
+  EXPECT_FLOAT_EQ(o.top_p, 0.9f);
+  EXPECT_EQ(o.top_k, 0);
+  EXPECT_FLOAT_EQ(o.min_p, 0.0f);
+  EXPECT_FLOAT_EQ(o.repetition_penalty, 1.0f);
+  EXPECT_FALSE(o.is_greedy());
+  auto lg = fixture_logits();
+  HostRNG rng(o.seed);
+  int id = KokkosDNN::sample_host_logits(lg, o, {}, rng);
+  EXPECT_GE(id, 0);
+  EXPECT_LT(id, (int)lg.size());
+}
