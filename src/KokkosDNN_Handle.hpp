@@ -6,11 +6,14 @@
 #include <utility>
 #include "KokkosDNN_config.h"
 
-#if defined(KOKKOSDNN_ENABLE_CUBLAS) && defined(KOKKOS_ENABLE_CUDA)
-#include <cublas_v2.h>
+// Third-party handle lifecycle lives in src/tpl/... and is included here
+// only when the matching TPL is enabled. The core header itself stays
+// free of TPL types (cached handles are opaque void*).
+#ifdef KOKKOSDNN_ENABLE_CUBLAS
+#include "tpl/cublas/KokkosDNN_CuBLAS_Handle.hpp"
 #endif
-#if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)
-#include <cudnn.h>
+#ifdef KOKKOSDNN_ENABLE_CUDNN
+#include "tpl/cudnn/KokkosDNN_CuDNN_Handle.hpp"
 #endif
 
 namespace KokkosDNN {
@@ -97,6 +100,7 @@ struct DNNHandle {
   // Lazily created cached cuBLAS handle (nullptr when unusable: non-CUDA
   // space, TPL disabled, or creation failure -- callers fall back then).
   // Const so gemm/gemv/attention can take `const DNNHandle&`.
+  // Lifecycle in tpl/cublas/KokkosDNN_CuBLAS_Handle.hpp.
   void* cublas_raw() const {
 #if defined(KOKKOSDNN_ENABLE_CUBLAS) && defined(KOKKOS_ENABLE_CUDA)
     constexpr bool is_cuda =
@@ -106,8 +110,7 @@ struct DNNHandle {
                        Kokkos::CudaUVMSpace>;
     if constexpr (is_cuda) {
       if (use_cublas && cublas_ptr_ == nullptr) {
-        cublasHandle_t h = nullptr;
-        if (cublasCreate(&h) == CUBLAS_STATUS_SUCCESS) cublas_ptr_ = h;
+        cublas_ptr_ = Impl::cublas_handle_create();
       }
       return cublas_ptr_;
     }
@@ -116,6 +119,7 @@ struct DNNHandle {
   }
 
   // Lazily created cached cuDNN handle (nullptr contract as above).
+  // Lifecycle in tpl/cudnn/KokkosDNN_CuDNN_Handle.hpp.
   void* cudnn_raw() const {
 #if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)
     constexpr bool is_cuda =
@@ -125,8 +129,7 @@ struct DNNHandle {
                        Kokkos::CudaUVMSpace>;
     if constexpr (is_cuda) {
       if (use_cudnn && cudnn_ptr_ == nullptr) {
-        cudnnHandle_t h = nullptr;
-        if (cudnnCreate(&h) == CUDNN_STATUS_SUCCESS) cudnn_ptr_ = h;
+        cudnn_ptr_ = Impl::cudnn_handle_create();
       }
       return cudnn_ptr_;
     }
@@ -137,18 +140,12 @@ struct DNNHandle {
  private:
   void destroy() {
 #if defined(KOKKOSDNN_ENABLE_CUBLAS) && defined(KOKKOS_ENABLE_CUDA)
-    if (cublas_ptr_ != nullptr) {
-      cublasDestroy(static_cast<cublasHandle_t>(cublas_ptr_));
-      cublas_ptr_ = nullptr;
-    }
+    Impl::cublas_handle_destroy(cublas_ptr_);
 #else
     cublas_ptr_ = nullptr;
 #endif
 #if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)
-    if (cudnn_ptr_ != nullptr) {
-      cudnnDestroy(static_cast<cudnnHandle_t>(cudnn_ptr_));
-      cudnn_ptr_ = nullptr;
-    }
+    Impl::cudnn_handle_destroy(cudnn_ptr_);
 #else
     cudnn_ptr_ = nullptr;
 #endif

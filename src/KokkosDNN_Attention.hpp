@@ -7,7 +7,9 @@
 #include <string>
 #include <type_traits>
 #include "KokkosDNN_Handle.hpp"
-#include "KokkosDNN_Attention_CuDNN.hpp"
+#ifdef KOKKOSDNN_ENABLE_CUDNN
+#include "tpl/cudnn/KokkosDNN_CuDNN.hpp"
+#endif
 
 namespace KokkosDNN {
 namespace Impl {
@@ -108,7 +110,7 @@ void attention_gqa_streaming(const DNNHandle<ExecSpace>& handle, const QView& q,
 // rounding (verified in tests/Test_Attention.cpp against a host reference).
 //
 // When KokkosDNN_ENABLE_CUDNN and ExecSpace is CUDA, float and bhalf_t
-// dispatch to cuDNN SDPA first (see KokkosDNN_Attention_CuDNN.hpp for
+// dispatch to cuDNN SDPA first (see tpl/cudnn/KokkosDNN_CuDNN.hpp for
 // contract). One narrow, version-gated exception lives in
 // cudnn_sdpa_forward: FP32 single-token GQA decode (T=1, Hq != Hkv) falls
 // back to native on cuDNN <= 9.27.0, where the composite path computes

@@ -41,7 +41,7 @@ if(KokkosDNN_ENABLE_CUDNN)
     find_package_handle_standard_args(CUDNN DEFAULT_MSG CUDNN_LIBRARY CUDNN_INCLUDE_DIR)
   endif()
   # cudnn-frontend (header-only graph API) builds the SDPA node used by
-  # src/KokkosDNN_Attention_CuDNN.cpp. Pinned to a commit tested against
+  # src/tpl/cudnn/KokkosDNN_CuDNN_SDPA.cpp. Pinned to a commit tested against
   # cuDNN 9.x; override offline with -DFETCHCONTENT_SOURCE_DIR_CUDNN_FRONTEND=<path>.
   include(FetchContent)
   if(POLICY CMP0135)
@@ -84,7 +84,7 @@ configure_file(cmake/KokkosDNN_config.h.in
 # ---------------------------------------------------------------------------
 add_library(kokkosdnn
   src/KokkosDNN_PrintConfiguration.cpp
-  src/KokkosDNN_Attention_CuDNN.cpp
+  src/tpl/cudnn/KokkosDNN_CuDNN_SDPA.cpp
 )
 add_library(KokkosDNN::kokkosdnn ALIAS kokkosdnn)
 

@@ -1,66 +1,10 @@
-#ifndef KOKKOSDNN_ATTENTION_CUDNN_HPP
-#define KOKKOSDNN_ATTENTION_CUDNN_HPP
+#ifndef KOKKOSDNN_CUDNN_TRY_HPP
+#define KOKKOSDNN_CUDNN_TRY_HPP
 
-// cuDNN scaled-dot-product attention dispatch point. The native Kokkos
-// GQA kernel in KokkosDNN_Attention.hpp is always available; when
-// KokkosDNN_ENABLE_CUDNN and a CUDA ExecSpace are active, callers route
-// here first.
-//
-// Contract (matches the native kernel in KokkosDNN_Attention.hpp):
-//   * q     : [T, Hq, D]  queries (already RoPE'd)
-//   * k, v  : [Ktot, Hkv, D] full KV cache prefix (RoPE'd keys)
-//   * out   : [T, Hq, D]
-//   * q_off : absolute position of q[0] inside the KV sequence; query t
-//             attends to keys [0, q_off + t] (causal).
-//   * scale : softmax scale (1/sqrt(D)).
-// Views are layout-agnostic: D-contiguous inputs pass through zero-copy
-// via their Kokkos strides; anything else is repacked into contiguous
-// temporaries (cheap for the small Q/O, rare for the large K/V caches).
-// Hq must be a multiple of Hkv (GQA).
-//
-// Causal masking uses bottom-right diagonal alignment, which is exactly
-// this contract when the caller passes the valid KV prefix
-// (Ktot == q_off + T, as the Llama model and all tests do). Calls with
-// Ktot != q_off + T fall back to the native kernel.
-//
-// Returns true when cuDNN ran the attention, false to run the native
-// kernel. Never throws: any cuDNN build/execute failure falls back.
-#include <cstddef>
-#include <cstdint>
-#include <type_traits>
-
-#include <Kokkos_Core.hpp>
-#include <Kokkos_Half.hpp>
-
-#include "KokkosDNN_config.h"
-#include "KokkosDNN_Handle.hpp"
-
-namespace KokkosDNN {
-namespace Impl {
-
-enum class CudnnSdpaScalar : int { Float = 0, BFloat16 = 1 };
-
-// Raw-pointer entry point, implemented in KokkosDNN_Attention_CuDNN.cpp.
-// cached_handle is the DNNHandle's cached cudnnHandle_t (opaque void*;
-// nullptr declines and the caller falls back to native). The callee
-// re-selects the Kokkos CUDA stream on it per call, so the one cached
-// handle stays ordered with surrounding Kokkos kernels instead of being
-// created/destroyed per call.
-// Strides are in elements for (token, head, dim) indexing, i.e. the
-// Kokkos View strides: q_sT = q.stride(0), q_sH = q.stride(1), etc.
-// Returns true on success, false to fall back to native. Never throws.
-bool cudnn_sdpa_forward(void* cached_handle, CudnnSdpaScalar dtype,
-                        const void* q, const void* k, const void* v, void* out,
-                        int64_t T, int64_t Ktot, int64_t Hq, int64_t Hkv,
-                        int64_t D, int64_t q_sT, int64_t q_sH, int64_t q_sD,
-                        int64_t k_sT, int64_t k_sH, int64_t k_sD, int64_t v_sT,
-                        int64_t v_sH, int64_t v_sD, int64_t o_sT, int64_t o_sH,
-                        int64_t o_sD, float scale);
-
-#if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)
-// Layout-agnostic template over Kokkos views. Performs the cheap shape
-// checks, maps the scalar type, and forwards raw pointers/strides along
-// with the handle's cached cuDNN handle (created once per DNNHandle).
+// Layout-agnostic cuDNN SDPA dispatch over Kokkos views. Performs the
+// cheap shape checks, maps the scalar type, and forwards raw
+// pointers/strides along with the handle's cached cuDNN handle (created
+// once per DNNHandle).
 //
 // cuDNN needs the head-dim axis innermost (element stride 1). Q/O are
 // small ([T, Hq, D]) and often LayoutLeft on CUDA, so they are repacked
@@ -68,6 +12,19 @@ bool cudnn_sdpa_forward(void* cached_handle, CudnnSdpaScalar dtype,
 // KV-cache prefix and pass through zero-copy when already D-contiguous
 // (the Llama model stores caches LayoutRight); otherwise they are
 // repacked as well. Any cuDNN failure still falls back to native.
+#include "KokkosDNN_config.h"
+
+#if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)
+#include <Kokkos_Core.hpp>
+#include <Kokkos_Half.hpp>
+#include <type_traits>
+
+#include "KokkosDNN_Handle.hpp"
+#include "tpl/cudnn/KokkosDNN_CuDNN_Forward.hpp"
+
+namespace KokkosDNN {
+namespace Impl {
+
 template <class Scalar, class Exec, class QView, class KView, class VView,
           class OView>
 inline bool try_cudnn_sdpa_gqa(const DNNHandle<Exec>& handle, const QView& q,
@@ -183,9 +140,9 @@ inline bool try_cudnn_sdpa_gqa(const DNNHandle<Exec>& handle, const QView& q,
   if (ok && repack_out) Kokkos::deep_copy(out, o_tmp);
   return ok;
 }
-#endif
 
 }  // namespace Impl
 }  // namespace KokkosDNN
 
+#endif
 #endif

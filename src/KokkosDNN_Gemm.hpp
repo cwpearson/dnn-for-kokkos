@@ -8,7 +8,9 @@
 #include <string>
 #include <type_traits>
 #include "KokkosDNN_Handle.hpp"
-#include "KokkosDNN_Gemm_CuBLAS.hpp"
+#ifdef KOKKOSDNN_ENABLE_CUBLAS
+#include "tpl/cublas/KokkosDNN_CuBLAS.hpp"
+#endif
 
 namespace KokkosDNN {
 namespace Impl {

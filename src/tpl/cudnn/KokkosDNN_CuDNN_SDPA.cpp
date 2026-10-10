@@ -14,7 +14,11 @@
 // Implementation selection is AUTO: unified flash for BF16, composite
 // (matmul+softmax+matmul) for FP32. Any build/execute failure returns
 // false so the caller falls back to the native Kokkos kernel.
-#include "KokkosDNN_Attention_CuDNN.hpp"
+#include "KokkosDNN_config.h"
+
+#include <Kokkos_Core.hpp>
+
+#include "tpl/cudnn/KokkosDNN_CuDNN_Forward.hpp"
 
 #if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)
 
