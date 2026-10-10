@@ -303,12 +303,14 @@ struct Config {
   // and the checkpoint has no lm_head tensor, the loader shares the
   // embedding table as lm_head instead of throwing.
   bool tie_word_embeddings = false;
-  // rope_scaling bookkeeping. This PoC implements plain NeoX RoPE only, so
-  // any non-null rope_scaling in config.json is rejected with a clear
-  // error at parse/validate time. The fields below record what was seen
-  // for the error message.
+  // rope_scaling bookkeeping. Supports plain NeoX RoPE (null/absent,
+  // type "") and Llama 3.1 llama3-type scaling. Other types (linear,
+  // dynamic, yarn, ...) are rejected with a clear error at parse/validate
+  // time. Fields record what was seen for frequency computation / errors.
   std::string rope_scaling_type  = "";  // empty == none (null/absent)
   double rope_scaling_factor     = 1.0;
+  double rope_scaling_low_freq_factor  = 1.0;
+  double rope_scaling_high_freq_factor = 4.0;
   int rope_scaling_original_max  = 0;
 
   static Config llama_3_1_8b() { return Config{}; }
@@ -377,18 +379,33 @@ struct Config {
           "layer, so cap it to what fits in memory");
     if (bos_token < 0) bad("bos_token_id must be >= 0");
     if (eos_token < 0) bad("eos_token_id must be >= 0");
-    if (!rope_scaling_type.empty())
+    if (rope_scaling_type.empty()) {
+      // none: plain NeoX RoPE, no further checks.
+    } else if (rope_scaling_type == "llama3") {
+      if (!std::isfinite(rope_scaling_factor) ||
+          !(rope_scaling_factor >= 1.0))
+        bad("rope_scaling factor must be >= 1 for type 'llama3'");
+      if (!std::isfinite(rope_scaling_low_freq_factor) ||
+          !std::isfinite(rope_scaling_high_freq_factor) ||
+          !(rope_scaling_high_freq_factor > rope_scaling_low_freq_factor))
+        bad("rope_scaling high_freq_factor must exceed low_freq_factor for "
+            "type 'llama3'");
+      if (rope_scaling_original_max <= 0)
+        bad("rope_scaling original_max_position_embeddings must be > 0 for "
+            "type 'llama3'");
+    } else {
       throw std::runtime_error(
           "Config::validate: rope_scaling type '" + rope_scaling_type +
           "' (factor " + std::to_string(rope_scaling_factor) +
-          ") is not supported: this PoC implements plain NeoX RoPE only "
-          "(YaRN/long-rope scaling would silently shift positions)");
+          ") is not supported: supported types are null/absent (none) and "
+          "'llama3' (linear/dynamic/yarn/etc would silently shift positions)");
+    }
   }
 
   // Parse an HF config.json object. Keys present override `base`; missing
   // keys keep base values (HF defaults via llama_3_1_8b()). Unknown keys
   // are ignored. Throws on malformed JSON, incompatible dims, or
-  // non-null rope_scaling (unsupported).
+  // unsupported rope_scaling types (only null/absent and "llama3" allowed).
   static Config from_json_string(const std::string& text,
                                  const Config& base = llama_3_1_8b()) {
     using namespace config_detail;
@@ -457,24 +474,43 @@ struct Config {
         } else {
           rtype = "unknown";
         }
-        double factor = 1.0;
-        long long orig = 0;
-        if (get_num(v, "factor", factor)) {
-        } else if (get_num(v, "rope_factor", factor)) {
+        double factor = c.rope_scaling_factor;
+        double low = c.rope_scaling_low_freq_factor;
+        double high = c.rope_scaling_high_freq_factor;
+        long long orig = c.rope_scaling_original_max;
+        bool have_orig = false;
+        double tmpd = 0;
+        if (get_num(v, "factor", tmpd)) {
+          factor = tmpd;
+        } else if (get_num(v, "rope_factor", tmpd)) {
+          factor = tmpd;  // legacy alias
         }
-        if (get_int(v, "original_max_position_embeddings", orig))
-          c.rope_scaling_original_max = checked_int(
-              orig, "original_max_position_embeddings");
+        if (get_num(v, "low_freq_factor", tmpd)) low = tmpd;
+        if (get_num(v, "high_freq_factor", tmpd)) high = tmpd;
+        if (get_int(v, "original_max_position_embeddings", orig)) {
+          have_orig = true;
+        }
         c.rope_scaling_type   = rtype;
         c.rope_scaling_factor = factor;
-        throw std::runtime_error(
-            "config: rope_scaling type '" + rtype + "' (factor " +
-            std::to_string(factor) +
-            ") is not supported: this PoC implements plain NeoX RoPE only; "
-            "use a checkpoint with rope_scaling=null (e.g. Llama 3.1 8B-Instruct)");
+        c.rope_scaling_low_freq_factor  = low;
+        c.rope_scaling_high_freq_factor = high;
+        if (have_orig)
+          c.rope_scaling_original_max = checked_int(
+              orig, "original_max_position_embeddings");
+        if (rtype != "llama3")
+          throw std::runtime_error(
+              "config: rope_scaling type '" + rtype + "' (factor " +
+              std::to_string(factor) +
+              ") is not supported: supported types are null/absent (none) "
+              "and 'llama3'; use a checkpoint with rope_scaling=null or "
+              "llama3-type scaling (e.g. Llama 3.1 8B-Instruct)");
+      } else {
+        c.rope_scaling_type   = "";
+        c.rope_scaling_factor = 1.0;
+        c.rope_scaling_low_freq_factor  = 1.0;
+        c.rope_scaling_high_freq_factor = 4.0;
+        c.rope_scaling_original_max     = 0;
       }
-      c.rope_scaling_type   = "";
-      c.rope_scaling_factor = 1.0;
     }
     c.recompute_derived();
     c.validate();

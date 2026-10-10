@@ -80,7 +80,10 @@ class Model {
     // incompatible dims or an out-of-range context fail here, not in a
     // device kernel or a multi-GiB allocation.
     cfg.validate();
-    inv_freq = rope_inv_freq<ExecSpace>(cfg.head_dim, cfg.rope_theta);
+    inv_freq = rope_inv_freq<ExecSpace>(
+        cfg.head_dim, cfg.rope_theta, cfg.rope_scaling_type,
+        cfg.rope_scaling_factor, cfg.rope_scaling_low_freq_factor,
+        cfg.rope_scaling_high_freq_factor, cfg.rope_scaling_original_max);
     k_cache.resize(cfg.n_layers);
     v_cache.resize(cfg.n_layers);
     for (int l = 0; l < cfg.n_layers; ++l) {
