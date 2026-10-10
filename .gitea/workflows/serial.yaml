@@ -1,0 +1,73 @@
+name: Serial build
+
+# CPU-only CI: Kokkos Serial backend, build everything, but execute only
+# the tests and examples that finish in reasonable time on a single core.
+on:
+  push:
+  pull_request:
+
+jobs:
+  serial:
+    runs-on: ubuntu-latest
+    env:
+      KOKKOS_VERSION: 5.2.1
+      KOKKOS_INSTALL: ${{ github.workspace }}/kokkos-install
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ git
+
+      - name: Download Kokkos
+        run: |
+          curl -L -o kokkos.tar.gz \
+            "https://github.com/kokkos/kokkos/releases/download/${KOKKOS_VERSION}/kokkos-${KOKKOS_VERSION}.tar.gz"
+          mkdir kokkos-src && tar -xzf kokkos.tar.gz -C kokkos-src --strip-components=1
+
+      - name: Build and install Kokkos (Serial only)
+        run: |
+          cmake -S kokkos-src -B kokkos-build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${KOKKOS_INSTALL}" \
+            -DKokkos_ENABLE_SERIAL=ON \
+            -DKokkos_ENABLE_TESTS=OFF
+          cmake --build kokkos-build --parallel "$(nproc)"
+          cmake --install kokkos-build
+
+      - name: Configure KokkosDNN
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DKokkos_ROOT="${KOKKOS_INSTALL}" \
+            -DKokkosDNN_ENABLE_TESTS=ON \
+            -DKokkosDNN_ENABLE_EXAMPLES=ON \
+            -DKokkosDNN_ENABLE_BENCHMARKS=ON
+
+      # Build every target (library, tests, examples, benchmarks).
+      - name: Build everything
+        run: cmake --build build --parallel "$(nproc)"
+
+      # Run the full ctest suite: unit tests plus example tests, all on tiny
+      # configs that run in seconds on Serial. Tests needing real data
+      # (KOKKOSDNN_WEIGHTS / TOKENIZER_JSON / GOLDEN_JSON / LLAMA_CONFIG_JSON)
+      # self-skip via GTEST_SKIP when those files are absent. The
+      # kokkosdnn_bench_list entry only lists benchmarks (no kernels run).
+      # Deliberately NOT executed here: kokkosdnn_bench microbenchmarks run
+      # Llama 8B shapes whose naive native kernels take seconds per
+      # iteration on Serial (see README "Benchmarks"), so they are
+      # GPU-oriented and unsuitable for a single-core runner.
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure --timeout 300
+
+      # Example smoke runs, limited to configs suitable for a single core:
+      # --tiny uses a 2-layer dim=64 random model (milliseconds); xor_train
+      # is a 2-layer MLP on 4 samples (milliseconds). Deliberately NOT run:
+      # full-shape random models (--model 3.2-1b takes ~40 s for 8 tokens on
+      # Serial, default 8B shapes take many minutes) and real checkpoints
+      # (~16 GiB downloads, large RAM/GPU needs).
+      - name: Run single-core example smoke tests
+        run: |
+          ./build/examples/llama/llama_generate --tiny --prompt "Hello" --max-new 8
+          ./build/examples/xor/xor_train
