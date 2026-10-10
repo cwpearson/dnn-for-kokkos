@@ -1,4 +1,4 @@
-# KokkosDNN
+# DNN for Kokkos
 
 > **WARNING — unofficial, experimental project.**
 > This is **not** part of, endorsed by, or affiliated with the Kokkos ecosystem.
@@ -7,7 +7,7 @@
 
 ## What this is
 
-KokkosDNN is a small, Kokkos-compatible DNN library built as a proof-of-concept around **Llama 3.1 8B-Instruct inference**.
+DNN for Kokkos is a small, Kokkos-compatible DNN library built as a proof-of-concept around **Llama 3.1 8B-Instruct inference**.
 It provides:
 
 - Native Kokkos implementations of every operator the model needs (GEMM/GEMV, RMSNorm, softmax, RoPE, SwiGLU, embedding gather, grouped-query causal attention, greedy sampler).
