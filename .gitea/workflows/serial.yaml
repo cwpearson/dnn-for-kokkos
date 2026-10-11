@@ -18,7 +18,9 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake g++ git
+          # libstb-dev provides the system stb headers (/usr/include/stb/)
+          # preferred by the optional image component (find-or-fetch).
+          sudo apt-get install -y cmake g++ git libstb-dev
 
       - name: Download Kokkos
         run: |
@@ -38,12 +40,15 @@ jobs:
 
       - name: Configure KokkosDNN
         run: |
+          # KokkosDNN_ENABLE_IMAGE=ON builds src/images (KokkosDNN::Image,
+          # stb-backed I/O) and registers its unit tests (Test_Image).
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DKokkos_ROOT="${KOKKOS_INSTALL}" \
             -DKokkosDNN_ENABLE_TESTS=ON \
             -DKokkosDNN_ENABLE_EXAMPLES=ON \
-            -DKokkosDNN_ENABLE_BENCHMARKS=ON
+            -DKokkosDNN_ENABLE_BENCHMARKS=ON \
+            -DKokkosDNN_ENABLE_IMAGE=ON
 
       # Build every target (library, tests, examples, benchmarks).
       - name: Build everything

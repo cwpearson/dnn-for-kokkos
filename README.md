@@ -41,6 +41,7 @@ Options:
 | `KokkosDNN_ENABLE_BENCHMARKS` | OFF | build `benchmarks/kokkosdnn_bench` (Google Benchmark, fetched if needed) |
 | `KokkosDNN_ENABLE_CUBLAS` | OFF | GEMM via cuBLAS on CUDA spaces |
 | `KokkosDNN_ENABLE_CUDNN` | OFF | attention via cuDNN SDPA (with automatic native fallback; needs `<cudnn.h>` + `cudnn-frontend`, fetched automatically) |
+| `KokkosDNN_ENABLE_IMAGE` | OFF | optional image component (`KokkosDNN::Image`, stb-backed I/O + DINOv3 preprocessing) |
 
 ## Examples
 

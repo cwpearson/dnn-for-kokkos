@@ -30,7 +30,7 @@ Example support (`examples/dinov3/`, all missing):
 
 - [ ] `Config` for `dinov3_vit` fields (patch/hidden/layers/heads/registers/bias flags/layerscale/rope/image size).
 - [ ] Safetensors loader map (`patch_embed/cls_token/register_tokens/norms/qkv-o/mlp/layerscale/final-norm` HF names; Llama loader names do not apply).
-- [ ] Image preprocessing (resize/crop, normalize, `HWC→CHW`, batching; no image I/O in repo today).
+- [x] Image preprocessing (resize/crop, normalize, `HWC→CHW`, batching; no image I/O in repo today). Done: `src/images/` (`KokkosDNN::Image`, stb-backed I/O, opt-in `-DKokkosDNN_ENABLE_IMAGE=ON`, OFF by default).
 - [ ] Encoder driver (`dinov3_forward(pixel) → cls/patch tokens`) + tiny-random smoke path (no download).
 - [ ] Golden test vs HF `facebook/dinov3-vitb16-pretrain-lvd1689m` (CLS + patch tokens, tolerance per scalar).
 - [ ] Wire into `examples/CMakeLists.txt` + driver flags (`--weights/--image/--fp32`) once the above land.
