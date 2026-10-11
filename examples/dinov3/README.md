@@ -24,7 +24,7 @@ Core `src/` ops (all missing today):
 - [x] 2D axial RoPE (`head_dim/4` inv_freq, dynamic H/W coords, `rotate_half`, patch-tokens-only, prefix skip). Done: `src/KokkosDNN_RoPE.hpp` (`KokkosDNN::rope2d_axial_forward`/`_inplace`, theta=100, prefix_skip=5).
 - [x] PatchEmbed Conv2d (`3→768`, `k=16/s=16`) or `im2col+gemm` helper. Done: `src/KokkosDNN_PatchEmbed.hpp` (`KokkosDNN::patchembed_forward`, `im2col+gemm_bias`).
 - [x] Token assembly + batching (`cat[cls,registers,patches]`, `[B,T,D]` policy). Done: `src/KokkosDNN_Tokens.hpp` (`KokkosDNN::tokens_assemble_forward`, broadcast + single-seq).
-- [ ] `layerscale` broadcast multiply + residual-add helper (`DropPath` is inference identity).
+- [x] `layerscale` broadcast multiply + residual-add helper (`DropPath` is inference identity). Done: `src/KokkosDNN_LayerScale.hpp` (`KokkosDNN::layerscale_residual_forward`/`layerscale_forward`).
 
 Example support (`examples/dinov3/`, all missing):
 

@@ -18,6 +18,7 @@ kokkosdnn_add_test(test_attention_bidirectional Test_AttentionBidirectional.cpp)
 kokkosdnn_add_test(test_gelu Test_Gelu.cpp)
 kokkosdnn_add_test(test_patchembed Test_PatchEmbed.cpp)
 kokkosdnn_add_test(test_tokens Test_Tokens.cpp)
+kokkosdnn_add_test(test_layerscale Test_LayerScale.cpp)
 kokkosdnn_add_test(test_sampler Test_Sampler.cpp)
 
 if(KokkosDNN_ENABLE_IMAGE)
