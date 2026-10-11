@@ -13,6 +13,7 @@
 #include "KokkosDNN_SwiGLU.hpp"
 #include "KokkosDNN_Embedding.hpp"
 #include "KokkosDNN_PatchEmbed.hpp"
+#include "KokkosDNN_Tokens.hpp"
 #include "KokkosDNN_Attention.hpp"
 #include "KokkosDNN_KVCache.hpp"
 #include "KokkosDNN_Sampler.hpp"

@@ -23,7 +23,7 @@ Core `src/` ops (all missing today):
 - [x] Bidirectional full MHA (non-causal; current `attention_gqa_single` is causal-only; cuDNN graph is causal-only too). Done: `src/KokkosDNN_Attention.hpp` (`KokkosDNN::attention_mha_bidirectional`, native Kokkos, FP32 streaming softmax).
 - [x] 2D axial RoPE (`head_dim/4` inv_freq, dynamic H/W coords, `rotate_half`, patch-tokens-only, prefix skip). Done: `src/KokkosDNN_RoPE.hpp` (`KokkosDNN::rope2d_axial_forward`/`_inplace`, theta=100, prefix_skip=5).
 - [x] PatchEmbed Conv2d (`3→768`, `k=16/s=16`) or `im2col+gemm` helper. Done: `src/KokkosDNN_PatchEmbed.hpp` (`KokkosDNN::patchembed_forward`, `im2col+gemm_bias`).
-- [ ] Token assembly + batching (`cat[cls,registers,patches]`, `[B,T,D]` policy).
+- [x] Token assembly + batching (`cat[cls,registers,patches]`, `[B,T,D]` policy). Done: `src/KokkosDNN_Tokens.hpp` (`KokkosDNN::tokens_assemble_forward`, broadcast + single-seq).
 - [ ] `layerscale` broadcast multiply + residual-add helper (`DropPath` is inference identity).
 
 Example support (`examples/dinov3/`, all missing):
