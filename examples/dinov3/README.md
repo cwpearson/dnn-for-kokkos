@@ -13,6 +13,24 @@ Single forward over `1+4+Np` tokens (201 @224px); no KV-cache, no sampling.
 This directory currently holds only this TODO list. Not wired into
 `examples/CMakeLists.txt`, so the build is unaffected.
 
+## Weights
+
+`facebook/dinov3-vitb16-pretrain-lvd1689m` is gated — accept the
+conditions at <https://huggingface.co/facebook/dinov3-vitb16-pretrain-lvd1689m>
+once, then download with the `hf` CLI (`pip install -U huggingface_hub`):
+
+```bash
+hf download facebook/dinov3-vitb16-pretrain-lvd1689m \
+  --local-dir ./weights/dinov3-vitb16-pretrain-lvd1689m \
+  --token "$HF_TOKEN"
+ls ./weights/dinov3-vitb16-pretrain-lvd1689m
+# expect model.safetensors (~343 MB) + config.json + preprocessor_config.json
+```
+
+Keep the full snapshot: `config.json` defines the arch and
+`preprocessor_config.json` defines the image normalization, both needed
+by the future driver / golden test.
+
 ## TODO
 
 Core `src/` ops (all missing today):
