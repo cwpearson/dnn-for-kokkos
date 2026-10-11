@@ -15,3 +15,8 @@ tests/           core op unit tests
 benchmarks/      microbenchmarks (native vs TPL dispatch)
 cmake/           config header + package config templates
 ```
+
+# Design Guidelines
+
+- Non-public functions / APIs should be in `KokkosDNN::Impl` namespace.
+- Non-public macros should be prefixed `KOKKOSDNN_IMPL_`
