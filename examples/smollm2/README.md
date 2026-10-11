@@ -47,3 +47,12 @@ KV-cache modes (`--kv-page-size N`, `--kv-int8` / `--kv-fp`): dense FP by defaul
 Chat: `--chat` wraps `--prompt` as one turn via the SmolLM2-Instruct ChatML template (`<|im_start|>`/`<|im_end|>` blocks + open assistant header, with default-system injection when no system turn is present); `--system` prepends a system turn (implies chat).
 
 Sampling defaults to `temperature=0.6`, `top_p=0.9`; `--temperature 0` restores greedy decode. Every sampling flag (`--temperature`, `--top-k`, `--top-p`, `--min-p`, `--repetition-penalty`, `--seed`) overrides the preset; seed defaults to 0 so runs repeat unless `--seed` is given.
+
+## TPL dispatch
+
+SmolLM2 shapes route through the same dispatch as the rest of the library —
+GEMM via cuBLAS (`sgemm`/`cublasGemmEx`) and attention via cuDNN SDPA on CUDA
+builds with `KokkosDNN_ENABLE_CUBLAS`/`KokkosDNN_ENABLE_CUDNN`, native
+kernels otherwise. No new TPL kernels were needed (shapes/dtypes already
+covered); verified by code inspection plus the Serial build, not GPU
+execution.

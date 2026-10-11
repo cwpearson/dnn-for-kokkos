@@ -1,6 +1,6 @@
 # DINOv3 example
 
-Planned: ViT-B/16 (`vitb16_lvd1689m`, `facebook/dinov3-vitb16-pretrain-lvd1689m`)
+ViT-B/16 (`vitb16_lvd1689m`, `facebook/dinov3-vitb16-pretrain-lvd1689m`)
 image-encoder inference built on the core library.
 
 Target arch (per HF `dinov3_vit` modeling/config + convert script):

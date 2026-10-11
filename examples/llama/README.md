@@ -128,3 +128,16 @@ against Python `tokenizers` on the real file: `Test_Tokenizer.RealFileOracle`
 (runs when `KOKKOSDNN_TOKENIZER_JSON` points at a Llama 3 `tokenizer.json`;
 92 targeted + 2000 fuzz differential cases pass). Re-validate a new file with
 `KOKKOSDNN_TOKENIZER_JSON=tokenizer.json ./build/examples/llama/test_tokenizer`.
+
+## TODO — toward real Llama 3.1 8B-Instruct inference
+
+Minimum checklist for a faithful, usable 8B run (ordered by priority):
+
+- Performance (future): CPU TPL path (no `OpenBLAS`/`MKL` dispatch);
+  weight quantization out of scope per above.
+- Small-model examples: `SmolLM2-135M` (separate family under
+  `examples/smollm2/` — preset + GPT-2 tokenizer + ChatML driver path +
+  config fixtures; TPL dispatch shared with Llama).
+- Small-model examples: `Qwen3-0.6B` / `1.7B` (needs QK-Norm support plus
+  tokenizer/preset work; verify bias and RoPE deltas against their
+  `config.json`).
