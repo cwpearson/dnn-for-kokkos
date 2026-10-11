@@ -113,6 +113,50 @@ scaling is `llama3`-type with factor 32 (vs 8 for 3.1 8B); BF16 weights
 are ~2.5 GiB plus the KV cache (see `Config::kv_cache_bytes()`; the
 driver prints the full-window figure).
 
+### SmolLM2-135M (separate example family)
+
+SmolLM2-135M lives in its own example family under `examples/smollm2/`
+(namespace `KokkosDNN::SmolLM2`; no shared headers with `examples/llama/`
+— only the core `src/` ops are reused). It supports
+`HuggingFaceTB/SmolLM2-135M` via `--model smollm2-135m` (aliases
+`smollm2`, `135m`, optional `huggingfacetb-` prefix) and the Instruct twin
+via `--model smollm2-135m-instruct` (alias `smollm2-instruct`). Same
+`llama` + `silu` + no-bias family as the Llama presets, so no new math
+ops: dim 576, 30 layers, 9 heads / 3 kv heads (head_dim 64), ffn 1536,
+vocab 49152, rope_theta 100k, `tie_word_embeddings=true`. Random-weights
+smoke (no downloads):
+
+```bash
+./build/examples/smollm2/smollm2_generate --model smollm2-135m --prompt "Hello" --max-new 8
+./build/examples/smollm2/smollm2_generate --model smollm2-135m-instruct --chat --prompt "Hello" --max-new 8
+```
+
+With a real checkpoint, add the weights, tokenizer, and the faithful
+config fixture (`examples/smollm2/config-smollm2-135m.json` /
+`config-smollm2-135m-instruct.json`, copies of the HF `config.json`
+values):
+
+```bash
+./build/examples/smollm2/smollm2_generate \
+  --model smollm2-135m --config examples/smollm2/config-smollm2-135m.json \
+  --weights model.safetensors --tokenizer tokenizer.json \
+  --prompt "Hello" --max-new 64
+```
+
+Tokenizer notes: SmolLM2 ships a GPT-2-style BPE tokenizer (vocab 49152,
+`pre_tokenizer` Sequence of Digits + ByteLevel), auto-detected on load;
+`--chat` renders the ChatML template (`<|im_start|>/<|im_end|>` with
+default-system injection), stops on the single GPT-2 EOS id (base `0`,
+instruct `2`), and BOS defaults to the config ids (base `0`, instruct `1`,
+or the sibling `tokenizer_config.json` choice when present).
+
+TPL note: SmolLM2 shapes route through the same dispatch as Llama — GEMM
+via cuBLAS (`sgemm`/`cublasGemmEx`) and attention via cuDNN SDPA on CUDA
+builds with `KokkosDNN_ENABLE_CUBLAS`/`KokkosDNN_ENABLE_CUDNN`, native
+kernels otherwise. No new TPL kernels were needed (shapes/dtypes already
+covered); verified by code inspection plus the Serial build, not GPU
+execution.
+
 ## Benchmarks
 
 `benchmarks/kokkosdnn_bench` (Google Benchmark, opt-in via
@@ -180,8 +224,9 @@ Minimum checklist for a faithful, usable 8B run (ordered by priority):
 
 - Performance (future): CPU TPL path (no `OpenBLAS`/`MKL` dispatch);
   weight quantization out of scope per above.
-- Small-model examples: `SmolLM2-135M` (same `llama` + `silu` + no-bias
-  family; needs preset + tokenizer/vocab work; fast CPU/CI download).
+- Small-model examples: `SmolLM2-135M` (separate family under
+  `examples/smollm2/` — preset + GPT-2 tokenizer + ChatML driver path +
+  config fixtures; TPL dispatch shared with Llama).
 - Small-model examples: `Qwen3-0.6B` / `1.7B` (needs QK-Norm support plus
   tokenizer/preset work; verify bias and RoPE deltas against their
   `config.json`).
