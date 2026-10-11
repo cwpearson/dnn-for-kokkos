@@ -20,6 +20,7 @@ kokkosdnn_add_test(test_patchembed Test_PatchEmbed.cpp)
 kokkosdnn_add_test(test_tokens Test_Tokens.cpp)
 kokkosdnn_add_test(test_layerscale Test_LayerScale.cpp)
 kokkosdnn_add_test(test_sampler Test_Sampler.cpp)
+kokkosdnn_add_test(test_gemmaops Test_GemmaOps.cpp)
 
 if(KokkosDNN_ENABLE_IMAGE)
   kokkosdnn_add_test(test_image Test_Image.cpp)

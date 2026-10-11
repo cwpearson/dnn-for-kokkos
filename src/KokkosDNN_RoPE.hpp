@@ -79,6 +79,50 @@ Kokkos::View<float*, ExecSpace> rope_inv_freq(int head_dim, float theta,
                                   label);
 }
 
+// Host reference for proportional partial rotary frequencies (e.g. Gemma4
+// full-attention layers; HF transformers
+// `modeling_rope_utils._compute_proportional_rope_parameters`):
+//   n_rot = int(partial_rotary_factor * head_dim / 2) rotary pairs;
+//   inv[j] = theta^(-2j/head_dim) for j < n_rot, 0 for j >= n_rot.
+// Zero entries give angle 0 (cos = 1, sin = 0), so the trailing
+// (1 - partial_rotary_factor) dims pass through the unchanged NeoX kernel.
+// head_dim must be positive and even; partial_rotary_factor in (0, 1].
+inline std::vector<float> rope_inv_freq_proportional_host(
+    int head_dim, float theta, float partial_rotary_factor) {
+  if (head_dim <= 0 || head_dim % 2 != 0)
+    throw std::invalid_argument(
+        "rope_inv_freq_proportional: head_dim must be positive and even (got " +
+        std::to_string(head_dim) + ")");
+  if (!(partial_rotary_factor > 0.0f && partial_rotary_factor <= 1.0f))
+    throw std::invalid_argument(
+        "rope_inv_freq_proportional: partial_rotary_factor must be in (0, 1]");
+  const int half = head_dim / 2;
+  const int n_rot =
+      (int)(partial_rotary_factor * (float)head_dim / 2.0f);
+  std::vector<float> out((size_t)half, 0.0f);
+  for (int j = 0; j < n_rot && j < half; ++j)
+    out[(size_t)j] = (float)(1.0 / std::pow((double)theta,
+                                            (2.0 * (double)j) /
+                                                (double)head_dim));
+  return out;
+}
+
+// Device mirror of rope_inv_freq_proportional_host.
+template <class ExecSpace>
+Kokkos::View<float*, ExecSpace> rope_inv_freq_proportional(
+    int head_dim, float theta, float partial_rotary_factor,
+    const std::string& label = "") {
+  (void)label;
+  std::vector<float> hv =
+      rope_inv_freq_proportional_host(head_dim, theta, partial_rotary_factor);
+  Kokkos::View<float*, ExecSpace> f("rope_inv_freq_proportional",
+                                    head_dim / 2);
+  auto h = Kokkos::create_mirror_view(f);
+  for (int i = 0; i < head_dim / 2; ++i) h(i) = hv[(size_t)i];
+  Kokkos::deep_copy(f, h);
+  return f;
+}
+
 // GPT-NeoX-style rotary embedding applied to q and k in place:
 // for each head, pairs (d, d+half) rotate by angle = pos * inv_freq[d].
 // q, k: [tokens, n_heads, head_dim] (flattened last two dims as [T, H*D]).

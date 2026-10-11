@@ -77,6 +77,75 @@ void gelu_forward(
       });
 }
 
+// Gated-GeLU multiply (e.g. Gemma MLP): out = gelu(gate) * up,
+// elementwise over [tokens, ffn_dim]. NOT SwiGLU (no SiLU). The gate is
+// activated with the selected GELU variant (Gemma uses GeluVariant::Tanh)
+// in FP32 and multiplied by the up projection; the result is cast back to
+// Scalar. In-place safe with respect to gate and up (each output depends
+// only on the same-index inputs, so out may alias gate and/or up).
+template <class ExecSpace, class Scalar>
+void gated_gelu_multiply(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& gate,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& up,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& out,
+    GeluVariant variant = GeluVariant::Tanh,
+    const std::string& label = "KokkosDNN::gated_gelu_multiply") {
+  if (gate.extent(0) != up.extent(0) || gate.extent(1) != up.extent(1) ||
+      gate.extent(0) != out.extent(0) || gate.extent(1) != out.extent(1))
+    throw std::invalid_argument("gated_gelu_multiply: dimension mismatch");
+  const size_t R = gate.extent(0), C = gate.extent(1);
+  if (R == 0 || C == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {R, C}),
+      KOKKOS_LAMBDA(size_t i, size_t j) {
+        float g = static_cast<float>(gate(i, j));
+        out(i, j) = static_cast<Scalar>(
+            Impl::gelu_apply(g, variant) * static_cast<float>(up(i, j)));
+      });
+}
+
+// Final-logit softcapping (e.g. Gemma `final_logit_softcapping`):
+//   y = cap * tanh(x / cap), elementwise.
+// Rank-2 variant (e.g. [tokens, vocab]). Computed in FP32 and cast back to
+// Scalar. In-place safe (x and y may alias). Throws for cap <= 0.
+template <class ExecSpace, class Scalar>
+void logit_softcap_forward(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x, float cap,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& y,
+    const std::string& label = "KokkosDNN::logit_softcap") {
+  if (cap <= 0.0f)
+    throw std::invalid_argument("logit_softcap_forward: cap must be > 0");
+  if (x.extent(0) != y.extent(0) || x.extent(1) != y.extent(1))
+    throw std::invalid_argument("logit_softcap_forward: dimension mismatch");
+  const size_t R = x.extent(0), C = x.extent(1);
+  if (R == 0 || C == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {R, C}),
+      KOKKOS_LAMBDA(size_t i, size_t j) {
+        float v = static_cast<float>(x(i, j));
+        y(i, j) = static_cast<Scalar>(cap * tanhf(v / cap));
+      });
+}
+
+// Rank-1 variant (e.g. single-row decode head).
+template <class ExecSpace, class Scalar>
+void logit_softcap_forward(
+    const Kokkos::View<Scalar*, ExecSpace>& x, float cap,
+    const Kokkos::View<Scalar*, ExecSpace>& y,
+    const std::string& label = "KokkosDNN::logit_softcap") {
+  if (cap <= 0.0f)
+    throw std::invalid_argument("logit_softcap_forward: cap must be > 0");
+  if (x.extent(0) != y.extent(0))
+    throw std::invalid_argument("logit_softcap_forward: dimension mismatch");
+  const size_t N = x.extent(0);
+  if (N == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::RangePolicy<ExecSpace>(0, N), KOKKOS_LAMBDA(size_t i) {
+        float v = static_cast<float>(x(i));
+        y(i) = static_cast<Scalar>(cap * tanhf(v / cap));
+      });
+}
+
 // Elementwise activations for small training MLPs (e.g. the XOR example).
 // All ops are out-of-place-capable and in-place safe (x and y may alias;
 // each output element depends only on the same-index input). Computed in

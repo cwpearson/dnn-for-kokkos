@@ -223,6 +223,45 @@ void layerscale_residual_forward(
       });
 }
 
+// Uniform scalar multiply (e.g. Gemma4 per-layer `layer_scalar`: x *= s[i]).
+// This is genuinely distinct from layerscale_forward above: the scale is a
+// single FP32 scalar broadcast over the whole tensor, not a per-channel [D]
+// vector. out = scalar * x over [T, D] (rank-2) or [D] (rank-1).
+// Scalar-agnostic (float, bhalf_t); computed in FP32. In-place safe
+// (out may alias x).
+template <class ExecSpace, class Scalar>
+void scale_by_scalar(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
+    float scalar,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& out,
+    const std::string& label = "KokkosDNN::scale_by_scalar") {
+  const size_t T = x.extent(0), D = x.extent(1);
+  if (out.extent(0) != T || out.extent(1) != D)
+    throw std::invalid_argument("scale_by_scalar: dimension mismatch");
+  if (T == 0 || D == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, D}),
+      KOKKOS_LAMBDA(size_t t, size_t d) {
+        out(t, d) =
+            static_cast<Scalar>(scalar * static_cast<float>(x(t, d)));
+      });
+}
+
+template <class ExecSpace, class Scalar>
+void scale_by_scalar(
+    const Kokkos::View<Scalar*, ExecSpace>& x, float scalar,
+    const Kokkos::View<Scalar*, ExecSpace>& out,
+    const std::string& label = "KokkosDNN::scale_by_scalar") {
+  const size_t D = x.extent(0);
+  if (out.extent(0) != D)
+    throw std::invalid_argument("scale_by_scalar: dimension mismatch");
+  if (D == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::RangePolicy<ExecSpace>(0, D), KOKKOS_LAMBDA(size_t d) {
+        out(d) = static_cast<Scalar>(scalar * static_cast<float>(x(d)));
+      });
+}
+
 }  // namespace KokkosDNN
 
 #endif

@@ -17,16 +17,22 @@ namespace Impl {
 // Streaming online-softmax GQA core shared by both public overloads below.
 // See the public docs for contract; Scalar is the I/O dtype, accumulation
 // is FP32, views are layout-agnostic (plain Views or subviews alike).
+// sliding_window == 0 selects full causal attention; otherwise query t at
+// absolute position p = q_off + t attends keys
+// [max(0, p + 1 - sliding_window), p] (sliding-window causal mask).
 template <class ExecSpace, class Scalar, class QView, class KView, class VView,
           class OView>
 void attention_gqa_streaming(const DNNHandle<ExecSpace>& handle, const QView& q,
                              const KView& k, const VView& v, size_t q_off,
                              const OView& out, float scale,
+                             size_t sliding_window,
                              const std::string& label) {
 #if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)
   if constexpr (std::is_same_v<Scalar, float> ||
                 std::is_same_v<Scalar, Kokkos::Experimental::bhalf_t>) {
-    if (handle.use_cudnn &&
+    // The cuDNN SDPA graph bakes in a full bottom-right causal mask, so the
+    // windowed path always runs the native kernel.
+    if (sliding_window == 0 && handle.use_cudnn &&
         try_cudnn_sdpa_gqa<Scalar>(handle, q, k, v, q_off, out, scale))
       return;
   } else {
@@ -45,15 +51,22 @@ void attention_gqa_streaming(const DNNHandle<ExecSpace>& handle, const QView& q,
   Kokkos::parallel_for(
       label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, Hq}),
       KOKKOS_LAMBDA(size_t t, size_t h) {
-        size_t klen = q_off + t + 1;
-        if (klen > Ktot) klen = Ktot;
+        size_t khi = q_off + t + 1;
+        if (khi > Ktot) khi = Ktot;
+        size_t klo = 0;
+        if (sliding_window > 0) {
+          const size_t p = q_off + t;  // absolute position of query t
+          const size_t start =
+              (p + 1 >= sliding_window) ? (p + 1 - sliding_window) : 0;
+          if (start > klo) klo = start;
+        }
         const size_t hkv = (h * Hkv) / Hq;
         // Zero the output row (accumulator for the streaming update).
         for (size_t d = 0; d < D; ++d) out(t, h, d) = static_cast<Scalar>(0);
-        if (klen == 0) return;
+        if (khi <= klo) return;
         float m = -1e30f;  // running max; -inf equivalent (scores are >> this)
         float l = 0.0f;    // running sum of exp(s - m)
-        for (size_t kk = 0; kk < klen; ++kk) {
+        for (size_t kk = klo; kk < khi; ++kk) {
           float s = 0;
           for (size_t d = 0; d < D; ++d)
             s += static_cast<float>(q(t, h, d)) *
@@ -127,7 +140,7 @@ void attention_gqa_single(
     const VView& v, size_t q_off, const OView& out, float scale,
     const std::string& label = "KokkosDNN::attn_gqa") {
   Impl::attention_gqa_streaming<ExecSpace, Scalar>(handle, q, k, v, q_off, out,
-                                                  scale, label);
+                                                  scale, 0, label);
 }
 
 template <class ExecSpace, class QView, class KView, class VView, class OView>
@@ -137,7 +150,41 @@ void attention_gqa_single(
     const std::string& label = "KokkosDNN::attn_gqa") {
   using Scalar = std::remove_const_t<typename QView::value_type>;
   Impl::attention_gqa_streaming<ExecSpace, Scalar>(handle, q, k, v, q_off, out,
-                                                  scale, label);
+                                                  scale, 0, label);
+}
+
+// Sliding-window causal GQA (e.g. Gemma4 sliding layers, window 512):
+// same contract as attention_gqa_single, except query t at absolute
+// position p = q_off + t attends keys [max(0, p + 1 - sliding_window), p]
+// instead of the full prefix [0, p]. sliding_window == 0 degrades to full
+// causal attention. GQA mapping, FP32 streaming numerics, and O(1) extra
+// memory match the full-causal path; the windowed path always runs the
+// native Kokkos kernel (no cuDNN dispatch: the cuDNN SDPA graph bakes in a
+// full causal mask).
+//
+// Two overloads: explicit <ExecSpace, Scalar> and a deduction overload
+// taking Scalar from the query view. Both share the Impl core above so
+// behavior cannot diverge from attention_gqa_single.
+template <class ExecSpace, class Scalar, class QView, class KView, class VView,
+          class OView>
+void attention_gqa_single_sliding(
+    const DNNHandle<ExecSpace>& handle, const QView& q, const KView& k,
+    const VView& v, size_t q_off, const OView& out, float scale,
+    size_t sliding_window,
+    const std::string& label = "KokkosDNN::attn_gqa_sliding") {
+  Impl::attention_gqa_streaming<ExecSpace, Scalar>(handle, q, k, v, q_off, out,
+                                                  scale, sliding_window, label);
+}
+
+template <class ExecSpace, class QView, class KView, class VView, class OView>
+void attention_gqa_single_sliding(
+    const DNNHandle<ExecSpace>& handle, const QView& q, const KView& k,
+    const VView& v, size_t q_off, const OView& out, float scale,
+    size_t sliding_window,
+    const std::string& label = "KokkosDNN::attn_gqa_sliding") {
+  using Scalar = std::remove_const_t<typename QView::value_type>;
+  Impl::attention_gqa_streaming<ExecSpace, Scalar>(handle, q, k, v, q_off, out,
+                                                  scale, sliding_window, label);
 }
 
 namespace Impl {
