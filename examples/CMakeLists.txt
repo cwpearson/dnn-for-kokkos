@@ -1,4 +1,5 @@
 add_subdirectory(llama)
 add_subdirectory(dinov3)
 add_subdirectory(smollm2)
+add_subdirectory(gemma4)
 add_subdirectory(xor)
