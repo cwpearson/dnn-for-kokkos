@@ -131,7 +131,7 @@ void ple_gate_mul(
     const std::string& label = "Gemma4::ple_gate_mul") {
   const size_t T = g.extent(0), P = (size_t)ple_dim;
   const size_t off = (size_t)layer * P;
-  if (g.extent(1) != P || mix.extent(0) != T || mix.extent(1) <= off + P)
+  if (g.extent(1) != P || mix.extent(0) != T || mix.extent(1) < off + P)
     throw std::invalid_argument("ple_gate_mul: dimension mismatch");
   if (T == 0 || P == 0) return;
   Kokkos::parallel_for(
