@@ -5,6 +5,7 @@
 #include "KokkosDNN_Types.hpp"
 #include "KokkosDNN_Handle.hpp"
 #include "KokkosDNN_Gemm.hpp"
+#include "KokkosDNN_GemmBias.hpp"
 #include "KokkosDNN_RMSNorm.hpp"
 #include "KokkosDNN_LayerNorm.hpp"
 #include "KokkosDNN_Softmax.hpp"
