@@ -191,7 +191,7 @@ class Model {
       kv_pages_alloc_.assign((size_t)NL, 0);
       for (int l = 0; l < NL; ++l) {
         kv_table[l] = ViewInt("kv_table", npages);
-        KvDetail::fill_identity<ExecSpace>(kv_table[l]);
+        Impl::fill_identity<ExecSpace>(kv_table[l]);
         if (!q) {
           kp_pool.emplace_back("kp_pool", size_t(0), page, NKV, HD);
           vp_pool.emplace_back("vp_pool", size_t(0), page, NKV, HD);
@@ -230,8 +230,8 @@ class Model {
         PagedPool nk("kp_pool", want, page, NKV, HD);
         PagedPool nv("vp_pool", want, page, NKV, HD);
         if (have > 0) {
-          KvDetail::copy_prefix_4<ExecSpace>(nk, kp_pool[(size_t)l]);
-          KvDetail::copy_prefix_4<ExecSpace>(nv, vp_pool[(size_t)l]);
+          Impl::copy_prefix_4<ExecSpace>(nk, kp_pool[(size_t)l]);
+          Impl::copy_prefix_4<ExecSpace>(nv, vp_pool[(size_t)l]);
           Kokkos::fence();
         }
         kp_pool[(size_t)l] = nk;
@@ -242,10 +242,10 @@ class Model {
         SPool sk("ksp_pool", want, page, NKV);
         SPool sv("vsp_pool", want, page, NKV);
         if (have > 0) {
-          KvDetail::copy_prefix_4<ExecSpace>(nk, kqp_pool[(size_t)l]);
-          KvDetail::copy_prefix_4<ExecSpace>(nv, vqp_pool[(size_t)l]);
-          KvDetail::copy_prefix_3<ExecSpace>(sk, ksp_pool[(size_t)l]);
-          KvDetail::copy_prefix_3<ExecSpace>(sv, vsp_pool[(size_t)l]);
+          Impl::copy_prefix_4<ExecSpace>(nk, kqp_pool[(size_t)l]);
+          Impl::copy_prefix_4<ExecSpace>(nv, vqp_pool[(size_t)l]);
+          Impl::copy_prefix_3<ExecSpace>(sk, ksp_pool[(size_t)l]);
+          Impl::copy_prefix_3<ExecSpace>(sv, vsp_pool[(size_t)l]);
           Kokkos::fence();
         }
         kqp_pool[(size_t)l] = nk;

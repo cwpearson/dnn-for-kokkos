@@ -11,7 +11,7 @@
 #include "KokkosDNN_Handle.hpp"
 
 namespace KokkosDNN {
-namespace KvDetail {
+namespace Impl {
 
 // Small residency helpers used by the Llama Model's paged pools. These are
 // free functions (not private Model members) on purpose: nvcc extended
@@ -55,7 +55,7 @@ void copy_prefix_3(const DstView& dst, const SrcView& src) {
       });
 }
 
-}  // namespace KvDetail
+}  // namespace Impl
 
 // Paged + int8-quantized KV-cache primitives for long-context inference.
 //

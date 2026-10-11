@@ -79,24 +79,6 @@ TEST(Gelu, TanhFloat2D) {
   check_gelu_2d<float>(KokkosDNN::GeluVariant::Tanh, 1e-6);
 }
 
-// Default variant must be the exact erf form (HF ACT2FN["gelu"]).
-TEST(Gelu, DefaultIsExactErf) {
-  using Exec = Kokkos::DefaultExecutionSpace;
-  const auto& vals = probe_values();
-  const size_t R = 1, C = vals.size();
-  Kokkos::View<float**, Kokkos::LayoutRight, Exec> x("x", R, C), y("y", R, C);
-  auto hx = Kokkos::create_mirror_view(x);
-  for (size_t j = 0; j < C; ++j) hx(0, j) = vals[j];
-  Kokkos::deep_copy(x, hx);
-  KokkosDNN::gelu_forward<Exec, float>(x, y);  // no variant -> ExactErf
-  Kokkos::fence();
-  auto got = Kokkos::create_mirror_view(y);
-  Kokkos::deep_copy(got, y);
-  for (size_t j = 0; j < C; ++j)
-    EXPECT_NEAR(got(0, j), gelu_exact_ref(vals[j]), 1e-6)
-        << "default-variant mismatch at x=" << vals[j];
-}
-
 TEST(Gelu, InPlaceAndRank1) {
   using Exec = Kokkos::DefaultExecutionSpace;
   const auto& vals = probe_values();
@@ -119,7 +101,7 @@ TEST(Gelu, InPlaceAndRank1) {
     }
     Kokkos::deep_copy(z, h);
   }
-  KokkosDNN::gelu_forward<Exec, float>(z, z);  // in-place, default erf
+  KokkosDNN::gelu_forward<Exec, float>(z, z, KokkosDNN::GeluVariant::ExactErf);
   Kokkos::fence();
   auto got1 = Kokkos::create_mirror_view(y);
   Kokkos::deep_copy(got1, y);

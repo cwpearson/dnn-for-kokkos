@@ -77,7 +77,7 @@ class HostRNG {
   std::mt19937_64 eng_;
 };
 
-namespace sampler_detail {
+namespace Impl {
 
 // Softmax (max-subtracted) over vals. Returns empty on empty input.
 inline std::vector<float> softmax(const std::vector<float>& vals) {
@@ -127,7 +127,7 @@ inline int categorical(const std::vector<float>& weights, HostRNG& rng) {
   return 0;
 }
 
-}  // namespace sampler_detail
+}  // namespace Impl
 
 // Divide positive penalized logits by `penalty`, multiply negative ones
 // (HF / llama.cpp convention). Each distinct prior id is penalized once,
@@ -190,7 +190,7 @@ inline std::vector<int> top_p_keep(const float* logits, size_t V, float top_p) {
   }
   std::vector<float> vals(V);
   for (size_t i = 0; i < V; ++i) vals[i] = logits[i];
-  std::vector<float> probs = sampler_detail::softmax(vals);
+  std::vector<float> probs = Impl::softmax(vals);
   std::sort(order.begin(), order.end(),
             [&](int a, int b) { return logits[a] > logits[b]; });
   if (!(top_p > 0.0f)) return std::vector<int>{order[0]};
@@ -222,7 +222,7 @@ inline std::vector<int> min_p_keep(const float* logits, size_t V, float min_p) {
   if (!(min_p > 0.0f)) return order;
   std::vector<float> vals(V);
   for (size_t i = 0; i < V; ++i) vals[i] = logits[i];
-  std::vector<float> probs = sampler_detail::softmax(vals);
+  std::vector<float> probs = Impl::softmax(vals);
   if (!(min_p < 1.0f)) return std::vector<int>{order[0]};
   float pmax = probs[(size_t)order[0]];
   float thresh = min_p * pmax;
@@ -280,7 +280,7 @@ inline int sample_host_logits(const float* logits, size_t V,
   std::vector<float> clogits(cand.size());
   for (size_t i = 0; i < cand.size(); ++i) clogits[i] = work[(size_t)cand[i]];
 
-  std::vector<float> probs = sampler_detail::softmax(clogits);
+  std::vector<float> probs = Impl::softmax(clogits);
   // Descending order over the candidate set (by logit == by prob).
   std::vector<int> order(cand.size());
   std::iota(order.begin(), order.end(), 0);
@@ -324,7 +324,7 @@ inline int sample_host_logits(const float* logits, size_t V,
 
   std::vector<float> final_w(kept.size());
   for (size_t i = 0; i < kept.size(); ++i) final_w[i] = probs[(size_t)kept[i]];
-  int pick = sampler_detail::categorical(final_w, rng);
+  int pick = Impl::categorical(final_w, rng);
   return cand[(size_t)kept[(size_t)pick]];
 }
 

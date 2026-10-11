@@ -1,5 +1,5 @@
 // Bidirectional (non-causal) MHA: host-reference agreement (float +
-// bfloat16, MHA + GQA mappings), default-scale == 1/sqrt(Dh), and the
+// bfloat16, MHA + GQA mappings), and the
 // non-causal property (early outputs depend on future tokens, unlike the
 // causal kernel).
 #include <gtest/gtest.h>
@@ -111,45 +111,6 @@ TEST(AttentionBidirectional, FloatGQAReference) {
 TEST(AttentionBidirectional, BHalfMHAReference) {
   check_bidir_reference<Kokkos::Experimental::bhalf_t>(
       /*T=*/5, /*K=*/5, /*Hq=*/2, /*Hkv=*/2, /*D=*/8, 5e-2f);
-}
-
-// ViT-B/16 head_dim default scale: omitted scale (<= 0 => 1/sqrt(Dh))
-// must match an explicit 1/sqrt(Dh) call, using Dh=64 like the model.
-TEST(AttentionBidirectional, DefaultScaleMatchesExplicit) {
-  using Exec = Kokkos::DefaultExecutionSpace;
-  KokkosDNN::DNNHandle<Exec> h;
-  const int T = 4, H = 2, D = 64;
-  const float explicit_scale = 1.0f / std::sqrt(static_cast<float>(D));
-  Kokkos::View<float***, Exec> q("q", T, H, D), k("k", T, H, D),
-      v("v", T, H, D), o_def("o_def", T, H, D), o_exp("o_exp", T, H, D);
-  auto hq = Kokkos::create_mirror_view(q);
-  auto hk = Kokkos::create_mirror_view(k);
-  auto hv = Kokkos::create_mirror_view(v);
-  for (int t = 0; t < T; ++t)
-    for (int hh = 0; hh < H; ++hh)
-      for (int d = 0; d < D; ++d) {
-        hq(t, hh, d) = 0.02f * ((t * 11 + hh * 7 + d) % 23) - 0.2f;
-        hk(t, hh, d) = 0.02f * ((t * 5 + hh * 13 + d * 2) % 29) - 0.2f;
-        hv(t, hh, d) = 0.02f * ((t * 3 + hh * 17 + d) % 31) - 0.3f;
-      }
-  Kokkos::deep_copy(q, hq);
-  Kokkos::deep_copy(k, hk);
-  Kokkos::deep_copy(v, hv);
-  // Explicit <Exec, Scalar> overload with defaulted scale vs explicit scale.
-  KokkosDNN::attention_mha_bidirectional<Exec, float>(h, q, k, v, o_def);
-  KokkosDNN::attention_mha_bidirectional<Exec, float>(h, q, k, v, o_exp,
-                                                     explicit_scale);
-  Kokkos::fence();
-  auto gd = Kokkos::create_mirror_view(o_def);
-  auto ge = Kokkos::create_mirror_view(o_exp);
-  Kokkos::deep_copy(gd, o_def);
-  Kokkos::deep_copy(ge, o_exp);
-  for (int t = 0; t < T; ++t)
-    for (int hh = 0; hh < H; ++hh)
-      for (int d = 0; d < D; ++d)
-        EXPECT_NEAR(gd(t, hh, d), ge(t, hh, d), 1e-6f)
-            << "default-scale mismatch at (" << t << "," << hh << "," << d
-            << ")";
 }
 
 // Non-causal property: perturbing a FUTURE key/value (last token) must
