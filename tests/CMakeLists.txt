@@ -7,6 +7,7 @@ endfunction()
 
 kokkosdnn_add_test(test_gemm Test_Gemm.cpp)
 kokkosdnn_add_test(test_rmsnorm Test_RMSNorm.cpp)
+kokkosdnn_add_test(test_layernorm Test_LayerNorm.cpp)
 kokkosdnn_add_test(test_softmax Test_Softmax.cpp)
 kokkosdnn_add_test(test_rope Test_RoPE.cpp)
 kokkosdnn_add_test(test_swiglu Test_SwiGLU.cpp)

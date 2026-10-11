@@ -6,6 +6,7 @@
 #include "KokkosDNN_Handle.hpp"
 #include "KokkosDNN_Gemm.hpp"
 #include "KokkosDNN_RMSNorm.hpp"
+#include "KokkosDNN_LayerNorm.hpp"
 #include "KokkosDNN_Softmax.hpp"
 #include "KokkosDNN_RoPE.hpp"
 #include "KokkosDNN_SwiGLU.hpp"
