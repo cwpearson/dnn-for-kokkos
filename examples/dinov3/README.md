@@ -18,7 +18,7 @@ This directory currently holds only this TODO list. Not wired into
 Core `src/` ops (all missing today):
 
 - [x] `layernorm_forward` (weight+bias, FP32 accum) — `RMSNorm` is not a substitute. Done: `src/KokkosDNN_LayerNorm.hpp` (`KokkosDNN::layernorm_forward`/`layernorm_row`).
-- [ ] `gelu_forward` — pin HF `ACT2FN["gelu"]` erf-vs-tanh variant first.
+- [x] `gelu_forward` — pin HF `ACT2FN["gelu"]` erf-vs-tanh variant first. Done: `src/KokkosDNN_Activation.hpp` (`KokkosDNN::gelu_forward`, `GeluVariant::ExactErf` default = HF `gelu`, `Tanh` = `gelu_new`).
 - [ ] Biased linear for inference (`gemm_bias`: `Y=X·Wᵀ+b`, reuse cuBLAS path).
 - [ ] Bidirectional full MHA (non-causal; current `attention_gqa_single` is causal-only; cuDNN graph is causal-only too).
 - [ ] 2D axial RoPE (`head_dim/4` inv_freq, dynamic H/W coords, `rotate_half`, patch-tokens-only, prefix skip).
