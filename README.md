@@ -37,7 +37,7 @@ Options:
 | Option | Default | Effect |
 | --- | --- | --- |
 | `KokkosDNN_ENABLE_TESTS` | ON | build `tests/` |
-| `KokkosDNN_ENABLE_EXAMPLES` | ON | build `examples/` (`llama_generate`, `xor_train`, + example tests) |
+| `KokkosDNN_ENABLE_EXAMPLES` | ON | build `examples/` (`llama_generate`, `smollm2_generate`, `xor_train`, + example tests) |
 | `KokkosDNN_ENABLE_BENCHMARKS` | OFF | build `benchmarks/kokkosdnn_bench` (Google Benchmark, fetched if needed) |
 | `KokkosDNN_ENABLE_CUBLAS` | OFF | GEMM via cuBLAS on CUDA spaces |
 | `KokkosDNN_ENABLE_CUDNN` | OFF | attention via cuDNN SDPA (with automatic native fallback; needs `<cudnn.h>` + `cudnn-frontend`, fetched automatically) |
@@ -45,6 +45,7 @@ Options:
 ## Examples
 
 - [llama](examples/llama/) — Llama 3.1 8B-Instruct (plus 3.2 1B) inference with KV-cache autoregressive generation via the `llama_generate` driver.
+- [smollm2](examples/smollm2/) — SmolLM2-135M (base + Instruct) inference with KV-cache autoregressive generation via the `smollm2_generate` driver.
 - [xor](examples/xor/) — 2-layer MLP that learns the XOR truth table with full-batch Adam via the `xor_train` driver.
 
 See each directory's README for flags, run commands, and design notes.
