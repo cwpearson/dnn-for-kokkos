@@ -30,11 +30,20 @@ void attention_gqa_streaming(const DNNHandle<ExecSpace>& handle, const QView& q,
 #if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)
   if constexpr (std::is_same_v<Scalar, float> ||
                 std::is_same_v<Scalar, Kokkos::Experimental::bhalf_t>) {
-    // The cuDNN SDPA graph bakes in a full bottom-right causal mask, so the
-    // windowed path always runs the native kernel.
-    if (sliding_window == 0 && handle.use_cudnn &&
-        try_cudnn_sdpa_gqa<Scalar>(handle, q, k, v, q_off, out, scale))
-      return;
+    // Full causal (sliding_window == 0) uses the bottom-right causal cuDNN
+    // SDPA graph; the windowed path uses the sliding cuDNN SDPA graph
+    // (bottom-right alignment + left band bound == window). Either returning
+    // false falls back to the native kernel below.
+    if (handle.use_cudnn) {
+      if (sliding_window == 0) {
+        if (try_cudnn_sdpa_gqa<Scalar>(handle, q, k, v, q_off, out, scale))
+          return;
+      } else {
+        if (try_cudnn_sdpa_gqa_sliding<Scalar>(handle, q, k, v, q_off, out,
+                                               scale, sliding_window))
+          return;
+      }
+    }
   } else {
     (void)handle;
   }
@@ -158,9 +167,10 @@ void attention_gqa_single(
 // position p = q_off + t attends keys [max(0, p + 1 - sliding_window), p]
 // instead of the full prefix [0, p]. sliding_window == 0 degrades to full
 // causal attention. GQA mapping, FP32 streaming numerics, and O(1) extra
-// memory match the full-causal path; the windowed path always runs the
-// native Kokkos kernel (no cuDNN dispatch: the cuDNN SDPA graph bakes in a
-// full causal mask).
+// memory match the full-causal path. On CUDA builds with cuDNN enabled,
+// float and bhalf_t dispatch to cuDNN SDPA first (sliding graph with left
+// band bound == window; falls back to native on failure), like the
+// full-causal path; other scalars run the native Kokkos kernel.
 //
 // Two overloads: explicit <ExecSpace, Scalar> and a deduction overload
 // taking Scalar from the query view. Both share the Impl core above so

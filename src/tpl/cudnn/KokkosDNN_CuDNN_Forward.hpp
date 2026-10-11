@@ -28,6 +28,21 @@ bool cudnn_sdpa_forward(void* cached_handle, CudnnSdpaScalar dtype,
                         int64_t v_sH, int64_t v_sD, int64_t o_sT, int64_t o_sH,
                         int64_t o_sD, float scale);
 
+// Sliding-window causal variant: same contract as cudnn_sdpa_forward, plus
+// a bottom-right-aligned diagonal band with left_bound == window, so each
+// query attends to at most `window` keys back (mask columns at or before
+// row_idx - window). window <= 0 declines (returns false); the caller
+// routes window == 0 to cudnn_sdpa_forward instead.
+bool cudnn_sdpa_forward_sliding(void* cached_handle, CudnnSdpaScalar dtype,
+                                const void* q, const void* k, const void* v,
+                                void* out, int64_t T, int64_t Ktot, int64_t Hq,
+                                int64_t Hkv, int64_t D, int64_t q_sT,
+                                int64_t q_sH, int64_t q_sD, int64_t k_sT,
+                                int64_t k_sH, int64_t k_sD, int64_t v_sT,
+                                int64_t v_sH, int64_t v_sD, int64_t o_sT,
+                                int64_t o_sH, int64_t o_sD, float scale,
+                                int64_t window);
+
 }  // namespace Impl
 }  // namespace KokkosDNN
 
