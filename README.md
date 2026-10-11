@@ -17,38 +17,6 @@ It provides:
 
 Scope is deliberately narrow: **bfloat16 storage/compute by default** (`--fp32` opts in). The Llama path is **inference only** (prefill + greedy decode), no weight quantization (the KV cache has an optional int8 mode, see below). A small set of training ops (dense forward/backward, sigmoid/tanh/ReLU, BCE-with-logits, SGD/Adam) supports the XOR example (`examples/xor/`: 2-layer MLP trained with full-batch Adam, also wired as a fast CPU unit test). All ops are templated on the scalar type (`float`, `Kokkos::Experimental::bhalf_t`) with FP32 accumulation; TPL paths cover GEMM for both scalars and fall back to native otherwise.
 
-## Layout
-
-```text
-CMakeLists.txt            standalone build, find_package(Kokkos)
-cmake/                    config header + package config templates
-src/
-  KokkosDNN.hpp           umbrella header
-  KokkosDNN_Types.hpp     FP32 View aliases
-  KokkosDNN_Handle.hpp    TPL dispatch handle (keeps call sites ifdef-free)
-  KokkosDNN_Gemm.hpp      Y = X·Wᵀ (+ cuBLAS path)
-  KokkosDNN_RMSNorm.hpp
-  KokkosDNN_Softmax.hpp
-  KokkosDNN_RoPE.hpp      NeoX-style rotary, rope_theta = 500000
-  KokkosDNN_SwiGLU.hpp
-  KokkosDNN_Embedding.hpp
-  KokkosDNN_Attention.hpp (+ _CuDNN: working SDPA dispatch, _CuDNN.cpp TU)
-  KokkosDNN_KVCache.hpp   paged / int8 KV (block-table attention,
-                          per-token per-head quant scales)
-  KokkosDNN_Sampler.hpp   greedy argmax
-  KokkosDNN_PrintConfiguration.cpp
-examples/llama/           Llama 3 example (not part of the library)
-  KokkosDNN_LlamaConfig.hpp    3.1 8B-Instruct defaults + tiny_test()
-  KokkosDNN_LlamaWeights.{hpp,cpp}
-  KokkosDNN_Tokenizer.{hpp,cpp}
-  KokkosDNN_LlamaModel.hpp     KV-cache Model::forward/generate (dense /
-                          paged x FP / int8 modes)
-  llama_generate.cpp      driver
-  Test_LlamaGenerate.cpp / Test_Safetensors.cpp / Test_LlamaKVCache.cpp (example-level tests)
-tests/                    one executable per core op
-benchmarks/               Google Benchmark micros (native vs TPL dispatch)
-```
-
 ## Requirements
 
 - CMake ≥ 3.22, C++20 compiler
