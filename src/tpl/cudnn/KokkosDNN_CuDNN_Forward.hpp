@@ -21,12 +21,22 @@ namespace KokkosDNN {
 namespace Impl {
 
 bool cudnn_sdpa_forward(void* cached_handle, CudnnSdpaScalar dtype,
-                        const void* q, const void* k, const void* v, void* out,
-                        int64_t T, int64_t Ktot, int64_t Hq, int64_t Hkv,
-                        int64_t D, int64_t q_sT, int64_t q_sH, int64_t q_sD,
-                        int64_t k_sT, int64_t k_sH, int64_t k_sD, int64_t v_sT,
-                        int64_t v_sH, int64_t v_sD, int64_t o_sT, int64_t o_sH,
-                        int64_t o_sD, float scale);
+                         const void* q, const void* k, const void* v, void* out,
+                         int64_t T, int64_t Ktot, int64_t Hq, int64_t Hkv,
+                         int64_t D, int64_t q_sT, int64_t q_sH, int64_t q_sD,
+                         int64_t k_sT, int64_t k_sH, int64_t k_sD, int64_t v_sT,
+                         int64_t v_sH, int64_t v_sD, int64_t o_sT, int64_t o_sH,
+                         int64_t o_sD, float scale);
+
+// Non-causal (dense) SDPA variant for bidirectional attention: same
+// signature/contract as cudnn_sdpa_forward, except the graph omits the
+// diagonal-mask attributes so every query attends to all keys.
+bool cudnn_sdpa_forward_noncausal(
+    void* cached_handle, CudnnSdpaScalar dtype, const void* q, const void* k,
+    const void* v, void* out, int64_t T, int64_t Ktot, int64_t Hq, int64_t Hkv,
+    int64_t D, int64_t q_sT, int64_t q_sH, int64_t q_sD, int64_t k_sT,
+    int64_t k_sH, int64_t k_sD, int64_t v_sT, int64_t v_sH, int64_t v_sD,
+    int64_t o_sT, int64_t o_sH, int64_t o_sD, float scale);
 
 }  // namespace Impl
 }  // namespace KokkosDNN

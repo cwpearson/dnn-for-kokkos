@@ -198,13 +198,6 @@ void attention_bidirectional_streaming(const DNNHandle<ExecSpace>& handle,
                                        const QView& q, const KView& k,
                                        const VView& v, const OView& out,
                                        float scale, const std::string& label) {
-  // NOTE: no cuDNN dispatch here. The cuDNN SDPA graph used by the causal
-  // path (see tpl/cudnn/) bakes in a bottom-right causal mask, so it cannot
-  // serve bidirectional attention; a non-causal graph variant does not exist
-  // yet. Run the native Kokkos kernel unconditionally. The handle parameter
-  // is kept so a future non-causal TPL branch can slot in without changing
-  // the public signature.
-  (void)handle;
   const size_t T = q.extent(0), Hq = q.extent(1), D = q.extent(2);
   const size_t Hkv = k.extent(1);
   const size_t Ktot = k.extent(0);
@@ -212,6 +205,19 @@ void attention_bidirectional_streaming(const DNNHandle<ExecSpace>& handle,
   // scale <= 0 selects the ViT default 1/sqrt(head_dim); see public docs.
   const float eff =
       (scale > 0.0f) ? scale : 1.0f / std::sqrt(static_cast<float>(D));
+
+#if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)
+  if constexpr (std::is_same_v<Scalar, float> ||
+                std::is_same_v<Scalar, Kokkos::Experimental::bhalf_t>) {
+    if (handle.use_cudnn &&
+        try_cudnn_sdpa_bidir<Scalar>(handle, q, k, v, out, eff))
+      return;
+  } else {
+    (void)handle;
+  }
+#else
+  (void)handle;
+#endif
 
   // One thread per (query token, query head); streams over the full key
   // axis with an online softmax running state (m, l) and accumulates
@@ -274,9 +280,9 @@ void attention_bidirectional_streaming(const DNNHandle<ExecSpace>& handle,
 //
 // scale : softmax scale; pass <= 0 (the default) for 1/sqrt(Dh).
 //
-// TPL: always runs the native Kokkos kernel. The cuDNN SDPA graph behind
-// the causal path is causal-only (bottom-right mask), so this function
-// deliberately does not dispatch to it; see the Impl note above.
+// TPL: float and bhalf_t dispatch to the non-causal cuDNN SDPA graph
+// first (see tpl/cudnn/); any failure falls back to the native kernel.
+// Other scalars run the native kernel. Otherwise native.
 //
 // Two overloads: explicit <ExecSpace, Scalar> and a deduction overload
 // taking Scalar from the query view. Both share the Impl core above so

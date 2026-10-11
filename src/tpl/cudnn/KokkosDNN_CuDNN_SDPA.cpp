@@ -2,13 +2,16 @@
 //
 // Single translation unit that includes <cudnn_frontend.h> so the rest of
 // the (header-only) library does not pay the frontend compile cost.
-// The header declares cudnn_sdpa_forward(); here it is either a stub
+// The header declares cudnn_sdpa_forward() (causal) and
+// cudnn_sdpa_forward_noncausal() (dense); here they are either stubs
 // returning false (CUDNN disabled or non-CUDA build) or the real graph.
 //
-// Real path: one inference SDPA node (generate_stats=false) with
-// bottom-right causal masking (diagonal_alignment=BOTTOM_RIGHT,
-// right_bound=0), which matches the native kernel's mask when
-// Ktot == q_off + T (checked by the caller). Q/K/V/O are described with
+// Real path: one inference SDPA node (generate_stats=false). The causal
+// variant bakes in bottom-right causal masking
+// (diagonal_alignment=BOTTOM_RIGHT, right_bound=0), which matches the
+// native kernel's mask when Ktot == q_off + T (checked by the caller);
+// the non-causal variant omits the diagonal-mask attributes for dense
+// attention. Q/K/V/O are described with
 // the caller's Kokkos strides (B=1, dims [B,H,S,D]), so arbitrary
 // Kokkos layouts and cache subviews work with no repack copy.
 // Implementation selection is AUTO: unified flash for BF16, composite
@@ -37,13 +40,18 @@ namespace fe = cudnn_frontend;
 namespace KokkosDNN {
 namespace Impl {
 
-bool cudnn_sdpa_forward(void* cached_handle, CudnnSdpaScalar dtype,
-                        const void* q, const void* k, const void* v, void* out,
-                        int64_t T, int64_t Ktot, int64_t Hq, int64_t Hkv,
-                        int64_t D, int64_t q_sT, int64_t q_sH, int64_t q_sD,
-                        int64_t k_sT, int64_t k_sH, int64_t k_sD, int64_t v_sT,
-                        int64_t v_sH, int64_t v_sD, int64_t o_sT, int64_t o_sH,
-                        int64_t o_sD, float scale) {
+namespace {
+// Shared SDPA graph builder/executor. causal=true bakes in the
+// bottom-right causal mask (right_bound=0); causal=false omits the
+// diagonal-mask attributes entirely, which per the cuDNN frontend docs
+// yields dense (non-causal) attention.
+bool sdpa_forward_impl(void* cached_handle, CudnnSdpaScalar dtype,
+                       const void* q, const void* k, const void* v, void* out,
+                       int64_t T, int64_t Ktot, int64_t Hq, int64_t Hkv,
+                       int64_t D, int64_t q_sT, int64_t q_sH, int64_t q_sD,
+                       int64_t k_sT, int64_t k_sH, int64_t k_sD, int64_t v_sT,
+                       int64_t v_sH, int64_t v_sD, int64_t o_sT, int64_t o_sH,
+                       int64_t o_sD, float scale, bool causal) {
   if (cached_handle == nullptr) return false;
   if (q == nullptr || k == nullptr || v == nullptr || out == nullptr)
     return false;
@@ -126,12 +134,15 @@ bool cudnn_sdpa_forward(void* cached_handle, CudnnSdpaScalar dtype,
     }
 
     auto sdpa_options = fe::graph::SDPA_attributes()
-                            .set_name("kokkosdnn_sdpa")
+                            .set_name(causal ? "kokkosdnn_sdpa"
+                                             : "kokkosdnn_sdpa_noncausal")
                             .set_attn_scale(scale)
-                            .set_generate_stats(false)
-                            .set_diagonal_alignment(
-                                fe::DiagonalAlignment_t::BOTTOM_RIGHT)
-                            .set_diagonal_band_right_bound(0);
+                            .set_generate_stats(false);
+    if (causal) {
+      sdpa_options.set_diagonal_alignment(
+          fe::DiagonalAlignment_t::BOTTOM_RIGHT);
+      sdpa_options.set_diagonal_band_right_bound(0);
+    }
     if (io_type == fe::DataType_t::FLOAT) {
       // FP32 I/O is only served by the composite (matmul + softmax +
       // matmul) implementation; AUTO selection does not route there on
@@ -182,6 +193,33 @@ bool cudnn_sdpa_forward(void* cached_handle, CudnnSdpaScalar dtype,
   return ok;
 }
 
+}  // namespace
+
+bool cudnn_sdpa_forward(void* cached_handle, CudnnSdpaScalar dtype,
+                        const void* q, const void* k, const void* v, void* out,
+                        int64_t T, int64_t Ktot, int64_t Hq, int64_t Hkv,
+                        int64_t D, int64_t q_sT, int64_t q_sH, int64_t q_sD,
+                        int64_t k_sT, int64_t k_sH, int64_t k_sD, int64_t v_sT,
+                        int64_t v_sH, int64_t v_sD, int64_t o_sT, int64_t o_sH,
+                        int64_t o_sD, float scale) {
+  return sdpa_forward_impl(cached_handle, dtype, q, k, v, out, T, Ktot, Hq,
+                           Hkv, D, q_sT, q_sH, q_sD, k_sT, k_sH, k_sD, v_sT,
+                           v_sH, v_sD, o_sT, o_sH, o_sD, scale,
+                           /*causal=*/true);
+}
+
+bool cudnn_sdpa_forward_noncausal(
+    void* cached_handle, CudnnSdpaScalar dtype, const void* q, const void* k,
+    const void* v, void* out, int64_t T, int64_t Ktot, int64_t Hq, int64_t Hkv,
+    int64_t D, int64_t q_sT, int64_t q_sH, int64_t q_sD, int64_t k_sT,
+    int64_t k_sH, int64_t k_sD, int64_t v_sT, int64_t v_sH, int64_t v_sD,
+    int64_t o_sT, int64_t o_sH, int64_t o_sD, float scale) {
+  return sdpa_forward_impl(cached_handle, dtype, q, k, v, out, T, Ktot, Hq,
+                           Hkv, D, q_sT, q_sH, q_sD, k_sT, k_sH, k_sD, v_sT,
+                           v_sH, v_sD, o_sT, o_sH, o_sD, scale,
+                           /*causal=*/false);
+}
+
 }  // namespace Impl
 }  // namespace KokkosDNN
 
@@ -195,6 +233,15 @@ bool cudnn_sdpa_forward(void*, CudnnSdpaScalar, const void*, const void*,
                         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                         int64_t, int64_t, float) {
+  return false;
+}
+
+bool cudnn_sdpa_forward_noncausal(void*, CudnnSdpaScalar, const void*,
+                                  const void*, const void*, void*, int64_t,
+                                  int64_t, int64_t, int64_t, int64_t, int64_t,
+                                  int64_t, int64_t, int64_t, int64_t, int64_t,
+                                  int64_t, int64_t, int64_t, int64_t, int64_t,
+                                  int64_t, float) {
   return false;
 }
 

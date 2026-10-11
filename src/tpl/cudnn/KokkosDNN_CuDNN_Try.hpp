@@ -141,6 +141,125 @@ inline bool try_cudnn_sdpa_gqa(const DNNHandle<Exec>& handle, const QView& q,
   return ok;
 }
 
+// Non-causal (bidirectional) SDPA dispatch over Kokkos views. Mirrors
+// try_cudnn_sdpa_gqa (dtype mapping, GQA Hq%Hkv check, D-contiguity
+// repack of Q/K/V/O incl. repack_out deep_copy back) but without the
+// causal Ktot == q_off + T requirement: bidirectional attention attends
+// to all K keys, so there is no q_off parameter.
+template <class Scalar, class Exec, class QView, class KView, class VView,
+          class OView>
+inline bool try_cudnn_sdpa_bidir(const DNNHandle<Exec>& handle, const QView& q,
+                                 const KView& k, const VView& v,
+                                 const OView& out, float scale) {
+  const int64_t T   = static_cast<int64_t>(q.extent(0));
+  const int64_t Hq  = static_cast<int64_t>(q.extent(1));
+  const int64_t D   = static_cast<int64_t>(q.extent(2));
+  const int64_t Hkv = static_cast<int64_t>(k.extent(1));
+  const int64_t Ktot = static_cast<int64_t>(k.extent(0));
+  if (T <= 0 || Hq <= 0 || Hkv <= 0 || D <= 0 || Ktot <= 0) return false;
+  if (static_cast<int64_t>(v.extent(0)) != Ktot) return false;
+  if (static_cast<int64_t>(v.extent(1)) != Hkv) return false;
+  if (static_cast<int64_t>(v.extent(2)) != D) return false;
+  if (static_cast<int64_t>(out.extent(0)) != T) return false;
+  if (static_cast<int64_t>(out.extent(1)) != Hq) return false;
+  if (static_cast<int64_t>(out.extent(2)) != D) return false;
+  // GQA requires whole-group mapping, matching the native kernel's
+  // hkv = (h * Hkv) / Hq integer projection.
+  if (Hq % Hkv != 0) return false;
+  if (q.data() == nullptr || k.data() == nullptr || v.data() == nullptr ||
+      out.data() == nullptr)
+    return false;
+
+  CudnnSdpaScalar dtype;
+  if constexpr (std::is_same_v<Scalar, float>) {
+    dtype = CudnnSdpaScalar::Float;
+    // No shape exclusion here: the only known-bad combination (FP32,
+    // s_q == 1 with GQA on cuDNN <= 9.27.0) is guarded inside
+    // cudnn_sdpa_forward_noncausal, which returns false so we fall back
+    // to native. MHA s_q == 1 and GQA s_q >= 2 verified correct to ~1e-7
+    // on the causal path; the non-causal graph shares the same
+    // implementation selection.
+  } else if constexpr (std::is_same_v<Scalar,
+                                      Kokkos::Experimental::bhalf_t>) {
+    dtype = CudnnSdpaScalar::BFloat16;
+  } else {
+    return false;
+  }
+
+  using QExec = typename QView::execution_space;
+  using KExec = typename KView::execution_space;
+  using VExec = typename VView::execution_space;
+  using OExec = typename OView::execution_space;
+  Kokkos::View<Scalar***, Kokkos::LayoutRight, QExec> q_tmp;
+  Kokkos::View<Scalar***, Kokkos::LayoutRight, KExec> k_tmp;
+  Kokkos::View<Scalar***, Kokkos::LayoutRight, VExec> v_tmp;
+  Kokkos::View<Scalar***, Kokkos::LayoutRight, OExec> o_tmp;
+
+  const void* qp = static_cast<const void*>(q.data());
+  const void* kp = static_cast<const void*>(k.data());
+  const void* vp = static_cast<const void*>(v.data());
+  void* op       = static_cast<void*>(out.data());
+  int64_t q_sT = static_cast<int64_t>(q.stride(0)),
+          q_sH = static_cast<int64_t>(q.stride(1)),
+          q_sD = static_cast<int64_t>(q.stride(2));
+  int64_t k_sT = static_cast<int64_t>(k.stride(0)),
+          k_sH = static_cast<int64_t>(k.stride(1)),
+          k_sD = static_cast<int64_t>(k.stride(2));
+  int64_t v_sT = static_cast<int64_t>(v.stride(0)),
+          v_sH = static_cast<int64_t>(v.stride(1)),
+          v_sD = static_cast<int64_t>(v.stride(2));
+  int64_t o_sT = static_cast<int64_t>(out.stride(0)),
+          o_sH = static_cast<int64_t>(out.stride(1)),
+          o_sD = static_cast<int64_t>(out.stride(2));
+
+  if (q_sD != 1) {
+    q_tmp = Kokkos::View<Scalar***, Kokkos::LayoutRight, QExec>(
+        "KokkosDNN::cudnn_q", static_cast<size_t>(T),
+        static_cast<size_t>(Hq), static_cast<size_t>(D));
+    Kokkos::deep_copy(q_tmp, q);
+    qp   = static_cast<const void*>(q_tmp.data());
+    q_sT = static_cast<int64_t>(q_tmp.stride(0));
+    q_sH = static_cast<int64_t>(q_tmp.stride(1));
+    q_sD = static_cast<int64_t>(q_tmp.stride(2));
+  }
+  if (k_sD != 1) {
+    k_tmp = Kokkos::View<Scalar***, Kokkos::LayoutRight, KExec>(
+        "KokkosDNN::cudnn_k", static_cast<size_t>(Ktot),
+        static_cast<size_t>(Hkv), static_cast<size_t>(D));
+    Kokkos::deep_copy(k_tmp, k);
+    kp   = static_cast<const void*>(k_tmp.data());
+    k_sT = static_cast<int64_t>(k_tmp.stride(0));
+    k_sH = static_cast<int64_t>(k_tmp.stride(1));
+    k_sD = static_cast<int64_t>(k_tmp.stride(2));
+  }
+  if (v_sD != 1) {
+    v_tmp = Kokkos::View<Scalar***, Kokkos::LayoutRight, VExec>(
+        "KokkosDNN::cudnn_v", static_cast<size_t>(Ktot),
+        static_cast<size_t>(Hkv), static_cast<size_t>(D));
+    Kokkos::deep_copy(v_tmp, v);
+    vp   = static_cast<const void*>(v_tmp.data());
+    v_sT = static_cast<int64_t>(v_tmp.stride(0));
+    v_sH = static_cast<int64_t>(v_tmp.stride(1));
+    v_sD = static_cast<int64_t>(v_tmp.stride(2));
+  }
+  const bool repack_out = (o_sD != 1);
+  if (repack_out) {
+    o_tmp = Kokkos::View<Scalar***, Kokkos::LayoutRight, OExec>(
+        "KokkosDNN::cudnn_o", static_cast<size_t>(T),
+        static_cast<size_t>(Hq), static_cast<size_t>(D));
+    op   = static_cast<void*>(o_tmp.data());
+    o_sT = static_cast<int64_t>(o_tmp.stride(0));
+    o_sH = static_cast<int64_t>(o_tmp.stride(1));
+    o_sD = static_cast<int64_t>(o_tmp.stride(2));
+  }
+
+  const bool ok = cudnn_sdpa_forward_noncausal(
+      handle.cudnn_raw(), dtype, qp, kp, vp, op, T, Ktot, Hq, Hkv, D, q_sT,
+      q_sH, q_sD, k_sT, k_sH, k_sD, v_sT, v_sH, v_sD, o_sT, o_sH, o_sD, scale);
+  if (ok && repack_out) Kokkos::deep_copy(out, o_tmp);
+  return ok;
+}
+
 }  // namespace Impl
 }  // namespace KokkosDNN
 
