@@ -12,3 +12,8 @@ kokkosdnn_add_test(test_rope Test_RoPE.cpp)
 kokkosdnn_add_test(test_swiglu Test_SwiGLU.cpp)
 kokkosdnn_add_test(test_attention Test_Attention.cpp)
 kokkosdnn_add_test(test_sampler Test_Sampler.cpp)
+
+if(KokkosDNN_ENABLE_IMAGE)
+  kokkosdnn_add_test(test_image Test_Image.cpp)
+  target_link_libraries(test_image PRIVATE KokkosDNN::image)
+endif()

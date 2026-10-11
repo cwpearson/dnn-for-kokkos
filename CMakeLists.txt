@@ -11,6 +11,7 @@ option(KokkosDNN_ENABLE_EXAMPLES "Build examples" ON)
 option(KokkosDNN_ENABLE_BENCHMARKS "Build benchmarks (Google Benchmark)" OFF)
 option(KokkosDNN_ENABLE_CUBLAS "Dispatch GEMM to cuBLAS when ExecSpace is CUDA" OFF)
 option(KokkosDNN_ENABLE_CUDNN "Dispatch attention to cuDNN SDPA when ExecSpace is CUDA" OFF)
+option(KokkosDNN_ENABLE_IMAGE "Build optional image I/O component (stb-based decode, JPEG/PNG/BMP)" OFF)
 option(KokkosDNN_ENABLE_COMPILER_WARNINGS "Enable compiler warnings" OFF)
 option(BUILD_SHARED_LIBS "Build shared libraries" OFF)
 
@@ -74,8 +75,12 @@ endif()
 if(KOKKOSDNN_ENABLE_CUDNN AND NOT KokkosDNN_ENABLE_CUDNN)
   set(KokkosDNN_ENABLE_CUDNN ON)
 endif()
+if(KOKKOSDNN_ENABLE_IMAGE AND NOT KokkosDNN_ENABLE_IMAGE)
+  set(KokkosDNN_ENABLE_IMAGE ON)
+endif()
 set(KOKKOSDNN_ENABLE_CUBLAS ${KokkosDNN_ENABLE_CUBLAS})
 set(KOKKOSDNN_ENABLE_CUDNN ${KokkosDNN_ENABLE_CUDNN})
+set(KOKKOSDNN_ENABLE_IMAGE ${KokkosDNN_ENABLE_IMAGE})
 configure_file(cmake/KokkosDNN_config.h.in
   ${CMAKE_CURRENT_BINARY_DIR}/KokkosDNN_config.h @ONLY)
 
@@ -116,6 +121,13 @@ if(KokkosDNN_ENABLE_COMPILER_WARNINGS)
 endif()
 
 set_target_properties(kokkosdnn PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+
+# ---------------------------------------------------------------------------
+# Optional image component (OFF by default; no dependency from core target)
+# ---------------------------------------------------------------------------
+if(KokkosDNN_ENABLE_IMAGE)
+  add_subdirectory(src/images)
+endif()
 
 # ---------------------------------------------------------------------------
 # Install

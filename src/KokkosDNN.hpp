@@ -18,6 +18,10 @@
 #include "KokkosDNN_Loss.hpp"
 #include "KokkosDNN_Optimizer.hpp"
 
+#ifdef KOKKOSDNN_ENABLE_IMAGE
+#include "images/KokkosDNN_Image.hpp"
+#endif
+
 #include <iosfwd>
 
 namespace KokkosDNN {
