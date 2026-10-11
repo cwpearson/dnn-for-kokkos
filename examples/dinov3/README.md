@@ -20,7 +20,7 @@ Core `src/` ops (all missing today):
 - [x] `layernorm_forward` (weight+bias, FP32 accum) — `RMSNorm` is not a substitute. Done: `src/KokkosDNN_LayerNorm.hpp` (`KokkosDNN::layernorm_forward`/`layernorm_row`).
 - [x] `gelu_forward` — pin HF `ACT2FN["gelu"]` erf-vs-tanh variant first. Done: `src/KokkosDNN_Activation.hpp` (`KokkosDNN::gelu_forward`, `GeluVariant::ExactErf` default = HF `gelu`, `Tanh` = `gelu_new`).
 - [x] Biased linear for inference (`gemm_bias`: `Y=X·Wᵀ+b`, reuse cuBLAS path). Done: `src/KokkosDNN_GemmBias.hpp` (`KokkosDNN::gemm_bias`/`gemv_bias`, empty bias = unbiased).
-- [ ] Bidirectional full MHA (non-causal; current `attention_gqa_single` is causal-only; cuDNN graph is causal-only too).
+- [x] Bidirectional full MHA (non-causal; current `attention_gqa_single` is causal-only; cuDNN graph is causal-only too). Done: `src/KokkosDNN_Attention.hpp` (`KokkosDNN::attention_mha_bidirectional`, native Kokkos, FP32 streaming softmax).
 - [ ] 2D axial RoPE (`head_dim/4` inv_freq, dynamic H/W coords, `rotate_half`, patch-tokens-only, prefix skip).
 - [ ] PatchEmbed Conv2d (`3→768`, `k=16/s=16`) or `im2col+gemm` helper.
 - [ ] Token assembly + batching (`cat[cls,registers,patches]`, `[B,T,D]` policy).

@@ -13,6 +13,7 @@ kokkosdnn_add_test(test_softmax Test_Softmax.cpp)
 kokkosdnn_add_test(test_rope Test_RoPE.cpp)
 kokkosdnn_add_test(test_swiglu Test_SwiGLU.cpp)
 kokkosdnn_add_test(test_attention Test_Attention.cpp)
+kokkosdnn_add_test(test_attention_bidirectional Test_AttentionBidirectional.cpp)
 kokkosdnn_add_test(test_gelu Test_Gelu.cpp)
 kokkosdnn_add_test(test_sampler Test_Sampler.cpp)
 
