@@ -9,23 +9,46 @@ on:
 
 jobs:
   rocm:
-    runs-on: ubuntu-latest
-    # ROCm dev image provides hipcc + HIP runtime; build-only
-    # (no GPU at runtime) so no device flags are needed.
-    container:
-      image: rocm/dev-ubuntu-24.04:6.4
+    # Pinned to 24.04 (noble) to match the AMD package repositories below.
+    runs-on: ubuntu-24.04
+    # /opt/rocm is the default install prefix; Kokkos's find_package(hip)
+    # honors ROCM_PATH, and kokkos_arch uses $ROCM_PATH for --rocm-path.
     env:
       KOKKOS_VERSION: 5.2.1
       KOKKOS_INSTALL: ${{ github.workspace }}/kokkos-install
+      ROCM_PATH: /opt/rocm
     steps:
       - uses: actions/checkout@v4
 
       - name: Install build tools
         run: |
-          apt-get update
+          sudo apt-get update
           # libstb-dev provides the system stb headers (/usr/include/stb/)
           # preferred by the optional image component (find-or-fetch).
-          apt-get install -y cmake g++ git curl libstb-dev
+          sudo apt-get install -y cmake g++ git curl gpg libstb-dev
+
+      # Install the ROCm HIP SDK (hipcc, headers, CMake config, LLVM, device
+      # libs) from AMD's apt repositories. rocm-hip-sdk is the documented
+      # meta-package for developing/porting HIP applications; install
+      # location is /opt/rocm. Pinned to 6.4.1 (same as AMD's own dev image
+      # recipe in ROCm/ROCm-docker).
+      - name: Install ROCm HIP SDK
+        run: |
+          sudo mkdir -p /etc/apt/keyrings
+          curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
+            | gpg --dearmor \
+            | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/amdgpu/6.4.1/ubuntu noble main" \
+            | sudo tee /etc/apt/sources.list.d/amdgpu.list
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/6.4.1 noble main" \
+            | sudo tee /etc/apt/sources.list.d/rocm.list
+          echo -e 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600' \
+            | sudo tee /etc/apt/preferences.d/rocm-pin-600
+          sudo apt-get update
+          sudo apt-get install -y rocm-hip-sdk
+          # Fail fast with a clear log if the install did not land.
+          /opt/rocm/bin/hipcc --version
+          ls /opt/rocm/lib/cmake/hip/
 
       - name: Download Kokkos
         run: |
@@ -38,11 +61,12 @@ jobs:
           # gfx90a (MI200, Kokkos_ARCH_VEGA90A) is a sensible compile-only
           # default: no GPU is present, so nothing queries the real device;
           # any supported Kokkos_ARCH_* (or Kokkos_ARCH_NATIVE=ON on a GPU
-          # node) works.
+          # node) works. ROCM_PATH points find_package(hip) at /opt/rocm.
           cmake -S kokkos-src -B kokkos-build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="${KOKKOS_INSTALL}" \
-            -DCMAKE_CXX_COMPILER=hipcc \
+            -DCMAKE_CXX_COMPILER="${ROCM_PATH}/bin/hipcc" \
+            -DROCM_PATH="${ROCM_PATH}" \
             -DKokkos_ENABLE_HIP=ON \
             -DKokkos_ENABLE_SERIAL=ON \
             -DKokkos_ARCH_VEGA90A=ON \
@@ -53,9 +77,11 @@ jobs:
       - name: Configure KokkosDNN
         run: |
           # Build-only: TESTS=ON + EXAMPLES=ON maximize compile coverage,
-          # BENCHMARKS=OFF keeps it fast.
+          # BENCHMARKS=OFF keeps it fast. The whole project must compile
+          # with hipcc against a HIP Kokkos (device code in headers).
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER="${ROCM_PATH}/bin/hipcc" \
             -DKokkos_ROOT="${KOKKOS_INSTALL}" \
             -DKokkosDNN_ENABLE_TESTS=ON \
             -DKokkosDNN_ENABLE_EXAMPLES=ON \
