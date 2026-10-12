@@ -1,0 +1,68 @@
+name: CUDA build
+
+# GPU build-only CI: Kokkos CUDA backend, compile everything but run
+# nothing (GitHub-hosted runners have no GPU). Mirrors the Serial CI
+# (.github/workflows/serial.yaml) in structure, minus the test execution.
+on:
+  push:
+  pull_request:
+
+jobs:
+  cuda:
+    runs-on: ubuntu-latest
+    # nvidia/cuda devel image provides nvcc + CUDAToolkit; build-only
+    # (no GPU at runtime) so no --gpus flag is needed.
+    container:
+      image: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    env:
+      KOKKOS_VERSION: 5.2.1
+      KOKKOS_INSTALL: ${{ github.workspace }}/kokkos-install
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          apt-get update
+          # libstb-dev provides the system stb headers (/usr/include/stb/)
+          # preferred by the optional image component (find-or-fetch).
+          apt-get install -y cmake g++ git curl libstb-dev
+
+      - name: Download Kokkos
+        run: |
+          curl -L -o kokkos.tar.gz \
+            "https://github.com/kokkos/kokkos/releases/download/${KOKKOS_VERSION}/kokkos-${KOKKOS_VERSION}.tar.gz"
+          mkdir kokkos-src && tar -xzf kokkos.tar.gz -C kokkos-src --strip-components=1
+
+      - name: Build and install Kokkos (CUDA + Serial)
+        run: |
+          # Ampere (SM80) is a sensible compile-only default: no GPU is
+          # present, so nothing queries the real device; any supported
+          # Kokkos_ARCH_* (or Kokkos_ARCH_NATIVE=ON on a GPU node) works.
+          cmake -S kokkos-src -B kokkos-build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${KOKKOS_INSTALL}" \
+            -DCMAKE_CXX_COMPILER="${{ github.workspace }}/kokkos-src/bin/nvcc_wrapper" \
+            -DKokkos_ENABLE_CUDA=ON \
+            -DKokkos_ENABLE_SERIAL=ON \
+            -DKokkos_ARCH_AMPERE80=ON \
+            -DKokkos_ENABLE_TESTS=OFF
+          cmake --build kokkos-build --parallel "$(nproc)"
+          cmake --install kokkos-build
+
+      - name: Configure KokkosDNN
+        run: |
+          # Build-only: TESTS=ON + EXAMPLES=ON maximize compile coverage,
+          # BENCHMARKS=OFF keeps it fast, CUBLAS/CUDNN=OFF keeps this a
+          # pure build check with no extra toolkit version coupling.
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DKokkos_ROOT="${KOKKOS_INSTALL}" \
+            -DKokkosDNN_ENABLE_TESTS=ON \
+            -DKokkosDNN_ENABLE_EXAMPLES=ON \
+            -DKokkosDNN_ENABLE_BENCHMARKS=OFF
+
+      # Build every target (library, tests, examples). Deliberately does
+      # NOT run ctest or any example binary: there is no GPU on the runner,
+      # so execution would fail; this workflow is compile coverage only.
+      - name: Build everything
+        run: cmake --build build --parallel "$(nproc)"
