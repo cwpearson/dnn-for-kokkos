@@ -58,9 +58,12 @@ jobs:
         run: |
           # Build-only: TESTS=ON + EXAMPLES=ON maximize compile coverage,
           # BENCHMARKS=OFF keeps it fast, CUBLAS/CUDNN=OFF keeps this a
-          # pure build check with no extra toolkit version coupling.
+          # pure build check with no extra toolkit version coupling. The
+          # whole project must compile with nvcc_wrapper against a CUDA
+          # Kokkos (device code in headers).
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER="${{ github.workspace }}/kokkos-src/bin/nvcc_wrapper" \
             -DKokkos_ROOT="${KOKKOS_INSTALL}" \
             -DKokkosDNN_ENABLE_TESTS=ON \
             -DKokkosDNN_ENABLE_EXAMPLES=ON \
