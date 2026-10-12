@@ -1,0 +1,16 @@
+# Doxygen configuration for DNN for Kokkos API documentation.
+# Plain (non-CMake-configured) config. Run from this directory:
+#   cd docs && doxygen Doxyfile
+# (Relative INPUT paths are resolved from the working directory, so always
+# invoke doxygen with docs/ as the working directory, as the docs workflow
+# does via `working-directory: docs`.)
+
+PROJECT_NAME           = "DNN for Kokkos"
+OUTPUT_DIRECTORY       = html
+INPUT                  = ../src ../README.md
+RECURSIVE              = YES
+FILE_PATTERNS          = *.hpp *.md
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+EXTRACT_ALL            = YES
+USE_MDFILE_AS_MAINPAGE = ../README.md
