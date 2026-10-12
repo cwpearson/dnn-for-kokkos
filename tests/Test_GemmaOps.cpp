@@ -296,8 +296,10 @@ template <class Scalar>
 void check_proportional_rope_passthrough(float tol) {
   using Exec = Kokkos::DefaultExecutionSpace;
   const int D = 512, H = 1, T = 2;
-  Kokkos::View<Scalar***, Exec> q("q", T, H, D), k("k", T, H, D);
-  Kokkos::View<Scalar***, HostSpace> hq("hq", T, H, D), hk("hk", T, H, D);
+  Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec> q("q", T, H, D),
+      k("k", T, H, D);
+  Kokkos::View<Scalar***, Kokkos::LayoutRight, HostSpace> hq("hq", T, H, D),
+      hk("hk", T, H, D);
   for (int t = 0; t < T; ++t)
     for (int d = 0; d < D; ++d) {
       hq(t, 0, d) = static_cast<Scalar>(0.05f * ((t * 131 + d * 7) % 17) - 0.2f);
@@ -360,11 +362,11 @@ void check_sliding_reference(size_t window, float tol) {
   const size_t q_off = 0;
   const float scale = 1.0f;
 
-  Kokkos::View<Scalar***, Exec> q("q", T, Hq, D), out("out", T, Hq, D),
-      out_full("out_full", T, Hq, D);
+  Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec> q("q", T, Hq, D),
+      out("out", T, Hq, D), out_full("out_full", T, Hq, D);
   Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec> k("k", Ktot, Hkv, D),
       v("v", Ktot, Hkv, D);
-  Kokkos::View<Scalar***, HostSpace> hq("hq", T, Hq, D);
+  Kokkos::View<Scalar***, Kokkos::LayoutRight, HostSpace> hq("hq", T, Hq, D);
   Kokkos::View<Scalar***, Kokkos::LayoutRight, HostSpace> hk("hk", Ktot, Hkv,
                                                              D),
       hv("hv", Ktot, Hkv, D);
@@ -459,10 +461,11 @@ TEST(GemmaOps, SlidingWindowOffsetFloat) {
   const int T = 2, Hq = 8, Hkv = 1, D = 4, Ktot = 10;
   const size_t q_off = 8, window = 4;  // p = 8, 9 -> klo = 5, 6
   const float scale = 1.0f;
-  Kokkos::View<float***, Exec> q("q", T, Hq, D), out("out", T, Hq, D);
+  Kokkos::View<float***, Kokkos::LayoutRight, Exec> q("q", T, Hq, D),
+      out("out", T, Hq, D);
   Kokkos::View<float***, Kokkos::LayoutRight, Exec> k("k", Ktot, Hkv, D),
       v("v", Ktot, Hkv, D);
-  Kokkos::View<float***, HostSpace> hq("hq", T, Hq, D);
+  Kokkos::View<float***, Kokkos::LayoutRight, HostSpace> hq("hq", T, Hq, D);
   Kokkos::View<float***, Kokkos::LayoutRight, HostSpace> hk("hk", Ktot, Hkv, D),
       hv("hv", Ktot, Hkv, D);
   for (int t = 0; t < T; ++t)

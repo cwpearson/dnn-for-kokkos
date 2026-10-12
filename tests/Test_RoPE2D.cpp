@@ -15,8 +15,14 @@ namespace {
 // create_mirror_view): on a host backend such as Serial the mirror may
 // alias device memory, which would let the in-place kernel mutate the
 // "original" values out from under the reference checks.
+// Explicit LayoutRight on both host and device keeps deep_copy legal on
+// CUDA (default device layout is LayoutLeft, default host is LayoutRight).
 template <class Scalar>
-using HostView3 = Kokkos::View<Scalar***, Kokkos::HostSpace>;
+using HostView3 = Kokkos::View<Scalar***, Kokkos::LayoutRight,
+                               Kokkos::HostSpace>;
+template <class Scalar, class Exec>
+using DevView3 =
+    Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec>;
 
 constexpr float kTwoPi = 6.283185307179586f;
 
@@ -85,7 +91,7 @@ TEST(RoPE2D, MatchesHostReferenceAndSkipsPrefix) {
         hq(t, h, d) = fill_val((int)t, h, d);
         hk(t, h, d) = -0.5f * fill_val((int)t, h, d);
       }
-  Kokkos::View<Scalar***, Exec> q("q", T, H, Dh), k("k", T, H, Dh);
+  DevView3<Scalar, Exec> q("q", T, H, Dh), k("k", T, H, Dh);
   Kokkos::deep_copy(q, hq);
   Kokkos::deep_copy(k, hk);
   auto inv = KokkosDNN::rope2d_inv_freq<Exec>(Dh, 100.0f);
@@ -139,7 +145,7 @@ TEST(RoPE2D, IdentityAtZeroCoord) {
       hq(t, 0, d) = fill_val((int)t, 0, d);
       hk(t, 0, d) = fill_val((int)t, 3, d);
     }
-  Kokkos::View<Scalar***, Exec> q("q", T, H, Dh), k("k", T, H, Dh);
+  DevView3<Scalar, Exec> q("q", T, H, Dh), k("k", T, H, Dh);
   Kokkos::deep_copy(q, hq);
   Kokkos::deep_copy(k, hk);
   auto inv = KokkosDNN::rope2d_inv_freq<Exec>(Dh, 100.0f);
@@ -174,7 +180,7 @@ TEST(RoPE2D, DynamicGridShape) {
     for (size_t t = 0; t < T; ++t)
       for (int h = 0; h < H; ++h)
         for (int d = 0; d < Dh; ++d) hq(t, h, d) = fill_val((int)t, h, d);
-    Kokkos::View<Scalar***, Exec> q("q", T, H, Dh), k("k", T, H, Dh);
+    DevView3<Scalar, Exec> q("q", T, H, Dh), k("k", T, H, Dh);
     Kokkos::deep_copy(q, hq);
     Kokkos::deep_copy(k, hq);
     auto inv = KokkosDNN::rope2d_inv_freq<Exec>(Dh, 100.0f);
@@ -211,8 +217,8 @@ TEST(RoPE2D, OutOfPlaceMatchesInplace) {
         hq(t, h, d) = fill_val((int)t, h, d);
         hk(t, h, d) = -0.5f * fill_val((int)t, h, d);
       }
-  Kokkos::View<Scalar***, Exec> q("q", T, H, Dh), k("k", T, H, Dh);
-  Kokkos::View<Scalar***, Exec> qo("qo", T, H, Dh), ko("ko", T, H, Dh);
+  DevView3<Scalar, Exec> q("q", T, H, Dh), k("k", T, H, Dh);
+  DevView3<Scalar, Exec> qo("qo", T, H, Dh), ko("ko", T, H, Dh);
   Kokkos::deep_copy(q, hq);
   Kokkos::deep_copy(k, hk);
   auto inv = KokkosDNN::rope2d_inv_freq<Exec>(Dh, 100.0f);
@@ -231,7 +237,7 @@ TEST(RoPE2D, OutOfPlaceMatchesInplace) {
         EXPECT_FLOAT_EQ(ck(t, h, d), hk(t, h, d));
       }
   // In-place on copies must agree bit-for-bit (same kernel, same order).
-  Kokkos::View<Scalar***, Exec> qi("qi", T, H, Dh), ki("ki", T, H, Dh);
+  DevView3<Scalar, Exec> qi("qi", T, H, Dh), ki("ki", T, H, Dh);
   Kokkos::deep_copy(qi, q);
   Kokkos::deep_copy(ki, k);
   KokkosDNN::rope2d_axial_inplace<Exec, Scalar>(qi, ki, inv, Hp, Wp, prefix);
@@ -261,7 +267,7 @@ TEST(RoPE2D, RejectsBadArgs) {
   using Scalar = float;
   const int Dh = 64, H = 1;
   const size_t prefix = 5;
-  Kokkos::View<Scalar***, Exec> q("q", 9, H, Dh), k("k", 9, H, Dh);
+  DevView3<Scalar, Exec> q("q", 9, H, Dh), k("k", 9, H, Dh);
   auto inv   = KokkosDNN::rope2d_inv_freq<Exec>(Dh, 100.0f);
   auto inv16 = KokkosDNN::rope2d_inv_freq<Exec>(16, 100.0f);  // wrong length
   // T=9 != prefix + Hp*Wp.
@@ -275,7 +281,7 @@ TEST(RoPE2D, RejectsBadArgs) {
   EXPECT_THROW(
       (KokkosDNN::rope2d_axial_inplace<Exec, Scalar>(q, k, inv, 0, 4, prefix)),
       std::invalid_argument);
-  Kokkos::View<Scalar***, Exec> qo("qo", 9, H, Dh), ko("ko", 9, H, Dh);
+  DevView3<Scalar, Exec> qo("qo", 9, H, Dh), ko("ko", 9, H, Dh);
   EXPECT_THROW((KokkosDNN::rope2d_axial_forward<Exec, Scalar>(q, k, qo, ko,
                                                              inv, 3, 3,
                                                              prefix)),
@@ -295,7 +301,7 @@ TEST(RoPE2D, BHalfNormPreserved) {
         hq(t, h, d) = static_cast<Scalar>(fill_val((int)t, h, d));
         hk(t, h, d) = static_cast<Scalar>(-0.5f * fill_val((int)t, h, d));
       }
-  Kokkos::View<Scalar***, Exec> q("q", T, H, Dh), k("k", T, H, Dh);
+  DevView3<Scalar, Exec> q("q", T, H, Dh), k("k", T, H, Dh);
   Kokkos::deep_copy(q, hq);
   Kokkos::deep_copy(k, hk);
   auto inv = KokkosDNN::rope2d_inv_freq<Exec>(Dh, 100.0f);

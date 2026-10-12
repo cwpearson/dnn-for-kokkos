@@ -128,13 +128,15 @@ Kokkos::View<float*, ExecSpace> rope_inv_freq_proportional(
 // q, k: [tokens, n_heads, head_dim] (flattened last two dims as [T, H*D]).
 // This matches HF `apply_rotary_pos_emb` (cat(freqs,freqs) convention).
 // Scalar-agnostic over q/k (float, bhalf_t); inv_freq stays FP32 and the
-// rotation is computed in FP32.
-template <class ExecSpace, class Scalar>
+// rotation is computed in FP32. Views are layout-agnostic (any Kokkos
+// layout); only extents and operator()(t/h/d) are used.
+template <class ExecSpace, class Scalar, class QView, class KView, class FView,
+          class PView>
 void rope_neoX_inplace(
-    const Kokkos::View<Scalar***, ExecSpace>& q,  // [T, Hq, D]
-    const Kokkos::View<Scalar***, ExecSpace>& k,  // [T, Hkv, D]
-    const Kokkos::View<float*, ExecSpace>& inv_freq, int head_dim,
-    const Kokkos::View<int*, ExecSpace>& positions,  // [T] absolute pos
+    const QView& q,  // [T, Hq, D]
+    const KView& k,  // [T, Hkv, D]
+    const FView& inv_freq, int head_dim,
+    const PView& positions,  // [T] absolute pos
     const std::string& label = "KokkosDNN::rope") {
   const size_t T  = q.extent(0), Hq = q.extent(1);
   const size_t Hk = k.extent(0) ? k.extent(1) : 0;
