@@ -3,14 +3,14 @@
 > **WARNING — unofficial, experimental project.**
 > This is **not** part of, endorsed by, or affiliated with the Kokkos ecosystem.
 > It is an independent experiment for the author to experiment with agentic coding.
-> Do not treat it as a supported, reviewed, or production-ready library.
+> Do not treat it as a supported or production-ready library.
 
 ## What this is
 
-DNN for Kokkos is a small, Kokkos-compatible DNN library.
+DNN for Kokkos is a small, Kokkos-compatible deep neural network library.
 It provides:
 
-- Native Kokkos implementations of common DNN operators (GEMM/GEMV with optional bias, dense forward/backward, embedding gather, RMSNorm/LayerNorm, softmax, causal grouped-query and bidirectional attention, 1D and 2D-axial RoPE, SwiGLU/GELU and other activations, patch embedding, token assembly, LayerScale, losses, SGD/Adam, sampling, KV-cache helpers).
+- [Native Kokkos implementations of common DNN operators](https://cwpearson.github.io/dnn-for-kokkos/api.html) (GEMM/GEMV with optional bias, dense forward/backward, embedding gather, RMSNorm/LayerNorm, softmax, causal grouped-query and bidirectional attention, 1D and 2D-axial RoPE, SwiGLU/GELU and other activations, patch embedding, token assembly, LayerScale, losses, SGD/Adam, sampling, KV-cache helpers).
 - Optional dispatch to CUDA libraries when enabled at configure time: GEMM to **cuBLAS** (FP32 via `sgemm`, BF16 via `cublasGemmEx` with FP32 accumulation), attention to **cuDNN SDPA** (with automatic fallback to the native kernel where cuDNN has no suitable path).
 - Unit tests plus end-to-end paths in the examples so the full pipelines run without downloading large checkpoints.
 
@@ -76,11 +76,3 @@ Without the TPL options (e.g. CPU-only CI) `Native == Dispatched` by
 construction. Large prefill rows (`M=64`, `T=128`, lm-head vocab) are
 GPU-oriented: the naive native kernel takes seconds per iteration on Serial,
 so subset with `--benchmark_filter` or lower `--benchmark_min_time` there.
-
-## Limitations
-
-- Attention uses a streaming online-softmax kernel (FlashAttention-style):
-  one thread per `(query token, query head)` streams over keys with O(1)
-  extra memory, so no large score tensor is ever materialized.
-- Sampling supports greedy, `temperature` / `top-k` / `top-p` / `min-p`,
-  repetition penalty, and seeded RNG; no batching.
