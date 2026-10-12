@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -87,8 +88,13 @@ struct JNode {
   bool boolean = false;
   double num = 0;
   std::string str;
-  std::vector<JNode> arr;
-  std::vector<std::pair<std::string, JNode>> obj;
+  // Boxed recursion: a value-recursive JNode (vector<JNode> /
+  // vector<pair<string, JNode>>) instantiates std containers with an
+  // incomplete type, which libstdc++ (GCC 14, used by the ROCm clang HIP
+  // wrapper) rejects via static_assert. shared_ptr keeps the pointee
+  // complete at container instantiation time.
+  std::vector<std::shared_ptr<JNode>> arr;
+  std::vector<std::pair<std::string, std::shared_ptr<JNode>>> obj;
 
   bool has(const std::string& k) const {
     for (auto& kv : obj)
@@ -97,7 +103,7 @@ struct JNode {
   }
   const JNode& at(const std::string& k) const {
     for (auto& kv : obj)
-      if (kv.first == k) return kv.second;
+      if (kv.first == k) return *kv.second;
     throw std::runtime_error("golden: missing key '" + k + "'");
   }
 };
@@ -163,7 +169,7 @@ class JParser {
       std::string k = string();
       skip();
       expect(':');
-      n.obj.emplace_back(k, value());
+      n.obj.emplace_back(k, std::make_shared<JNode>(value()));
       skip();
       char c = peek();
       if (c == ',') {
@@ -188,7 +194,7 @@ class JParser {
       return n;
     }
     while (true) {
-      n.arr.push_back(value());
+      n.arr.push_back(std::make_shared<JNode>(value()));
       skip();
       char c = peek();
       if (c == ',') {
@@ -335,9 +341,9 @@ std::vector<int> jint_array(const JNode& n, const std::string& ctx) {
     throw std::runtime_error("golden: '" + ctx + "' is not an array");
   std::vector<int> out;
   for (auto& e : n.arr) {
-    if (e.type != JNode::Type::Num)
+    if (e->type != JNode::Type::Num)
       throw std::runtime_error("golden: '" + ctx + "' has non-number entry");
-    out.push_back((int)std::llround(e.num));
+    out.push_back((int)std::llround(e->num));
   }
   return out;
 }
@@ -347,9 +353,9 @@ std::vector<double> jnum_array(const JNode& n, const std::string& ctx) {
     throw std::runtime_error("golden: '" + ctx + "' is not an array");
   std::vector<double> out;
   for (auto& e : n.arr) {
-    if (e.type != JNode::Type::Num)
+    if (e->type != JNode::Type::Num)
       throw std::runtime_error("golden: '" + ctx + "' has non-number entry");
-    out.push_back(e.num);
+    out.push_back(e->num);
   }
   return out;
 }
@@ -368,24 +374,24 @@ GoldenFile parse_golden(const std::string& text) {
     throw std::runtime_error("golden: 'entries' is not an array");
   for (auto& en : entries.arr) {
     GoldenEntry e;
-    if (en.type != JNode::Type::Obj)
+    if (en->type != JNode::Type::Obj)
       throw std::runtime_error("golden: entry is not an object");
-    if (en.at("prompt").type != JNode::Type::Str)
+    if (en->at("prompt").type != JNode::Type::Str)
       throw std::runtime_error("golden: entry prompt is not a string");
-    e.prompt      = en.at("prompt").str;
-    e.input_ids   = jint_array(en.at("input_ids"), "input_ids");
-    e.top_ids     = jint_array(en.at("top_ids"), "top_ids");
-    e.top_logits  = jnum_array(en.at("top_logits"), "top_logits");
-    e.argmax      = (int)std::llround(en.at("argmax").num);
-    e.nll         = en.at("nll").num;
+    e.prompt      = en->at("prompt").str;
+    e.input_ids   = jint_array(en->at("input_ids"), "input_ids");
+    e.top_ids     = jint_array(en->at("top_ids"), "top_ids");
+    e.top_logits  = jnum_array(en->at("top_logits"), "top_logits");
+    e.argmax      = (int)std::llround(en->at("argmax").num);
+    e.nll         = en->at("nll").num;
     if (e.top_ids.size() != e.top_logits.size() || e.top_ids.empty())
       throw std::runtime_error("golden: top_ids/top_logits length mismatch");
-    if (en.has("next_id")) {
+    if (en->has("next_id")) {
       e.has_next         = true;
-      e.next_id          = (int)std::llround(en.at("next_id").num);
-      e.next_nll         = en.at("next_nll").num;
-      e.next_top_ids     = jint_array(en.at("next_top_ids"), "next_top_ids");
-      e.next_top_logits  = jnum_array(en.at("next_top_logits"),
+      e.next_id          = (int)std::llround(en->at("next_id").num);
+      e.next_nll         = en->at("next_nll").num;
+      e.next_top_ids     = jint_array(en->at("next_top_ids"), "next_top_ids");
+      e.next_top_logits  = jnum_array(en->at("next_top_logits"),
                                       "next_top_logits");
       if (e.next_top_ids.size() != e.next_top_logits.size())
         throw std::runtime_error("golden: next_top length mismatch");

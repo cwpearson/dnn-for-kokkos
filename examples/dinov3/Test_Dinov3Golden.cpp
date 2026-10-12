@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -86,8 +87,13 @@ struct JNode {
   bool boolean = false;
   double num = 0;
   std::string str;
-  std::vector<JNode> arr;
-  std::vector<std::pair<std::string, JNode>> obj;
+  // Boxed recursion: a value-recursive JNode (vector<JNode> /
+  // vector<pair<string, JNode>>) instantiates std containers with an
+  // incomplete type, which libstdc++ (GCC 14, used by the ROCm clang HIP
+  // wrapper) rejects via static_assert. shared_ptr keeps the pointee
+  // complete at container instantiation time.
+  std::vector<std::shared_ptr<JNode>> arr;
+  std::vector<std::pair<std::string, std::shared_ptr<JNode>>> obj;
 
   bool has(const std::string& k) const {
     for (auto& kv : obj)
@@ -96,7 +102,7 @@ struct JNode {
   }
   const JNode& at(const std::string& k) const {
     for (auto& kv : obj)
-      if (kv.first == k) return kv.second;
+      if (kv.first == k) return *kv.second;
     throw std::runtime_error("golden: missing key '" + k + "'");
   }
 };
@@ -162,7 +168,7 @@ class JParser {
       std::string k = string();
       skip();
       expect(':');
-      n.obj.emplace_back(k, value());
+      n.obj.emplace_back(k, std::make_shared<JNode>(value()));
       skip();
       char c = peek();
       if (c == ',') {
@@ -187,7 +193,7 @@ class JParser {
       return n;
     }
     while (true) {
-      n.arr.push_back(value());
+      n.arr.push_back(std::make_shared<JNode>(value()));
       skip();
       char c = peek();
       if (c == ',') {
@@ -323,9 +329,9 @@ std::vector<double> jnum_array(const JNode& n, const std::string& ctx) {
     throw std::runtime_error("golden: '" + ctx + "' is not an array");
   std::vector<double> out;
   for (auto& e : n.arr) {
-    if (e.type != JNode::Type::Num)
+    if (e->type != JNode::Type::Num)
       throw std::runtime_error("golden: '" + ctx + "' has non-number entry");
-    out.push_back(e.num);
+    out.push_back(e->num);
   }
   return out;
 }
@@ -357,7 +363,7 @@ GoldenFile parse_golden(const std::string& text) {
   const JNode& pf       = root.at("patch_first4");
   if (pf.type != JNode::Type::Arr || pf.arr.size() != 4)
     throw std::runtime_error("golden: 'patch_first4' must have 4 rows");
-  for (auto& row : pf.arr) g.patch_first4.push_back(jnum_array(row, "patch row"));
+  for (auto& row : pf.arr) g.patch_first4.push_back(jnum_array(*row, "patch row"));
   g.patch_mean = jnum_array(root.at("patch_mean"), "patch_mean");
   if ((int)g.cls.size() != g.hidden_size)
     throw std::runtime_error("golden: cls length != hidden_size");

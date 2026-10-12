@@ -1,6 +1,13 @@
 cmake_minimum_required(VERSION 3.22 FATAL_ERROR)
 project(KokkosDNN VERSION 0.1.0 LANGUAGES CXX)
 
+# Kokkos 5.x requires C++20. Enforce it globally so every target in this
+# build (library, tests, examples, benchmarks) compiles in C++20 mode
+# regardless of toolchain defaults (e.g. hipcc, nvcc_wrapper).
+# Per-target CXX_STANDARD properties below are kept as belt-and-braces.
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 include(GNUInstallDirs)
 
 # ---------------------------------------------------------------------------
@@ -14,6 +21,22 @@ option(KokkosDNN_ENABLE_CUDNN "Dispatch attention to cuDNN SDPA when ExecSpace i
 option(KokkosDNN_ENABLE_IMAGE "Build optional image I/O component (stb-based decode, JPEG/PNG/BMP)" OFF)
 option(KokkosDNN_ENABLE_COMPILER_WARNINGS "Enable compiler warnings" OFF)
 option(BUILD_SHARED_LIBS "Build shared libraries" OFF)
+# gtest_discover_tests executes each test binary at build time. On GPU-less
+# build-only CI (CUDA/ROCm runners have no GPU) the binaries abort inside
+# Kokkos::initialize, failing the build. Pass
+# -DKokkosDNN_ENABLE_TEST_DISCOVERY=OFF there; ctest then simply sees no
+# tests, which matches the compile-coverage-only intent.
+option(KokkosDNN_ENABLE_TEST_DISCOVERY "Register gtest tests via gtest_discover_tests (requires runnable test binaries)" ON)
+# Wrapper around gtest_discover_tests that no-ops when discovery is
+# disabled. Defined here (before any add_subdirectory) so tests/, examples/
+# and benchmarks/ can all use it. The call is deferred to configure time of
+# the caller, by which point include(GoogleTest) has run whenever
+# KokkosDNN_ENABLE_TESTS=ON.
+function(kokkosdnn_discover_tests TARGET)
+  if(KokkosDNN_ENABLE_TEST_DISCOVERY)
+    gtest_discover_tests(${TARGET} ${ARGN})
+  endif()
+endfunction()
 
 # ---------------------------------------------------------------------------
 # Dependencies

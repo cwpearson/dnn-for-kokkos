@@ -695,44 +695,25 @@ void load_safetensors(const Config& cfg,
   }
 }
 
-// Explicit instantiations for common spaces (defined here so the .cpp
-// compiles them; other ExecSpaces instantiate implicitly from the header).
+// Explicit instantiations for the default execution space (defined here so
+// the .cpp compiles them). All callers use DefaultExecutionSpace, so no
+// backend needs enumerating here: whichever space Kokkos was configured with
+// (Serial, OpenMP, Cuda, HIP, ...) is covered. DefaultHostExecutionSpace is
+// deliberately not instantiated: nothing calls these functions on a host
+// space, and on CPU-only builds it aliases DefaultExecutionSpace, where a
+// second instantiation would be a duplicate-definition error.
 // On builds without a native bhalf type Kokkos aliases bhalf_t to float
 // (KOKKOS_BHALF_T_IS_FLOAT), so the bhalf_t lines are skipped there to
 // avoid duplicate explicit instantiations.
-template void random_init<Kokkos::Serial, float>(const Config&, Weights<Kokkos::Serial, float>&, uint64_t);
-template void load_safetensors<Kokkos::Serial, float>(const Config&, const std::vector<std::string>&, Weights<Kokkos::Serial, float>&);
-template void copy_host_to_device<Kokkos::Serial, float>(const std::vector<float>&, size_t, size_t,
-    const Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::Serial>&);
+template void random_init<Kokkos::DefaultExecutionSpace, float>(const Config&, Weights<Kokkos::DefaultExecutionSpace, float>&, uint64_t);
+template void load_safetensors<Kokkos::DefaultExecutionSpace, float>(const Config&, const std::vector<std::string>&, Weights<Kokkos::DefaultExecutionSpace, float>&);
+template void copy_host_to_device<Kokkos::DefaultExecutionSpace, float>(const std::vector<float>&, size_t, size_t,
+    const Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::DefaultExecutionSpace>&);
 #if !KOKKOS_BHALF_T_IS_FLOAT
-template void random_init<Kokkos::Serial, Kokkos::Experimental::bhalf_t>(const Config&, Weights<Kokkos::Serial, Kokkos::Experimental::bhalf_t>&, uint64_t);
-template void load_safetensors<Kokkos::Serial, Kokkos::Experimental::bhalf_t>(const Config&, const std::vector<std::string>&, Weights<Kokkos::Serial, Kokkos::Experimental::bhalf_t>&);
-template void copy_host_to_device<Kokkos::Serial, Kokkos::Experimental::bhalf_t>(const std::vector<float>&, size_t, size_t,
-    const Kokkos::View<Kokkos::Experimental::bhalf_t**, Kokkos::LayoutRight, Kokkos::Serial>&);
-#endif
-#ifdef KOKKOS_ENABLE_OPENMP
-template void random_init<Kokkos::OpenMP, float>(const Config&, Weights<Kokkos::OpenMP, float>&, uint64_t);
-template void load_safetensors<Kokkos::OpenMP, float>(const Config&, const std::vector<std::string>&, Weights<Kokkos::OpenMP, float>&);
-template void copy_host_to_device<Kokkos::OpenMP, float>(const std::vector<float>&, size_t, size_t,
-    const Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::OpenMP>&);
-#if !KOKKOS_BHALF_T_IS_FLOAT
-template void random_init<Kokkos::OpenMP, Kokkos::Experimental::bhalf_t>(const Config&, Weights<Kokkos::OpenMP, Kokkos::Experimental::bhalf_t>&, uint64_t);
-template void load_safetensors<Kokkos::OpenMP, Kokkos::Experimental::bhalf_t>(const Config&, const std::vector<std::string>&, Weights<Kokkos::OpenMP, Kokkos::Experimental::bhalf_t>&);
-template void copy_host_to_device<Kokkos::OpenMP, Kokkos::Experimental::bhalf_t>(const std::vector<float>&, size_t, size_t,
-    const Kokkos::View<Kokkos::Experimental::bhalf_t**, Kokkos::LayoutRight, Kokkos::OpenMP>&);
-#endif
-#endif
-#ifdef KOKKOS_ENABLE_CUDA
-template void random_init<Kokkos::Cuda, float>(const Config&, Weights<Kokkos::Cuda, float>&, uint64_t);
-template void load_safetensors<Kokkos::Cuda, float>(const Config&, const std::vector<std::string>&, Weights<Kokkos::Cuda, float>&);
-template void copy_host_to_device<Kokkos::Cuda, float>(const std::vector<float>&, size_t, size_t,
-    const Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::Cuda>&);
-#if !KOKKOS_BHALF_T_IS_FLOAT
-template void random_init<Kokkos::Cuda, Kokkos::Experimental::bhalf_t>(const Config&, Weights<Kokkos::Cuda, Kokkos::Experimental::bhalf_t>&, uint64_t);
-template void load_safetensors<Kokkos::Cuda, Kokkos::Experimental::bhalf_t>(const Config&, const std::vector<std::string>&, Weights<Kokkos::Cuda, Kokkos::Experimental::bhalf_t>&);
-template void copy_host_to_device<Kokkos::Cuda, Kokkos::Experimental::bhalf_t>(const std::vector<float>&, size_t, size_t,
-    const Kokkos::View<Kokkos::Experimental::bhalf_t**, Kokkos::LayoutRight, Kokkos::Cuda>&);
-#endif
+template void random_init<Kokkos::DefaultExecutionSpace, Kokkos::Experimental::bhalf_t>(const Config&, Weights<Kokkos::DefaultExecutionSpace, Kokkos::Experimental::bhalf_t>&, uint64_t);
+template void load_safetensors<Kokkos::DefaultExecutionSpace, Kokkos::Experimental::bhalf_t>(const Config&, const std::vector<std::string>&, Weights<Kokkos::DefaultExecutionSpace, Kokkos::Experimental::bhalf_t>&);
+template void copy_host_to_device<Kokkos::DefaultExecutionSpace, Kokkos::Experimental::bhalf_t>(const std::vector<float>&, size_t, size_t,
+    const Kokkos::View<Kokkos::Experimental::bhalf_t**, Kokkos::LayoutRight, Kokkos::DefaultExecutionSpace>&);
 #endif
 
 }  // namespace Gemma4

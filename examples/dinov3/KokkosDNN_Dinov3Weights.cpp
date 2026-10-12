@@ -787,25 +787,18 @@ void load_safetensors(const Config& cfg,
   }
 }
 
-// Explicit instantiations for float (the checkpoint dtype) on the common
-// spaces (defined here so the .cpp compiles them; other ExecSpaces/Scalars
-// instantiate implicitly from the header).
-template void random_init<Kokkos::Serial, float>(const Config&, Weights<Kokkos::Serial, float>&, uint64_t);
-template void load_safetensors<Kokkos::Serial, float>(const Config&, const std::vector<std::string>&, Weights<Kokkos::Serial, float>&);
-template void copy_host_to_device<Kokkos::Serial, float>(const std::vector<float>&, size_t, size_t,
-    const Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::Serial>&);
-#ifdef KOKKOS_ENABLE_OPENMP
-template void random_init<Kokkos::OpenMP, float>(const Config&, Weights<Kokkos::OpenMP, float>&, uint64_t);
-template void load_safetensors<Kokkos::OpenMP, float>(const Config&, const std::vector<std::string>&, Weights<Kokkos::OpenMP, float>&);
-template void copy_host_to_device<Kokkos::OpenMP, float>(const std::vector<float>&, size_t, size_t,
-    const Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::OpenMP>&);
-#endif
-#ifdef KOKKOS_ENABLE_CUDA
-template void random_init<Kokkos::Cuda, float>(const Config&, Weights<Kokkos::Cuda, float>&, uint64_t);
-template void load_safetensors<Kokkos::Cuda, float>(const Config&, const std::vector<std::string>&, Weights<Kokkos::Cuda, float>&);
-template void copy_host_to_device<Kokkos::Cuda, float>(const std::vector<float>&, size_t, size_t,
-    const Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::Cuda>&);
-#endif
+// Explicit instantiations for the default execution space (defined here so
+// the .cpp compiles them) for float, the checkpoint dtype. All callers use
+// DefaultExecutionSpace, so no backend needs enumerating here: whichever
+// space Kokkos was configured with (Serial, OpenMP, Cuda, HIP, ...) is
+// covered. DefaultHostExecutionSpace is deliberately not instantiated:
+// nothing calls these functions on a host space, and on CPU-only builds it
+// aliases DefaultExecutionSpace, where a second instantiation would be a
+// duplicate-definition error.
+template void random_init<Kokkos::DefaultExecutionSpace, float>(const Config&, Weights<Kokkos::DefaultExecutionSpace, float>&, uint64_t);
+template void load_safetensors<Kokkos::DefaultExecutionSpace, float>(const Config&, const std::vector<std::string>&, Weights<Kokkos::DefaultExecutionSpace, float>&);
+template void copy_host_to_device<Kokkos::DefaultExecutionSpace, float>(const std::vector<float>&, size_t, size_t,
+    const Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::DefaultExecutionSpace>&);
 
 }  // namespace Dinov3
 }  // namespace KokkosDNN

@@ -104,12 +104,17 @@ jobs:
           # with hipcc against a HIP Kokkos (device code in headers).
           # CMAKE_PREFIX_PATH keeps downstream find_package(Kokkos) ->
           # find_dependency(hip/rocthrust) resolving under /opt/rocm.
+          # TEST_DISCOVERY=OFF: gtest_discover_tests executes test binaries
+          # at build time, but the runner has no GPU, so every test binary
+          # aborts inside Kokkos::initialize. This workflow is compile
+          # coverage only.
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_PREFIX_PATH="${ROCM_PATH}" \
             -DCMAKE_CXX_COMPILER="${ROCM_PATH}/bin/hipcc" \
             -DKokkos_ROOT="${KOKKOS_INSTALL}" \
             -DKokkosDNN_ENABLE_TESTS=ON \
+            -DKokkosDNN_ENABLE_TEST_DISCOVERY=OFF \
             -DKokkosDNN_ENABLE_EXAMPLES=ON \
             -DKokkosDNN_ENABLE_BENCHMARKS=ON
 

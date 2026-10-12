@@ -78,6 +78,10 @@ jobs:
           # check with no extra toolkit version coupling. The
           # whole project must compile with nvcc_wrapper against a CUDA
           # Kokkos (device code in headers).
+          # TEST_DISCOVERY=OFF: gtest_discover_tests executes test binaries
+          # at build time, but the runner has no GPU (libcuda.so.1 is
+          # absent), so every test binary fails to start. This workflow is
+          # compile coverage only.
           KOKKOS_INSTALL="$GITHUB_WORKSPACE/kokkos-install"
           NVCC_WRAPPER="$GITHUB_WORKSPACE/kokkos-src/bin/nvcc_wrapper"
           cmake -S . -B build \
@@ -85,6 +89,7 @@ jobs:
             -DCMAKE_CXX_COMPILER="${NVCC_WRAPPER}" \
             -DKokkos_ROOT="${KOKKOS_INSTALL}" \
             -DKokkosDNN_ENABLE_TESTS=ON \
+            -DKokkosDNN_ENABLE_TEST_DISCOVERY=OFF \
             -DKokkosDNN_ENABLE_EXAMPLES=ON \
             -DKokkosDNN_ENABLE_BENCHMARKS=ON
 
