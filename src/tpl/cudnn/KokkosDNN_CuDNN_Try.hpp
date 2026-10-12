@@ -27,9 +27,16 @@ namespace Impl {
 
 template <class Scalar, class Exec, class QView, class KView, class VView,
           class OView>
-inline bool try_cudnn_sdpa_gqa(const DNNHandle<Exec>& handle, const QView& q,
-                               const KView& k, const VView& v, size_t q_off,
-                               const OView& out, float scale) {
+inline bool try_cudnn_sdpa_gqa_impl(const DNNHandle<Exec>& handle,
+                                    const QView& q, const KView& k,
+                                    const VView& v, size_t q_off,
+                                    const OView& out, float scale,
+                                    int64_t window) {
+  // window < 0 selects full causal attention; window > 0 selects
+  // sliding-window causal attention with that band width. window == 0 is
+  // rejected (the sliding entry point below never forwards it; the causal
+  // entry point passes -1).
+  if (window == 0) return false;
   const int64_t T   = static_cast<int64_t>(q.extent(0));
   const int64_t Hq  = static_cast<int64_t>(q.extent(1));
   const int64_t D   = static_cast<int64_t>(q.extent(2));
@@ -133,12 +140,48 @@ inline bool try_cudnn_sdpa_gqa(const DNNHandle<Exec>& handle, const QView& q,
     o_sD = static_cast<int64_t>(o_tmp.stride(2));
   }
 
+  const bool sliding = (window > 0);
   const bool ok =
-      cudnn_sdpa_forward(handle.cudnn_raw(), dtype, qp, kp, vp, op, T, Ktot,
-                         Hq, Hkv, D, q_sT, q_sH, q_sD, k_sT, k_sH, k_sD, v_sT,
-                         v_sH, v_sD, o_sT, o_sH, o_sD, scale);
+      sliding ? cudnn_sdpa_forward_sliding(
+                    handle.cudnn_raw(), dtype, qp, kp, vp, op, T, Ktot, Hq,
+                    Hkv, D, q_sT, q_sH, q_sD, k_sT, k_sH, k_sD, v_sT, v_sH, v_sD,
+                    o_sT, o_sH, o_sD, scale, window)
+              : cudnn_sdpa_forward(handle.cudnn_raw(), dtype, qp, kp, vp, op,
+                                   T, Ktot, Hq, Hkv, D, q_sT, q_sH, q_sD, k_sT,
+                                   k_sH, k_sD, v_sT, v_sH, v_sD, o_sT, o_sH,
+                                   o_sD, scale);
   if (ok && repack_out) Kokkos::deep_copy(out, o_tmp);
   return ok;
+}
+
+// Full causal dispatch: same mask as the native kernel when
+// Ktot == q_off + T (checked inside).
+template <class Scalar, class Exec, class QView, class KView, class VView,
+          class OView>
+inline bool try_cudnn_sdpa_gqa(const DNNHandle<Exec>& handle, const QView& q,
+                               const KView& k, const VView& v, size_t q_off,
+                               const OView& out, float scale) {
+  return try_cudnn_sdpa_gqa_impl<Scalar>(handle, q, k, v, q_off, out, scale,
+                                         -1);
+}
+
+// Sliding-window causal dispatch: query t at absolute position p attends
+// keys [max(0, p + 1 - sliding_window), p]. sliding_window == 0 declines
+// (the caller routes that to try_cudnn_sdpa_gqa); otherwise the
+// bottom-right-aligned cuDNN band reproduces the native sliding mask under
+// the same Ktot == q_off + T precondition. Dtype mapping (float + bhalf_t
+// only), GQA checks, Ktot check, and D-contiguity repack match the causal
+// path. Returns true when cuDNN ran, false to run the native kernel.
+template <class Scalar, class Exec, class QView, class KView, class VView,
+          class OView>
+inline bool try_cudnn_sdpa_gqa_sliding(const DNNHandle<Exec>& handle,
+                                       const QView& q, const KView& k,
+                                       const VView& v, size_t q_off,
+                                       const OView& out, float scale,
+                                       size_t sliding_window) {
+  if (sliding_window == 0) return false;
+  return try_cudnn_sdpa_gqa_impl<Scalar>(handle, q, k, v, q_off, out, scale,
+                                         static_cast<int64_t>(sliding_window));
 }
 
 // Non-causal (bidirectional) SDPA dispatch over Kokkos views. Mirrors

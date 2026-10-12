@@ -2,16 +2,21 @@
 //
 // Single translation unit that includes <cudnn_frontend.h> so the rest of
 // the (header-only) library does not pay the frontend compile cost.
-// The header declares cudnn_sdpa_forward() (causal) and
-// cudnn_sdpa_forward_noncausal() (dense); here they are either stubs
+// The header declares cudnn_sdpa_forward() (causal),
+// cudnn_sdpa_forward_noncausal() (dense), and
+// cudnn_sdpa_forward_sliding() (sliding-window causal); here they are either stubs
 // returning false (CUDNN disabled or non-CUDA build) or the real graph.
 //
-// Real path: one inference SDPA node (generate_stats=false). The causal
-// variant bakes in bottom-right causal masking
-// (diagonal_alignment=BOTTOM_RIGHT, right_bound=0), which matches the
-// native kernel's mask when Ktot == q_off + T (checked by the caller);
-// the non-causal variant omits the diagonal-mask attributes for dense
-// attention. Q/K/V/O are described with
+// Real path: one inference SDPA node (generate_stats=false) with three
+// mask modes sharing one graph builder below. The causal variant bakes in
+// bottom-right causal masking (diagonal_alignment=BOTTOM_RIGHT,
+// right_bound=0), which matches the native kernel's mask when
+// Ktot == q_off + T (checked by the caller); the sliding-window variant
+// additionally sets diagonal_band_left_bound to the window size, masking
+// columns at or before row_idx - window (visible band of `window` keys
+// per query), which reproduces the native sliding mask under the same
+// KV-prefix precondition; the non-causal variant omits the diagonal-mask
+// attributes for dense attention. Q/K/V/O are described with
 // the caller's Kokkos strides (B=1, dims [B,H,S,D]), so arbitrary
 // Kokkos layouts and cache subviews work with no repack copy.
 // Implementation selection is AUTO: unified flash for BF16, composite
@@ -41,17 +46,22 @@ namespace KokkosDNN {
 namespace Impl {
 
 namespace {
-// Shared SDPA graph builder/executor. causal=true bakes in the
-// bottom-right causal mask (right_bound=0); causal=false omits the
-// diagonal-mask attributes entirely, which per the cuDNN frontend docs
-// yields dense (non-causal) attention.
+// Shared SDPA graph builder/executor. causal=false omits the diagonal-mask
+// attributes entirely, which per the cuDNN frontend docs yields dense
+// (non-causal) attention (left_bound is ignored). causal=true bakes in the
+// bottom-right causal mask (right_bound=0); left_bound >= 0 additionally
+// sets diagonal_band_left_bound, i.e. sliding-window causal attention where
+// each query sees a band of `left_bound` keys back. All validation, stream
+// handling, implementation selection, and failure semantics are shared so
+// the three mask modes cannot diverge.
 bool sdpa_forward_impl(void* cached_handle, CudnnSdpaScalar dtype,
                        const void* q, const void* k, const void* v, void* out,
                        int64_t T, int64_t Ktot, int64_t Hq, int64_t Hkv,
                        int64_t D, int64_t q_sT, int64_t q_sH, int64_t q_sD,
                        int64_t k_sT, int64_t k_sH, int64_t k_sD, int64_t v_sT,
                        int64_t v_sH, int64_t v_sD, int64_t o_sT, int64_t o_sH,
-                       int64_t o_sD, float scale, bool causal) {
+                       int64_t o_sD, float scale, bool causal,
+                       int64_t left_bound, const char* node_name) {
   if (cached_handle == nullptr) return false;
   if (q == nullptr || k == nullptr || v == nullptr || out == nullptr)
     return false;
@@ -134,14 +144,21 @@ bool sdpa_forward_impl(void* cached_handle, CudnnSdpaScalar dtype,
     }
 
     auto sdpa_options = fe::graph::SDPA_attributes()
-                            .set_name(causal ? "kokkosdnn_sdpa"
-                                             : "kokkosdnn_sdpa_noncausal")
+                            .set_name(node_name)
                             .set_attn_scale(scale)
                             .set_generate_stats(false);
     if (causal) {
       sdpa_options.set_diagonal_alignment(
           fe::DiagonalAlignment_t::BOTTOM_RIGHT);
       sdpa_options.set_diagonal_band_right_bound(0);
+      if (left_bound >= 0) {
+        // Sliding window: mask columns at or before row_idx - left_bound,
+        // leaving a visible band of `left_bound` keys per query. With the
+        // caller's KV prefix satisfying Ktot == q_off + T, bottom-right
+        // alignment reproduces the native kernel's
+        // [max(0, p + 1 - window), p] mask with left_bound == window.
+        sdpa_options.set_diagonal_band_left_bound(left_bound);
+      }
     }
     if (io_type == fe::DataType_t::FLOAT) {
       // FP32 I/O is only served by the composite (matmul + softmax +
@@ -205,7 +222,7 @@ bool cudnn_sdpa_forward(void* cached_handle, CudnnSdpaScalar dtype,
   return sdpa_forward_impl(cached_handle, dtype, q, k, v, out, T, Ktot, Hq,
                            Hkv, D, q_sT, q_sH, q_sD, k_sT, k_sH, k_sD, v_sT,
                            v_sH, v_sD, o_sT, o_sH, o_sD, scale,
-                           /*causal=*/true);
+                           /*causal=*/true, -1, "kokkosdnn_sdpa");
 }
 
 bool cudnn_sdpa_forward_noncausal(
@@ -217,7 +234,20 @@ bool cudnn_sdpa_forward_noncausal(
   return sdpa_forward_impl(cached_handle, dtype, q, k, v, out, T, Ktot, Hq,
                            Hkv, D, q_sT, q_sH, q_sD, k_sT, k_sH, k_sD, v_sT,
                            v_sH, v_sD, o_sT, o_sH, o_sD, scale,
-                           /*causal=*/false);
+                           /*causal=*/false, -1, "kokkosdnn_sdpa_noncausal");
+}
+
+bool cudnn_sdpa_forward_sliding(
+    void* cached_handle, CudnnSdpaScalar dtype, const void* q, const void* k,
+    const void* v, void* out, int64_t T, int64_t Ktot, int64_t Hq, int64_t Hkv,
+    int64_t D, int64_t q_sT, int64_t q_sH, int64_t q_sD, int64_t k_sT,
+    int64_t k_sH, int64_t k_sD, int64_t v_sT, int64_t v_sH, int64_t v_sD,
+    int64_t o_sT, int64_t o_sH, int64_t o_sD, float scale, int64_t window) {
+  if (window <= 0) return false;
+  return sdpa_forward_impl(cached_handle, dtype, q, k, v, out, T, Ktot, Hq,
+                           Hkv, D, q_sT, q_sH, q_sD, k_sT, k_sH, k_sD, v_sT,
+                           v_sH, v_sD, o_sT, o_sH, o_sD, scale,
+                           /*causal=*/true, window, "kokkosdnn_sdpa_sliding");
 }
 
 }  // namespace Impl
@@ -242,6 +272,15 @@ bool cudnn_sdpa_forward_noncausal(void*, CudnnSdpaScalar, const void*,
                                   int64_t, int64_t, int64_t, int64_t, int64_t,
                                   int64_t, int64_t, int64_t, int64_t, int64_t,
                                   int64_t, float) {
+  return false;
+}
+
+bool cudnn_sdpa_forward_sliding(void*, CudnnSdpaScalar, const void*,
+                                const void*, const void*, void*, int64_t,
+                                int64_t, int64_t, int64_t, int64_t, int64_t,
+                                int64_t, int64_t, int64_t, int64_t, int64_t,
+                                int64_t, int64_t, int64_t, int64_t, int64_t,
+                                int64_t, float, int64_t) {
   return false;
 }
 
