@@ -22,7 +22,11 @@ jobs:
       image: nvidia/cuda:12.8.1-devel-ubuntu24.04
     env:
       KOKKOS_VERSION: 5.2.1
-      KOKKOS_INSTALL: ${{ github.workspace }}/kokkos-install
+      # NOTE: do NOT derive paths from ${{ github.workspace }} here.
+      # Inside a `container:` job that context holds the *host* path
+      # (/home/runner/work/...), which does not exist inside the container
+      # (see actions/runner#2058). Use $GITHUB_WORKSPACE at run time instead,
+      # which holds the container-side mount (/github/workspace).
     steps:
       - uses: actions/checkout@v4
 
@@ -49,10 +53,17 @@ jobs:
           # Ampere (SM80) is a sensible compile-only default: no GPU is
           # present, so nothing queries the real device; any supported
           # Kokkos_ARCH_* (or Kokkos_ARCH_NATIVE=ON on a GPU node) works.
+          # $GITHUB_WORKSPACE is the container-side workspace path; the
+          # ${{ github.workspace }} context would expand to the host path and
+          # does not exist inside the container.
+          KOKKOS_INSTALL="$GITHUB_WORKSPACE/kokkos-install"
+          NVCC_WRAPPER="$GITHUB_WORKSPACE/kokkos-src/bin/nvcc_wrapper"
+          # Fail fast with a clear log if the checkout did not land.
+          test -x "$NVCC_WRAPPER" || { echo "nvcc_wrapper not found at $NVCC_WRAPPER"; ls "$GITHUB_WORKSPACE/kokkos-src/bin" || true; exit 1; }
           cmake -S kokkos-src -B kokkos-build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="${KOKKOS_INSTALL}" \
-            -DCMAKE_CXX_COMPILER="${{ github.workspace }}/kokkos-src/bin/nvcc_wrapper" \
+            -DCMAKE_CXX_COMPILER="${NVCC_WRAPPER}" \
             -DKokkos_ENABLE_CUDA=ON \
             -DKokkos_ENABLE_SERIAL=ON \
             -DKokkos_ARCH_AMPERE80=ON \
@@ -67,9 +78,11 @@ jobs:
           # check with no extra toolkit version coupling. The
           # whole project must compile with nvcc_wrapper against a CUDA
           # Kokkos (device code in headers).
+          KOKKOS_INSTALL="$GITHUB_WORKSPACE/kokkos-install"
+          NVCC_WRAPPER="$GITHUB_WORKSPACE/kokkos-src/bin/nvcc_wrapper"
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_COMPILER="${{ github.workspace }}/kokkos-src/bin/nvcc_wrapper" \
+            -DCMAKE_CXX_COMPILER="${NVCC_WRAPPER}" \
             -DKokkos_ROOT="${KOKKOS_INSTALL}" \
             -DKokkosDNN_ENABLE_TESTS=ON \
             -DKokkosDNN_ENABLE_EXAMPLES=ON \
