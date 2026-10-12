@@ -51,10 +51,16 @@ jobs:
           echo -e 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600' \
             | sudo tee /etc/apt/preferences.d/rocm-pin-600
           sudo apt-get update
-          sudo apt-get install -y rocm-hip-sdk
+          # rocm-hip-sdk alone does not ship rocThrust/rocPRIM/hipCUB, but
+          # Kokkos's HIP backend enables its ROCTHRUST TPL by default
+          # (Kokkos_ENABLE_ROCTHRUST=ON since Kokkos 4.3), whose
+          # rocthrust-config.cmake does find_dependency(rocprim). Install the
+          # dev packages so Kokkos configure can find them under /opt/rocm.
+          sudo apt-get install -y rocm-hip-sdk rocprim-dev rocthrust-dev hipcub-dev
           # Fail fast with a clear log if the install did not land.
           /opt/rocm/bin/hipcc --version
           ls /opt/rocm/lib/cmake/hip/
+          ls /opt/rocm/lib/cmake/rocthrust/ /opt/rocm/lib/cmake/rocprim/ /opt/rocm/lib/cmake/hipcub/
 
       # Shallow checkout of the Kokkos release tag into kokkos-src.
       # submodules: recursive is required: the build needs desul/mdspan,
