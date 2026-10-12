@@ -1,0 +1,100 @@
+name: SmolLM2 inference
+
+# Serial-only CI that runs a real SmolLM2-135M checkpoint through the
+# existing examples/smollm2/smollm2_generate driver. The ~269 MB weights
+# (model.safetensors + tokenizer.json from HuggingFaceTB/SmolLM2-135M)
+# are cached with actions/cache so they are downloaded once and reused.
+on:
+  push:
+    paths-ignore:
+      - "docs/**"
+      - ".github/workflows/docs.yaml"
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+      - ".github/workflows/docs.yaml"
+
+jobs:
+  smollm2:
+    runs-on: ubuntu-latest
+    env:
+      KOKKOS_VERSION: 5.2.1
+      KOKKOS_INSTALL: ${{ github.workspace }}/kokkos-install
+      SMOLLM2_REPO: HuggingFaceTB/SmolLM2-135M
+      SMOLLM2_DIR: ${{ github.workspace }}/smollm2-weights
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ git python3-pip
+
+      # Shallow checkout of the Kokkos release tag into kokkos-src.
+      # submodules: recursive is required: the build needs desul/mdspan,
+      # which git does not fetch by default.
+      - name: Check out Kokkos
+        uses: actions/checkout@v4
+        with:
+          repository: kokkos/kokkos
+          ref: ${{ env.KOKKOS_VERSION }}
+          path: kokkos-src
+          submodules: recursive
+
+      - name: Build and install Kokkos (Serial only)
+        run: |
+          cmake -S kokkos-src -B kokkos-build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${KOKKOS_INSTALL}" \
+            -DKokkos_ENABLE_SERIAL=ON \
+            -DKokkos_ENABLE_TESTS=OFF
+          cmake --build kokkos-build --parallel "$(nproc)"
+          cmake --install kokkos-build
+
+      - name: Configure KokkosDNN (examples only)
+        run: |
+          # TESTS=OFF + BENCHMARKS=OFF: this workflow only needs the
+          # example drivers (and runs just the SmolLM2 one below).
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DKokkos_ROOT="${KOKKOS_INSTALL}" \
+            -DKokkosDNN_ENABLE_TESTS=OFF \
+            -DKokkosDNN_ENABLE_EXAMPLES=ON \
+            -DKokkosDNN_ENABLE_BENCHMARKS=OFF
+
+      - name: Build examples
+        run: cmake --build build --parallel "$(nproc)"
+
+      # Cache the downloaded checkpoint so follow-up runs skip the
+      # ~269 MB download. Bump the -v1 suffix to force a refresh
+      # (e.g. if the upstream weights change).
+      - name: Cache SmolLM2-135M weights
+        id: cache-smollm2
+        uses: actions/cache@v4
+        with:
+          path: smollm2-weights
+          key: smollm2-135m-v1
+          restore-keys: |
+            smollm2-135m-
+
+      # huggingface_hub handles the xet-backed model.safetensors; the
+      # plain-HTTPS resolve URL would not. Skipped on cache hit.
+      - name: Download SmolLM2-135M weights
+        if: steps.cache-smollm2.outputs.cache-hit != 'true'
+        run: |
+          pip install -U "huggingface_hub[cli]" hf_xet
+          mkdir -p "${SMOLLM2_DIR}"
+          python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='${SMOLLM2_REPO}', local_dir='${SMOLLM2_DIR}', allow_patterns=['model.safetensors', 'tokenizer.json'])"
+          ls -lh "${SMOLLM2_DIR}"
+
+      # Greedy (--temperature 0) for deterministic CI output. --max-new 32
+      # keeps the single-core Serial runtime in the tens of seconds
+      # (135M BF16); the checked-in config fixture mirrors the HF config.
+      - name: Run SmolLM2-135M inference
+        run: |
+          ./build/examples/smollm2/smollm2_generate \
+            --model smollm2-135m \
+            --config examples/smollm2/config-smollm2-135m.json \
+            --weights "${SMOLLM2_DIR}/model.safetensors" \
+            --tokenizer "${SMOLLM2_DIR}/tokenizer.json" \
+            --prompt "Hello" --max-new 32 --temperature 0
