@@ -81,8 +81,8 @@ jobs:
 
       - name: Configure KokkosDNN
         run: |
-          # Build-only: TESTS=ON + EXAMPLES=ON maximize compile coverage,
-          # BENCHMARKS=OFF keeps it fast. The whole project must compile
+          # Build-only: TESTS=ON + EXAMPLES=ON + BENCHMARKS=ON maximize
+          # compile coverage. The whole project must compile
           # with hipcc against a HIP Kokkos (device code in headers).
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
@@ -90,7 +90,7 @@ jobs:
             -DKokkos_ROOT="${KOKKOS_INSTALL}" \
             -DKokkosDNN_ENABLE_TESTS=ON \
             -DKokkosDNN_ENABLE_EXAMPLES=ON \
-            -DKokkosDNN_ENABLE_BENCHMARKS=OFF
+            -DKokkosDNN_ENABLE_BENCHMARKS=ON
 
       # Build every target (library, tests, examples). Deliberately does
       # NOT run ctest or any example binary: there is no GPU on the runner,
