@@ -4,7 +4,13 @@ name: Serial build
 # the tests and examples that finish in reasonable time on a single core.
 on:
   push:
+    paths-ignore:
+      - "docs/**"
+      - ".github/workflows/docs.yaml"
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - ".github/workflows/docs.yaml"
 
 jobs:
   serial:

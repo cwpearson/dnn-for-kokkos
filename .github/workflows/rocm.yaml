@@ -5,7 +5,13 @@ name: ROCm build
 # (.github/workflows/serial.yaml) in structure, minus the test execution.
 on:
   push:
+    paths-ignore:
+      - "docs/**"
+      - ".github/workflows/docs.yaml"
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - ".github/workflows/docs.yaml"
 
 jobs:
   rocm:

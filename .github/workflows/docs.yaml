@@ -1,11 +1,18 @@
 name: Docs
 
-# Build API docs on every PR (build only); build + deploy to GitHub Pages
-# on pushes to main.
+# Build the Sphinx docs on every PR (build only); build + deploy to
+# GitHub Pages on pushes to main. Only runs when the docs (or this
+# workflow) change; build workflows ignore docs-only changes in return.
 on:
   push:
     branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yaml"
   pull_request:
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yaml"
 
 permissions:
   contents: read
@@ -25,19 +32,21 @@ jobs:
       - name: Setup Pages
         uses: actions/configure-pages@v5
 
-      - name: Install Doxygen and Graphviz
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y doxygen graphviz
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-      - name: Build Doxygen docs
-        working-directory: docs
-        run: doxygen Doxyfile
+      - name: Install Sphinx dependencies
+        run: pip install -r docs/requirements.txt
+
+      - name: Build Sphinx docs
+        run: sphinx-build -W --keep-going docs docs/_build/html
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: docs/html
+          path: docs/_build/html
 
   deploy:
     needs: build

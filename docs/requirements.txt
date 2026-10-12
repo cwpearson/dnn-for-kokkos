@@ -1,0 +1,4 @@
+# docs build dependencies (pip install -r docs/requirements.txt)
+sphinx
+myst-parser
+sphinx-rtd-theme
