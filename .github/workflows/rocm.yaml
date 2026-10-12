@@ -79,9 +79,15 @@ jobs:
           # default: no GPU is present, so nothing queries the real device;
           # any supported Kokkos_ARCH_* (or Kokkos_ARCH_NATIVE=ON on a GPU
           # node) works. ROCM_PATH points find_package(hip) at /opt/rocm.
+          # CMAKE_PREFIX_PATH is also required: FindTPLROCTHRUST locates
+          # rocthrust via ROCM_PATH, but rocthrust-config.cmake itself does
+          # find_dependency(rocprim) with no PATHS hint, so without /opt/rocm
+          # on the prefix path CMake fails with "Could not find a package
+          # configuration file provided by rocprim".
           cmake -S kokkos-src -B kokkos-build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="${KOKKOS_INSTALL}" \
+            -DCMAKE_PREFIX_PATH="${ROCM_PATH}" \
             -DCMAKE_CXX_COMPILER="${ROCM_PATH}/bin/hipcc" \
             -DROCM_PATH="${ROCM_PATH}" \
             -DKokkos_ENABLE_HIP=ON \
@@ -96,8 +102,11 @@ jobs:
           # Build-only: TESTS=ON + EXAMPLES=ON + BENCHMARKS=ON maximize
           # compile coverage. The whole project must compile
           # with hipcc against a HIP Kokkos (device code in headers).
+          # CMAKE_PREFIX_PATH keeps downstream find_package(Kokkos) ->
+          # find_dependency(hip/rocthrust) resolving under /opt/rocm.
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="${ROCM_PATH}" \
             -DCMAKE_CXX_COMPILER="${ROCM_PATH}/bin/hipcc" \
             -DKokkos_ROOT="${KOKKOS_INSTALL}" \
             -DKokkosDNN_ENABLE_TESTS=ON \
