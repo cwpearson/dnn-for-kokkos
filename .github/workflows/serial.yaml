@@ -22,11 +22,16 @@ jobs:
           # preferred by the optional image component (find-or-fetch).
           sudo apt-get install -y cmake g++ git libstb-dev
 
-      - name: Download Kokkos
-        run: |
-          curl -L -o kokkos.tar.gz \
-            "https://github.com/kokkos/kokkos/releases/download/${KOKKOS_VERSION}/kokkos-${KOKKOS_VERSION}.tar.gz"
-          mkdir kokkos-src && tar -xzf kokkos.tar.gz -C kokkos-src --strip-components=1
+      # Shallow checkout of the Kokkos release tag into kokkos-src.
+      # submodules: recursive is required: the build needs desul/mdspan,
+      # which git does not fetch by default.
+      - name: Check out Kokkos
+        uses: actions/checkout@v4
+        with:
+          repository: kokkos/kokkos
+          ref: ${{ env.KOKKOS_VERSION }}
+          path: kokkos-src
+          submodules: recursive
 
       - name: Build and install Kokkos (Serial only)
         run: |
