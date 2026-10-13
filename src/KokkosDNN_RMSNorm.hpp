@@ -31,6 +31,37 @@ void rmsnorm(const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
       });
 }
 
+// Batched variant: x, y: [batch, tokens, dim], w: [dim].
+// Same per-row math as the rank-2 overload, applied independently to each
+// (batch, token) row. Scalar-agnostic; norm accumulated in FP32.
+// In-place safe (x and y may alias).
+template <class ExecSpace, class Scalar>
+void rmsnorm(
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& x,
+    const Kokkos::View<Scalar*, ExecSpace>& w, float eps,
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& y,
+    const std::string& label = "KokkosDNN::rmsnorm") {
+  const size_t B = x.extent(0), T = x.extent(1), D = x.extent(2);
+  if (y.extent(0) != B || y.extent(1) != T || y.extent(2) != D ||
+      w.extent(0) != D)
+    throw std::invalid_argument("rmsnorm: dimension mismatch");
+  if (B == 0 || T == 0 || D == 0) return;
+  Kokkos::parallel_for(
+      label,
+      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {B, T}),
+      KOKKOS_LAMBDA(size_t b, size_t t) {
+        float ss = 0;
+        for (size_t d = 0; d < D; ++d) {
+          float v = static_cast<float>(x(b, t, d));
+          ss += v * v;
+        }
+        float inv = 1.0f / sqrt(ss / (float)D + eps);
+        for (size_t d = 0; d < D; ++d)
+          y(b, t, d) = static_cast<Scalar>(
+              static_cast<float>(x(b, t, d)) * inv * static_cast<float>(w(d)));
+      });
+}
+
 // Single-row variant for decode.
 template <class ExecSpace, class Scalar>
 void rmsnorm_row(const Kokkos::View<Scalar*, ExecSpace>& x,

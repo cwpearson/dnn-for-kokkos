@@ -23,6 +23,11 @@ target_link_libraries(sana_generate PRIVATE KokkosDNN::sana)
 set_target_properties(sana_generate PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
 
 if(KokkosDNN_ENABLE_TESTS)
+  add_executable(test_sana_ops Test_SanaOpsAttention.cpp Test_SanaOpsConv.cpp)
+  target_link_libraries(test_sana_ops PRIVATE KokkosDNN::sana KokkosDNN::gtest_main)
+  set_target_properties(test_sana_ops PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+  gtest_discover_tests(test_sana_ops)
+
   add_executable(test_sana_smoke Test_SanaSmoke.cpp)
   target_link_libraries(test_sana_smoke PRIVATE KokkosDNN::sana KokkosDNN::gtest_main)
   set_target_properties(test_sana_smoke PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)

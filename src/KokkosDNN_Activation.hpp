@@ -6,6 +6,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "KokkosDNN_SwiGLU.hpp"
+
 namespace KokkosDNN {
 
 // GELU variant selector (pins down the HuggingFace `ACT2FN` ambiguity):
@@ -74,6 +76,45 @@ void gelu_forward(
       label, Kokkos::RangePolicy<ExecSpace>(0, N), KOKKOS_LAMBDA(size_t i) {
         float v = static_cast<float>(x(i));
         y(i) = static_cast<Scalar>(Impl::gelu_apply(v, variant));
+      });
+}
+
+// SiLU forward: y = x / (1 + exp(-x)), elementwise. Computed in FP32 and
+// cast back to Scalar via ::KokkosDNN::silu (see KokkosDNN_SwiGLU.hpp).
+// In-place safe (x and y may alias; each output depends only on the
+// same-index input).
+// Rank-2 variant (e.g. [tokens, dim] MLP activations).
+template <class ExecSpace, class Scalar>
+void silu_forward(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& y,
+    const std::string& label = "KokkosDNN::silu_forward") {
+  if (x.extent(0) != y.extent(0) || x.extent(1) != y.extent(1))
+    throw std::invalid_argument("silu_forward: dimension mismatch");
+  const size_t R = x.extent(0), C = x.extent(1);
+  if (R == 0 || C == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {R, C}),
+      KOKKOS_LAMBDA(size_t i, size_t j) {
+        float v = static_cast<float>(x(i, j));
+        y(i, j) = static_cast<Scalar>(::KokkosDNN::silu(v));
+      });
+}
+
+// Rank-1 variant (e.g. single-row / decode path).
+template <class ExecSpace, class Scalar>
+void silu_forward(
+    const Kokkos::View<Scalar*, ExecSpace>& x,
+    const Kokkos::View<Scalar*, ExecSpace>& y,
+    const std::string& label = "KokkosDNN::silu_forward") {
+  if (x.extent(0) != y.extent(0))
+    throw std::invalid_argument("silu_forward: dimension mismatch");
+  const size_t N = x.extent(0);
+  if (N == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::RangePolicy<ExecSpace>(0, N), KOKKOS_LAMBDA(size_t i) {
+        float v = static_cast<float>(x(i));
+        y(i) = static_cast<Scalar>(::KokkosDNN::silu(v));
       });
 }
 

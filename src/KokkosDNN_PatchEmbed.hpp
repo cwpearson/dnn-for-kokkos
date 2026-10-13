@@ -116,6 +116,50 @@ void patchembed_forward(
   gemm_bias(handle, patches, weight, bias, flat, label + "_gemm");
 }
 
+// Unpatchify (inverse of the patch embed): tokens [T, C] -> image [C, H, W]
+// with T = H*W row-major (token t = h*W + w). Pure transpose, no handle.
+template <class ExecSpace, class Scalar>
+void unpatchify_forward(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& tokens,
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& image,
+    size_t H, size_t W,
+    const std::string& label = "KokkosDNN::unpatchify_forward") {
+  if (H == 0 || W == 0)
+    throw std::invalid_argument("unpatchify_forward: H and W must be nonzero");
+  const size_t T = tokens.extent(0), C = tokens.extent(1);
+  if (T != H * W || image.extent(0) != C || image.extent(1) != H ||
+      image.extent(2) != W)
+    throw std::invalid_argument("unpatchify_forward: dimension mismatch");
+  if (T == 0 || C == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, C}),
+      KOKKOS_LAMBDA(size_t t, size_t c) {
+        image(c, t / W, t % W) = tokens(t, c);
+      });
+}
+
+// Batched variant: tokens [B, T, C] -> images [B, C, H, W].
+template <class ExecSpace, class Scalar>
+void unpatchify_forward(
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& tokens,
+    const Kokkos::View<Scalar****, Kokkos::LayoutRight, ExecSpace>& images,
+    size_t H, size_t W,
+    const std::string& label = "KokkosDNN::unpatchify_forward") {
+  if (H == 0 || W == 0)
+    throw std::invalid_argument("unpatchify_forward: H and W must be nonzero");
+  const size_t B = tokens.extent(0), T = tokens.extent(1), C = tokens.extent(2);
+  if (T != H * W || images.extent(0) != B || images.extent(1) != C ||
+      images.extent(2) != H || images.extent(3) != W)
+    throw std::invalid_argument("unpatchify_forward: dimension mismatch");
+  if (B == 0 || T == 0 || C == 0) return;
+  Kokkos::parallel_for(
+      label,
+      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<3>>({0, 0, 0}, {B, T, C}),
+      KOKKOS_LAMBDA(size_t b, size_t t, size_t c) {
+        images(b, c, t / W, t % W) = tokens(b, t, c);
+      });
+}
+
 }  // namespace KokkosDNN
 
 #endif

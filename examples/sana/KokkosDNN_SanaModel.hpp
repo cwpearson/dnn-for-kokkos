@@ -250,10 +250,11 @@ void unpatchify(const Mat& rows, const Lat& img, int patch,
 // Owns the TPL handle and persistent grow-only scratch, mirroring the
 // structural pattern of Dinov3::Model (weights/handle/scratch + forward).
 //
-// Dependency note (SanaCore / SanaAttention / SanaConv): those core ops now
-// exist in src/ and are mathematically equivalent to the Impl kernels below
-// (silu/timestep/rmsnorm/modulate <-> SanaCore, LiteLA/cross bodies <->
-// SanaAttention, depthwise/GLU/unpatchify <-> SanaConv), but they allocate
+// Dependency note: generic elementwise/norm/diffusion/conv ops live in src/
+// (silu/timestep/rmsnorm/modulate <-> Activation/Diffusion/RMSNorm,
+// depthwise/GLU/unpatchify <-> DepthwiseConv/PatchEmbed) and the fused Sana
+// reference ops (LiteLA/cross/GLUMBConv) live in KokkosDNN_SanaOps.hpp, but
+// they allocate temporaries per call. This model instead uses purpose-built
 // temporaries per call. This model instead uses purpose-built kernels that
 // write into persistent scratch so that steady state performs no View
 // allocations (see class docs); the building blocks reused from the core

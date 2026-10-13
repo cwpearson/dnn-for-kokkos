@@ -116,3 +116,75 @@ TEST(LayerNorm, DimensionMismatchThrows) {
   EXPECT_THROW((KokkosDNN::layernorm_row<Exec, float>(xr, bad, b, 1e-5f, yr)),
                std::invalid_argument);
 }
+
+template <class Scalar>
+void check_layernorm_noaffine(float tol) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  const float eps = 1e-5f;
+  const int T = 3, D = 8;
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> x("x", T, D), y("y", T, D);
+  auto hx = Kokkos::create_mirror_view(x);
+  for (int t = 0; t < T; ++t)
+    for (int d = 0; d < D; ++d)
+      hx(t, d) = static_cast<Scalar>(0.5f * (t + 1) - 0.25f * d);
+  Kokkos::deep_copy(x, hx);
+  KokkosDNN::layernorm_noaffine_forward<Exec, Scalar>(x, eps, y);
+  const int B = 2, T3 = 4;
+  Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec> x3("x3", B, T3, D),
+      y3("y3", B, T3, D);
+  auto hx3 = Kokkos::create_mirror_view(x3);
+  for (int b = 0; b < B; ++b)
+    for (int t = 0; t < T3; ++t)
+      for (int d = 0; d < D; ++d)
+        hx3(b, t, d) =
+            static_cast<Scalar>(0.4f * (b + 1) - 0.2f * t + 0.1f * d);
+  Kokkos::deep_copy(x3, hx3);
+  KokkosDNN::layernorm_noaffine_forward<Exec, Scalar>(x3, eps, y3);
+  Kokkos::fence();
+  auto got = Kokkos::create_mirror_view(y);
+  Kokkos::deep_copy(got, y);
+  auto got3 = Kokkos::create_mirror_view(y3);
+  Kokkos::deep_copy(got3, y3);
+  for (int t = 0; t < T; ++t) {
+    double mean = 0;
+    for (int d = 0; d < D; ++d) mean += static_cast<double>(hx(t, d));
+    mean /= D;
+    double var = 0;
+    for (int d = 0; d < D; ++d) {
+      double c = static_cast<double>(hx(t, d)) - mean;
+      var += c * c;
+    }
+    var /= D;
+    double inv = 1.0 / std::sqrt(var + eps);
+    for (int d = 0; d < D; ++d) {
+      double want = (static_cast<double>(hx(t, d)) - mean) * inv;
+      EXPECT_NEAR(static_cast<double>(got(t, d)), want, tol)
+          << "layernorm_noaffine rank-2 mismatch at (" << t << "," << d
+          << ")";
+    }
+  }
+  for (int b = 0; b < B; ++b)
+    for (int t = 0; t < T3; ++t) {
+      double mean = 0;
+      for (int d = 0; d < D; ++d) mean += static_cast<double>(hx3(b, t, d));
+      mean /= D;
+      double var = 0;
+      for (int d = 0; d < D; ++d) {
+        double c = static_cast<double>(hx3(b, t, d)) - mean;
+        var += c * c;
+      }
+      var /= D;
+      double inv = 1.0 / std::sqrt(var + eps);
+      for (int d = 0; d < D; ++d) {
+        double want = (static_cast<double>(hx3(b, t, d)) - mean) * inv;
+        EXPECT_NEAR(static_cast<double>(got3(b, t, d)), want, tol)
+            << "layernorm_noaffine rank-3 mismatch at (" << b << "," << t
+            << "," << d << ")";
+      }
+    }
+}
+
+TEST(LayerNormNoAffine, Float) { check_layernorm_noaffine<float>(1e-5f); }
+TEST(LayerNormNoAffine, BHalf) {
+  check_layernorm_noaffine<Kokkos::Experimental::bhalf_t>(5e-2f);
+}

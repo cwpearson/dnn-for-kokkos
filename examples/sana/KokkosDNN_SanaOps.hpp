@@ -1,19 +1,75 @@
-#ifndef KOKKOSDNN_SANAATTENTION_HPP
-#define KOKKOSDNN_SANAATTENTION_HPP
+#ifndef KOKKOSDNN_SANA_OPS_HPP
+#define KOKKOSDNN_SANA_OPS_HPP
+
+// Sana-model-specific fused ops (NVlabs Sana), moved verbatim out of
+// src/KokkosDNN_SanaConv.hpp (glumbconv section) and
+// src/KokkosDNN_SanaAttention.hpp (full). src/ is core DNN operators only;
+// these stitching kernels belong to the Sana example.
+//
+// Namespace choice: public names are identical to the src versions but live
+// in KokkosDNN::Sana:: (e.g. KokkosDNN::Sana::glumbconv_forward) to make
+// model-specificity explicit. Internal Impl helpers live in
+// KokkosDNN::Sana::Impl, EXCEPT the depthwise 3x3 kernels, which are core
+// operators owned by src/KokkosDNN_DepthwiseConv.hpp (sibling agent) and are
+// called fully qualified as ::KokkosDNN::Impl::depthwise3x3_{2d,3d} so the
+// call sites work identically with or without the fallback below.
+//
+// examples/sana/KokkosDNN_SanaModel.hpp does NOT use this header (it owns
+// persistent-scratch Impl kernels); this header serves the moved tests and
+// any out-of-model callers of the fused reference ops.
 
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
 #include <cmath>
+#include <cstddef>
 #include <stdexcept>
 #include <string>
 
 #include "KokkosDNN_Attention.hpp"
+#include "KokkosDNN_DepthwiseConv.hpp"
 #include "KokkosDNN_Gemm.hpp"
 #include "KokkosDNN_GemmBias.hpp"
 #include "KokkosDNN_Handle.hpp"
+#include "KokkosDNN_SwiGLU.hpp"
 
 namespace KokkosDNN {
+namespace Sana {
 namespace Impl {
+
+// Elementwise SiLU in place over a rank-2 view (FP32, cast back).
+// Reuses KokkosDNN::silu from KokkosDNN_SwiGLU.hpp (same x*sigmoid(x)).
+template <class ExecSpace, class Scalar>
+void silu_inplace_2d(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& v,
+    const std::string& label) {
+  const size_t R = v.extent(0), C = v.extent(1);
+  if (R == 0 || C == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {R, C}),
+      KOKKOS_LAMBDA(size_t i, size_t j) {
+        v(i, j) = static_cast<Scalar>(silu(static_cast<float>(v(i, j))));
+      });
+}
+
+// GLU-style gated multiply: h(t,j) = dw(t,j) * SiLU(dw(t,j+Hid)).
+// Each output depends only on same-row inputs; dw and h must not alias
+// (h is narrower than dw, so out-of-place is required).
+template <class ExecSpace, class Scalar>
+void silu_gate_multiply_2d(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& dw,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& h, size_t Hid,
+    const std::string& label) {
+  const size_t T = h.extent(0);
+  if (T == 0 || Hid == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0},
+                                                              {T, Hid}),
+      KOKKOS_LAMBDA(size_t t, size_t j) {
+        const float a = static_cast<float>(dw(t, j));
+        const float g = static_cast<float>(dw(t, j + Hid));
+        h(t, j)       = static_cast<Scalar>(a * silu(g));
+      });
+}
 
 // Weight-orientation helper for the fused Sana ops.
 //
@@ -251,6 +307,124 @@ void sana_cross_2d_body(
 }
 
 }  // namespace Impl
+
+// GLUMBConv MixFFN forward (rank-2, single batch element or flattened
+// batch): x [T, Cin] with T = H*W, y [T, Cout], where
+//   inv_w [2*Hid, Cin], inv_b [2*Hid] (or empty for no bias),
+//   dw_w [2*Hid, 3, 3], dw_b [2*Hid] (or empty for no bias),
+//   pt_w [Cout, Hid] (point conv is unbiased).
+// Pipeline: u = SiLU(x @ inv_w^T + inv_b); dw = depthwise3x3(u);
+// split dw into (a, g) along channels; h = a * SiLU(g);
+// y = h @ pt_w^T. Scratch: [T, 2*Hid] x2 + [T, Hid].
+//
+// Reference: NVlabs Sana diffusion/model/nets/basic_modules.py classes
+// ConvLayer / GLUMBConv, with mlp_acts (silu, silu, None). Weight layout:
+// 1x1 conv weights [Cout, Cin] row-major (HF Linear, gemm Y = X * W^T);
+// depthwise weights [Cin, 3, 3] LayoutRight; token views LayoutRight
+// [T, C] with T = H*W row-major.
+template <class ExecSpace, class Scalar>
+void glumbconv_forward(
+    const DNNHandle<ExecSpace>& handle,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& inv_w,
+    const Kokkos::View<Scalar*, ExecSpace>& inv_b,
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& dw_w,
+    const Kokkos::View<Scalar*, ExecSpace>& dw_b,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& pt_w,
+    size_t H, size_t W,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& y,
+    const std::string& label = "KokkosDNN::glumbconv_forward") {
+  if (H == 0 || W == 0)
+    throw std::invalid_argument("glumbconv_forward: H and W must be nonzero");
+  const size_t T = x.extent(0), Cin = x.extent(1);
+  const size_t inv_out = inv_w.extent(0);
+  const bool inv_biased = (inv_b.extent(0) != 0);
+  const bool dw_biased  = (dw_b.extent(0) != 0);
+  if (T != H * W || inv_out == 0 || inv_out % 2 != 0 || inv_w.extent(1) != Cin ||
+      (inv_biased && inv_b.extent(0) != inv_out) || dw_w.extent(0) != inv_out ||
+      dw_w.extent(1) != 3 || dw_w.extent(2) != 3 ||
+      (dw_biased && dw_b.extent(0) != inv_out))
+    throw std::invalid_argument("glumbconv_forward: dimension mismatch");
+  const size_t Hid = inv_out / 2, Cout = pt_w.extent(0);
+  if (pt_w.extent(1) != Hid || y.extent(0) != T || y.extent(1) != Cout)
+    throw std::invalid_argument("glumbconv_forward: dimension mismatch");
+  if (T == 0 || Cin == 0 || Cout == 0) return;
+
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> u(label + "_u", T,
+                                                           inv_out);
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> dw(label + "_dw", T,
+                                                            inv_out);
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> h(label + "_h", T,
+                                                           Hid);
+  gemm_bias(handle, x, inv_w, inv_b, u, label + "_inv");
+  Impl::silu_inplace_2d<ExecSpace, Scalar>(u, label + "_silu");
+  ::KokkosDNN::Impl::depthwise3x3_2d<ExecSpace, Scalar>(u, dw_w, dw_b, dw, H, W,
+                                                       label + "_dw");
+  Impl::silu_gate_multiply_2d<ExecSpace, Scalar>(dw, h, Hid, label + "_gate");
+  Kokkos::View<Scalar*, ExecSpace> no_bias;  // point conv is unbiased
+  gemm_bias(handle, h, pt_w, no_bias, y, label + "_pt");
+}
+
+// Batched variant: x [B, T, Cin], y [B, T, Cout], weights shared across the
+// batch. GEMM stages run on flattened [B*T, C] aliases of contiguous views
+// (same aliasing pattern as patchembed_forward); the depthwise stage has a
+// dedicated rank-3 kernel. x and y must be contiguous.
+template <class ExecSpace, class Scalar>
+void glumbconv_forward(
+    const DNNHandle<ExecSpace>& handle,
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& x,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& inv_w,
+    const Kokkos::View<Scalar*, ExecSpace>& inv_b,
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& dw_w,
+    const Kokkos::View<Scalar*, ExecSpace>& dw_b,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& pt_w,
+    size_t H, size_t W,
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& y,
+    const std::string& label = "KokkosDNN::glumbconv_forward") {
+  if (H == 0 || W == 0)
+    throw std::invalid_argument("glumbconv_forward: H and W must be nonzero");
+  const size_t B = x.extent(0), T = x.extent(1), Cin = x.extent(2);
+  const size_t inv_out = inv_w.extent(0);
+  const bool inv_biased = (inv_b.extent(0) != 0);
+  const bool dw_biased  = (dw_b.extent(0) != 0);
+  if (T != H * W || inv_out == 0 || inv_out % 2 != 0 || inv_w.extent(1) != Cin ||
+      (inv_biased && inv_b.extent(0) != inv_out) || dw_w.extent(0) != inv_out ||
+      dw_w.extent(1) != 3 || dw_w.extent(2) != 3 ||
+      (dw_biased && dw_b.extent(0) != inv_out))
+    throw std::invalid_argument("glumbconv_forward: dimension mismatch");
+  const size_t Hid = inv_out / 2, Cout = pt_w.extent(0);
+  if (pt_w.extent(1) != Hid || y.extent(0) != B || y.extent(1) != T ||
+      y.extent(2) != Cout)
+    throw std::invalid_argument("glumbconv_forward: dimension mismatch");
+  if (!x.span_is_contiguous() || !y.span_is_contiguous())
+    throw std::invalid_argument("glumbconv_forward: x and y must be contiguous");
+  if (B == 0 || T == 0 || Cin == 0 || Cout == 0) return;
+
+  Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace> u(label + "_u", B, T,
+                                                            inv_out);
+  Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace> dw(label + "_dw", B,
+                                                             T, inv_out);
+  Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace> h(label + "_h", B, T,
+                                                            Hid);
+  // Flattened aliases (fresh views above are contiguous by construction).
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> xf(x.data(), B * T,
+                                                            Cin);
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> uf(u.data(), B * T,
+                                                            inv_out);
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> dwf(dw.data(), B * T,
+                                                             inv_out);
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> hf(h.data(), B * T,
+                                                            Hid);
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> yf(y.data(), B * T,
+                                                            Cout);
+  gemm_bias(handle, xf, inv_w, inv_b, uf, label + "_inv");
+  Impl::silu_inplace_2d<ExecSpace, Scalar>(uf, label + "_silu");
+  ::KokkosDNN::Impl::depthwise3x3_3d<ExecSpace, Scalar>(u, dw_w, dw_b, dw, H, W,
+                                                       label + "_dw");
+  Impl::silu_gate_multiply_2d<ExecSpace, Scalar>(dwf, hf, Hid, label + "_gate");
+  Kokkos::View<Scalar*, ExecSpace> no_bias;  // point conv is unbiased
+  gemm_bias(handle, hf, pt_w, no_bias, yf, label + "_pt");
+}
 
 // Sana linear self-attention (LiteLA, NVlabs/Sana
 // diffusion/model/nets/sana_blocks.py) for SanaMS_600M_P1_D28
@@ -559,6 +733,7 @@ void cross_attention_mha_bidirectional(
   }
 }
 
+}  // namespace Sana
 }  // namespace KokkosDNN
 
 #endif

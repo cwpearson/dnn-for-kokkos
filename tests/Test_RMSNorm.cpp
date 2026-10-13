@@ -69,3 +69,48 @@ void check_rmsnorm(float tol) {
 TEST(RMSNorm, Float) { check_rmsnorm<float>(1e-5f); }
 
 TEST(RMSNorm, BHalf) { check_rmsnorm<Kokkos::Experimental::bhalf_t>(5e-2f); }
+
+template <class Scalar>
+void check_rmsnorm_batched(float tol) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  const float eps = 1e-5f;
+  const int B = 2, T = 4, D = 8;
+  Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec> x("x", B, T, D),
+      y("y", B, T, D);
+  Kokkos::View<Scalar*, Exec> w("w", D);
+  auto hx = Kokkos::create_mirror_view(x);
+  auto hw = Kokkos::create_mirror_view(w);
+  for (int b = 0; b < B; ++b)
+    for (int t = 0; t < T; ++t)
+      for (int d = 0; d < D; ++d)
+        hx(b, t, d) =
+            static_cast<Scalar>(0.4f * (b + 1) - 0.2f * t + 0.1f * d);
+  for (int d = 0; d < D; ++d) hw(d) = static_cast<Scalar>(1.0f + 0.1f * d);
+  Kokkos::deep_copy(x, hx);
+  Kokkos::deep_copy(w, hw);
+  KokkosDNN::rmsnorm<Exec, Scalar>(x, w, eps, y);
+  Kokkos::fence();
+  auto got = Kokkos::create_mirror_view(y);
+  Kokkos::deep_copy(got, y);
+  for (int b = 0; b < B; ++b)
+    for (int t = 0; t < T; ++t) {
+      double ss = 0;
+      for (int d = 0; d < D; ++d) {
+        double v = static_cast<double>(hx(b, t, d));
+        ss += v * v;
+      }
+      double inv = 1.0 / std::sqrt(ss / D + eps);
+      for (int d = 0; d < D; ++d) {
+        double want = static_cast<double>(hx(b, t, d)) * inv *
+                      static_cast<double>(hw(d));
+        EXPECT_NEAR(static_cast<double>(got(b, t, d)), want, tol)
+            << "rmsnorm rank-3 mismatch at (" << b << "," << t << "," << d
+            << ")";
+      }
+    }
+}
+
+TEST(RMSNormBatched, Float) { check_rmsnorm_batched<float>(1e-5f); }
+TEST(RMSNormBatched, BHalf) {
+  check_rmsnorm_batched<Kokkos::Experimental::bhalf_t>(5e-2f);
+}

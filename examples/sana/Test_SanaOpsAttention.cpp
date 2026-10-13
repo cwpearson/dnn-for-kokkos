@@ -1,4 +1,6 @@
-// Sana attention ops vs naive triple-loop host references (float + bhalf):
+// Sana fused attention ops vs naive triple-loop host references (float + bhalf):
+// Model-specific stitching; lives with the Sana example (see
+// KokkosDNN_SanaOps.hpp), not the core library.
 // LiteLA linear self-attention (with RMSNorm weights and the Identity
 // empty-norm path) and bidirectional multi-head cross attention, each in
 // rank-2 and rank-3 (batched) form.
@@ -10,6 +12,7 @@
 #include <vector>
 
 #include "KokkosDNN.hpp"
+#include "KokkosDNN_SanaOps.hpp"
 
 namespace {
 
@@ -144,7 +147,7 @@ void check_litela_2d(bool with_norm, float tol) {
   }
   Kokkos::deep_copy(pb, hpb);
 
-  KokkosDNN::linear_attention_lite_la<Exec, Scalar>(h, x, qkvw, qnw, knw, pw, pb,
+  KokkosDNN::Sana::linear_attention_lite_la<Exec, Scalar>(h, x, qkvw, qnw, knw, pw, pb,
                                                    out, H);
   Kokkos::fence();
   auto got = Kokkos::create_mirror_view_and_copy(HostSpace{}, out);
@@ -186,7 +189,7 @@ void check_litela_3d(float tol) {
   Kokkos::deep_copy(pw, hpw);
   Kokkos::deep_copy(pb, hpb);
 
-  KokkosDNN::linear_attention_lite_la<Exec, Scalar>(h, x, qkvw, qnw, knw, pw, pb,
+  KokkosDNN::Sana::linear_attention_lite_la<Exec, Scalar>(h, x, qkvw, qnw, knw, pw, pb,
                                                    out, H);
   Kokkos::fence();
   auto got = Kokkos::create_mirror_view_and_copy(HostSpace{}, out);
@@ -301,7 +304,7 @@ void check_cross_2d(float tol) {
   Kokkos::deep_copy(pw, hpw);
   Kokkos::deep_copy(pb, hpb);
 
-  KokkosDNN::cross_attention_mha_bidirectional<Exec, Scalar>(h, x, c, qw, qb, kvw,
+  KokkosDNN::Sana::cross_attention_mha_bidirectional<Exec, Scalar>(h, x, c, qw, qb, kvw,
                                                              kvb, pw, pb, out, H);
   Kokkos::fence();
   auto got = Kokkos::create_mirror_view_and_copy(HostSpace{}, out);
@@ -357,7 +360,7 @@ void check_cross_3d(float tol) {
   Kokkos::deep_copy(pw, hpw);
   Kokkos::deep_copy(pb, hpb);
 
-  KokkosDNN::cross_attention_mha_bidirectional<Exec, Scalar>(h, x, c, qw, qb, kvw,
+  KokkosDNN::Sana::cross_attention_mha_bidirectional<Exec, Scalar>(h, x, c, qw, qb, kvw,
                                                              kvb, pw, pb, out, H);
   Kokkos::fence();
   auto got = Kokkos::create_mirror_view_and_copy(HostSpace{}, out);
@@ -379,18 +382,18 @@ void check_cross_3d(float tol) {
 
 }  // namespace
 
-TEST(SanaAttention, LiteLaFloat) { check_litela_2d<float>(true, 1e-4f); }
+TEST(SanaOpsAttention, LiteLaFloat) { check_litela_2d<float>(true, 1e-4f); }
 
-TEST(SanaAttention, LiteLaIdentityFloat) { check_litela_2d<float>(false, 1e-4f); }
+TEST(SanaOpsAttention, LiteLaIdentityFloat) { check_litela_2d<float>(false, 1e-4f); }
 
-TEST(SanaAttention, LiteLaBatchedFloat) { check_litela_3d<float>(1e-4f); }
+TEST(SanaOpsAttention, LiteLaBatchedFloat) { check_litela_3d<float>(1e-4f); }
 
-TEST(SanaAttention, LiteLaBHalf) { check_litela_2d<bhalf>(true, 2e-2f); }
+TEST(SanaOpsAttention, LiteLaBHalf) { check_litela_2d<bhalf>(true, 2e-2f); }
 
-TEST(SanaAttention, LiteLaIdentityBHalf) { check_litela_2d<bhalf>(false, 2e-2f); }
+TEST(SanaOpsAttention, LiteLaIdentityBHalf) { check_litela_2d<bhalf>(false, 2e-2f); }
 
-TEST(SanaAttentionCross, MhaFloat) { check_cross_2d<float>(1e-4f); }
+TEST(SanaOpsAttentionCross, MhaFloat) { check_cross_2d<float>(1e-4f); }
 
-TEST(SanaAttentionCross, MhaBatchedFloat) { check_cross_3d<float>(1e-4f); }
+TEST(SanaOpsAttentionCross, MhaBatchedFloat) { check_cross_3d<float>(1e-4f); }
 
-TEST(SanaAttentionCross, MhaBHalf) { check_cross_2d<bhalf>(2e-2f); }
+TEST(SanaOpsAttentionCross, MhaBHalf) { check_cross_2d<bhalf>(2e-2f); }

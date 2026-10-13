@@ -88,6 +88,69 @@ void layernorm_row(
       });
 }
 
+// LayerNorm without affine parameters:
+//   y[i,:] = (x[i,:] - mean(x[i,:])) / sqrt(var(x[i,:]) + eps)
+// Scalar-agnostic; statistics accumulated in FP32. In-place safe.
+// Rank-2 variant ([tokens, dim]).
+template <class ExecSpace, class Scalar>
+void layernorm_noaffine_forward(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x, float eps,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& y,
+    const std::string& label = "KokkosDNN::layernorm_noaffine_forward") {
+  const size_t T = x.extent(0), D = x.extent(1);
+  if (y.extent(0) != T || y.extent(1) != D)
+    throw std::invalid_argument("layernorm_noaffine_forward: dimension mismatch");
+  if (T == 0 || D == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::RangePolicy<ExecSpace>(0, T), KOKKOS_LAMBDA(size_t t) {
+        float mean = 0;
+        for (size_t d = 0; d < D; ++d)
+          mean += static_cast<float>(x(t, d));
+        mean /= static_cast<float>(D);
+        float var = 0;
+        for (size_t d = 0; d < D; ++d) {
+          float c = static_cast<float>(x(t, d)) - mean;
+          var += c * c;
+        }
+        var /= static_cast<float>(D);
+        float inv = 1.0f / sqrt(var + eps);
+        for (size_t d = 0; d < D; ++d)
+          y(t, d) = static_cast<Scalar>(
+              (static_cast<float>(x(t, d)) - mean) * inv);
+      });
+}
+
+// Rank-3 variant ([batch, tokens, dim]).
+template <class ExecSpace, class Scalar>
+void layernorm_noaffine_forward(
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& x, float eps,
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& y,
+    const std::string& label = "KokkosDNN::layernorm_noaffine_forward") {
+  const size_t B = x.extent(0), T = x.extent(1), D = x.extent(2);
+  if (y.extent(0) != B || y.extent(1) != T || y.extent(2) != D)
+    throw std::invalid_argument("layernorm_noaffine_forward: dimension mismatch");
+  if (B == 0 || T == 0 || D == 0) return;
+  Kokkos::parallel_for(
+      label,
+      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {B, T}),
+      KOKKOS_LAMBDA(size_t b, size_t t) {
+        float mean = 0;
+        for (size_t d = 0; d < D; ++d)
+          mean += static_cast<float>(x(b, t, d));
+        mean /= static_cast<float>(D);
+        float var = 0;
+        for (size_t d = 0; d < D; ++d) {
+          float c = static_cast<float>(x(b, t, d)) - mean;
+          var += c * c;
+        }
+        var /= static_cast<float>(D);
+        float inv = 1.0f / sqrt(var + eps);
+        for (size_t d = 0; d < D; ++d)
+          y(b, t, d) = static_cast<Scalar>(
+              (static_cast<float>(x(b, t, d)) - mean) * inv);
+      });
+}
+
 }  // namespace KokkosDNN
 
 #endif

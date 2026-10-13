@@ -190,3 +190,156 @@ TEST(PatchEmbed, RejectsBadArgs) {
       (KokkosDNN::patchembed_forward(h, images, weight, bad_b, out, 2, 2)),
       std::invalid_argument);
 }
+
+TEST(PatchEmbedK1S1, MatchesHost1x1Conv) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  using Host = Kokkos::HostSpace;
+  auto probe = [](size_t a, size_t b, size_t c = 0) {
+    return 0.06f * static_cast<float>((a * 31 + b * 17 + c * 13) % 19) - 0.5f;
+  };
+  KokkosDNN::DNNHandle<Exec> h;
+  const size_t B = 2, C = 3, H = 4, W = 4, T = H * W, D = 5;
+  Kokkos::View<float****, Kokkos::LayoutRight, Host> himg("himg", B, C, H, W);
+  Kokkos::View<float**, Kokkos::LayoutRight, Host> hwt("hwt", D, C);
+  Kokkos::View<float*, Host> hbs("hbs", D);
+  for (size_t b = 0; b < B; ++b)
+    for (size_t c = 0; c < C; ++c)
+      for (size_t hh = 0; hh < H; ++hh)
+        for (size_t w = 0; w < W; ++w)
+          himg(b, c, hh, w) = probe(b * C * H * W + c * H * W + hh * W + w, c);
+  for (size_t d = 0; d < D; ++d) {
+    for (size_t c = 0; c < C; ++c) hwt(d, c) = probe(d, c, 3);
+    hbs(d) = 0.2f * (float)d - 0.3f;
+  }
+  Kokkos::View<float****, Kokkos::LayoutRight, Exec> images("images", B, C, H,
+                                                            W);
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> weight("weight", D, C);
+  Kokkos::View<float*, Exec> bias("bias", D), empty_b;
+  Kokkos::View<float***, Kokkos::LayoutRight, Exec> tok("tok", B, T, D),
+      tok_u("tok_u", B, T, D);
+  Kokkos::deep_copy(images, himg);
+  Kokkos::deep_copy(weight, hwt);
+  Kokkos::deep_copy(bias, hbs);
+  KokkosDNN::patchembed_forward(h, images, weight, bias, tok, 1, 1);
+  KokkosDNN::patchembed_forward(h, images, weight, empty_b, tok_u, 1, 1);
+  Kokkos::fence();
+  Kokkos::View<float***, Kokkos::LayoutRight, Host> got("got", B, T, D),
+      got_u("got_u", B, T, D), ref("ref", B, T, D), ref_u("ref_u", B, T, D);
+  Kokkos::deep_copy(got, tok);
+  Kokkos::deep_copy(got_u, tok_u);
+  // Host 1x1 reference: tok[b, h*W+w, d] = bias[d] + sum_c img[b,c,h,w]*wt[d,c].
+  auto host_patch1x1 = [&](const Kokkos::View<float*, Host>& bs, bool biased,
+                           const Kokkos::View<float***, Kokkos::LayoutRight, Host>& out) {
+    for (size_t b = 0; b < B; ++b)
+      for (size_t hh = 0; hh < H; ++hh)
+        for (size_t w = 0; w < W; ++w)
+          for (size_t d = 0; d < D; ++d) {
+            double acc = biased ? bs(d) : 0.0;
+            for (size_t c = 0; c < C; ++c)
+              acc += (double)himg(b, c, hh, w) * (double)hwt(d, c);
+            out(b, hh * W + w, d) = static_cast<float>(acc);
+          }
+  };
+  host_patch1x1(hbs, true, ref);
+  Kokkos::View<float*, Host> hb;
+  host_patch1x1(hb, false, ref_u);
+  for (size_t b = 0; b < B; ++b)
+    for (size_t t = 0; t < T; ++t)
+      for (size_t d = 0; d < D; ++d) {
+        EXPECT_NEAR(got(b, t, d), ref(b, t, d), 1e-4f)
+            << " biased at (" << b << "," << t << "," << d << ")";
+        EXPECT_NEAR(got_u(b, t, d), ref_u(b, t, d), 1e-4f)
+            << " unbiased at (" << b << "," << t << "," << d << ")";
+      }
+}
+
+TEST(Unpatchify, MatchesHostTranspose) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  using Host = Kokkos::HostSpace;
+  auto probe = [](size_t a, size_t b, size_t c = 0) {
+    return 0.06f * static_cast<float>((a * 31 + b * 17 + c * 13) % 19) - 0.5f;
+  };
+  const size_t B = 2, H = 3, W = 3, T = H * W, C = 2;
+  Kokkos::View<float**, Kokkos::LayoutRight, Host> htok("htok", T, C);
+  Kokkos::View<float***, Kokkos::LayoutRight, Host> htok3("htok3", B, T, C);
+  for (size_t b = 0; b < B; ++b)
+    for (size_t t = 0; t < T; ++t)
+      for (size_t c = 0; c < C; ++c) {
+        const float v = probe(b * T + t, c);
+        htok3(b, t, c) = v;
+        if (b == 0) htok(t, c) = v;
+      }
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> tok("tok", T, C);
+  Kokkos::View<float***, Kokkos::LayoutRight, Exec> img("img", C, H, W),
+      tok3("tok3", B, T, C);
+  Kokkos::View<float****, Kokkos::LayoutRight, Exec> imgs("imgs", B, C, H, W);
+  Kokkos::deep_copy(tok, htok);
+  Kokkos::deep_copy(tok3, htok3);
+  KokkosDNN::unpatchify_forward(tok, img, H, W);
+  KokkosDNN::unpatchify_forward(tok3, imgs, H, W);
+  Kokkos::fence();
+  Kokkos::View<float***, Kokkos::LayoutRight, Host> got("got", C, H, W);
+  Kokkos::View<float****, Kokkos::LayoutRight, Host> got3("got3", B, C, H, W);
+  Kokkos::deep_copy(got, img);
+  Kokkos::deep_copy(got3, imgs);
+  for (size_t t = 0; t < T; ++t)
+    for (size_t c = 0; c < C; ++c)
+      EXPECT_NEAR(got(c, t / W, t % W), htok(t, c), 1e-6f)
+          << " rank-2 at (" << t << "," << c << ")";
+  for (size_t b = 0; b < B; ++b)
+    for (size_t t = 0; t < T; ++t)
+      for (size_t c = 0; c < C; ++c)
+        EXPECT_NEAR(got3(b, c, t / W, t % W), htok3(b, t, c), 1e-6f)
+            << " rank-3 at (" << b << "," << t << "," << c << ")";
+  // Validation.
+  Kokkos::View<float***, Kokkos::LayoutRight, Exec> bad_img("bad_img", C, H,
+                                                            W + 1);
+  EXPECT_THROW(KokkosDNN::unpatchify_forward(tok, bad_img, H, W),
+               std::invalid_argument);
+  EXPECT_THROW(KokkosDNN::unpatchify_forward(tok, img, 0, W),
+               std::invalid_argument);
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> bad_tok("bad_tok", T + 1, C);
+  EXPECT_THROW(KokkosDNN::unpatchify_forward(bad_tok, img, H, W),
+               std::invalid_argument);
+}
+
+// End-to-end: identity 1x1 patch embed followed by unpatchify recovers the
+// VAE-latent images exactly (Sana patch_size=1 is a pure reshape under an
+// identity projection).
+TEST(PatchUnpatchRoundTrip, Identity1x1RecoversImages) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  using Host = Kokkos::HostSpace;
+  auto probe = [](size_t a, size_t b, size_t c = 0) {
+    return 0.06f * static_cast<float>((a * 31 + b * 17 + c * 13) % 19) - 0.5f;
+  };
+  KokkosDNN::DNNHandle<Exec> h;
+  const size_t B = 2, C = 4, H = 4, W = 4, T = H * W;
+  Kokkos::View<float****, Kokkos::LayoutRight, Host> himg("himg", B, C, H, W);
+  Kokkos::View<float**, Kokkos::LayoutRight, Host> hwt("hwt", C, C);
+  for (size_t b = 0; b < B; ++b)
+    for (size_t c = 0; c < C; ++c)
+      for (size_t hh = 0; hh < H; ++hh)
+        for (size_t w = 0; w < W; ++w)
+          himg(b, c, hh, w) = probe(b * 97 + c * 13 + hh * W + w, 7);
+  for (size_t i = 0; i < C; ++i)
+    for (size_t j = 0; j < C; ++j) hwt(i, j) = (i == j) ? 1.0f : 0.0f;
+  Kokkos::View<float****, Kokkos::LayoutRight, Exec> images("images", B, C, H,
+                                                            W),
+      back("back", B, C, H, W);
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> weight("weight", C, C);
+  Kokkos::View<float*, Exec> empty_b;
+  Kokkos::View<float***, Kokkos::LayoutRight, Exec> tok("tok", B, T, C);
+  Kokkos::deep_copy(images, himg);
+  Kokkos::deep_copy(weight, hwt);
+  KokkosDNN::patchembed_forward(h, images, weight, empty_b, tok, 1, 1);
+  KokkosDNN::unpatchify_forward(tok, back, H, W);
+  Kokkos::fence();
+  Kokkos::View<float****, Kokkos::LayoutRight, Host> got("got", B, C, H, W);
+  Kokkos::deep_copy(got, back);
+  for (size_t b = 0; b < B; ++b)
+    for (size_t c = 0; c < C; ++c)
+      for (size_t hh = 0; hh < H; ++hh)
+        for (size_t w = 0; w < W; ++w)
+          EXPECT_NEAR(got(b, c, hh, w), himg(b, c, hh, w), 1e-5f)
+              << " at (" << b << "," << c << "," << hh << "," << w << ")";
+}
