@@ -51,7 +51,7 @@ Options:
 - [gemma4](examples/gemma4/) — Gemma 3 4B-E2B-IT text inference with KV-cache autoregressive generation.
 - [xor](examples/xor/) — 2-layer MLP that learns the XOR truth table with full-batch Adam.
 - [dinov3](examples/dinov3/) — DINOv3 ViT-B/16 image-encoder inference.
-- [sana](examples/sana/) — Sana-0.6B (SanaMS_600M_P1_D28) text-to-image latent generation with FlowEuler + CFG (DiT weights load directly from the `.pth` checkpoint; no Gemma text encoder or DC-AE decoder bundled, so conditioning defaults to the checkpoint null embedding unless `--prompt-embeds` is given, and output is raw latents plus a channel-mean grayscale preview).
+- [sana](examples/sana/) — Sana-0.6B (SanaMS_600M_P1_D28) text-to-image with FlowEuler + CFG (DiT weights load directly from the `.pth` checkpoint; native Gemma-2-2B-IT text encoder via `--text-weights` and native DC-AE f32c32 decoder via `--vae-safetensors`; without them conditioning falls back to the checkpoint null embedding unless `--prompt-embeds` is given, and output is raw latents plus a channel-mean grayscale preview).
 
 See each directory's README for flags, run commands, and design notes.
 
@@ -82,9 +82,11 @@ so subset with `--benchmark_filter` or lower `--benchmark_min_time` there.
 
 ## Limitations
 
-- Sana scope: DiT-only (28-block Linear DiT, FP32). No Gemma-2-2B text
-  encoder or DC-AE VAE decoder is bundled: `--prompt` alone falls back to
-  the checkpoint null embedding, and decode is a channel-mean preview
-  (plus raw `.f32` latents). Geometry is fixed at 1024px (32x32x32
-  latents; `--tiny` uses 4x4). A full-resolution run is hours on a Serial
-  CPU build; use a CUDA/cuBLAS build for anything beyond smoke tests.
+- Sana scope: 28-block Linear DiT (FP32) + native Gemma-2-2B text
+  encoder (`--text-weights`, gated HF download) + native DC-AE VAE
+  decoder (`--vae-safetensors`, diffusers layout): `--prompt` alone
+  still falls back to the checkpoint null embedding, and decode without
+  the VAE weights is a channel-mean preview (plus raw `.f32` latents).
+  Geometry is fixed at 1024px (32x32x32 latents; `--tiny` uses 4x4). A
+  full-resolution run is hours on a Serial CPU build; use a CUDA/cuBLAS
+  build for anything beyond smoke tests.

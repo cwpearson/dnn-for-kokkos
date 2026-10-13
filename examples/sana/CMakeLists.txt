@@ -4,7 +4,9 @@
 
 add_library(kokkosdnn_sana STATIC
   KokkosDNN_SanaWeights.cpp
+  KokkosDNN_SanaVAE.cpp
   SanaWeightsPth.cpp
+  KokkosDNN_SanaTextEncoder.cpp
 )
 add_library(KokkosDNN::sana ALIAS kokkosdnn_sana)
 target_link_libraries(kokkosdnn_sana PUBLIC KokkosDNN::kokkosdnn)
@@ -30,6 +32,22 @@ if(KokkosDNN_ENABLE_TESTS)
   target_link_libraries(test_sana_sampler PRIVATE KokkosDNN::sana KokkosDNN::gtest_main)
   set_target_properties(test_sana_sampler PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
   gtest_discover_tests(test_sana_sampler)
+
+  add_executable(test_sana_vae Test_SanaVAE.cpp)
+  target_link_libraries(test_sana_vae PRIVATE KokkosDNN::sana KokkosDNN::gtest_main)
+  target_compile_definitions(test_sana_vae PRIVATE
+    SANA_WORKSPACE_DIR="${CMAKE_SOURCE_DIR}")
+  set_target_properties(test_sana_vae PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+  gtest_discover_tests(test_sana_vae)
+
+  add_executable(test_sana_text_encoder Test_SanaTextEncoder.cpp)
+  target_link_libraries(test_sana_text_encoder PRIVATE KokkosDNN::sana KokkosDNN::gtest_main)
+  # Workspace-absolute fallback so env-gated tests can locate the in-repo
+  # Gemma/tokenizer paths under ctest (whose CWD is the build dir).
+  target_compile_definitions(test_sana_text_encoder PRIVATE
+    SANA_WORKSPACE_DIR="${CMAKE_SOURCE_DIR}")
+  set_target_properties(test_sana_text_encoder PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+  gtest_discover_tests(test_sana_text_encoder)
 
   add_executable(test_sana_golden Test_SanaGolden.cpp)
   target_link_libraries(test_sana_golden PRIVATE KokkosDNN::sana KokkosDNN::gtest_main)
