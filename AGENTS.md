@@ -22,5 +22,7 @@ cmake/           config header + package config templates
 # Design Guidelines
 
 - Follow the Kokkos performance portability ethos. Unless necessary for some reason, implementations should not be gated on specific Kokkos backends or execution space types.
-- Non-public functions / APIs should be in `KokkosDNN::Impl` namespace.
+- Prefer using existing Kokkos features rather than creating new equivalent utilities.
+- Non-public functions / APIs should be in and `Impl` namespace (e.g. `KokkosDNN::Impl`)
 - Non-public macros should be prefixed `KOKKOSDNN_IMPL_`
+- Tests do not exist to freeze configuration decisions (e.g. default values) or implementation details, but to confirm that public functionality is correct.
