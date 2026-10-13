@@ -10,7 +10,8 @@
 DNN for Kokkos is a small, Kokkos-compatible deep neural network library.
 It provides:
 
-- [Native Kokkos implementations of common DNN operators](https://cwpearson.github.io/dnn-for-kokkos/api.html) (GEMM/GEMV with optional bias, dense forward/backward, embedding gather, RMSNorm/LayerNorm, softmax, causal grouped-query and bidirectional attention, 1D and 2D-axial RoPE, SwiGLU/GELU and other activations, patch embedding, token assembly, LayerScale, losses, SGD/Adam, sampling, KV-cache helpers).
+- [Native Kokkos implementations of common DNN operators](https://cwpearson.github.io/dnn-for-kokkos/api.html) (GEMM/GEMV with optional bias, dense forward/backward, embedding gather, RMSNorm/LayerNorm, softmax, causal grouped-query and bidirectional attention, 1D and 2D-axial RoPE, SwiGLU/GELU/SiLU and other activations, patch embedding, token assembly, LayerScale, losses, SGD/Adam, sampling, KV-cache helpers).
+- Diffusion-transformer operators for Sana image generation: SiLU, scaled RMSNorm, affine-free LayerNorm, AdaLN modulation (`x*(1+scale)+shift`), sinusoidal timestep embeddings, LiteLA linear attention (ReLU kernel), bidirectional cross-attention, GLUMBConv MixFFN (1x1 + depthwise 3x3 + SiLU gating), 1x1 patch embedding / unpatchify, and a FlowEuler sampler with classifier-free guidance.
 - Optional dispatch to CUDA libraries when enabled at configure time: GEMM to **cuBLAS** (FP32 via `sgemm`, BF16 via `cublasGemmEx` with FP32 accumulation), attention to **cuDNN SDPA** (with automatic fallback to the native kernel where cuDNN has no suitable path).
 - Unit tests plus end-to-end paths in the examples so the full pipelines run without downloading large checkpoints.
 
@@ -37,7 +38,7 @@ Options:
 | Option | Default | Effect |
 | --- | --- | --- |
 | `KokkosDNN_ENABLE_TESTS` | ON | build `tests/` |
-| `KokkosDNN_ENABLE_EXAMPLES` | ON | build `examples/` (`llama_generate`, `smollm2_generate`, `xor_train`, `dinov3_encode`, + example tests) |
+| `KokkosDNN_ENABLE_EXAMPLES` | ON | build `examples/` (`llama_generate`, `smollm2_generate`, `gemma4_generate`, `xor_train`, `dinov3_encode`, `sana_generate`, + example tests) |
 | `KokkosDNN_ENABLE_BENCHMARKS` | OFF | build `benchmarks/kokkosdnn_bench` (Google Benchmark, fetched if needed) |
 | `KokkosDNN_ENABLE_CUBLAS` | OFF | GEMM via cuBLAS on CUDA spaces |
 | `KokkosDNN_ENABLE_CUDNN` | OFF | attention via cuDNN SDPA (with automatic native fallback; needs `<cudnn.h>` + `cudnn-frontend`, fetched automatically) |
@@ -47,8 +48,10 @@ Options:
 
 - [llama](examples/llama/) — Llama 3.1 8B-Instruct (plus 3.2 1B) text inference with KV-cache autoregressive generation.
 - [smollm2](examples/smollm2/) — SmolLM2-135M (base + Instruct) text inference with KV-cache autoregressive generation.
+- [gemma4](examples/gemma4/) — Gemma 3 4B-E2B-IT text inference with KV-cache autoregressive generation.
 - [xor](examples/xor/) — 2-layer MLP that learns the XOR truth table with full-batch Adam.
 - [dinov3](examples/dinov3/) — DINOv3 ViT-B/16 image-encoder inference.
+- [sana](examples/sana/) — Sana-0.6B (SanaMS_600M_P1_D28) text-to-image latent generation with FlowEuler + CFG (DiT weights load directly from the `.pth` checkpoint; no Gemma text encoder or DC-AE decoder bundled, so conditioning defaults to the checkpoint null embedding unless `--prompt-embeds` is given, and output is raw latents plus a channel-mean grayscale preview).
 
 See each directory's README for flags, run commands, and design notes.
 
@@ -76,3 +79,12 @@ Without the TPL options (e.g. CPU-only CI) `Native == Dispatched` by
 construction. Large prefill rows (`M=64`, `T=128`, lm-head vocab) are
 GPU-oriented: the naive native kernel takes seconds per iteration on Serial,
 so subset with `--benchmark_filter` or lower `--benchmark_min_time` there.
+
+## Limitations
+
+- Sana scope: DiT-only (28-block Linear DiT, FP32). No Gemma-2-2B text
+  encoder or DC-AE VAE decoder is bundled: `--prompt` alone falls back to
+  the checkpoint null embedding, and decode is a channel-mean preview
+  (plus raw `.f32` latents). Geometry is fixed at 1024px (32x32x32
+  latents; `--tiny` uses 4x4). A full-resolution run is hours on a Serial
+  CPU build; use a CUDA/cuBLAS build for anything beyond smoke tests.
