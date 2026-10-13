@@ -15,6 +15,7 @@
 #include "KokkosDNN_Embedding.hpp"
 #include "KokkosDNN_PatchEmbed.hpp"
 #include "KokkosDNN_DepthwiseConv.hpp"
+#include "KokkosDNN_Conv.hpp"
 #include "KokkosDNN_Tokens.hpp"
 #include "KokkosDNN_LayerScale.hpp"
 #include "KokkosDNN_Attention.hpp"

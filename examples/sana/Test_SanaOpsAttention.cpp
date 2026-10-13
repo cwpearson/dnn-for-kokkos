@@ -380,6 +380,107 @@ void check_cross_3d(float tol) {
   }
 }
 
+// ---- Math-layout ([in, out]) coverage: same host refs, weights passed
+// transposed so the ops auto-detect the math orientation ----
+template <class Scalar>
+void check_litela_2d_math_layout(float tol) {
+  const size_t T = 5, D = 8, H = 2, W = 3 * D;
+  KokkosDNN::DNNHandle<Exec> h;
+  DevMat<Scalar> x("x", T, D), qkvw("w", D, W), pw("pw", D, D), out("out", T, D);
+  DevVec<Scalar> qnw("qnw", D), knw("knw", D), pb("pb", D);
+  HostMat<Scalar> hx("hx", T, D), hw("hw", W, D), hwm("hwm", D, W),
+      hpw("hpw", D, D);
+  HostVec<Scalar> hqn("hqn", D), hkn("hkn", D), hpb("hpb", D);
+  for (size_t t = 0; t < T; ++t)
+    for (size_t d = 0; d < D; ++d)
+      hx(t, d) = static_cast<Scalar>(det_val((int)t, (int)d, 11, 0.15f, -0.7f));
+  for (size_t j = 0; j < W; ++j)
+    for (size_t kk = 0; kk < D; ++kk) {
+      hw(j, kk) = static_cast<Scalar>(det_val((int)j, (int)kk, 13, 0.12f, -0.6f));
+      hwm(kk, j) = hw(j, kk);
+    }
+  for (size_t j = 0; j < D; ++j)
+    for (size_t kk = 0; kk < D; ++kk)
+      hpw(j, kk) = static_cast<Scalar>(det_val((int)kk, (int)j, 7, 0.2f, -0.5f));
+  for (size_t d = 0; d < D; ++d) {
+    hqn(d) = static_cast<Scalar>(0.8f + 0.05f * (d % 5));
+    hkn(d) = static_cast<Scalar>(0.9f + 0.04f * ((d + 2) % 5));
+    hpb(d) = static_cast<Scalar>(det_val((int)d, 3, 5, 0.1f, -0.2f));
+  }
+  Kokkos::deep_copy(x, hx);
+  Kokkos::deep_copy(qkvw, hwm);
+  Kokkos::deep_copy(pw, hpw);
+  Kokkos::deep_copy(qnw, hqn);
+  Kokkos::deep_copy(knw, hkn);
+  Kokkos::deep_copy(pb, hpb);
+
+  KokkosDNN::Sana::linear_attention_lite_la<Exec, Scalar>(h, x, qkvw, qnw, knw, pw,
+                                                   pb, out, H);
+  Kokkos::fence();
+  auto got = Kokkos::create_mirror_view_and_copy(HostSpace{}, out);
+
+  std::vector<float> ref(T * D);
+  litela_host_ref(hx, hw, hqn, hkn, true, hpw, hpb, H, ref.data());
+  for (size_t t = 0; t < T; ++t)
+    for (size_t d = 0; d < D; ++d)
+      EXPECT_NEAR(static_cast<float>(got(t, d)), ref[t * D + d], tol)
+          << "litela math-layout mismatch at (" << t << "," << d << ")";
+}
+
+template <class Scalar>
+void check_cross_2d_math_layout(float tol) {
+  const size_t T = 4, L = 5, D = 8, H = 2;
+  KokkosDNN::DNNHandle<Exec> h;
+  DevMat<Scalar> x("x", T, D), c("c", L, D), qw("qw", D, D), kvw("kvw", D, 2 * D),
+      pw("pw", D, D), out("out", T, D);
+  DevVec<Scalar> qb("qb", D), kvb("kvb", 2 * D), pb("pb", D);
+  HostMat<Scalar> hx("hx", T, D), hc("hc", L, D), hqw("hqw", D, D),
+      hkv("hkv", 2 * D, D), hkm("hkm", D, 2 * D), hpw("hpw", D, D);
+  HostVec<Scalar> hqb("hqb", D), hkvb("hkvb", 2 * D), hpb("hpb", D);
+  for (size_t t = 0; t < T; ++t)
+    for (size_t d = 0; d < D; ++d)
+      hx(t, d) = static_cast<Scalar>(det_val((int)t, (int)d, 9, 0.2f, -0.6f));
+  for (size_t l = 0; l < L; ++l)
+    for (size_t d = 0; d < D; ++d)
+      hc(l, d) = static_cast<Scalar>(det_val((int)l + 3, (int)d, 7, 0.25f, -0.5f));
+  for (size_t j = 0; j < D; ++j) {
+    for (size_t kk = 0; kk < D; ++kk) {
+      hqw(j, kk) = static_cast<Scalar>(det_val((int)j, (int)kk, 11, 0.15f, -0.5f));
+      hpw(j, kk) = static_cast<Scalar>(det_val((int)kk + 1, (int)j, 7, 0.2f, -0.5f));
+    }
+    hqb(j) = static_cast<Scalar>(det_val((int)j, 0, 5, 0.1f, -0.2f));
+    hpb(j) = static_cast<Scalar>(det_val((int)j, 2, 5, 0.1f, -0.2f));
+  }
+  for (size_t j = 0; j < 2 * D; ++j) {
+    for (size_t kk = 0; kk < D; ++kk) {
+      hkv(j, kk) = static_cast<Scalar>(det_val((int)j + 5, (int)kk, 11, 0.15f, -0.5f));
+      hkm(kk, j) = hkv(j, kk);
+    }
+    hkvb(j) = static_cast<Scalar>(det_val((int)j, 4, 5, 0.1f, -0.2f));
+  }
+  Kokkos::deep_copy(x, hx);
+  Kokkos::deep_copy(c, hc);
+  Kokkos::deep_copy(qw, hqw);
+  Kokkos::deep_copy(qb, hqb);
+  Kokkos::deep_copy(kvw, hkm);
+  Kokkos::deep_copy(kvb, hkvb);
+  Kokkos::deep_copy(pw, hpw);
+  Kokkos::deep_copy(pb, hpb);
+
+  KokkosDNN::Sana::cross_attention_mha_bidirectional<Exec, Scalar>(h, x, c, qw, qb,
+                                                            kvw, kvb, pw, pb, out,
+                                                            H);
+  Kokkos::fence();
+  auto got = Kokkos::create_mirror_view_and_copy(HostSpace{}, out);
+
+  std::vector<float> ref(T * D);
+  cross_host_ref(hx, hc, hqw, hqb, hkv, hkvb, hpw, hpb, H, ref.data());
+  for (size_t t = 0; t < T; ++t)
+    for (size_t d = 0; d < D; ++d)
+      EXPECT_NEAR(static_cast<float>(got(t, d)), ref[t * D + d], tol)
+          << "cross math-layout mismatch at (" << t << "," << d << ")";
+}
+
 }  // namespace
 
 TEST(SanaOpsAttention, LiteLaFloat) { check_litela_2d<float>(true, 1e-4f); }
@@ -397,3 +498,19 @@ TEST(SanaOpsAttentionCross, MhaFloat) { check_cross_2d<float>(1e-4f); }
 TEST(SanaOpsAttentionCross, MhaBatchedFloat) { check_cross_3d<float>(1e-4f); }
 
 TEST(SanaOpsAttentionCross, MhaBHalf) { check_cross_2d<bhalf>(2e-2f); }
+
+TEST(SanaOpsAttention, LiteLaMathLayoutFloat) {
+  check_litela_2d_math_layout<float>(1e-4f);
+}
+
+TEST(SanaOpsAttention, LiteLaMathLayoutBHalf) {
+  check_litela_2d_math_layout<bhalf>(2e-2f);
+}
+
+TEST(SanaOpsAttentionCross, MhaMathLayoutFloat) {
+  check_cross_2d_math_layout<float>(1e-4f);
+}
+
+TEST(SanaOpsAttentionCross, MhaMathLayoutBHalf) {
+  check_cross_2d_math_layout<bhalf>(2e-2f);
+}

@@ -12,9 +12,11 @@
 #include <stdexcept>
 
 #include "KokkosDNN_Activation.hpp"
+#include "KokkosDNN_Attention.hpp"
 #include "KokkosDNN_Embedding.hpp"
 #include "KokkosDNN_Gemm.hpp"
 #include "KokkosDNN_Handle.hpp"
+#include "KokkosDNN_RMSNorm.hpp"
 #include "KokkosDNN_RoPE.hpp"
 
 #if defined(__unix__) || defined(__unix) || defined(__APPLE__) || \
@@ -1501,92 +1503,6 @@ std::string Tokenizer::decode(const std::vector<int>& ids,
 // Model
 // ---------------------------------------------------------------------------
 
-namespace Impl {
-
-// Gemma2 RMSNorm variant (example-local: the library rmsnorm multiplies by
-// w, Gemma2 multiplies by (1 + w) with zero-initialized weights):
-//   y[t,:] = x[t,:] / sqrt(mean(x[t,:]^2) + eps) * (1 + w[:])
-// Matches HF Gemma2RMSNorm (norm in FP32, then scale, then cast).
-template <class ExecSpace, class Scalar>
-void rmsnorm_one_plus(
-    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
-    const Kokkos::View<Scalar*, ExecSpace>& w, float eps,
-    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& y,
-    const std::string& label = "SanaGemma::rmsnorm_one_plus") {
-  const size_t T = x.extent(0), D = x.extent(1);
-  if (y.extent(0) != T || y.extent(1) != D || w.extent(0) != D)
-    throw std::invalid_argument("rmsnorm_one_plus: dimension mismatch");
-  if (T == 0 || D == 0) return;
-  Kokkos::parallel_for(
-      label, Kokkos::RangePolicy<ExecSpace>(0, T),
-      KOKKOS_LAMBDA(size_t t) {
-        float ss = 0;
-        for (size_t d = 0; d < D; ++d) {
-          float v = static_cast<float>(x(t, d));
-          ss += v * v;
-        }
-        float inv = 1.0f / sqrt(ss / (float)D + eps);
-        for (size_t d = 0; d < D; ++d)
-          y(t, d) = static_cast<Scalar>(static_cast<float>(x(t, d)) * inv *
-                                        (1.0f + static_cast<float>(w(d))));
-      });
-}
-
-// Causal GQA self-attention with Gemma2 tanh logit softcapping and a key
-// padding mask (example-local: the core attention op has no softcap path).
-//   s = cap * tanh((q.k * scale) / cap)   [cap <= 0 disables softcapping]
-//   out[t,h] = softmax over valid keys k <= t of s(t,k) times v[k]
-// query t attends valid keys [0, t]; pad keys (valid == 0) are skipped,
-// which equals the HF additive -inf mask whenever at least one key is valid
-// (BOS, key 0, is always valid in the Sana path). FP32 streaming
-// online-softmax numerics, same structure as the core attention kernel.
-template <class ExecSpace, class Scalar, class QView, class KView, class VView,
-          class OView, class MView>
-void attention_causal_softcap(
-    const QView& q, const KView& k, const VView& v, const MView& key_valid,
-    float scale, float softcap, const OView& out,
-    const std::string& label = "SanaGemma::attn_softcap") {
-  const size_t T = q.extent(0), Hq = q.extent(1), D = q.extent(2);
-  const size_t Hkv = k.extent(1);
-  if (v.extent(0) != T || out.extent(0) != T || out.extent(1) != Hq ||
-      out.extent(2) != D || key_valid.extent(0) != T)
-    throw std::invalid_argument("attention_causal_softcap: dimension mismatch");
-  if (T == 0 || Hq == 0 || D == 0) return;
-  Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, Hq}),
-      KOKKOS_LAMBDA(size_t t, size_t h) {
-        const size_t hkv = (h * Hkv) / Hq;
-        for (size_t d = 0; d < D; ++d) out(t, h, d) = static_cast<Scalar>(0);
-        float m = -1e30f, l = 0.0f;
-        for (size_t kk = 0; kk <= t; ++kk) {
-          if (!key_valid(kk)) continue;
-          float s = 0;
-          for (size_t d = 0; d < D; ++d)
-            s += static_cast<float>(q(t, h, d)) *
-                 static_cast<float>(k(kk, hkv, d));
-          s *= scale;
-          if (softcap > 0) s = softcap * tanhf(s / softcap);
-          const float m_new = (m > s) ? m : s;
-          const float a = expf(m - m_new);
-          const float g = expf(s - m_new);
-          const float la = l * a;
-          const float l_new = la + g;
-          const float inv = 1.0f / l_new;
-          const float c = la * inv;
-          const float e = g * inv;
-          for (size_t d = 0; d < D; ++d) {
-            const float o_old = static_cast<float>(out(t, h, d));
-            const float v_kd = static_cast<float>(v(kk, hkv, d));
-            out(t, h, d) = static_cast<Scalar>(o_old * c + v_kd * e);
-          }
-          m = m_new;
-          l = l_new;
-        }
-      });
-}
-
-}  // namespace Impl
-
 template <class ExecSpace, class Scalar>
 Model<ExecSpace, Scalar>::Model(const Config& c,
                                 const Weights<ExecSpace, Scalar>& w)
@@ -1701,7 +1617,7 @@ std::vector<float> Model<ExecSpace, Scalar>::forward(
     auto in_n = b.input_norm, po_n = b.post_attn_norm;
     auto pf_n = b.pre_ffn_norm, qf_n = b.post_ffn_norm;
 
-    Impl::rmsnorm_one_plus<ExecSpace, Scalar>(h, in_n, EPS, tmp);
+    rmsnorm_one_plus<ExecSpace, Scalar>(h, in_n, EPS, tmp);
     gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), tmp, wq,
                             static_cast<Scalar>(0), q2);
     gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), tmp, wk,
@@ -1723,8 +1639,8 @@ std::vector<float> Model<ExecSpace, Scalar>::forward(
           v3(t, i / (size_t)DH, i % (size_t)DH) = v2(t, i);
         });
     rope_neoX_inplace<ExecSpace, Scalar>(q3, k3, inv, DH, pos);
-    Impl::attention_causal_softcap<ExecSpace, Scalar>(q3, k3, v3, valid, SCALE,
-                                                     SOFTCAP, ao);
+    attention_gqa_single_softcap<ExecSpace, Scalar>(handle, q3, k3, v3, valid,
+                                                       0, ao, SCALE, SOFTCAP);
     Kokkos::parallel_for(
         "sg_flatten",
         Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, (size_t)HqD}),
@@ -1733,13 +1649,13 @@ std::vector<float> Model<ExecSpace, Scalar>::forward(
         });
     gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), af, wo,
                             static_cast<Scalar>(0), proj);
-    Impl::rmsnorm_one_plus<ExecSpace, Scalar>(proj, po_n, EPS, tmp2);
+    rmsnorm_one_plus<ExecSpace, Scalar>(proj, po_n, EPS, tmp2);
     Kokkos::parallel_for(
         "sg_resid1",
         Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, (size_t)D}),
         KOKKOS_LAMBDA(size_t t, size_t d) { h(t, d) += tmp2(t, d); });
 
-    Impl::rmsnorm_one_plus<ExecSpace, Scalar>(h, pf_n, EPS, tmp);
+    rmsnorm_one_plus<ExecSpace, Scalar>(h, pf_n, EPS, tmp);
     gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), tmp, wg,
                             static_cast<Scalar>(0), gate);
     gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), tmp, wu,
@@ -1747,13 +1663,13 @@ std::vector<float> Model<ExecSpace, Scalar>::forward(
     gated_gelu_multiply<ExecSpace, Scalar>(gate, up, act, GeluVariant::Tanh);
     gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), act, wd,
                             static_cast<Scalar>(0), down);
-    Impl::rmsnorm_one_plus<ExecSpace, Scalar>(down, qf_n, EPS, tmp2);
+    rmsnorm_one_plus<ExecSpace, Scalar>(down, qf_n, EPS, tmp2);
     Kokkos::parallel_for(
         "sg_resid2",
         Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, (size_t)D}),
         KOKKOS_LAMBDA(size_t t, size_t d) { h(t, d) += tmp2(t, d); });
   }
-  Impl::rmsnorm_one_plus<ExecSpace, Scalar>(h, weights.final_norm, EPS, tmp);
+  rmsnorm_one_plus<ExecSpace, Scalar>(h, weights.final_norm, EPS, tmp);
   Kokkos::fence();
 
   std::vector<float> out(T * (size_t)D);

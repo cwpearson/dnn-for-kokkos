@@ -113,6 +113,37 @@ void rmsnorm_noscale(
       });
 }
 
+// Gemma2 RMSNorm variant (zero-initialized weights multiply as (1 + w)):
+//   y[i,:] = x[i,:] / sqrt(mean(x[i,:]^2) + eps) * (1 + w[:])
+// Matches HF Gemma2RMSNorm (norm in FP32, then scale, then cast).
+// Scalar-agnostic; norm accumulated in FP32.
+// In-place safe (x and y may alias).
+// No TPL dispatch: pure elementwise dedup shared with the Sana Gemma2 text
+// encoder (same justification as rmsnorm_noscale above).
+template <class ExecSpace, class Scalar>
+void rmsnorm_one_plus(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
+    const Kokkos::View<Scalar*, ExecSpace>& w, float eps,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& y,
+    const std::string& label = "KokkosDNN::rmsnorm_one_plus") {
+  const size_t T = x.extent(0), D = x.extent(1);
+  if (y.extent(0) != T || y.extent(1) != D || w.extent(0) != D)
+    throw std::invalid_argument("rmsnorm_one_plus: dimension mismatch");
+  if (T == 0 || D == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::RangePolicy<ExecSpace>(0, T), KOKKOS_LAMBDA(size_t t) {
+        float ss = 0;
+        for (size_t d = 0; d < D; ++d) {
+          float v = static_cast<float>(x(t, d));
+          ss += v * v;
+        }
+        float inv = 1.0f / sqrt(ss / (float)D + eps);
+        for (size_t d = 0; d < D; ++d)
+          y(t, d) = static_cast<Scalar>(static_cast<float>(x(t, d)) * inv *
+                                        (1.0f + static_cast<float>(w(d))));
+      });
+}
+
 // Single-row scaleless variant for decode.
 template <class ExecSpace, class Scalar>
 void rmsnorm_row_noscale(

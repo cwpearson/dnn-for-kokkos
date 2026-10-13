@@ -4,6 +4,7 @@
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
 #include <cmath>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include "KokkosDNN_Handle.hpp"
@@ -195,6 +196,128 @@ void attention_gqa_single_sliding(
   using Scalar = std::remove_const_t<typename QView::value_type>;
   Impl::attention_gqa_streaming<ExecSpace, Scalar>(handle, q, k, v, q_off, out,
                                                   scale, sliding_window, label);
+}
+
+namespace Impl {
+
+// Streaming online-softmax causal GQA core with Gemma2 tanh logit
+// softcapping and a per-key validity mask. Same FP32 streaming structure as
+// attention_gqa_streaming above, plus:
+//   s = softcap * tanh((q.k * scale) / softcap)  [softcap <= 0 disables]
+// and pad keys (key_valid == 0) are skipped entirely. Shared by both public
+// overloads below so behavior cannot diverge.
+template <class ExecSpace, class Scalar, class QView, class KView, class VView,
+          class MView, class OView>
+void attention_gqa_softcap_streaming(const DNNHandle<ExecSpace>& handle,
+                                     const QView& q, const KView& k,
+                                     const VView& v, const MView& key_valid,
+                                     size_t q_off, const OView& out, float scale,
+                                     float softcap, const std::string& label) {
+  // No TPL dispatch: the pinned cudnn-frontend (GIT_TAG b8e39555...)
+  // exposes no SDPA tanh-softcap attribute — its Attention.md score-mod
+  // knobs are only diagonal bands, additive bias, block mask, ALiBi, and a
+  // generic score_mod callback — and its padding mask is a per-batch
+  // sequence-length truncation, which cannot express interior per-key
+  // validity alongside pad query rows. Emulating the mask with a bias
+  // tensor would materialize O(T*K) mask state and still leave the tanh
+  // unfused, so the native kernel below is the only path (exact by
+  // construction, no version-gated fallback to validate).
+  (void)handle;
+  const size_t T = q.extent(0), Hq = q.extent(1), D = q.extent(2);
+  const size_t Hkv = k.extent(1);
+  const size_t Ktot = k.extent(0);
+  if (v.extent(0) != Ktot || out.extent(0) != T || out.extent(1) != Hq ||
+      out.extent(2) != D || key_valid.extent(0) != Ktot)
+    throw std::invalid_argument(
+        "attention_gqa_single_softcap: dimension mismatch");
+  if (T == 0 || Hq == 0 || D == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, Hq}),
+      KOKKOS_LAMBDA(size_t t, size_t h) {
+        size_t khi = q_off + t + 1;
+        if (khi > Ktot) khi = Ktot;
+        const size_t hkv = (h * Hkv) / Hq;
+        for (size_t d = 0; d < D; ++d) out(t, h, d) = static_cast<Scalar>(0);
+        float m = -1e30f, l = 0.0f;
+        for (size_t kk = 0; kk < khi; ++kk) {
+          if (!key_valid(kk)) continue;
+          float s = 0;
+          for (size_t d = 0; d < D; ++d)
+            s += static_cast<float>(q(t, h, d)) *
+                 static_cast<float>(k(kk, hkv, d));
+          s *= scale;
+          if (softcap > 0) s = softcap * tanhf(s / softcap);
+          const float m_new = (m > s) ? m : s;
+          const float a = expf(m - m_new);
+          const float g = expf(s - m_new);
+          const float la = l * a;
+          const float l_new = la + g;
+          const float inv = 1.0f / l_new;
+          const float c = la * inv;
+          const float e = g * inv;
+          for (size_t d = 0; d < D; ++d) {
+            const float o_old = static_cast<float>(out(t, h, d));
+            const float v_kd = static_cast<float>(v(kk, hkv, d));
+            out(t, h, d) = static_cast<Scalar>(o_old * c + v_kd * e);
+          }
+          m = m_new;
+          l = l_new;
+        }
+      });
+}
+
+}  // namespace Impl
+
+// Causal GQA attention with Gemma2 tanh logit softcapping and a key padding
+// mask (e.g. the Sana Gemma2 text encoder: 8 Q / 4 KV heads, head_dim 256,
+// scale = 256^-0.5, softcap 50).
+//   q         : [T, Hq, D] queries (already RoPE'd)
+//   k, v      : [Ktot, Hkv, D] keys / values
+//   key_valid : [Ktot] per-key validity (1 = real token, 0 = pad)
+//   out       : [T, Hq, D]
+//   q_off     : absolute position of q[0] inside the K sequence; query t
+//               attends valid keys [0, q_off + t]
+//   s         : softcap * tanh((q.k * scale) / softcap); softcap <= 0
+//               disables softcapping (pure scaled dot-product scores)
+// Pad keys (valid == 0) are skipped, which equals the HF additive -inf mask
+// whenever at least one key is valid. A query row with no valid key keeps
+// zeros (documented; the Sana path always has key 0 valid, so this never
+// triggers there). GQA mapping, FP32 streaming online-softmax numerics, and
+// O(1) extra memory match attention_gqa_single; with q_off == 0,
+// Ktot == T, and all keys valid the only difference from
+// attention_gqa_single is the tanh (identity when softcap <= 0).
+//
+// Views are layout-agnostic (any Kokkos layout / subview / memory traits),
+// like the rest of the attention family; key_valid is any rank-1 view whose
+// elements are truthiness-testable (char/int/bool).
+//
+// TPL: none (see Impl note above) — the native kernel is the only path on
+// every backend, so dispatched-vs-native agreement holds trivially.
+//
+// Two overloads: explicit <ExecSpace, Scalar> and a deduction overload
+// taking Scalar from the query view. Both share the Impl core above so
+// behavior cannot diverge.
+template <class ExecSpace, class Scalar, class QView, class KView, class VView,
+          class MView, class OView>
+void attention_gqa_single_softcap(
+    const DNNHandle<ExecSpace>& handle, const QView& q, const KView& k,
+    const VView& v, const MView& key_valid, size_t q_off, const OView& out,
+    float scale, float softcap,
+    const std::string& label = "KokkosDNN::attn_gqa_softcap") {
+  Impl::attention_gqa_softcap_streaming<ExecSpace, Scalar>(
+      handle, q, k, v, key_valid, q_off, out, scale, softcap, label);
+}
+
+template <class ExecSpace, class QView, class KView, class VView, class MView,
+          class OView>
+void attention_gqa_single_softcap(
+    const DNNHandle<ExecSpace>& handle, const QView& q, const KView& k,
+    const VView& v, const MView& key_valid, size_t q_off, const OView& out,
+    float scale, float softcap,
+    const std::string& label = "KokkosDNN::attn_gqa_softcap") {
+  using Scalar = std::remove_const_t<typename QView::value_type>;
+  Impl::attention_gqa_softcap_streaming<ExecSpace, Scalar>(
+      handle, q, k, v, key_valid, q_off, out, scale, softcap, label);
 }
 
 namespace Impl {

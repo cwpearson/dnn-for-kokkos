@@ -5,6 +5,7 @@
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
 #include <cmath>
+#include <stdexcept>
 #include <utility>
 
 #include "KokkosDNN.hpp"
@@ -220,6 +221,294 @@ TEST(Attention, FloatLongKeys) {
           << "long-key mismatch at (" << hh << "," << d << ")";
     }
   }
+}
+
+// Causal GQA with tanh logit softcapping and a per-key validity mask vs a
+// host reference. Covers softcap on (large + small cap), cap <= 0 disabling,
+// interior pad keys, and a nonzero prefill offset (generalized q_off/Ktot
+// contract beyond the Sana self-attention case).
+template <class Scalar>
+void check_attention_softcap_reference(float tol, float softcap,
+                                       size_t q_off) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  KokkosDNN::DNNHandle<Exec> h;
+  const int T = 4, Hq = 4, Hkv = 2, D = 8;
+  const int Ktot = static_cast<int>(q_off) + T;
+  const float scale = 1.0f / 8.0f;
+
+  Kokkos::View<Scalar***, Exec> q("q", T, Hq, D), out("out", T, Hq, D);
+  Kokkos::View<Scalar***, Exec> k("k", Ktot, Hkv, D), v("v", Ktot, Hkv, D);
+  Kokkos::View<char*, Exec> valid("valid", Ktot);
+  auto hq = Kokkos::create_mirror_view(q);
+  auto hk = Kokkos::create_mirror_view(k);
+  auto hv = Kokkos::create_mirror_view(v);
+  auto hvalid = Kokkos::create_mirror_view(valid);
+  for (int t = 0; t < T; ++t)
+    for (int hh = 0; hh < Hq; ++hh)
+      for (int d = 0; d < D; ++d)
+        hq(t, hh, d) =
+            static_cast<Scalar>(0.05f * ((t * 7 + hh * 13 + d * 3) % 17) - 0.2f);
+  for (int n = 0; n < Ktot; ++n)
+    for (int hh = 0; hh < Hkv; ++hh)
+      for (int d = 0; d < D; ++d) {
+        hk(n, hh, d) =
+            static_cast<Scalar>(0.05f * ((n * 5 + hh * 11 + d) % 19) - 0.2f);
+        hv(n, hh, d) =
+            static_cast<Scalar>(0.05f * ((n * 3 + hh * 17 + d * 2) % 23) - 0.3f);
+      }
+  // Key 0 always valid; pad out interior key 2 (and key 5 when present).
+  for (int n = 0; n < Ktot; ++n)
+    hvalid(n) = (n == 2 || n == 5) ? 0 : 1;
+  Kokkos::deep_copy(q, hq);
+  Kokkos::deep_copy(k, hk);
+  Kokkos::deep_copy(v, hv);
+  Kokkos::deep_copy(valid, hvalid);
+
+  KokkosDNN::attention_gqa_single_softcap<Exec, Scalar>(h, q, k, v, valid,
+                                                       q_off, out, scale,
+                                                       softcap);
+  Kokkos::fence();
+  auto got = Kokkos::create_mirror_view(out);
+  Kokkos::deep_copy(got, out);
+
+  // Host reference: causal softmax over valid keys, tanh softcap applied
+  // exactly as the kernel does (float tanhf after scaling).
+  for (int t = 0; t < T; ++t) {
+    size_t khi = q_off + t + 1;
+    if (khi > (size_t)Ktot) khi = Ktot;
+    for (int hh = 0; hh < Hq; ++hh) {
+      int hkv = (hh * Hkv) / Hq;
+      float m = -1e30f;
+      for (size_t kk = 0; kk < khi; ++kk) {
+        if (!hvalid(kk)) continue;
+        float s = 0;
+        for (int d = 0; d < D; ++d)
+          s += static_cast<float>(hq(t, hh, d)) *
+               static_cast<float>(hk(kk, hkv, d));
+        s *= scale;
+        if (softcap > 0) s = softcap * std::tanh(s / softcap);
+        m = std::max(m, s);
+      }
+      float denom = 0;
+      for (size_t kk = 0; kk < khi; ++kk) {
+        if (!hvalid(kk)) continue;
+        float s = 0;
+        for (int d = 0; d < D; ++d)
+          s += static_cast<float>(hq(t, hh, d)) *
+               static_cast<float>(hk(kk, hkv, d));
+        s *= scale;
+        if (softcap > 0) s = softcap * std::tanh(s / softcap);
+        denom += std::exp(s - m);
+      }
+      for (int d = 0; d < D; ++d) {
+        float acc = 0;
+        for (size_t kk = 0; kk < khi; ++kk) {
+          if (!hvalid(kk)) continue;
+          float s = 0;
+          for (int dd = 0; dd < D; ++dd)
+            s += static_cast<float>(hq(t, hh, dd)) *
+                 static_cast<float>(hk(kk, hkv, dd));
+          s *= scale;
+          if (softcap > 0) s = softcap * std::tanh(s / softcap);
+          acc += std::exp(s - m) * static_cast<float>(hv(kk, hkv, d));
+        }
+        float ref = acc / denom;
+        EXPECT_NEAR(static_cast<float>(got(t, hh, d)), ref, tol)
+            << "softcap(cap=" << softcap << ",off=" << q_off << ") mismatch at ("
+            << t << "," << hh << "," << d << ")";
+      }
+    }
+  }
+}
+
+TEST(Attention, FloatSoftcapReference) {
+  check_attention_softcap_reference<float>(1e-4f, 50.0f, 0);
+}
+
+TEST(Attention, FloatSoftcapSmallCapOffsetReference) {
+  check_attention_softcap_reference<float>(1e-4f, 1.0f, 3);
+}
+
+TEST(Attention, BHalfSoftcapReference) {
+  check_attention_softcap_reference<Kokkos::Experimental::bhalf_t>(5e-2f, 50.0f,
+                                                                   0);
+}
+
+// Micro geometry (T=2, single head, D=2) with a trailing pad key.
+TEST(Attention, FloatSoftcapMicro) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  KokkosDNN::DNNHandle<Exec> h;
+  const int T = 2, Hq = 1, Hkv = 1, D = 2, Ktot = 2;
+  const float scale = 0.5f, softcap = 50.0f;
+  Kokkos::View<float***, Exec> q("q", T, Hq, D), k("k", Ktot, Hkv, D),
+      v("v", Ktot, Hkv, D), out("out", T, Hq, D);
+  Kokkos::View<char*, Exec> valid("valid", Ktot);
+  auto hq = Kokkos::create_mirror_view(q);
+  auto hk = Kokkos::create_mirror_view(k);
+  auto hv = Kokkos::create_mirror_view(v);
+  auto hvalid = Kokkos::create_mirror_view(valid);
+  hq(0, 0, 0) = 0.3f;
+  hq(0, 0, 1) = -0.4f;
+  hq(1, 0, 0) = 0.1f;
+  hq(1, 0, 1) = 0.7f;
+  hk(0, 0, 0) = 0.5f;
+  hk(0, 0, 1) = 0.2f;
+  hk(1, 0, 0) = -0.6f;
+  hk(1, 0, 1) = 0.9f;
+  hv(0, 0, 0) = 1.0f;
+  hv(0, 0, 1) = 2.0f;
+  hv(1, 0, 0) = 3.0f;
+  hv(1, 0, 1) = 4.0f;
+  hvalid(0) = 1;
+  hvalid(1) = 0;  // trailing pad: row 1 attends key 0 only
+  Kokkos::deep_copy(q, hq);
+  Kokkos::deep_copy(k, hk);
+  Kokkos::deep_copy(v, hv);
+  Kokkos::deep_copy(valid, hvalid);
+  // Deduction overload (Scalar taken from the query view).
+  KokkosDNN::attention_gqa_single_softcap(h, q, k, v, valid, size_t{0}, out,
+                                          scale, softcap);
+  Kokkos::fence();
+  auto got = Kokkos::create_mirror_view(out);
+  Kokkos::deep_copy(got, out);
+  // Row 0 attends a single valid key, so it must equal V[0] regardless of
+  // the softcap value.
+  EXPECT_FLOAT_EQ(got(0, 0, 0), 1.0f);
+  EXPECT_FLOAT_EQ(got(0, 0, 1), 2.0f);
+  // Row 1 also sees only key 0 (key 1 is a pad).
+  EXPECT_FLOAT_EQ(got(1, 0, 0), 1.0f);
+  EXPECT_FLOAT_EQ(got(1, 0, 1), 2.0f);
+}
+
+// cap <= 0 disables softcapping: with an all-valid mask the softcap path is
+// bit-identical to attention_gqa_single, and with pads it matches the
+// plain-scores host reference.
+TEST(Attention, FloatSoftcapDisabledMatchesPlain) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  KokkosDNN::DNNHandle<Exec> h;
+  const int T = 4, Hq = 4, Hkv = 2, D = 8, Ktot = 4;
+  const float scale = 1.0f / 8.0f;
+  Kokkos::View<float***, Exec> q("q", T, Hq, D), k("k", Ktot, Hkv, D),
+      v("v", Ktot, Hkv, D), out_cap("oc", T, Hq, D), out_plain("op", T, Hq, D);
+  Kokkos::View<char*, Exec> valid("valid", Ktot);
+  auto hq = Kokkos::create_mirror_view(q);
+  auto hk = Kokkos::create_mirror_view(k);
+  auto hv = Kokkos::create_mirror_view(v);
+  auto hvalid = Kokkos::create_mirror_view(valid);
+  for (int t = 0; t < T; ++t)
+    for (int hh = 0; hh < Hq; ++hh)
+      for (int d = 0; d < D; ++d)
+        hq(t, hh, d) = 0.05f * ((t * 7 + hh * 13 + d * 3) % 17) - 0.2f;
+  for (int n = 0; n < Ktot; ++n)
+    for (int hh = 0; hh < Hkv; ++hh)
+      for (int d = 0; d < D; ++d) {
+        hk(n, hh, d) = 0.05f * ((n * 5 + hh * 11 + d) % 19) - 0.2f;
+        hv(n, hh, d) = 0.05f * ((n * 3 + hh * 17 + d * 2) % 23) - 0.3f;
+      }
+  for (int n = 0; n < Ktot; ++n) hvalid(n) = 1;
+  Kokkos::deep_copy(q, hq);
+  Kokkos::deep_copy(k, hk);
+  Kokkos::deep_copy(v, hv);
+  Kokkos::deep_copy(valid, hvalid);
+  for (float cap : {0.0f, -2.0f}) {
+    KokkosDNN::attention_gqa_single_softcap<Exec, float>(
+        h, q, k, v, valid, 0, out_cap, scale, cap);
+    KokkosDNN::attention_gqa_single<Exec, float>(h, q, k, v, 0, out_plain,
+                                                scale);
+    Kokkos::fence();
+    auto gcap = Kokkos::create_mirror_view(out_cap);
+    auto gplain = Kokkos::create_mirror_view(out_plain);
+    Kokkos::deep_copy(gcap, out_cap);
+    Kokkos::deep_copy(gplain, out_plain);
+    for (int t = 0; t < T; ++t)
+      for (int hh = 0; hh < Hq; ++hh)
+        for (int d = 0; d < D; ++d)
+          EXPECT_EQ(gcap(t, hh, d), gplain(t, hh, d))
+              << "cap=" << cap << " diverges from plain at (" << t << ","
+              << hh << "," << d << ")";
+  }
+  // Masked + disabled: pad key 2 skipped, plain scores.
+  hvalid(2) = 0;
+  Kokkos::deep_copy(valid, hvalid);
+  KokkosDNN::attention_gqa_single_softcap<Exec, float>(h, q, k, v, valid, 0,
+                                                      out_cap, scale, 0.0f);
+  Kokkos::fence();
+  auto gcap = Kokkos::create_mirror_view(out_cap);
+  Kokkos::deep_copy(gcap, out_cap);
+  for (int t = 0; t < T; ++t) {
+    for (int hh = 0; hh < Hq; ++hh) {
+      int hkv = (hh * Hkv) / Hq;
+      float m = -1e30f;
+      for (int kk = 0; kk <= t; ++kk) {
+        if (kk == 2) continue;
+        float s = 0;
+        for (int d = 0; d < D; ++d) s += hq(t, hh, d) * hk(kk, hkv, d);
+        m = std::max(m, s * scale);
+      }
+      float denom = 0;
+      for (int kk = 0; kk <= t; ++kk) {
+        if (kk == 2) continue;
+        float s = 0;
+        for (int d = 0; d < D; ++d) s += hq(t, hh, d) * hk(kk, hkv, d);
+        denom += std::exp(s * scale - m);
+      }
+      for (int d = 0; d < D; ++d) {
+        float acc = 0;
+        for (int kk = 0; kk <= t; ++kk) {
+          if (kk == 2) continue;
+          float s = 0;
+          for (int dd = 0; dd < D; ++dd) s += hq(t, hh, dd) * hk(kk, hkv, dd);
+          acc += std::exp(s * scale - m) * hv(kk, hkv, d);
+        }
+        EXPECT_NEAR(gcap(t, hh, d), acc / denom, 1e-4f)
+            << "masked disabled mismatch at (" << t << "," << hh << "," << d
+            << ")";
+      }
+    }
+  }
+}
+
+// Mask contract: a query row with no valid key keeps zeros, and a
+// wrong-length mask is rejected.
+TEST(Attention, FloatSoftcapMaskContract) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  KokkosDNN::DNNHandle<Exec> h;
+  const int T = 3, Hq = 2, Hkv = 1, D = 4, Ktot = 3;
+  Kokkos::View<float***, Exec> q("q", T, Hq, D), k("k", Ktot, Hkv, D),
+      v("v", Ktot, Hkv, D), out("out", T, Hq, D);
+  Kokkos::View<char*, Exec> valid("valid", Ktot);
+  auto hq = Kokkos::create_mirror_view(q);
+  auto hk = Kokkos::create_mirror_view(k);
+  auto hv = Kokkos::create_mirror_view(v);
+  auto hvalid = Kokkos::create_mirror_view(valid);
+  for (int t = 0; t < T; ++t)
+    for (int hh = 0; hh < Hq; ++hh)
+      for (int d = 0; d < D; ++d) hq(t, hh, d) = 0.1f * (t + hh + d + 1);
+  for (int n = 0; n < Ktot; ++n)
+    for (int d = 0; d < D; ++d) {
+      hk(n, 0, d) = 0.1f * (n - d);
+      hv(n, 0, d) = 1.0f + 0.1f * n + 0.01f * d;
+    }
+  for (int n = 0; n < Ktot; ++n) hvalid(n) = 0;  // nothing valid
+  Kokkos::deep_copy(q, hq);
+  Kokkos::deep_copy(k, hk);
+  Kokkos::deep_copy(v, hv);
+  Kokkos::deep_copy(valid, hvalid);
+  KokkosDNN::attention_gqa_single_softcap<Exec, float>(h, q, k, v, valid, 0,
+                                                      out, 0.5f, 50.0f);
+  Kokkos::fence();
+  auto got = Kokkos::create_mirror_view(out);
+  Kokkos::deep_copy(got, out);
+  for (int t = 0; t < T; ++t)
+    for (int hh = 0; hh < Hq; ++hh)
+      for (int d = 0; d < D; ++d)
+        EXPECT_EQ(got(t, hh, d), 0.0f)
+            << "all-invalid row not zero at (" << t << "," << hh << "," << d
+            << ")";
+  Kokkos::View<char*, Exec> bad_valid("bad_valid", Ktot + 1);
+  EXPECT_THROW((KokkosDNN::attention_gqa_single_softcap<Exec, float>(
+                   h, q, k, v, bad_valid, 0, out, 0.5f, 50.0f)),
+               std::invalid_argument);
 }
 
 #if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)

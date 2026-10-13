@@ -79,8 +79,10 @@ void silu_gate_multiply_2d(
 // computes Y = X * W^T + b. Both spellings describe the same math, so
 // the non-square Sana weights (qkv [D,3D]<->[3D,D], kv [D,2D]<->[2D,D])
 // are auto-detected by extents: [3D,D]/[2D,D] takes the gemm/gemm_bias
-// fast path (cuBLAS dispatch included), [D,3D]/[D,2D] runs an exact
-// FP32 device GEMM with the indices swapped. Square weights
+// fast path (cuBLAS dispatch included) directly, [D,3D]/[D,2D] is first
+// transposed into an HF-layout temp (exact elementwise copy) and then
+// goes through the same dispatched gemm/gemm_bias entry points, so the
+// TPL ladder applies to both layouts. Square weights
 // (q_w, proj_w : [D, D]) are ambiguous by extents and always use the
 // repo convention (HF layout, Y = X * W^T + b).
 enum class SanaWeightOri { HF, Math };
@@ -92,29 +94,22 @@ inline SanaWeightOri sana_detect_ori(size_t e0, size_t e1, size_t in_dim,
   throw std::invalid_argument(what);
 }
 
-// Y = X * W + b with W : [K, N] math layout and optional bias
-// (empty b means zeros). FP32 accumulation, cast back to Scalar.
-// Used only for math-layout weights; HF-layout weights go through
-// gemm()/gemm_bias() so the TPL dispatch ladder keeps applying.
+// Transpose shim for math-layout weights: Wt(j, k) = W(k, j) with
+// W : [K, N] math layout ([in, out]) -> Wt : [N, K] HF layout
+// ([out, in]), so the call site can use the dispatched gemm()/gemm_bias()
+// entry points (TPL ladder intact). Pure elementwise copy, hence exact
+// for any Scalar; backend-portable MDRange kernel. These reference ops
+// already allocate temporaries per call, so one more temp is consistent.
 template <class ExecSpace, class Scalar>
-void sana_gemm_math(
-    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& X,
+void sana_transpose_2d(
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& W,
-    const Kokkos::View<Scalar*, ExecSpace>& b,
-    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& Y,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& Wt,
     const std::string& label) {
-  const size_t M = X.extent(0), K = X.extent(1), N = W.extent(1);
-  if (M == 0 || N == 0 || K == 0) return;
-  const bool biased = (b.extent(0) != 0);
+  const size_t R = W.extent(0), C = W.extent(1);
+  if (R == 0 || C == 0) return;
   Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {M, N}),
-      KOKKOS_LAMBDA(size_t i, size_t j) {
-        float acc = 0;
-        for (size_t k = 0; k < K; ++k)
-          acc += static_cast<float>(X(i, k)) * static_cast<float>(W(k, j));
-        if (biased) acc += static_cast<float>(b(j));
-        Y(i, j) = static_cast<Scalar>(acc);
-      });
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {R, C}),
+      KOKKOS_LAMBDA(size_t i, size_t j) { Wt(j, i) = W(i, j); });
 }
 
 // Rank-2 LiteLA body: x [T,D] -> out [T,D]. H/Dh, orientations, and
@@ -144,8 +139,11 @@ void sana_litela_2d_body(
     gemm(handle, static_cast<Scalar>(1), x, qkv_w, static_cast<Scalar>(0), qkv,
          label + "_qkv");
   } else {
-    Kokkos::View<Scalar*, ExecSpace> no_bias("KokkosDNN::sana_nobias", 0);
-    sana_gemm_math<ExecSpace, Scalar>(x, qkv_w, no_bias, qkv, label + "_qkv");
+    Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> qkv_wt(
+        "KokkosDNN::sana_qkv_wt", 3 * D, D);
+    sana_transpose_2d<ExecSpace, Scalar>(qkv_w, qkv_wt, label + "_qkv_t");
+    gemm(handle, static_cast<Scalar>(1), x, qkv_wt, static_cast<Scalar>(0), qkv,
+         label + "_qkv");
   }
 
   // 2. Split q/k/v, RMSNorm (or Identity when the weight is empty),
@@ -265,7 +263,10 @@ void sana_cross_2d_body(
   if (kv_ori == SanaWeightOri::HF) {
     gemm_bias(handle, cond, kv_w, kv_b, kvlin, label + "_kv");
   } else {
-    sana_gemm_math<ExecSpace, Scalar>(cond, kv_w, kv_b, kvlin, label + "_kv");
+    Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> kv_wt(
+        "KokkosDNN::sana_kv_wt", 2 * D, D);
+    sana_transpose_2d<ExecSpace, Scalar>(kv_w, kv_wt, label + "_kv_t");
+    gemm_bias(handle, cond, kv_wt, kv_b, kvlin, label + "_kv");
   }
   Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace> q3("KokkosDNN::sana_q3",
                                                               T, H, Dh),

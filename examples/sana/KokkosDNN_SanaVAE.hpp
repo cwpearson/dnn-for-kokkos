@@ -47,8 +47,11 @@
 //       +residual. (expand_ratio 4.)
 //
 // Activations are [T,C] token rows (T=H*W row-major, t=h*W+w); 1x1 convs
-// and linears reuse KokkosDNN::gemm_bias (cuBLAS ladder intact); all other
-// kernels are example-local below. Backend-portable parallel_for only.
+// and linears reuse KokkosDNN::gemm_bias (cuBLAS ladder intact); spatial
+// compute (dense 3x3, depthwise, grouped 1x1) uses the promoted core ops
+// in KokkosDNN_Conv.hpp (native; see the TPL-status note there for why
+// there is no cuDNN dispatch). Remaining kernels below are example-local. Backend-portable
+// parallel_for only.
 
 #include <Kokkos_Core.hpp>
 
@@ -61,6 +64,7 @@
 #include <vector>
 
 #include "KokkosDNN_GemmBias.hpp"
+#include "KokkosDNN_Conv.hpp"
 #include "KokkosDNN_Handle.hpp"
 
 namespace KokkosDNN {
@@ -397,97 +401,6 @@ void rmsnorm_wb(
         const float inv = 1.0f / sqrtf(ss / (float)C + eps);
         for (size_t c = 0; c < C; ++c)
           y(t, c) = x(t, c) * inv * w(c) + b(c);
-      });
-}
-
-// ---- general 3x3 conv, stride 1, pad 1, zero padding ----
-// x [T,Cin] (T=H*W), w [Cout,Cin,3,3], b [Cout] or empty, y [T,Cout].
-template <class ExecSpace>
-void conv3x3(
-    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& x,
-    const Kokkos::View<float****, Kokkos::LayoutRight, ExecSpace>& w,
-    const Kokkos::View<float*, ExecSpace>& b,
-    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& y, size_t H,
-    size_t W, const std::string& label) {
-  const size_t T = x.extent(0), Cin = x.extent(1), Cout = w.extent(0);
-  const bool biased = (b.extent(0) != 0);
-  if (w.extent(1) != Cin || w.extent(2) != 3 || w.extent(3) != 3 ||
-      y.extent(0) != T || y.extent(1) != Cout || (biased && b.extent(0) != Cout))
-    throw std::invalid_argument("Sana::VAE conv3x3: dimension mismatch");
-  if (H == 0 || W == 0 || T != H * W)
-    throw std::invalid_argument("Sana::VAE conv3x3: H*W must equal rows");
-  if (T == 0 || Cin == 0 || Cout == 0) return;
-  Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, Cout}),
-      KOKKOS_LAMBDA(size_t t, size_t o) {
-        const size_t h = t / W, ww = t % W;
-        float acc = biased ? b(o) : 0.0f;
-        for (size_t i = 0; i < Cin; ++i)
-          for (int kh = 0; kh < 3; ++kh) {
-            const int ih = (int)h + kh - 1;
-            if (ih < 0 || (size_t)ih >= H) continue;
-            for (int kw = 0; kw < 3; ++kw) {
-              const int iw = (int)ww + kw - 1;
-              if (iw < 0 || (size_t)iw >= W) continue;
-              acc += x((size_t)ih * W + (size_t)iw, i) *
-                     w(o, i, (size_t)kh, (size_t)kw);
-            }
-          }
-        y(t, o) = acc;
-      });
-}
-
-// ---- depthwise KxK, stride 1, pad K/2 ----
-template <class ExecSpace, int K>
-void depthwise(
-    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& x,
-    const Kokkos::View<float***, Kokkos::LayoutRight, ExecSpace>& w,
-    const Kokkos::View<float*, ExecSpace>& b,
-    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& y, size_t H,
-    size_t W, const std::string& label) {
-  constexpr int P = K / 2;
-  const size_t T = x.extent(0), C = x.extent(1);
-  const bool biased = (b.extent(0) != 0);
-  if (T == 0 || C == 0) return;
-  Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, C}),
-      KOKKOS_LAMBDA(size_t t, size_t c) {
-        const size_t h = t / W, ww = t % W;
-        float acc = biased ? b(c) : 0.0f;
-        for (int kh = 0; kh < K; ++kh) {
-          const int ih = (int)h + kh - P;
-          if (ih < 0 || (size_t)ih >= H) continue;
-          for (int kw = 0; kw < K; ++kw) {
-            const int iw = (int)ww + kw - P;
-            if (iw < 0 || (size_t)iw >= W) continue;
-            acc += x((size_t)ih * W + (size_t)iw, c) *
-                   w(c, (size_t)kh, (size_t)kw);
-          }
-        }
-        y(t, c) = acc;
-      });
-}
-
-// ---- grouped 1x1 conv (e.g. multiscale proj_out: groups=3*heads) ----
-// x [T,Cin], w [Cout,Cg] (Cg = per-group in channels), y [T,Cout], no bias.
-// Group g owns outputs [g*Co..(g+1)*Co) and inputs [g*Cg..(g+1)*Cg).
-template <class ExecSpace>
-void grouped_conv1x1(
-    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& x,
-    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& w,
-    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& y,
-    size_t groups, const std::string& label) {
-  const size_t T = x.extent(0), Cin = x.extent(1), Cout = w.extent(0);
-  const size_t Cg = w.extent(1);
-  if (T == 0 || Cin == 0 || Cout == 0) return;
-  const size_t Co = Cout / groups;
-  Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, Cout}),
-      KOKKOS_LAMBDA(size_t t, size_t o) {
-        const size_t g = o / Co;
-        float acc = 0.0f;
-        for (size_t k = 0; k < Cg; ++k) acc += x(t, g * Cg + k) * w(o, k);
-        y(t, o) = acc;
       });
 }
 

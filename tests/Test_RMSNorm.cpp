@@ -4,6 +4,7 @@
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
 #include <cmath>
+#include <stdexcept>
 
 #include "KokkosDNN.hpp"
 
@@ -113,4 +114,65 @@ void check_rmsnorm_batched(float tol) {
 TEST(RMSNormBatched, Float) { check_rmsnorm_batched<float>(1e-5f); }
 TEST(RMSNormBatched, BHalf) {
   check_rmsnorm_batched<Kokkos::Experimental::bhalf_t>(5e-2f);
+}
+
+// Gemma2 (1 + w) RMSNorm variant vs host reference (float + bfloat16).
+// Zero weights must reproduce the scaleless variant (family consistency).
+template <class Scalar>
+void check_rmsnorm_one_plus(float tol) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  const int T = 3, D = 8;
+  const float eps = 1e-6f;
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> x("x", T, D), y("y", T, D),
+      y_ns("y_ns", T, D);
+  Kokkos::View<Scalar*, Exec> w("w", D), w0("w0", D);
+  auto hx = Kokkos::create_mirror_view(x);
+  auto hw = Kokkos::create_mirror_view(w);
+  auto hw0 = Kokkos::create_mirror_view(w0);
+  for (int t = 0; t < T; ++t)
+    for (int d = 0; d < D; ++d)
+      hx(t, d) = static_cast<Scalar>(0.5f * (t + 1) - 0.25f * d);
+  for (int d = 0; d < D; ++d) {
+    hw(d) = static_cast<Scalar>(0.05f * d - 0.1f);  // small, zero-centered
+    hw0(d) = static_cast<Scalar>(0);
+  }
+  Kokkos::deep_copy(x, hx);
+  Kokkos::deep_copy(w, hw);
+  Kokkos::deep_copy(w0, hw0);
+  KokkosDNN::rmsnorm_one_plus<Exec, Scalar>(x, w, eps, y);
+  KokkosDNN::rmsnorm_one_plus<Exec, Scalar>(x, w0, eps, y_ns);
+  Kokkos::fence();
+  auto got = Kokkos::create_mirror_view(y);
+  Kokkos::deep_copy(got, y);
+  auto got_ns = Kokkos::create_mirror_view(y_ns);
+  Kokkos::deep_copy(got_ns, y_ns);
+  for (int t = 0; t < T; ++t) {
+    float ss = 0;
+    for (int d = 0; d < D; ++d) {
+      float v = static_cast<float>(hx(t, d));
+      ss += v * v;
+    }
+    float inv = 1.0f / std::sqrt(ss / D + eps);
+    for (int d = 0; d < D; ++d) {
+      float want = static_cast<float>(hx(t, d)) * inv *
+                   (1.0f + static_cast<float>(hw(d)));
+      EXPECT_NEAR(static_cast<float>(got(t, d)), want, tol)
+          << "rmsnorm_one_plus mismatch at (" << t << "," << d << ")";
+      float want_ns = static_cast<float>(hx(t, d)) * inv;
+      EXPECT_NEAR(static_cast<float>(got_ns(t, d)), want_ns, tol)
+          << "rmsnorm_one_plus zero-weight mismatch at (" << t << "," << d
+          << ")";
+    }
+  }
+  // Dimension mismatch throws.
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> bad("bad", T, D - 1);
+  EXPECT_THROW(
+      (KokkosDNN::rmsnorm_one_plus<Exec, Scalar>(x, w, eps, bad)),
+      std::invalid_argument);
+}
+
+TEST(RMSNormOnePlus, Float) { check_rmsnorm_one_plus<float>(1e-5f); }
+
+TEST(RMSNormOnePlus, BHalf) {
+  check_rmsnorm_one_plus<Kokkos::Experimental::bhalf_t>(5e-2f);
 }

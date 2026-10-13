@@ -330,10 +330,10 @@ typename Decoder<ExecSpace>::View2 Decoder<ExecSpace>::res_block(
     size_t H, size_t W, const std::string& tag) const {
   const size_t T = H * W;
   View2 c1(tag + "_c1", T, C), c2(tag + "_c2", T, C);
-  Impl::conv3x3<ExecSpace>(x, r.conv1_w, r.conv1_b, c1, H, W, tag + "_conv1");
+  conv3x3_forward(handle_, x, r.conv1_w, r.conv1_b, c1, H, W, tag + "_conv1");
   Impl::silu_inplace<ExecSpace>(c1, tag + "_silu");
   typename Weights<ExecSpace>::Vec no_bias;
-  Impl::conv3x3<ExecSpace>(c1, r.conv2_w, no_bias, c2, H, W, tag + "_conv2");
+  conv3x3_forward(handle_, c1, r.conv2_w, no_bias, c2, H, W, tag + "_conv2");
   Impl::rmsnorm_wb<ExecSpace>(c2, r.norm_w, r.norm_b, cfg_.norm_eps, c2,
                               tag + "_norm");
   Impl::add_inplace<ExecSpace>(c2, x, tag + "_res");
@@ -368,8 +368,10 @@ typename Decoder<ExecSpace>::View2 Decoder<ExecSpace>::evit_block(
     Kokkos::deep_copy(u, uh);
   }
   View2 m5(tag + "_m5", T, 3 * C), m(tag + "_m", T, 3 * C);
-  Impl::depthwise<ExecSpace, 5>(u, e.ms_in, no_bias, m5, H, W, tag + "_msdw");
-  Impl::grouped_conv1x1<ExecSpace>(m5, e.ms_out, m, 3 * heads, tag + "_mspt");
+  depthwise_conv_forward(handle_, u, e.ms_in, no_bias, m5, 5, H, W,
+                         tag + "_msdw");
+  grouped_conv1x1_forward(handle_, m5, e.ms_out, no_bias, m, 3 * heads,
+                          tag + "_mspt");
   View2 feats(tag + "_feats", T, 6 * C);
   {
     auto fh = Kokkos::create_mirror_view(feats);
@@ -396,7 +398,8 @@ typename Decoder<ExecSpace>::View2 Decoder<ExecSpace>::evit_block(
   gemm_bias(handle_, ao, e.gl_inv, e.gl_inv_b, gi, tag + "_ginv");
   Impl::silu_inplace<ExecSpace>(gi, tag + "_gsilu");
   View2 gd(tag + "_gd", T, 2 * Hid);
-  Impl::depthwise<ExecSpace, 3>(gi, e.gl_dw, e.gl_dw_b, gd, H, W, tag + "_gdw");
+  depthwise_conv_forward(handle_, gi, e.gl_dw, e.gl_dw_b, gd, 3, H, W,
+                         tag + "_gdw");
   View2 gh(tag + "_gh", T, Hid);
   Impl::silu_gate<ExecSpace>(gd, gh, Hid, tag + "_gate");
   View2 gp(tag + "_gp", T, C);
@@ -433,8 +436,8 @@ std::vector<float> Decoder<ExecSpace>::decode(const std::vector<float>& lat,
   size_t cH = H, cW = W;
   {
     View2 y("vae_conv_in", H * W, C);
-    Impl::conv3x3<ExecSpace>(h, w_.conv_in_w, w_.conv_in_b, y, H, W,
-                             "vae_conv_in");
+    conv3x3_forward(handle_, h, w_.conv_in_w, w_.conv_in_b, y, H, W,
+                    "vae_conv_in");
     Impl::add_repeat_inplace<ExecSpace>(y, h, "vae_in_shortcut");
     h = y;
   }
@@ -455,8 +458,8 @@ std::vector<float> Decoder<ExecSpace>::decode(const std::vector<float>& lat,
       View2 up("vae_up", 4 * cH * cW, Cout);
       View2 nn("vae_nn", 4 * cH * cW, C);
       Impl::nearest_upsample2x<ExecSpace>(h, nn, cH, cW, tag + "_nn");
-      Impl::conv3x3<ExecSpace>(nn, upst.up_w, upst.up_b, up, 2 * cH, 2 * cW,
-                               tag + "_upconv");
+      conv3x3_forward(handle_, nn, upst.up_w, upst.up_b, up, 2 * cH, 2 * cW,
+                      tag + "_upconv");
       View2 sh("vae_sh", 4 * cH * cW, Cout);
       Impl::repeat_pixel_shuffle2x<ExecSpace>(h, sh, cH, cW, Cout,
                                              tag + "_upsh");
@@ -471,8 +474,8 @@ std::vector<float> Decoder<ExecSpace>::decode(const std::vector<float>& lat,
                               "vae_norm_out");
   Impl::relu_inplace<ExecSpace>(h, "vae_head_relu");
   View2 rgb_tok("vae_rgb", cH * cW, (size_t)cfg_.out_channels);
-  Impl::conv3x3<ExecSpace>(h, w_.conv_out_w, w_.conv_out_b, rgb_tok, cH, cW,
-                           "vae_conv_out");
+  conv3x3_forward(handle_, h, w_.conv_out_w, w_.conv_out_b, rgb_tok, cH, cW,
+                  "vae_conv_out");
   // Tokens -> host [3,oH,oW] row-major.
   std::vector<float> rgb((size_t)cfg_.out_channels * cH * cW);
   auto rh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), rgb_tok);
