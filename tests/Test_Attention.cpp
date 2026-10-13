@@ -381,11 +381,15 @@ TEST(Attention, FloatSoftcapMicro) {
 }
 
 // cap <= 0 disables softcapping: with an all-valid mask the softcap path is
-// bit-identical to attention_gqa_single, and with pads it matches the
-// plain-scores host reference.
+// bit-identical to attention_gqa_single under the native kernel, and with
+// pads it matches the plain-scores host reference. The softcap entry point
+// is native-only (no cuDNN softcap form) while the plain path dispatches to
+// cuDNN SDPA on CUDA+cuDNN builds (~1-ulp drift), so the comparison forces
+// native; dispatched-vs-native parity is covered separately with tolerance.
 TEST(Attention, FloatSoftcapDisabledMatchesPlain) {
   using Exec = Kokkos::DefaultExecutionSpace;
   KokkosDNN::DNNHandle<Exec> h;
+  h.use_cudnn = false;
   const int T = 4, Hq = 4, Hkv = 2, D = 8, Ktot = 4;
   const float scale = 1.0f / 8.0f;
   Kokkos::View<float***, Exec> q("q", T, Hq, D), k("k", Ktot, Hkv, D),

@@ -39,7 +39,9 @@ namespace Llama {
 //     addressed through an explicit identity block table, grown on demand so
 //     a short prompt on a long-context config only rents the pages it
 //     touches. Int8 halves KV bytes (plus scales) at the cost of small
-//     numerical drift; paged dense is bit-exact vs dense.
+  //     numerical drift; paged dense is bit-exact vs dense under the
+  //     native kernel (on CUDA+cuDNN builds dense attention may dispatch
+  //     to cuDNN SDPA while paged stays native, giving ~1-ulp drift).
 //
 // Memory note: BF16 8B weights are ~16 GiB (FP32 would be ~32 GiB), so a
 // 24 GiB RTX 3090 can hold BF16 weights but not FP32. tiny_test() configs
