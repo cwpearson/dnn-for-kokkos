@@ -5,10 +5,9 @@
 // at the end of the cache). FLOPs ≈ 4*T*Hq*Klen*D (scores + weighted sum).
 //
 // Native is always the Kokkos kernel. Dispatched uses the default handle and
-// routes float attention to cuDNN SDPA when built with
-// KokkosDNN_ENABLE_CUDNN on a CUDA space; otherwise (including all bhalf_t
-// and non-CUDA builds) it falls back to native, so Native == Dispatched.
-// bhalf_t therefore registers Native only.
+// routes float and bhalf_t attention to cuDNN SDPA when built with
+// KokkosDNN_ENABLE_CUDNN on a CUDA space; otherwise it falls back to native,
+// so Native == Dispatched.
 //
 //   ./kokkosdnn_bench --benchmark_filter='Attention.*'
 //   ./kokkosdnn_bench --benchmark_filter='Attention/Float.*' --benchmark_counters_tabular=true
@@ -87,6 +86,9 @@ static void BM_Attention_Float_Dispatched(benchmark::State& state) {
 static void BM_Attention_BHalf_Native(benchmark::State& state) {
   run_attention<bhalf_t>(state, true);
 }
+static void BM_Attention_BHalf_Dispatched(benchmark::State& state) {
+  run_attention<bhalf_t>(state, false);
+}
 
 // (T, Ktot): decode T=1 plus short prefills. T=128/Ktot=512 is
 // GPU-oriented on the naive kernel (4*T*Hq*Ktot*D FLOPs with one thread per
@@ -97,5 +99,6 @@ static void BM_Attention_BHalf_Native(benchmark::State& state) {
 KOKKOSDNN_ATTN_ARGS(BENCHMARK(BM_Attention_Float_Native)->Unit(benchmark::kMillisecond)->ArgNames({"T", "Ktot"}));
 KOKKOSDNN_ATTN_ARGS(BENCHMARK(BM_Attention_Float_Dispatched)->Unit(benchmark::kMillisecond)->ArgNames({"T", "Ktot"}));
 KOKKOSDNN_ATTN_ARGS(BENCHMARK(BM_Attention_BHalf_Native)->Unit(benchmark::kMillisecond)->ArgNames({"T", "Ktot"}));
+KOKKOSDNN_ATTN_ARGS(BENCHMARK(BM_Attention_BHalf_Dispatched)->Unit(benchmark::kMillisecond)->ArgNames({"T", "Ktot"}));
 
 }  // namespace

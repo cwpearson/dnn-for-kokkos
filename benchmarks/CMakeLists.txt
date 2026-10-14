@@ -1,8 +1,9 @@
 # Google Benchmark-based microbenchmarks for core KokkosDNN operators.
 #
-# Produces a single `kokkosdnn_bench` binary. GEMM and attention register
-# Native vs Dispatched variants so native Kokkos kernels can be compared
-# against TPL paths (cuBLAS GEMM, cuDNN SDPA) on CUDA builds:
+# Produces a single `kokkosdnn_bench` binary. GEMM, biased-linear, and
+# attention register Native vs Dispatched variants so native Kokkos kernels
+# can be compared against TPL paths (cuBLAS GEMM incl. gemm_bias/gemv_bias/
+# dense_forward reuse, cuDNN causal/sliding/bidirectional SDPA) on CUDA builds:
 #
 #   ./kokkosdnn_bench --benchmark_filter='Gemm.*'
 #   ./kokkosdnn_bench --benchmark_filter='.*Cublas.*|.*Native.*'
@@ -31,7 +32,10 @@ endif()
 add_executable(kokkosdnn_bench
   BenchmarkMain.cpp
   Bench_Gemm.cpp
+  Bench_GemmBias.cpp
   Bench_Attention.cpp
+  Bench_AttentionSliding.cpp
+  Bench_AttentionBidirectional.cpp
   Bench_Elementwise.cpp
 )
 target_link_libraries(kokkosdnn_bench PRIVATE KokkosDNN::kokkosdnn benchmark::benchmark)
