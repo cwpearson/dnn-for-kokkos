@@ -35,7 +35,11 @@
 
 #include <cuda_runtime.h>
 
+#include <cstring>
+#include <deque>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -46,6 +50,107 @@ namespace KokkosDNN {
 namespace Impl {
 
 namespace {
+// Persistent execution-plan cache: Sana's DiT calls cross-attention 28x per
+// forward with identical shapes/strides, so rebuilding the cudnn_frontend
+// graph (validate + build with HeurMode A+FALLBACK, cuDNN JIT) and
+// cudaMalloc/cudaFree-ing the workspace on every call is pure host-side
+// overhead. The graph bakes dims/strides but NOT data pointers, so a built
+// graph can be re-executed with the current call's pointers via the variant
+// pack. Keyed on every parameter that affects the built plan; bounded with
+// FIFO eviction (~16 entries) so memory stays flat.
+constexpr std::size_t kSdpaPlanCacheCapacity = 16;
+
+struct SdpaPlanKey {
+  CudnnSdpaScalar dtype = CudnnSdpaScalar::Float;
+  int64_t T = 0, Ktot = 0, Hq = 0, Hkv = 0, D = 0;
+  // All 16 element strides: per-tensor (sT, sH, sD) plus the per-batch
+  // footprint (B stride, unused for B=1 but baked into the graph).
+  int64_t q_sT = 0, q_sH = 0, q_sD = 0, q_sB = 0;
+  int64_t k_sT = 0, k_sH = 0, k_sD = 0, k_sB = 0;
+  int64_t v_sT = 0, v_sH = 0, v_sD = 0, v_sB = 0;
+  int64_t o_sT = 0, o_sH = 0, o_sD = 0, o_sB = 0;
+  uint32_t scale_bits = 0;  // bit-exact float key, no epsilon issues
+  bool causal = false;
+  int64_t left_bound = -1;
+  std::string node_name;
+
+  bool operator==(const SdpaPlanKey& o) const {
+    return dtype == o.dtype && T == o.T && Ktot == o.Ktot && Hq == o.Hq &&
+           Hkv == o.Hkv && D == o.D && q_sT == o.q_sT && q_sH == o.q_sH &&
+           q_sD == o.q_sD && q_sB == o.q_sB && k_sT == o.k_sT &&
+           k_sH == o.k_sH && k_sD == o.k_sD && k_sB == o.k_sB &&
+           v_sT == o.v_sT && v_sH == o.v_sH && v_sD == o.v_sD &&
+           v_sB == o.v_sB && o_sT == o.o_sT && o_sH == o.o_sH &&
+           o_sD == o.o_sD && o_sB == o.o_sB &&
+           scale_bits == o.scale_bits && causal == o.causal &&
+           left_bound == o.left_bound && node_name == o.node_name;
+  }
+};
+
+struct SdpaPlanKeyHash {
+  static void mix(std::size_t& h, std::size_t v) {
+    h ^= v + 0x9e3779b9u + (h << 6) + (h >> 2);
+  }
+  std::size_t operator()(const SdpaPlanKey& k) const noexcept {
+    std::size_t h = std::hash<int>{}(static_cast<int>(k.dtype));
+    mix(h, std::hash<int64_t>{}(k.T));
+    mix(h, std::hash<int64_t>{}(k.Ktot));
+    mix(h, std::hash<int64_t>{}(k.Hq));
+    mix(h, std::hash<int64_t>{}(k.Hkv));
+    mix(h, std::hash<int64_t>{}(k.D));
+    mix(h, std::hash<int64_t>{}(k.q_sT));
+    mix(h, std::hash<int64_t>{}(k.q_sH));
+    mix(h, std::hash<int64_t>{}(k.q_sD));
+    mix(h, std::hash<int64_t>{}(k.q_sB));
+    mix(h, std::hash<int64_t>{}(k.k_sT));
+    mix(h, std::hash<int64_t>{}(k.k_sH));
+    mix(h, std::hash<int64_t>{}(k.k_sD));
+    mix(h, std::hash<int64_t>{}(k.k_sB));
+    mix(h, std::hash<int64_t>{}(k.v_sT));
+    mix(h, std::hash<int64_t>{}(k.v_sH));
+    mix(h, std::hash<int64_t>{}(k.v_sD));
+    mix(h, std::hash<int64_t>{}(k.v_sB));
+    mix(h, std::hash<int64_t>{}(k.o_sT));
+    mix(h, std::hash<int64_t>{}(k.o_sH));
+    mix(h, std::hash<int64_t>{}(k.o_sD));
+    mix(h, std::hash<int64_t>{}(k.o_sB));
+    mix(h, std::hash<uint32_t>{}(k.scale_bits));
+    mix(h, std::hash<bool>{}(k.causal));
+    mix(h, std::hash<int64_t>{}(k.left_bound));
+    mix(h, std::hash<std::string>{}(k.node_name));
+    return h;
+  }
+};
+
+// Cached value: the built graph plus its tensor handles (needed to rebuild
+// the variant pack with fresh pointers on each hit) and a persistent device
+// workspace buffer allocated once per key (max-needed) and reused.
+struct SdpaPlanEntry {
+  std::shared_ptr<fe::graph::Graph> graph;
+  std::shared_ptr<fe::graph::Tensor_attributes> Q, K, V, O;
+  void* workspace = nullptr;
+
+  SdpaPlanEntry() = default;
+  SdpaPlanEntry(const SdpaPlanEntry&) = delete;
+  SdpaPlanEntry& operator=(const SdpaPlanEntry&) = delete;
+  ~SdpaPlanEntry() {
+    if (workspace != nullptr) cudaFree(workspace);
+  }
+};
+
+struct SdpaPlanCache {
+  std::mutex mutex;
+  std::unordered_map<SdpaPlanKey, std::shared_ptr<SdpaPlanEntry>,
+                     SdpaPlanKeyHash>
+      plans;
+  std::deque<SdpaPlanKey> order;  // insertion order for FIFO eviction
+};
+
+SdpaPlanCache& sdpa_plan_cache() {
+  static SdpaPlanCache cache;
+  return cache;
+}
+
 // Shared SDPA graph builder/executor. causal=false omits the diagonal-mask
 // attributes entirely, which per the cuDNN frontend docs yields dense
 // (non-causal) attention (left_bound is ignored). causal=true bakes in the
@@ -93,10 +198,11 @@ bool sdpa_forward_impl(void* cached_handle, CudnnSdpaScalar dtype,
   if (dtype == CudnnSdpaScalar::Float && T == 1 && Hq != Hkv) return false;
 #endif
 
-  // The caller (Kokkos execution space) owns Q/K/V/O. Fence so prior
-  // Kokkos kernels have completed before cuDNN reads them.
-  Kokkos::fence();
-
+  // No fence here: the cached handle re-selects the Kokkos CUDA stream
+  // every call below, so cuDNN work is ordered with surrounding Kokkos
+  // kernels on that stream (all KokkosDNN kernels launch on the default
+  // instance). Same justification as the cuBLAS fence removal in
+  // src/KokkosDNN_Gemm.hpp.
   // Cached handle owned by the DNNHandle (created once per handle, not per
   // call). Re-select the Kokkos CUDA stream every call so ordering with
   // surrounding Kokkos kernels is preserved without extra synchronization.
@@ -105,8 +211,75 @@ bool sdpa_forward_impl(void* cached_handle, CudnnSdpaScalar dtype,
   if (cudnnSetStream(cudnn_handle, kokkos_stream) != CUDNN_STATUS_SUCCESS)
     return false;
 
+  // Build the cache key from every parameter that affects the built plan.
+  // B=1; the per-batch footprint is baked into the graph as the B stride.
+  SdpaPlanKey key;
+  key.dtype = dtype;
+  key.T = T;
+  key.Ktot = Ktot;
+  key.Hq = Hq;
+  key.Hkv = Hkv;
+  key.D = D;
+  key.q_sT = q_sT;
+  key.q_sH = q_sH;
+  key.q_sD = q_sD;
+  key.q_sB = Hq * T * D;
+  key.k_sT = k_sT;
+  key.k_sH = k_sH;
+  key.k_sD = k_sD;
+  key.k_sB = Hkv * Ktot * D;
+  key.v_sT = v_sT;
+  key.v_sH = v_sH;
+  key.v_sD = v_sD;
+  key.v_sB = Hkv * Ktot * D;
+  key.o_sT = o_sT;
+  key.o_sH = o_sH;
+  key.o_sD = o_sD;
+  key.o_sB = Hq * T * D;
+  static_assert(sizeof(float) == sizeof(uint32_t),
+                "float scale key needs 32 bits");
+  std::memcpy(&key.scale_bits, &scale, sizeof(scale));
+  key.causal = causal;
+  key.left_bound = left_bound;
+  key.node_name = (node_name != nullptr) ? node_name : "";
+
+  // Cache hit: skip validate/build/workspace-query/malloc entirely; just
+  // re-execute the built graph with the CURRENT call's pointers (the graph
+  // bakes dims/strides, not data pointers). The shared_ptr copy keeps the
+  // entry (and its workspace) alive past a concurrent eviction.
+  {
+    std::shared_ptr<SdpaPlanEntry> hit;
+    {
+      SdpaPlanCache& cache = sdpa_plan_cache();
+      std::lock_guard<std::mutex> lock(cache.mutex);
+      auto it = cache.plans.find(key);
+      if (it != cache.plans.end()) hit = it->second;
+    }
+    if (hit != nullptr) {
+      bool hit_ok = false;
+      try {
+        std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>,
+                           void*>
+            variant_pack = {{hit->Q, const_cast<void*>(q)},
+                            {hit->K, const_cast<void*>(k)},
+                            {hit->V, const_cast<void*>(v)},
+                            {hit->O, out}};
+        hit_ok =
+            hit->graph->execute(cudnn_handle, variant_pack, hit->workspace)
+                .is_good();
+      } catch (...) {
+        hit_ok = false;
+      }
+      return hit_ok;
+    }
+  }
+
+  // Cache miss: build exactly as before. Any failure returns false so the
+  // caller falls back to the native Kokkos kernel; nothing is cached.
   bool ok = false;
   void* workspace = nullptr;
+  std::shared_ptr<fe::graph::Graph> graph;
+  std::shared_ptr<fe::graph::Tensor_attributes> Q, K, V, O;
 
   try {
     // B=1; cuDNN dims are [B,H,S,D], strides are the caller's Kokkos
@@ -114,31 +287,31 @@ bool sdpa_forward_impl(void* cached_handle, CudnnSdpaScalar dtype,
     // stride is unused for B=1; set it to the per-batch footprint.
     const int64_t b = 1;
     const std::vector<int64_t> q_dim = {b, Hq, T, D};
-    const std::vector<int64_t> q_stride = {Hq * T * D, q_sH, q_sT, q_sD};
+    const std::vector<int64_t> q_stride = {key.q_sB, q_sH, q_sT, q_sD};
     const std::vector<int64_t> k_dim = {b, Hkv, Ktot, D};
-    const std::vector<int64_t> k_stride = {Hkv * Ktot * D, k_sH, k_sT, k_sD};
+    const std::vector<int64_t> k_stride = {key.k_sB, k_sH, k_sT, k_sD};
     const std::vector<int64_t> v_dim = {b, Hkv, Ktot, D};
-    const std::vector<int64_t> v_stride = {Hkv * Ktot * D, v_sH, v_sT, v_sD};
+    const std::vector<int64_t> v_stride = {key.v_sB, v_sH, v_sT, v_sD};
     const std::vector<int64_t> o_dim = {b, Hq, T, D};
-    const std::vector<int64_t> o_stride = {Hq * T * D, o_sH, o_sT, o_sD};
+    const std::vector<int64_t> o_stride = {key.o_sB, o_sH, o_sT, o_sD};
 
-    auto graph = std::make_shared<fe::graph::Graph>();
+    graph = std::make_shared<fe::graph::Graph>();
     graph->set_io_data_type(io_type)
         .set_intermediate_data_type(fe::DataType_t::FLOAT)
         .set_compute_data_type(fe::DataType_t::FLOAT);
 
-    auto Q = graph->tensor(fe::graph::Tensor_attributes()
-                               .set_name("Q")
-                               .set_dim(q_dim)
-                               .set_stride(q_stride));
-    auto K = graph->tensor(fe::graph::Tensor_attributes()
-                               .set_name("K")
-                               .set_dim(k_dim)
-                               .set_stride(k_stride));
-    auto V = graph->tensor(fe::graph::Tensor_attributes()
-                               .set_name("V")
-                               .set_dim(v_dim)
-                               .set_stride(v_stride));
+    Q = graph->tensor(fe::graph::Tensor_attributes()
+                          .set_name("Q")
+                          .set_dim(q_dim)
+                          .set_stride(q_stride));
+    K = graph->tensor(fe::graph::Tensor_attributes()
+                          .set_name("K")
+                          .set_dim(k_dim)
+                          .set_stride(k_stride));
+    V = graph->tensor(fe::graph::Tensor_attributes()
+                          .set_name("V")
+                          .set_dim(v_dim)
+                          .set_stride(v_stride));
     if (Q == nullptr || K == nullptr || V == nullptr) {
       return false;
     }
@@ -169,10 +342,11 @@ bool sdpa_forward_impl(void* cached_handle, CudnnSdpaScalar dtype,
           fe::AttentionImplementation_t::COMPOSITE);
     }
 
-    auto [O, Stats] = graph->sdpa(Q, K, V, sdpa_options);
-    if (O == nullptr) {
+    auto [Out, Stats] = graph->sdpa(Q, K, V, sdpa_options);
+    if (Out == nullptr) {
       return false;
     }
+    O = Out;
     O->set_output(true).set_dim(o_dim).set_stride(o_stride);
 
     if (!graph->validate().is_good()) {
@@ -205,6 +379,41 @@ bool sdpa_forward_impl(void* cached_handle, CudnnSdpaScalar dtype,
     ok = false;
   }
 
+  if (!ok) {
+    if (workspace != nullptr) cudaFree(workspace);
+    // NOTE: cudnn_handle is cached by the DNNHandle -- never destroyed here.
+    return false;
+  }
+
+  // Full success only: publish the built plan + persistent workspace so
+  // repeat calls skip the rebuild. A concurrent insert of the same key wins;
+  // ours is then dropped (workspace freed by the entry destructor).
+  try {
+    auto entry = std::make_shared<SdpaPlanEntry>();
+    entry->graph = graph;
+    entry->Q = Q;
+    entry->K = K;
+    entry->V = V;
+    entry->O = O;
+    entry->workspace = workspace;
+
+    SdpaPlanCache& cache = sdpa_plan_cache();
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    if (cache.plans.find(key) == cache.plans.end()) {
+      while (cache.plans.size() >= kSdpaPlanCacheCapacity &&
+             !cache.order.empty()) {
+        auto evict_it = cache.plans.find(cache.order.front());
+        if (evict_it != cache.plans.end()) cache.plans.erase(evict_it);
+        cache.order.pop_front();
+      }
+      cache.plans.emplace(key, entry);
+      cache.order.push_back(key);
+      workspace = nullptr;  // owned by the entry now
+    }
+  } catch (...) {
+    // Cache bookkeeping failed; the compute itself succeeded, so report
+    // success and let the local entry clean up the workspace.
+  }
   if (workspace != nullptr) cudaFree(workspace);
   // NOTE: cudnn_handle is cached by the DNNHandle -- never destroyed here.
   return ok;
