@@ -64,3 +64,103 @@ void check_gemm(float tol) {
 TEST(Gemm, Float) { check_gemm<float>(1e-4f); }
 
 TEST(Gemm, BHalf) { check_gemm<Kokkos::Experimental::bhalf_t>(5e-2f); }
+
+// Tile-edge coverage for the tiled native kernel: exercises M/N/K tile
+// remainders, the vec/scalar load paths (K%4==0 vs odd K), and non-trivial
+// alpha/beta against a host reference. M=17 routes to the mid geometry
+// (TM=32/TN=64/TK=32: M edge + second/third N tiles, K edge over 3 slabs),
+// M=13 to thin-fine (TM=16/TN=32/TK=64: N edge + K edge).
+template <class Scalar>
+void check_gemm_edges(int M, int N, int K, float tol) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  // Force the native kernel even when cuBLAS dispatch is available.
+  KokkosDNN::DNNHandle<Exec> h;
+  h.use_cublas = false;
+  h.use_cudnn  = false;
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> X("X", M, K), W("W", N, K),
+      Y("Y", M, N);
+  auto hx = Kokkos::create_mirror_view(X);
+  auto hw = Kokkos::create_mirror_view(W);
+  auto hy = Kokkos::create_mirror_view(Y);
+  for (int i = 0; i < M; ++i)
+    for (int k = 0; k < K; ++k)
+      hx(i, k) = static_cast<Scalar>(0.05f * ((i * 37 + k * 11) % 41) - 0.5f);
+  for (int j = 0; j < N; ++j)
+    for (int k = 0; k < K; ++k)
+      hw(j, k) = static_cast<Scalar>(0.05f * ((j * 23 + k * 5) % 37) - 0.4f);
+  for (int i = 0; i < M; ++i)
+    for (int j = 0; j < N; ++j)
+      hy(i, j) = static_cast<Scalar>(0.1f * ((i + j) % 7) - 0.3f);
+  Kokkos::deep_copy(X, hx);
+  Kokkos::deep_copy(W, hw);
+  Kokkos::deep_copy(Y, hy);
+  const float alpha = 2.0f, beta = 0.5f;
+  KokkosDNN::gemm(h, static_cast<Scalar>(alpha), X, W,
+                  static_cast<Scalar>(beta), Y);
+  Kokkos::fence();
+  auto got = Kokkos::create_mirror_view(Y);
+  Kokkos::deep_copy(got, Y);
+  for (int i = 0; i < M; ++i)
+    for (int j = 0; j < N; ++j) {
+      float acc = 0;
+      for (int k = 0; k < K; ++k)
+        acc += static_cast<float>(hx(i, k)) * static_cast<float>(hw(j, k));
+      float want = alpha * acc + beta * static_cast<float>(hy(i, j));
+      EXPECT_NEAR(static_cast<float>(got(i, j)), want, tol)
+          << "gemm edge mismatch at (" << i << "," << j << ") M=" << M
+          << " N=" << N << " K=" << K;
+    }
+}
+
+TEST(GemmEdges, FloatBase) { check_gemm_edges<float>(17, 130, 68, 2e-3f); }
+TEST(GemmEdges, FloatSkinny) { check_gemm_edges<float>(13, 70, 67, 2e-3f); }
+TEST(GemmEdges, BHalfBase) {
+  check_gemm_edges<Kokkos::Experimental::bhalf_t>(17, 130, 68, 0.5f);
+}
+TEST(GemmEdges, BHalfSkinny) {
+  check_gemm_edges<Kokkos::Experimental::bhalf_t>(13, 70, 67, 0.5f);
+}
+
+// Portability: Serial cannot field a team (max team size 1), so gemm must
+// take the naive fallback there -- same result, verified against the host
+// reference (team-capable backends, including CUDA above, run the tiled
+// kernel through the same gemm entry point).
+TEST(GemmEdges, PortableSerial) {
+  using Exec = Kokkos::Serial;
+  KokkosDNN::DNNHandle<Exec> h;
+  const int M = 13, N = 70, K = 67;
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> X("X", M, K), W("W", N, K),
+      Y("Y", M, N);
+  auto hx = Kokkos::create_mirror_view(X);
+  auto hw = Kokkos::create_mirror_view(W);
+  auto hy = Kokkos::create_mirror_view(Y);
+  for (int i = 0; i < M; ++i)
+    for (int k = 0; k < K; ++k)
+      hx(i, k) = 0.05f * ((i * 37 + k * 11) % 41) - 0.5f;
+  for (int j = 0; j < N; ++j)
+    for (int k = 0; k < K; ++k)
+      hw(j, k) = 0.05f * ((j * 23 + k * 5) % 37) - 0.4f;
+  for (int i = 0; i < M; ++i)
+    for (int j = 0; j < N; ++j) hy(i, j) = 0.1f * ((i + j) % 7) - 0.3f;
+  Kokkos::deep_copy(X, hx);
+  Kokkos::deep_copy(W, hw);
+  Kokkos::deep_copy(Y, hy);
+  // Snapshot the beta input: on Serial the mirror hy aliases Y, so gemm
+  // would overwrite the reference values (host mirrors of device views
+  // are separate allocations, where this aliasing does not happen).
+  Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> hy0("hy0", M,
+                                                                    N);
+  Kokkos::deep_copy(hy0, hy);
+  KokkosDNN::gemm(h, 2.0f, X, W, 0.5f, Y);
+  Kokkos::fence();
+  auto got = Kokkos::create_mirror_view(Y);
+  Kokkos::deep_copy(got, Y);
+  for (int i = 0; i < M; ++i)
+    for (int j = 0; j < N; ++j) {
+      float acc = 0;
+      for (int k = 0; k < K; ++k) acc += hx(i, k) * hw(j, k);
+      float want = 2.0f * acc + 0.5f * hy0(i, j);
+      EXPECT_NEAR(got(i, j), want, 2e-3f)
+          << "serial gemm mismatch at (" << i << "," << j << ")";
+    }
+}
