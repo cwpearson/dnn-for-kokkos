@@ -16,6 +16,42 @@
 namespace KokkosDNN {
 namespace Impl {
 
+// Team-scratch footprint (in floats) of GqaStreamingFunctor below: scaled Q
+// rows plus FP32 accumulator rows ([nqr x SS] each), one K/V tile row pair
+// per (tile slot, distinct-KV-head row), and per-row (m, l) state. SS carries
+// the +1 bank pad (plus one more when that lands on a multiple of 32).
+// Shared by the device functor (offsets) and the host launcher (request),
+// so the two cannot drift apart. Device-callable (used inside operator()).
+KOKKOS_INLINE_FUNCTION
+size_t gqa_scratch_floats(int tchunk, int hchunk, int ktiles, int kvrows,
+                           size_t D) {
+  size_t ss = D + 1;
+  if (ss % 32 == 0) ++ss;
+  return (size_t)(2 * tchunk * hchunk + 2 * kvrows * ktiles) * ss +
+         (size_t)2 * tchunk * hchunk;
+}
+
+// Max distinct KV heads inside any HC-wide head chunk: the K/V tile only
+// needs kvrows rows per key slot (standard GQA shares one KV head per whole
+// chunk, so kvrows == 1 there). Host-side loop over <= 32 chunks; exact, so
+// no scratch is wasted on never-used tile rows.
+inline int gqa_max_kvrows(size_t Hq, size_t Hkv, int hchunk) {
+  int kvmax = 1;
+  for (size_t hbase = 0; hbase < Hq; hbase += (size_t)hchunk) {
+    int n = 0, prev = -1;
+    for (int jj = 0; jj < hchunk; ++jj) {
+      const int kvh =
+          static_cast<int>(((hbase + jj) * Hkv) / Hq);
+      if (jj == 0 || kvh != prev) {
+        ++n;
+        prev = kvh;
+      }
+    }
+    if (n > kvmax) kvmax = n;
+  }
+  return kvmax;
+}
+
 // Team-parallel streaming online-softmax GQA core shared by the plain and
 // softcap paths below (UseMask/UseSoftcap select the softcap extras at
 // compile time, so both entry points execute an identical FP32 op sequence
@@ -29,27 +65,33 @@ namespace Impl {
 // x head tile, instead of every (t, h) thread streaming K/V from global
 // memory independently.
 //
-// Per-team team-scratch holds the scaled query rows (loaded once, scale
-// fused), the FP32 output accumulators (keys stream through fast scratch;
-// each output row is written once at the end), the distinct K/V rows of
-// the current key, and the per-row (m, l) streaming state. Row loads use
-// the whole team (TeamVectorRange), which coalesces for D-contiguous
-// (LayoutRight) inputs and still issues D-parallel loads otherwise; all
-// per-row work is serial on the owning team thread, so no vector-lane
-// coherence hazards exist by construction.
+// Keys stream through in tiles of KT (runtime ktiles): one cooperative
+// tile load plus two barriers per KT keys instead of per key, and each
+// tile load spans distinct-heads x KT x D units so the whole team stays
+// busy even for small head dims. Per-team team-scratch holds the scaled
+// query rows (loaded once, scale fused), the FP32 output accumulators (keys
+// stream through fast scratch; each output row is written once at the end),
+// the K/V tile (kvrows rows per key slot), and the per-row (m, l) streaming
+// state. Row loads use the whole team (TeamVectorRange), which coalesces
+// for D-contiguous (LayoutRight) inputs and still issues D-parallel loads
+// otherwise; all per-row work is serial on the owning team thread, so no
+// vector-lane coherence hazards exist by construction.
 //
 // Math is the per-key deferred-normalization streaming rescaling:
 //   m_new = max(m, s), l_new = l*exp(m-m_new) + exp(s-m_new),
 //   acc_new = acc*exp(m-m_new) + V*exp(s-m_new),
 // with a single acc/l write per row at the end.
-// The final result equals softmax(QK^T*scale)*V up to FP32 rounding; dot and
-// update order over D is serial-blocked, so results agree with a
-// sequential reference up to ~1-ulp reassociation, exactly as between any
-// two parallel schedules. FP32 accumulation throughout; the only Scalar
-// rounding is the single final write. UF blocks the D axis (each iteration
-// handles UF consecutive D) so the compiler can issue wide loads/stores
-// for D-contiguous inputs and interleave independent chains; UF == 1 keeps
-// the plain scalar order.
+// The final result equals softmax(QK^T*scale)*V up to FP32 rounding; the dot
+// uses eight interleaved accumulators over full-D rows (independent FMA
+// chains hide latency and vectorize portably; order differs from a plain
+// serial dot only by ~1-ulp reassociation, exactly as between any two
+// parallel schedules). Update order over D is serial-blocked, so results
+// agree with a sequential reference up to ~1-ulp reassociation. FP32
+// accumulation throughout; the only Scalar rounding is the single final
+// write. UF blocks the D axis of loads/updates (each iteration handles UF
+// consecutive D) so the compiler can issue wide loads/stores for
+// D-contiguous inputs and interleave independent chains; UF == 1 keeps the
+// plain scalar order.
 template <class ExecSpace, class Scalar, class QView, class KView, class VView,
           class MView, class OView, int UF, int HC, bool UseMask,
           bool UseSoftcap>
@@ -65,6 +107,8 @@ struct GqaStreamingFunctor {
   OView out;
   size_t T, Hq, D, Hkv, Ktot, q_off, sliding_window;
   int tchunk;  // tokens covered per team (heads covered = HC, compile-time)
+  int ktiles;  // keys streamed per K-tile (runtime KT blocking)
+  int kvrows;  // tile rows per key slot (max distinct KV heads over chunks)
   float scale, softcap;  // softcap unused unless UseSoftcap
 
   // KV head of head (hbase + jj): plain integer arithmetic, callable from
@@ -102,6 +146,8 @@ struct GqaStreamingFunctor {
     const size_t Hqloc = Hq;
     const size_t Tloc = T;
     const int TC = tchunk;
+    const int KT = ktiles;
+    const int NR = kvrows;
     const float scl = scale;
     const float cap = softcap;
     // Team (ct, ch) covers tokens [tbase, tbase+TC) and heads
@@ -129,20 +175,22 @@ struct GqaStreamingFunctor {
     (void)khi_last;
     (void)klo_first;
 
-    // Scratch layout: Q rows, acc rows (TC*HC each, stride SS = D + 1),
-    // one K row + one V row per distinct KV head (<= HC), then per-row
-    // (m, l) state. The +1 pad makes the row stride coprime to the 32
-    // shared-memory banks, so the team threads touching the same d in
-    // different rows hit distinct banks instead of serializing 32-way.
+    // Scratch layout: Q rows, acc rows (TC*HC each, stride SS), one K/V
+    // tile row pair per (key slot, distinct-KV-head row) ([KT x NR], tile
+    // slot kki and head row r at (kki*NR + r)), then per-row (m, l) state.
+    // SS carries the +1 pad (plus one more on multiples of 32) so the team
+    // threads touching the same d in different rows hit distinct banks
+    // instead of serializing 32-way. Sizes mirror gqa_scratch_floats.
     const size_t nqr = static_cast<size_t>(TC) * HC;  // query rows per team
-    const size_t SS = Dloc + 1;
+    size_t SS = Dloc + 1;
+    if (SS % 32 == 0) ++SS;
     ScratchView buf(member.team_scratch(0),
-                    (2 * nqr + 2 * HC) * SS + 2 * nqr);
+                    gqa_scratch_floats(TC, HC, KT, NR, Dloc));
     const size_t qoff = 0;
     const size_t aoff = nqr * SS;
-    const size_t koff = 2 * nqr * SS;
-    const size_t voff = (2 * nqr + HC) * SS;
-    const size_t moff = (2 * nqr + 2 * HC) * SS;
+    const size_t koff = aoff + nqr * SS;
+    const size_t voff = koff + static_cast<size_t>(NR) * KT * SS;
+    const size_t moff = voff + static_cast<size_t>(NR) * KT * SS;
     const size_t loff = moff + nqr;
     // Distinct-KV-head plan for this head chunk, computed once per team:
     // ku_of_row[r] is the kv head of the r-th leader head (jj == 0 or a
@@ -194,95 +242,149 @@ struct GqaStreamingFunctor {
     // them on other warps.
     member.team_barrier();
 
-    for (size_t kk = klo_u; kk < khi_u; ++kk) {
-      if constexpr (UseMask) {
-        if (!Valid(kk)) continue;
-      }
-      // Load this key's distinct K/V rows once per team (one row per
+    // Keys stream through in tiles of KT: one cooperative tile load plus
+    // two barriers per KT keys instead of per key. Tile loads span nrows x
+    // KT x D units (flat (row, slot, block) index, shift-free decode), so
+    // the whole team stays busy; tail slots and masked keys are zero-filled
+    // so the row loop below only ever reads owned tile rows.
+    const size_t KTs = static_cast<size_t>(KT);
+    const size_t NRs = static_cast<size_t>(NR);
+    for (size_t k0 = klo_u; k0 < khi_u; k0 += KTs) {
+      const int kw = (k0 + KTs <= khi_u) ? KT : static_cast<int>(khi_u - k0);
+      // Load this tile's distinct K/V rows once per team (one row per
       // leader head; row->kv-head mapping hoisted above). Team-wide
       // collective: every team thread participates.
       for (int r = 0; r < nrows; ++r) {
         const size_t ku = static_cast<size_t>(ku_of_row[r]);
         Kokkos::parallel_for(
-            Kokkos::TeamVectorRange(member, nbu), KOKKOS_LAMBDA(size_t m) {
-              const size_t b = m * UF;
-              for (int u = 0; u < UF; ++u) {
-                const size_t d = b + u;
-                buf(koff + r * SS + d) = static_cast<float>(K(kk, ku, d));
-                buf(voff + r * SS + d) = static_cast<float>(V(kk, ku, d));
+            Kokkos::TeamVectorRange(member, KTs * nbu),
+            KOKKOS_LAMBDA(size_t u) {
+              const int kki = static_cast<int>(u / nbu);
+              const size_t b = (u % nbu) * UF;
+              const size_t kk = k0 + static_cast<size_t>(kki);
+              float* __restrict__ kdst = buf.data() + koff +
+                                         (static_cast<size_t>(kki) * NRs + r) *
+                                             SS +
+                                         b;
+              float* __restrict__ vdst = buf.data() + voff +
+                                         (static_cast<size_t>(kki) * NRs + r) *
+                                             SS +
+                                         b;
+              bool ok = (kki < kw);
+              if (ok && UseMask) ok = static_cast<bool>(Valid(kk));
+              if (ok) {
+                for (int uu = 0; uu < UF; ++uu) {
+                  const size_t d = b + uu;
+                  kdst[uu] = static_cast<float>(K(kk, ku, d));
+                  vdst[uu] = static_cast<float>(V(kk, ku, d));
+                }
+              } else {
+                for (int uu = 0; uu < UF; ++uu) {
+                  kdst[uu] = 0.0f;
+                  vdst[uu] = 0.0f;
+                }
               }
             });
       }
-      // Cross-warp visibility for the freshly loaded rows before any
-      // thread's warp consumes them in the row loop below.
+      // Cross-warp visibility for the freshly loaded tile before any
+      // thread's warp consumes it in the row loop below.
       member.team_barrier();
       // Per-row streaming update, serial on the owning team thread. Each
-      // row is owned by exactly one team thread; rows of tokens outside
-      // this key's window sit out (their state stays put, so no NaN can
-      // poison it). With vector_length == 1 there are no lanes: the dot,
-      // the scalars, and the update are plain serial code with no
+      // row is owned by exactly one team thread; (m, l) ride in registers
+      // across the tile's keys and are written back once per tile. Rows of
+      // tokens outside a key's window sit out (their state stays put, so no
+      // NaN can poison it). With vector_length == 1 there are no lanes: the
+      // dots, the scalars, and the updates are plain serial code with no
       // coherence hazards, and skipping rows is always safe.
       for (int rr = rank; rr < nqr; rr += team_n) {
         const size_t t = tbase + rr / HC;
         if (t >= Tloc) continue;  // dummy row of a partial edge chunk
         size_t klo_t = 0, khi_t = 0;
         key_window(q_off, Ktot, sliding_window, t, klo_t, khi_t);
-        if (kk < klo_t || kk >= khi_t) continue;
         const int j = rr % HC;
         const int myrow = myrow_of_head[j];
-        const size_t myoff = rr;
-        const float m = buf(moff + rr);
-        const float l = buf(loff + rr);
+        float m = buf(moff + rr);
+        float l = buf(loff + rr);
         // Raw restrict pointers so the compiler can pipeline/vectorize the
         // serial streams (View operator() on a shared base otherwise
         // inhibits aliasing assumptions). Portable C++, no intrinsics.
-        const float* __restrict__ qrow = buf.data() + qoff + myoff * SS;
-        const float* __restrict__ krow = buf.data() + koff + myrow * SS;
-        float* __restrict__ accrow = buf.data() + aoff + myoff * SS;
-        const float* __restrict__ vrow = buf.data() + voff + myrow * SS;
-        float s = 0.0f;
-        for (size_t b = 0; b < nbu; ++b) {
-          const size_t bb = b * UF;
-          for (int u = 0; u < UF; ++u) s += qrow[bb + u] * krow[bb + u];
-        }
-        float ss = s;
-        if (cap > 0) ss = cap * tanhf(ss / cap);
-        // m == -1e30 on the first key => a = exp(-1e30) = 0, as desired.
-        // (Runtime cap check: plain passes softcap == 0, so the tanh is
-        // skipped there exactly as with if constexpr.)
-        // Split on new-maximum so each path needs one expf (the other is
-        // expf(0) == 1): a new max rescales acc by aa, otherwise acc only
-        // accumulates (aa == 1, bit-identical to the fused form).
-        if (ss > m) {
-          const float aa = expf(m - ss);
-          const float l_new = l * aa + 1.0f;
-          for (size_t b = 0; b < nbu; ++b) {
-            const size_t bb = b * UF;
-            for (int u = 0; u < UF; ++u) {
-              const size_t d = bb + u;
-              accrow[d] = accrow[d] * aa + vrow[d];
-            }
+        const float* __restrict__ qrow = buf.data() + qoff + rr * SS;
+        float* __restrict__ accrow = buf.data() + aoff + rr * SS;
+        for (int kki = 0; kki < kw; ++kki) {
+          const size_t kk = k0 + static_cast<size_t>(kki);
+          if (kk < klo_t || kk >= khi_t) continue;
+          if constexpr (UseMask) {
+            if (!Valid(kk)) continue;
           }
-          buf(moff + rr) = ss;
-          buf(loff + rr) = l_new;
-        } else {
-          const float gg = expf(ss - m);
-          const float l_new = l + gg;
-          for (size_t b = 0; b < nbu; ++b) {
-            const size_t bb = b * UF;
-            for (int u = 0; u < UF; ++u) {
-              const size_t d = bb + u;
-              accrow[d] += vrow[d] * gg;
-            }
+          const float* __restrict__ krow = buf.data() + koff +
+                                           (static_cast<size_t>(kki) * NRs +
+                                            myrow) *
+                                               SS;
+          const float* __restrict__ vrow = buf.data() + voff +
+                                           (static_cast<size_t>(kki) * NRs +
+                                            myrow) *
+                                               SS;
+          // Full-D dot with eight interleaved accumulators (independent
+          // FMA chains hide latency and vectorize portably; reassociation
+          // vs a serial dot is ~1 ulp). Q rows carry the fused scale, so
+          // no extra multiply here.
+          float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+          float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
+          size_t dd = 0;
+          const size_t dend8 = Dloc & ~size_t(7);
+          for (; dd < dend8; dd += 8) {
+            a0 += qrow[dd] * krow[dd];
+            a1 += qrow[dd + 1] * krow[dd + 1];
+            a2 += qrow[dd + 2] * krow[dd + 2];
+            a3 += qrow[dd + 3] * krow[dd + 3];
+            a4 += qrow[dd + 4] * krow[dd + 4];
+            a5 += qrow[dd + 5] * krow[dd + 5];
+            a6 += qrow[dd + 6] * krow[dd + 6];
+            a7 += qrow[dd + 7] * krow[dd + 7];
           }
-          buf(loff + rr) = l_new;
+          float stail = 0.0f;
+          for (; dd < Dloc; ++dd) stail += qrow[dd] * krow[dd];
+          const float s =
+              ((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7)) + stail;
+          float ss = s;
+          if (cap > 0) ss = cap * tanhf(ss / cap);
+          // m == -1e30 on the first key => a = exp(-1e30) = 0, as desired.
+          // (Runtime cap check: plain passes softcap == 0, so the tanh is
+          // skipped there exactly as with if constexpr.)
+          // Split on new-maximum so each path needs one expf (the other is
+          // expf(0) == 1): a new max rescales acc by aa, otherwise acc only
+          // accumulates (aa == 1, bit-identical to the fused form).
+          if (ss > m) {
+            const float aa = expf(m - ss);
+            const float l_new = l * aa + 1.0f;
+            for (size_t b = 0; b < nbu; ++b) {
+              const size_t bb = b * UF;
+              for (int u = 0; u < UF; ++u) {
+                const size_t d = bb + u;
+                accrow[d] = accrow[d] * aa + vrow[d];
+              }
+            }
+            m = ss;
+            l = l_new;
+          } else {
+            const float gg = expf(ss - m);
+            const float l_new = l + gg;
+            for (size_t b = 0; b < nbu; ++b) {
+              const size_t bb = b * UF;
+              for (int u = 0; u < UF; ++u) {
+                const size_t d = bb + u;
+                accrow[d] += vrow[d] * gg;
+              }
+            }
+            l = l_new;
+          }
         }
+        buf(moff + rr) = m;
+        buf(loff + rr) = l;
       }
-      // End-of-key barrier: the next key's row loads overwrite the K/V
-      // rows this key's update just consumed; without it a fast warp can
-      // clobber rows a slower warp is still accumulating from. (The mask
-      // continue above skips uniformly, so all threads reach this barrier
-      // together.)
+      // End-of-tile barrier: the next tile's loads overwrite the K/V tile
+      // this tile's update just consumed; without it a fast warp can
+      // clobber rows a slower warp is still accumulating from.
       member.team_barrier();
     }
     // Write back: rows with no contributing key (l == 0) keep zeros,
@@ -319,31 +421,31 @@ struct GqaStreamingFunctor {
 // team_size == AUTO (1 on Serial, occupancy-chosen on CUDA): rows stride
 // across team threads, so the kernel is correct for every team size and on
 // every backend. Token chunks of up to 8 and 4-head chunks let a team load
-// each K/V row once and reuse it across 32 query rows (standard GQA shares
-// one KV head per 4 heads). Smaller chunks cover odd head counts, small T,
-// and large D (scratch fit). All per-row work is serial (no vector lanes
-// exist), so the dot/update order is fixed and identical across the plain
-// and softcap instantiations (and backends) for a given D; UF == 4
-// additionally groups D into consecutive quadruples for wide loads.
+// each K/V tile once and reuse it across 32 query rows (standard GQA shares
+// one KV head per 4 heads); keys stream in tiles of up to 8 so barriers and
+// cooperative loads amortize over KT keys. Smaller chunks cover odd head
+// counts, small T, and large D (scratch fit). All per-row work is serial
+// (no vector lanes exist), so the dot/update order is fixed and identical
+// across the plain and softcap instantiations (and backends) for a given D;
+// UF == 4 additionally groups D into consecutive quadruples for wide loads.
 template <class ExecSpace, class Scalar, class QView, class KView, class VView,
           class MView, class OView, int UF, int HC, bool UseMask,
           bool UseSoftcap>
 void launch_gqa_streaming(const QView& q, const KView& k, const VView& v,
-                          const MView& key_valid, const OView& out, size_t T,
-                          size_t Hq, size_t D, size_t Hkv, size_t Ktot,
-                          size_t q_off, float scale, float softcap,
-                          size_t sliding_window, int tchunk,
-                          const std::string& label) {
+                           const MView& key_valid, const OView& out, size_t T,
+                           size_t Hq, size_t D, size_t Hkv, size_t Ktot,
+                           size_t q_off, float scale, float softcap,
+                           size_t sliding_window, int tchunk, int ktiles,
+                           int kvrows, const std::string& label) {
   GqaStreamingFunctor<ExecSpace, Scalar, QView, KView, VView, MView, OView, UF,
                       HC, UseMask, UseSoftcap>
       f{q, k,      v,       key_valid, out, T, Hq, D, Hkv, Ktot,
-        q_off, sliding_window, tchunk, scale, softcap};
+        q_off, sliding_window, tchunk, ktiles, kvrows, scale, softcap};
   const size_t nchunks_t = (T + tchunk - 1) / tchunk;
   Kokkos::TeamPolicy<ExecSpace> policy(nchunks_t * (Hq / HC),
                                        Kokkos::AUTO, 1);
   policy.set_scratch_size(
-      0, Kokkos::PerTeam(((2 * tchunk * HC + 2 * HC) * (D + 1) +
-                          2 * tchunk * HC) *
+      0, Kokkos::PerTeam(gqa_scratch_floats(tchunk, HC, ktiles, kvrows, D) *
                          sizeof(float)));
   Kokkos::parallel_for(label, policy, f);
 }
@@ -357,54 +459,64 @@ void launch_gqa_streaming_auto(const QView& q, const KView& k, const VView& v,
                                float softcap, size_t sliding_window,
                                const std::string& label) {
   // 4-head chunks share KV rows under standard GQA; odd head counts fall
-  // back to one head per team. Token chunks of 8 reuse each K/V row across
-  // 8 query rows; smaller chunks keep team scratch ((2*TC*HC + 2*HC) rows
-  // of D + 1 plus 2*TC*HC (m, l) scalars) under ~40 KiB for large head dims.
-  // UF == 8 unrolls D in consecutive octuples (D % 8 == 0), UF == 4 in
-  // quadruples (D % 4 == 0); all branches share the serial dot/update
-  // order, so plain-vs-softcap bit-identity holds within each branch.
+  // back to one head per team. Token chunks of 8 reuse each K/V tile across
+  // 32 query rows; keys stream in tiles of up to 8 (one cooperative tile
+  // load plus two barriers per tile instead of per key). Smaller chunks and
+  // tiles keep team scratch (see gqa_scratch_floats) within the portable
+  // 48 KiB per-team budget for large head dims. The K/V tile only carries
+  // the head chunk's distinct KV rows (1 under standard GQA), so wide tiles
+  // stay affordable where they matter. UF == 8 unrolls D in consecutive
+  // octuples (D % 8 == 0), UF == 4 in quadruples (D % 4 == 0); all branches
+  // share the dot/update order, so plain-vs-softcap bit-identity holds
+  // within each branch.
   const int hchunk = (Hq % 4 == 0) ? 4 : 1;
+  const int kvmax = gqa_max_kvrows(Hq, Hkv, hchunk);
   int tchunk = 8;  // (hchunk stays runtime here for the scratch budget)
-  while (tchunk > 1 &&
-         ((2 * tchunk * hchunk + 2 * hchunk) * (D + 1) + 2 * tchunk * hchunk) *
-                 sizeof(float) >
-             size_t(40 * 1024))
-    tchunk /= 2;
   if (T < static_cast<size_t>(tchunk)) tchunk = static_cast<int>(T);
+  int ktiles = 8;
+  // Shrink tokens first (KT drives the barrier/load-width win), then tiles.
+  while (tchunk > 1 &&
+         gqa_scratch_floats(tchunk, hchunk, ktiles, kvmax, D) * sizeof(float) >
+             size_t(48 * 1024))
+    tchunk /= 2;
+  while (ktiles > 1 &&
+         gqa_scratch_floats(tchunk, hchunk, ktiles, kvmax, D) * sizeof(float) >
+             size_t(48 * 1024))
+    ktiles /= 2;
   const int uf = (D % 8 == 0) ? 8 : ((D % 4 == 0) ? 4 : 1);
   if (hchunk == 4) {
     if (uf == 8) {
       launch_gqa_streaming<ExecSpace, Scalar, QView, KView, VView, MView,
                            OView, 8, 4, UseMask, UseSoftcap>(
           q, k, v, key_valid, out, T, Hq, D, Hkv, Ktot, q_off, scale, softcap,
-          sliding_window, tchunk, label);
+          sliding_window, tchunk, ktiles, kvmax, label);
     } else if (uf == 4) {
       launch_gqa_streaming<ExecSpace, Scalar, QView, KView, VView, MView,
                            OView, 4, 4, UseMask, UseSoftcap>(
           q, k, v, key_valid, out, T, Hq, D, Hkv, Ktot, q_off, scale, softcap,
-          sliding_window, tchunk, label);
+          sliding_window, tchunk, ktiles, kvmax, label);
     } else {
       launch_gqa_streaming<ExecSpace, Scalar, QView, KView, VView, MView,
                            OView, 1, 4, UseMask, UseSoftcap>(
           q, k, v, key_valid, out, T, Hq, D, Hkv, Ktot, q_off, scale, softcap,
-          sliding_window, tchunk, label);
+          sliding_window, tchunk, ktiles, kvmax, label);
     }
   } else {
     if (uf == 8) {
       launch_gqa_streaming<ExecSpace, Scalar, QView, KView, VView, MView,
                            OView, 8, 1, UseMask, UseSoftcap>(
           q, k, v, key_valid, out, T, Hq, D, Hkv, Ktot, q_off, scale, softcap,
-          sliding_window, tchunk, label);
+          sliding_window, tchunk, ktiles, kvmax, label);
     } else if (uf == 4) {
       launch_gqa_streaming<ExecSpace, Scalar, QView, KView, VView, MView,
                            OView, 4, 1, UseMask, UseSoftcap>(
           q, k, v, key_valid, out, T, Hq, D, Hkv, Ktot, q_off, scale, softcap,
-          sliding_window, tchunk, label);
+          sliding_window, tchunk, ktiles, kvmax, label);
     } else {
       launch_gqa_streaming<ExecSpace, Scalar, QView, KView, VView, MView,
                            OView, 1, 1, UseMask, UseSoftcap>(
           q, k, v, key_valid, out, T, Hq, D, Hkv, Ktot, q_off, scale, softcap,
-          sliding_window, tchunk, label);
+          sliding_window, tchunk, ktiles, kvmax, label);
     }
   }
 }
