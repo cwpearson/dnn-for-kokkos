@@ -451,6 +451,187 @@ void gemm_tiled(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Native GEMV: one team per N-row, vector-parallel K (design notes).
+//
+// Why the old kernel was slow: a RangePolicy over N with a scalar K-loop
+// gives each warp 32 threads on 32 DIFFERENT rows at the same k -- row
+// stride K elements apart, so every 4 B (float) / 2 B (bhalf_t) load pulls
+// its own 32 B sector (~8x/16x DRAM amplification). That is the ~4x gap vs
+// cuBLAS. Here consecutive threads of a team cooperate on ONE row, so
+// consecutive threads read consecutive K -- full sectors, zero waste.
+//
+// Structure (portable: TeamPolicy + team scratch + parallel_reduce only):
+//   * League = N teams (one row each); team size 256 (clamped at runtime
+//     via team_size_max for teams that cannot field it, e.g. Serial -> 1).
+//   * K is streamed in TK = 2048 slabs: the team cooperatively stages the x
+//     slab in scratch once (coalesced, 4-wide when UseVec), then each
+//     thread accumulates its strided share (quads in the vec path --
+//     explicit 16 B / 8 B loads, so bhalf_t never goes through scalar 2 B
+//     sector-wasting loads; scalar elems otherwise) from scratch + the
+//     W row, which streams straight from DRAM with no shared pressure.
+//   * One TeamThreadRange parallel_reduce over the per-thread partials at
+//     the end (no per-row atomics, no per-slab collectives).
+//   * UseVec needs K % 4 == 0, natural alignment of both base pointers and
+//     quad-aligned W row stride (runtime check, same rule as gemm_tiled;
+//     all Llama shapes qualify; odd test shapes take the scalar path,
+//     which is still fully coalesced).
+//   * alpha/beta write-back mirrors gemm so rank-2 M == 1 can reuse this
+//     kernel (same shape, same working set); plain gemv passes 1/0.
+// ---------------------------------------------------------------------------
+constexpr int GemvTeamSize = 256;
+constexpr int GemvTK       = 2048;  // K-slab staged through scratch
+
+template <class ExecSpace, class Scalar, class XView, class YView, bool UseVec>
+struct GemvFunctor {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  using Vec4   = GemmVec4<Scalar>;
+  using WView  = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
+  XView x;
+  YView y;
+  WView W;
+  float alpha_f, beta_f;
+  size_t N, K, nSlabs, shBytes, sw0;
+
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& team) const {
+    const size_t j = static_cast<size_t>(team.league_rank());
+    const int Tk   = team.team_size();
+    const int t    = team.team_rank();
+    float* sh =
+        static_cast<float*>(team.team_scratch(0).get_shmem(shBytes));
+    float* sx   = sh;            // [GemvTK] staged x slab (FP32)
+    float* psum = sh + GemvTK;   // [team_size] per-thread partials
+    const Scalar* Xd = x.data();
+    const Scalar* Wd = W.data();
+    Scalar* Yd       = y.data();
+
+    float acc = 0;
+    if constexpr (UseVec) {
+      // Vec path: K % 4 == 0 and GemvTK % 4 == 0, so every slab is an exact
+      // number of quads -- no tail, no OOB quad reads.
+      const Vec4* Xv = reinterpret_cast<const Vec4*>(Xd);
+      const Vec4* Wv = reinterpret_cast<const Vec4*>(Wd);
+      const size_t sw4 = sw0 / 4;
+      for (size_t s = 0; s < nSlabs; ++s) {
+        const size_t k0  = s * size_t(GemvTK);
+        const size_t cur = (k0 + size_t(GemvTK) <= K) ? size_t(GemvTK) : K - k0;
+        const size_t nq  = cur / 4;
+        const size_t k04 = k0 / 4;
+        // Stage x slab: strided quads keep consecutive threads on
+        // consecutive quads (coalesced 16 B / 8 B segments).
+        for (size_t q = size_t(t); q < nq; q += size_t(Tk)) {
+          const Vec4 v = Xv[k04 + q];
+          float* dst   = &sx[4 * q];
+          dst[0]       = static_cast<float>(v.v[0]);
+          dst[1]       = static_cast<float>(v.v[1]);
+          dst[2]       = static_cast<float>(v.v[2]);
+          dst[3]       = static_cast<float>(v.v[3]);
+        }
+        team.team_barrier();
+        // Strided quad dots: consecutive threads, consecutive quads.
+#pragma unroll 4
+        for (size_t q = size_t(t); q < nq; q += size_t(Tk)) {
+          const Vec4 w  = Wv[j * sw4 + k04 + q];
+          const float* xs = &sx[4 * q];
+          acc += xs[0] * static_cast<float>(w.v[0]) +
+                 xs[1] * static_cast<float>(w.v[1]) +
+                 xs[2] * static_cast<float>(w.v[2]) +
+                 xs[3] * static_cast<float>(w.v[3]);
+        }
+        team.team_barrier();
+      }
+    } else {
+      // Scalar path (odd K / misaligned): still team-cooperative, so
+      // consecutive threads cover consecutive K (coalesced sectors).
+      for (size_t s = 0; s < nSlabs; ++s) {
+        const size_t k0  = s * size_t(GemvTK);
+        const size_t cur = (k0 + size_t(GemvTK) <= K) ? size_t(GemvTK) : K - k0;
+        for (size_t e = size_t(t); e < cur; e += size_t(Tk))
+          sx[e] = static_cast<float>(Xd[k0 + e]);
+        team.team_barrier();
+        for (size_t e = size_t(t); e < cur; e += size_t(Tk))
+          acc += sx[e] * static_cast<float>(Wd[j * sw0 + k0 + e]);
+        team.team_barrier();
+      }
+    }
+
+    psum[t] = acc;
+    team.team_barrier();
+    float team_sum = 0;
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(team, Tk),
+        KOKKOS_LAMBDA(const int i, float& lsum) { lsum += psum[i]; },
+        team_sum);
+    if (t == 0) {
+      float yold =
+          (beta_f != 0) ? beta_f * static_cast<float>(Yd[j]) : 0.0f;
+      Yd[j] = static_cast<Scalar>(alpha_f * team_sum + yold);
+    }
+  }
+};
+
+// Native GEMV launcher: runtime UseVec selection + team-size probe (same
+// pattern as gemm_tiled_impl). FP32 accumulation, result cast to Scalar.
+// XView/YView are rank-1 views (managed, or unmanaged row aliases for the
+// rank-2 M == 1 reuse below); WView stays rank-2 LayoutRight.
+template <class ExecSpace, class Scalar, class XView, class YView>
+void gemv_native(
+    const XView& x,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& W,
+    float alpha_f, float beta_f, const YView& y,
+    const std::string& label) {
+  using Vec4 = GemmVec4<Scalar>;
+  const size_t K = x.extent(0), N = W.extent(0);
+  if (N == 0 || K == 0) return;
+  const size_t nSlabs  = (K + size_t(GemvTK) - 1) / size_t(GemvTK);
+  const size_t shBytes = (size_t(GemvTK) + size_t(GemvTeamSize)) * sizeof(float);
+  const size_t sw0     = W.stride(0);
+
+  // 4-wide loads need K divisible by 4 (exact quad cover), natural
+  // alignment of both base pointers, and a quad-aligned W row stride.
+  // x is a contiguous rank-1 view, so no stride check is needed for it.
+  const auto ax = reinterpret_cast<uintptr_t>(x.data());
+  const auto aw = reinterpret_cast<uintptr_t>(W.data());
+  const bool use_vec =
+      (K % 4 == 0) && (ax % sizeof(Vec4) == 0) &&
+      (aw % sizeof(Vec4) == 0) &&
+      ((sw0 * sizeof(Scalar)) % sizeof(Vec4) == 0);
+
+  // Team-capability probe FIRST (same reason as gemm_tiled_impl): clamp to
+  // what the backend can field (Serial -> 1). All loops below stride on
+  // the runtime team size, so any size is correct.
+  int team_size = GemvTeamSize;
+  {
+    Kokkos::TeamPolicy<ExecSpace> probe(1, 1);
+    probe.set_scratch_size(0, Kokkos::PerTeam(shBytes));
+    int mx;
+    if (use_vec) {
+      GemvFunctor<ExecSpace, Scalar, XView, YView, true> f{
+          x, y, W, alpha_f, beta_f, N, K, nSlabs, shBytes, sw0};
+      mx = probe.team_size_max(f, Kokkos::ParallelForTag{});
+    } else {
+      GemvFunctor<ExecSpace, Scalar, XView, YView, false> f{
+          x, y, W, alpha_f, beta_f, N, K, nSlabs, shBytes, sw0};
+      mx = probe.team_size_max(f, Kokkos::ParallelForTag{});
+    }
+    if (mx < team_size) team_size = mx;
+    if (team_size < 1) team_size = 1;
+  }
+
+  Kokkos::TeamPolicy<ExecSpace> policy(static_cast<int>(N), team_size);
+  policy.set_scratch_size(0, Kokkos::PerTeam(shBytes));
+  if (use_vec) {
+    GemvFunctor<ExecSpace, Scalar, XView, YView, true> f{
+        x, y, W, alpha_f, beta_f, N, K, nSlabs, shBytes, sw0};
+    Kokkos::parallel_for(label, policy, f);
+  } else {
+    GemvFunctor<ExecSpace, Scalar, XView, YView, false> f{
+        x, y, W, alpha_f, beta_f, N, K, nSlabs, shBytes, sw0};
+    Kokkos::parallel_for(label, policy, f);
+  }
+}
+
 }  // namespace Impl
 
 // Y = alpha * X * W^T + beta * Y
@@ -465,7 +646,8 @@ void gemm_tiled(
 // re-selected per call); anything else (or a cuBLAS failure) uses the
 // portable shared-memory tiled kernel in Impl (design notes there), with
 // thin-fine/mid small-M specializations (TM=16/TN=32/TK=64 for M <= 16,
-// TM=32/TN=64/TK=32 for M <= 64).
+// TM=32/TN=64/TK=32 for M <= 64) -- except rank-2 M == 1, which reuses the
+// native team-per-row GEMV kernel (same shape/working set as gemv).
 template <class ExecSpace, class Scalar>
 void gemm(const DNNHandle<ExecSpace>& handle, Scalar alpha,
           const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& X,
@@ -512,9 +694,19 @@ void gemm(const DNNHandle<ExecSpace>& handle, Scalar alpha,
 #else
   (void)handle;
 #endif
-  // Native: portable shared-memory tiled kernel (all backends, Impl notes).
+  // Native: rank-2 M == 1 is the same working set as GEMV (lm_head/vocab
+  // row), so it reuses the team-per-row GEMV kernel with alpha/beta (one
+  // team per N-row, vector-parallel K) instead of the tiled GEMM; M > 1
+  // uses the portable shared-memory tiled kernel (Impl notes).
   const float alpha_f = static_cast<float>(alpha);
   const float beta_f  = static_cast<float>(beta);
+  if (M == 1 && K > 0 && N > 0) {
+    Kokkos::View<Scalar*, ExecSpace,
+                 Kokkos::MemoryTraits<Kokkos::Unmanaged>>
+        x1(X.data(), K), y1(Y.data(), N);
+    Impl::gemv_native<ExecSpace, Scalar>(x1, W, alpha_f, beta_f, y1, label);
+    return;
+  }
   Impl::gemm_tiled<ExecSpace, Scalar>(X, W, alpha_f, beta_f, Y, label);
 }
 
@@ -566,13 +758,9 @@ void gemv(const DNNHandle<ExecSpace>& handle,
   (void)handle;
 #endif
   if (N == 0 || K == 0) return;
-  Kokkos::parallel_for(
-      label, Kokkos::RangePolicy<ExecSpace>(0, N), KOKKOS_LAMBDA(size_t j) {
-        float acc = 0;
-        for (size_t k = 0; k < K; ++k)
-          acc += static_cast<float>(x(k)) * static_cast<float>(W(j, k));
-        y(j) = static_cast<Scalar>(acc);
-      });
+  // Native: team-per-row GEMV (one team per N-row, vector-parallel K over
+  // scratch-staged x slabs; Impl notes). FP32 accumulation.
+  Impl::gemv_native<ExecSpace, Scalar>(x, W, 1.0f, 0.0f, y, label);
 }
 
 }  // namespace KokkosDNN
