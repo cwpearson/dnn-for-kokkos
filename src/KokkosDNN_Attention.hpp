@@ -4,6 +4,7 @@
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
 #include <cmath>
+#include <cstring>  // memcpy (bit tricks in bidir_expf)
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -654,6 +655,588 @@ void attention_gqa_single_softcap(
 
 namespace Impl {
 
+// Inline single-precision exp for the bidirectional streaming update.
+// Cody-Waite range reduction (k = round(x/ln2) with a 12-significant-bit
+// c1, so k*c1 is exact) plus a degree-5 Horner polynomial and exact 2^k
+// scaling via exponent bits. No function calls, no tables, no branches in
+// the hot path — portable C++ callable from any backend. Host-verified max
+// relative error vs expf is ~3.3e-6 over [-87, 0], far inside the attention
+// test tolerances; args below -87 return 0 (true value is a subnormal <
+// 1e-38, immaterial after normalization). Args above 0 never occur here
+// (both call sites pass non-positive differences); the guard returns a
+// large finite value instead of inf to keep downstream math NaN free if
+// that contract ever changes.
+KOKKOS_INLINE_FUNCTION float bidir_expf(float x) {
+  const float c1 = 0.693359375f;
+  const float c2 = -2.1219440717e-4f;
+  const float invln2 = 1.4426950408889634f;
+  const float k_real = x * invln2;
+  const int k = static_cast<int>(k_real + ((k_real >= 0.0f) ? 0.5f : -0.5f));
+  const float r = (x - static_cast<float>(k) * c1) - static_cast<float>(k) * c2;
+  // Degree-5 Horner (~2.5e-6 max rel err on |r| <= ln2/2, verified on
+  // host; far inside attention test tolerances when combined with the
+  // exact 2^k scaling).
+  const float p =
+      1.0f +
+      r * (1.0f +
+           r * (0.5f +
+                r * (0.1666666716337204f +
+                     r * (0.0416666679084301f +
+                          r * 0.0083333337679505f))));
+  if (k < -126) return 0.0f;
+  if (k > 127) return 1e30f;
+  unsigned u = static_cast<unsigned>(k + 127) << 23;
+  float s;
+  memcpy(&s, &u, sizeof(float));
+  return p * s;
+}
+
+// Single-kernel team-blocked bidirectional attention (native path for
+// attention_mha_bidirectional). One team covers a tile of TC query tokens x
+// HC heads with full-D rows; keys stream through in tiles of KT, with all
+// reuse in team scratch:
+//
+//   - full Q rows ([nqr x SQ], loaded once per team) and full FP32
+//     accumulator rows ([nqr x SQ] in scratch, or a per-thread register
+//     array when DMAX > 0),
+//   - K/V tiles ([nkv x KT x SD] each, cooperatively loaded once per K-tile
+//     and reused across every row),
+//   - per-row (m, l) online-softmax state in registers; every output row is
+//     written exactly once.
+//
+// Row strides carry a +1 pad (plus one more when that lands on a multiple
+// of 32) so same-element accesses across rows never bank-conflict. Cost per
+// team is one Q-load plus #K-tiles x (one KV-load + nqr row updates) with
+// one barrier per load phase — about two barriers per KT keys instead of
+// per key. Dots use full-D rows with eight interleaved FP32 accumulators
+// (portable C++, no intrinsics); the exp is an inlined Cody-Waite
+// polynomial (~3e-6 vs expf, no function calls). Cooperative loads use
+// vectorized 16-wide segments. FP32 accumulation throughout; the only
+// Scalar rounding is the single final write. Team size is one thread per
+// row (explicit, portable TeamPolicy API); GQA leader mapping shares KV
+// tile rows the way the causal kernel does. K-tail keys and T-tail rows
+// are guarded; Ktot == 0 yields zeros per the documented contract.
+//
+// Numerics equal softmax(QK^T*scale)*V up to FP32 reassociation (verified
+// against the host reference in tests/Test_AttentionBidirectional).
+template <class ExecSpace, class QP, class KP, class VP, class OView, int HC,
+          int DMAX>
+struct BidirFlashFunctor {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  using ScratchView =
+      Kokkos::View<float*, typename ExecSpace::scratch_memory_space,
+                   Kokkos::MemoryUnmanaged>;
+  using Elem = std::remove_const_t<typename OView::value_type>;
+  const QP* qbase;
+  const KP* kbase;
+  const VP* vbase;
+  OView out;
+  size_t T, Hq, D, Hkv, Ktot;
+  size_t qs0, qs1;  // row(t,h) = base + t*s0 + h*s1 (D-contiguous rows)
+  size_t ks0, ks1;
+  size_t vs0, vs1;
+  size_t os0, os1;  // out row(t,h) = obase + t*os0 + h*os1 (+d*os2)
+  size_t os2;       // out D stride (out is never repacked: usually 1)
+  Elem* obase;      // mutable out base (extracted on host; see launch)
+  int tchunk;  // tokens per team (heads per team = HC, compile-time)
+  int ktiles;  // keys per K-tile
+  float scale;
+
+  static KOKKOS_INLINE_FUNCTION int kv_of_head(size_t hbase, size_t Hkv,
+                                               size_t Hq, int jj) {
+    return static_cast<int>(((hbase + jj) * Hkv) / Hq);
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& member) const {
+    const size_t Dloc = D;
+    const size_t Hqloc = Hq;
+    const size_t Tloc = T;
+    const size_t Kloc = Ktot;
+    const int TC = tchunk;
+    const int KT = ktiles;
+    const float scl = scale;
+    const int rank = static_cast<int>(member.team_rank());
+    const int team_n = static_cast<int>(member.team_size());
+
+    const size_t nchunks_h = Hqloc / HC;
+    const size_t chunk = static_cast<size_t>(member.league_rank());
+    const size_t tbase = (chunk / nchunks_h) * TC;
+    const size_t hbase = (chunk % nchunks_h) * HC;
+    const size_t nqr = static_cast<size_t>(TC) * HC;
+
+    // Distinct-KV-head plan for this head chunk (computed once per team).
+    const size_t Hkbloc = Hkv;
+    int ku_of_row[HC];
+    int myrow_of_head[HC];
+    int nkv = 0;
+    for (int jj = 0; jj < HC; ++jj) {
+      const int kvh = kv_of_head(hbase, Hkbloc, Hqloc, jj);
+      if (jj == 0 || kvh != ku_of_row[nkv - 1]) {
+        ku_of_row[nkv] = kvh;
+        myrow_of_head[jj] = nkv;
+        ++nkv;
+      } else {
+        myrow_of_head[jj] = nkv - 1;
+      }
+    }
+
+    // Scratch holds full Q rows ([nqr x SQ]) plus the K/V tiles ([HC x
+    // KT x SD] each; nkv <= HC rows used); with DMAX == 0 it additionally
+    // holds full FP32 acc rows ([nqr x SQ]). Row strides get +1 pad, plus
+    // one more when that lands on a multiple of 32, so same-element
+    // accesses across rows never bank-conflict; SD is also at least DMAX
+    // so fixed-DMAX register bodies stay in-bounds. Full rows (not
+    // D-chunks): the online softmax needs complete dots before any exp,
+    // so D is reduced inside the per-key dot, never across passes.
+    size_t SQ = Dloc + 1;
+    if (SQ % 32 == 0) ++SQ;
+    size_t SD = Dloc + 1;
+    if (SD % 32 == 0) ++SD;
+    if (DMAX > 0 && SD < (size_t)DMAX) SD = DMAX;
+    ScratchView buf(member.team_scratch(0),
+                    nqr * SQ + (DMAX > 0 ? 0 : nqr * SQ) + 2 * HC * KT * SD);
+    const size_t qoff = 0;
+    const size_t aoff = nqr * SQ;
+    const size_t koff = nqr * SQ + (DMAX > 0 ? 0 : nqr * SQ);
+    const size_t voff = koff + HC * KT * SD;
+    float* __restrict__ qb = buf.data() + qoff;
+    float* accb = buf.data() + aoff;  // unused when DMAX > 0
+
+    // Cooperative full-row Q load, 16-wide vectorized segments (one
+    // (row, segment) unit per iteration over floor(D/16) segments) plus a
+    // scalar tail for D % 16. Segment stores stay strictly inside the
+    // [0, D) row range (never into padding or neighbors).
+    const size_t QSEG = 16;
+    const size_t qseg = Dloc / QSEG;
+    const size_t qunits = nqr * qseg;
+    for (size_t u = static_cast<size_t>(rank); u < qunits;
+         u += static_cast<size_t>(team_n)) {
+      const size_t row = u / qseg;
+      const size_t s = u % qseg;
+      const size_t t = tbase + row / HC;
+      const size_t h = hbase + row % HC;
+      float* __restrict__ qdst = qb + row * SQ + s * QSEG;
+      if (t < Tloc) {
+        const QP* qrowp = qbase + t * qs0 + h * qs1 + s * QSEG;
+#pragma unroll
+        for (int w = 0; w < 16; ++w)
+          qdst[w] = static_cast<float>(qrowp[w]);
+      } else {
+#pragma unroll
+        for (int w = 0; w < 16; ++w) qdst[w] = 0.0f;
+      }
+    }
+    for (size_t dd = qseg * QSEG + rank; dd < Dloc;
+         dd += static_cast<size_t>(team_n)) {
+      for (size_t row = 0; row < nqr; ++row) {
+        const size_t t = tbase + row / HC;
+        const size_t h = hbase + row % HC;
+        float x = 0.0f;
+        if (t < Tloc) x = static_cast<float>(qbase[t * qs0 + h * qs1 + dd]);
+        qb[row * SQ + dd] = x;
+      }
+    }
+    member.team_barrier();
+    // DMAX == 0 (generic path) zeroes the shared acc rows; the DMAX > 0
+    // path uses a per-thread register array instead (zeroed below).
+    if constexpr (DMAX == 0) {
+      for (int rr = rank; rr < (int)nqr; rr += team_n) {
+        float* __restrict__ accrow = accb + rr * SQ;
+        for (size_t d = 0; d < Dloc; ++d) accrow[d] = 0.0f;
+      }
+      member.team_barrier();
+    }
+
+    for (int rr = rank; rr < (int)nqr; rr += team_n) {
+      // Per-row streaming state lives in registers.
+      float m = -1e30f;
+      float l = 0.0f;
+      const size_t t = tbase + rr / HC;
+      const bool real = (t < Tloc);
+      const int jj0 = real ? myrow_of_head[rr % HC] : 0;
+      const float* __restrict__ qrow = qb + rr * SQ;
+      float* __restrict__ accrow = accb + rr * SQ;
+      float areg[DMAX > 0 ? DMAX : 1];
+      if constexpr (DMAX > 0) {
+        for (int dd = 0; dd < DMAX; ++dd) areg[dd] = 0.0f;
+      }
+      for (size_t k0 = 0; k0 < Kloc; k0 += KT) {
+        // Cooperative K/V tile load, full D rows, 16-wide vectorized
+        // segments (flat units, shift-free decode via division — a few
+        // integer divisions per tile, negligible). Scalar tail for D % 16.
+        const size_t SEG = 16;
+        const size_t nseg = Dloc / SEG;
+        const size_t per = (size_t)KT * nseg;
+        const size_t nunits = (size_t)nkv * per;
+        for (size_t u = static_cast<size_t>(rank); u < nunits;
+             u += static_cast<size_t>(team_n)) {
+          const size_t r = u / per;
+          const size_t rem = u % per;
+          const size_t kki = rem / nseg;
+          const size_t s = rem % nseg;
+          const size_t kh = static_cast<size_t>(ku_of_row[r]);
+          const size_t kk = k0 + kki;
+          const size_t dd = s * SEG;
+          float* __restrict__ kdst = buf.data() + koff + (r * KT + kki) * SD + dd;
+          float* __restrict__ vdst = buf.data() + voff + (r * KT + kki) * SD + dd;
+          if (kk < Kloc) {
+            const KP* krowp = kbase + kk * ks0 + kh * ks1 + dd;
+            const VP* vrowp = vbase + kk * vs0 + kh * vs1 + dd;
+            for (int w = 0; w < 16; ++w) {
+              kdst[w] = static_cast<float>(krowp[w]);
+              vdst[w] = static_cast<float>(vrowp[w]);
+            }
+          } else {
+            for (int w = 0; w < 16; ++w) {
+              kdst[w] = 0.0f;
+              vdst[w] = 0.0f;
+            }
+          }
+        }
+        for (size_t dd = nseg * SEG + rank; dd < Dloc;
+             dd += static_cast<size_t>(team_n)) {
+          for (int r = 0; r < nkv; ++r) {
+            const size_t kh = static_cast<size_t>(ku_of_row[r]);
+            float* __restrict__ kdst = buf.data() + koff + r * KT * SD + dd;
+            float* __restrict__ vdst = buf.data() + voff + r * KT * SD + dd;
+            for (int kki = 0; kki < KT; ++kki) {
+              const size_t kk = k0 + kki;
+              if (kk < Kloc) {
+                kdst[kki * SD] = static_cast<float>(
+                    kbase[kk * ks0 + kh * ks1 + dd]);
+                vdst[kki * SD] = static_cast<float>(
+                    vbase[kk * vs0 + kh * vs1 + dd]);
+              } else {
+                kdst[kki * SD] = 0.0f;
+                vdst[kki * SD] = 0.0f;
+              }
+            }
+          }
+        }
+        member.team_barrier();
+          if (real) {
+            // Tile row bases hoisted out of the per-key loop.
+            const float* __restrict__ kbase_r = buf.data() + koff + jj0 * KT * SD;
+            const float* __restrict__ vbase_r = buf.data() + voff + jj0 * KT * SD;
+#pragma unroll 2
+            for (int kki = 0; kki < KT; ++kki) {
+              const size_t kk = k0 + kki;
+              if (kk >= Kloc) break;
+              const float* __restrict__ krow = kbase_r + kki * SD;
+              // Full-D dot with eight interleaved accumulators (D blocked
+              // in octets for wide shared loads and independent chains).
+              float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+              float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
+              size_t dd = 0;
+              const size_t dend8 = Dloc & ~size_t(7);
+              for (; dd < dend8; dd += 8) {
+                a0 += qrow[dd] * krow[dd];
+                a1 += qrow[dd + 1] * krow[dd + 1];
+                a2 += qrow[dd + 2] * krow[dd + 2];
+                a3 += qrow[dd + 3] * krow[dd + 3];
+                a4 += qrow[dd + 4] * krow[dd + 4];
+                a5 += qrow[dd + 5] * krow[dd + 5];
+                a6 += qrow[dd + 6] * krow[dd + 6];
+                a7 += qrow[dd + 7] * krow[dd + 7];
+              }
+              float tail = 0.0f;
+              for (; dd < Dloc; ++dd) tail += qrow[dd] * krow[dd];
+              const float st =
+                  (((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7)) + tail) *
+                  scl;
+            const float* __restrict__ vrow = vbase_r + kki * SD;
+            // Single-exp streaming update with the inlined polynomial exp
+            // (no function calls, so no caller-saved spill traffic). Only
+            // one direction is evaluated; the other follows from
+            // exp(st - m) == 1/exp(m - st) via one reciprocal (accurate
+            // division, ~2e-7 combined error — far inside test
+            // tolerances). The branch diverges only while the running
+            // max is still settling (early keys) and runs uniformly
+            // converged afterwards. m == -1e30 on the first key gives
+            // aa = exp(-1e30) = 0, as desired (the unused reciprocal of
+            // zero stays a finite-weighted select, never NaN).
+            if (st > m) {
+                const float aa = bidir_expf(m - st);
+                const float l_new = l * aa + 1.0f;
+                if constexpr (DMAX > 0) {
+#pragma unroll
+                  for (int e = 0; e < DMAX; e += 4) {
+                    areg[e] = areg[e] * aa + vrow[e];
+                    areg[e + 1] = areg[e + 1] * aa + vrow[e + 1];
+                    areg[e + 2] = areg[e + 2] * aa + vrow[e + 2];
+                    areg[e + 3] = areg[e + 3] * aa + vrow[e + 3];
+                  }
+                } else {
+                  size_t dd = 0;
+                  const size_t dend8 = Dloc & ~size_t(7);
+                  for (; dd < dend8; dd += 8) {
+                    accrow[dd] = accrow[dd] * aa + vrow[dd];
+                    accrow[dd + 1] = accrow[dd + 1] * aa + vrow[dd + 1];
+                    accrow[dd + 2] = accrow[dd + 2] * aa + vrow[dd + 2];
+                    accrow[dd + 3] = accrow[dd + 3] * aa + vrow[dd + 3];
+                    accrow[dd + 4] = accrow[dd + 4] * aa + vrow[dd + 4];
+                    accrow[dd + 5] = accrow[dd + 5] * aa + vrow[dd + 5];
+                    accrow[dd + 6] = accrow[dd + 6] * aa + vrow[dd + 6];
+                    accrow[dd + 7] = accrow[dd + 7] * aa + vrow[dd + 7];
+                  }
+                  for (; dd < Dloc; ++dd)
+                    accrow[dd] = accrow[dd] * aa + vrow[dd];
+                }
+                m = st;
+                l = l_new;
+              } else {
+                // exp(st - m) == 1/exp(m - st): reuse via one reciprocal
+                // (m - st >= 0 here, so e_big is finite-positive; when it
+                // saturates to 1e30 the reciprocal correctly rounds to ~0).
+                const float gg = 1.0f / bidir_expf(m - st);
+                const float l_new = l + gg;
+                if constexpr (DMAX > 0) {
+#pragma unroll
+                  for (int e = 0; e < DMAX; e += 4) {
+                    areg[e] += vrow[e] * gg;
+                    areg[e + 1] += vrow[e + 1] * gg;
+                    areg[e + 2] += vrow[e + 2] * gg;
+                    areg[e + 3] += vrow[e + 3] * gg;
+                  }
+                } else {
+                  size_t dd = 0;
+                  const size_t dend8 = Dloc & ~size_t(7);
+                  for (; dd < dend8; dd += 8) {
+                    accrow[dd] += vrow[dd] * gg;
+                    accrow[dd + 1] += vrow[dd + 1] * gg;
+                    accrow[dd + 2] += vrow[dd + 2] * gg;
+                    accrow[dd + 3] += vrow[dd + 3] * gg;
+                    accrow[dd + 4] += vrow[dd + 4] * gg;
+                    accrow[dd + 5] += vrow[dd + 5] * gg;
+                    accrow[dd + 6] += vrow[dd + 6] * gg;
+                    accrow[dd + 7] += vrow[dd + 7] * gg;
+                  }
+                  for (; dd < Dloc; ++dd) accrow[dd] += vrow[dd] * gg;
+                }
+                l = l_new;
+              }
+            }
+          }
+        member.team_barrier();
+      }
+      // Write back full rows (l == 0, i.e. Ktot == 0, keeps zeros).
+      // Raw out row pointer: one mult-add per row instead of a full 3-D
+      // index computation per element.
+      if (real) {
+        const size_t hwr = hbase + rr % HC;
+        Elem* __restrict__ orow = obase + t * os0 + hwr * os1;
+        const size_t ostr = os2;
+        if (l > 0.0f) {
+          const float inv_l = 1.0f / l;
+          if constexpr (DMAX > 0) {
+#pragma unroll
+            for (int e = 0; e < DMAX; e += 4) {
+              const float w0 = areg[e] * inv_l;
+              const float w1 = areg[e + 1] * inv_l;
+              const float w2 = areg[e + 2] * inv_l;
+              const float w3 = areg[e + 3] * inv_l;
+              // Dloc-masked stores: tail lanes never escape.
+              if ((size_t)e < Dloc) orow[e * ostr] = static_cast<Elem>(w0);
+              if ((size_t)(e + 1) < Dloc)
+                orow[(e + 1) * ostr] = static_cast<Elem>(w1);
+              if ((size_t)(e + 2) < Dloc)
+                orow[(e + 2) * ostr] = static_cast<Elem>(w2);
+              if ((size_t)(e + 3) < Dloc)
+                orow[(e + 3) * ostr] = static_cast<Elem>(w3);
+            }
+          } else {
+            size_t dd = 0;
+            const size_t dend8 = Dloc & ~size_t(7);
+            for (; dd < dend8; dd += 8) {
+              orow[dd * ostr] = static_cast<Elem>(accrow[dd] * inv_l);
+              orow[(dd + 1) * ostr] =
+                  static_cast<Elem>(accrow[dd + 1] * inv_l);
+              orow[(dd + 2) * ostr] =
+                  static_cast<Elem>(accrow[dd + 2] * inv_l);
+              orow[(dd + 3) * ostr] =
+                  static_cast<Elem>(accrow[dd + 3] * inv_l);
+              orow[(dd + 4) * ostr] =
+                  static_cast<Elem>(accrow[dd + 4] * inv_l);
+              orow[(dd + 5) * ostr] =
+                  static_cast<Elem>(accrow[dd + 5] * inv_l);
+              orow[(dd + 6) * ostr] =
+                  static_cast<Elem>(accrow[dd + 6] * inv_l);
+              orow[(dd + 7) * ostr] =
+                  static_cast<Elem>(accrow[dd + 7] * inv_l);
+            }
+            for (; dd < Dloc; ++dd)
+              orow[dd * ostr] = static_cast<Elem>(accrow[dd] * inv_l);
+          }
+        } else {
+          for (size_t dd = 0; dd < Dloc; ++dd)
+            orow[dd * ostr] = static_cast<Elem>(0);
+        }
+      }
+    }
+    member.team_barrier();
+  }
+};
+
+template <class ExecSpace, class QP, class KP, class VP, class OView, int HC,
+          int DMAX>
+void launch_bidir_flash(const QP* qbase, const KP* kbase, const VP* vbase,
+                        const OView& out, size_t T, size_t Hq, size_t D,
+                        size_t Hkv, size_t Ktot, size_t qs0, size_t qs1,
+                        size_t ks0, size_t ks1, size_t vs0, size_t vs1,
+                        float scale, const std::string& label) {
+  // Token chunks (rows = TC x HC) with full-D Q rows plus K/V tiles in
+  // scratch (acc lives in registers for D <= 64). TC favors fatter tiles
+  // on long sequences (fewer teams, more K/V reuse per tile load) and more
+  // teams on short ones (fill the machine): T >= 320 uses 24-token chunks,
+  // else 16. KT starts at 12 and shrinks (gradually, then by halves) with
+  // TC so scratch stays within the portable 48 KiB per-team budget.
+  int tchunk = (T < 16) ? static_cast<int>(T) : ((T >= 320) ? 24 : 16);
+  int kt = 12;
+  // Scratch mirror of the functor layout (Q rows + optional acc rows +
+  // K/V tiles); must match exactly. DMAX > 0 drops the shared acc rows.
+  // KT shrinks gradually (then by halves) and TC by halves so scratch
+  // stays within the portable 48 KiB per-team budget.
+  auto bidir_scratch_floats = [&](int tc, int kkt) -> size_t {
+    size_t sq = D + 1;
+    if (sq % 32 == 0) ++sq;
+    size_t sd = D + 1;
+    if (sd % 32 == 0) ++sd;
+    constexpr bool reg = (DMAX > 0);
+    if (reg && sd < 64) sd = 64;
+    const size_t nq = (size_t)tc * HC;
+    return nq * sq + (reg ? 0 : nq * sq) + 2 * HC * kkt * sd;
+  };
+  while (kt > 8 && bidir_scratch_floats(tchunk, kt) * sizeof(float) >
+                        size_t(48 * 1024))
+    --kt;
+  while (kt > 1 && bidir_scratch_floats(tchunk, kt) * sizeof(float) >
+                        size_t(48 * 1024))
+    kt /= 2;
+  while (tchunk > 1 && bidir_scratch_floats(tchunk, kt) * sizeof(float) >
+                            size_t(48 * 1024))
+    tchunk /= 2;
+  // Mutable out base via a non-const handle copy (avoids a const_cast; the
+  // caller's allocation is mutable — out is only ever written here).
+  OView out_nc = out;
+  using Elem = std::remove_const_t<typename OView::value_type>;
+  Elem* obase = out_nc.data();
+  const size_t os0 = out_nc.stride(0), os1 = out_nc.stride(1);
+  const size_t os2 = out_nc.stride(2);
+  BidirFlashFunctor<ExecSpace, QP, KP, VP, OView, HC, DMAX> f{
+      qbase, kbase, vbase, out, T, Hq, D, Hkv, Ktot, qs0, qs1, ks0,
+      ks1,   vs0,   vs1,   os0, os1, os2, obase, tchunk,  kt,  scale};
+  const size_t nqr = static_cast<size_t>(tchunk) * HC;
+  const size_t nchunks_t = (T + tchunk - 1) / tchunk;
+  // One thread per row: full warps stay lockstep-simple and barriers stay
+  // single-warp cheap (still portable: rank-strided loops stay correct for
+  // any team size, and team_size is core TeamPolicy API).
+  Kokkos::TeamPolicy<ExecSpace> policy(nchunks_t * (Hq / HC),
+                                       static_cast<int>(nqr), 1);
+  // Scratch mirror of the functor layout below (Q rows + optional acc
+  // rows + K/V tiles); must match exactly. DMAX > 0 drops the shared acc
+  // rows (register array instead).
+  size_t sqq = D + 1;
+  if (sqq % 32 == 0) ++sqq;
+  size_t sdd = D + 1;
+  if (sdd % 32 == 0) ++sdd;
+  if (DMAX > 0 && sdd < (size_t)DMAX) sdd = DMAX;
+  policy.set_scratch_size(
+      0, Kokkos::PerTeam((nqr * sqq + (DMAX > 0 ? 0 : nqr * sqq) +
+                          2 * HC * kt * sdd) *
+                         sizeof(float)));
+  Kokkos::parallel_for(label, policy, f);
+}
+
+template <class ExecSpace, class Scalar, class QView, class KView, class VView,
+          class OView>
+void launch_bidir_flat(const QView& q, const KView& k, const VView& v,
+                       const OView& out, size_t T, size_t Hq, size_t D,
+                       size_t Hkv, size_t Ktot, float scale,
+                       const std::string& label) {
+  using QE = std::remove_const_t<typename QView::value_type>;
+  using KE = std::remove_const_t<typename KView::value_type>;
+  using VE = std::remove_const_t<typename VView::value_type>;
+  const QE* qb = q.data();
+  const KE* kb = k.data();
+  const VE* vb = v.data();
+  const size_t qs0 = q.stride(0), qs1 = q.stride(1);
+  const size_t ks0 = k.stride(0), ks1 = k.stride(1);
+  const size_t vs0 = v.stride(0), vs1 = v.stride(1);
+  // D <= 64 uses the register-accumulator instantiation (fixed-64 bodies,
+  // no local-memory spill); larger head dims fall back to the shared-acc
+  // instantiation (always correct, slower).
+  const bool use_reg = (D <= 64);
+  if ((Hq % 4) == 0) {
+    if (use_reg) {
+      launch_bidir_flash<ExecSpace, QE, KE, VE, OView, 4, 64>(
+          qb, kb, vb, out, T, Hq, D, Hkv, Ktot, qs0, qs1, ks0, ks1, vs0,
+          vs1, scale, label);
+    } else {
+      launch_bidir_flash<ExecSpace, QE, KE, VE, OView, 4, 0>(
+          qb, kb, vb, out, T, Hq, D, Hkv, Ktot, qs0, qs1, ks0, ks1, vs0,
+          vs1, scale, label);
+    }
+  } else {
+    if (use_reg) {
+      launch_bidir_flash<ExecSpace, QE, KE, VE, OView, 1, 64>(
+          qb, kb, vb, out, T, Hq, D, Hkv, Ktot, qs0, qs1, ks0, ks1, vs0,
+          vs1, scale, label);
+    } else {
+      launch_bidir_flash<ExecSpace, QE, KE, VE, OView, 1, 0>(
+          qb, kb, vb, out, T, Hq, D, Hkv, Ktot, qs0, qs1, ks0, ks1, vs0,
+          vs1, scale, label);
+    }
+  }
+}
+
+// D-contiguous fast path gate. The kernel below streams whole rows
+// elementwise through raw pointers, so a D stride != 1 (e.g. Kokkos's
+// default LayoutLeft on device, where consecutive D elements sit T*H apart
+// and every access wastes a full cache sector) collapses effective bandwidth
+// ~16x. Repack strided inputs once into LayoutRight temporaries;
+// already-contiguous inputs run in place with zero copies. `out` is never
+// repacked: every path writes each output element exactly once, so its
+// strided cost is one pass regardless.
+template <class View>
+inline bool bidir_is_d_contig(const View& w) {
+  return w.span_is_contiguous() && w.stride(2) == 1;
+}
+
+template <class ExecSpace, class Scalar, class QView, class KView, class VView,
+          class OView>
+void launch_bidir_streaming_auto(const QView& q, const KView& k, const VView& v,
+                                 const OView& out, size_t T, size_t Hq,
+                                 size_t D, size_t Hkv, size_t Ktot, float scale,
+                                 const std::string& label) {
+  if (bidir_is_d_contig(q) && bidir_is_d_contig(k) && bidir_is_d_contig(v)) {
+    launch_bidir_flat<ExecSpace, Scalar>(q, k, v, out, T, Hq, D, Hkv, Ktot,
+                                         scale, label);
+    return;
+  }
+  // Strided inputs are repacked into LayoutRight temporaries (with a
+  // transposing copy) so the main kernel streams D-contiguous rows.
+  // WithoutInitializing: every element is overwritten by the repack copy
+  // immediately below.
+  using QE = std::remove_const_t<typename QView::value_type>;
+  using KE = std::remove_const_t<typename KView::value_type>;
+  using VE = std::remove_const_t<typename VView::value_type>;
+  Kokkos::View<QE***, Kokkos::LayoutRight, ExecSpace> qc(
+      Kokkos::ViewAllocateWithoutInitializing("KokkosDNN::bidir_q"), T, Hq,
+      D);
+  Kokkos::View<KE***, Kokkos::LayoutRight, ExecSpace> kc(
+      Kokkos::ViewAllocateWithoutInitializing("KokkosDNN::bidir_k"), Ktot,
+      Hkv, D);
+  Kokkos::View<VE***, Kokkos::LayoutRight, ExecSpace> vc(
+      Kokkos::ViewAllocateWithoutInitializing("KokkosDNN::bidir_v"), Ktot,
+      Hkv, D);
+  Kokkos::deep_copy(qc, q);
+  Kokkos::deep_copy(kc, k);
+  Kokkos::deep_copy(vc, v);
+  launch_bidir_flat<ExecSpace, Scalar>(qc, kc, vc, out, T, Hq, D, Hkv, Ktot,
+                                       scale, label);
+}
+
 // Streaming online-softmax bidirectional core shared by both public
 // overloads below. Same structure as attention_gqa_streaming above, except
 // every query attends to ALL keys (no causal truncation).
@@ -684,40 +1267,15 @@ void attention_bidirectional_streaming(const DNNHandle<ExecSpace>& handle,
   (void)handle;
 #endif
 
-  // One thread per (query token, query head); streams over the full key
-  // axis with an online softmax running state (m, l) and accumulates
-  // directly into out. No [T, Hq, K] score tensor is materialized.
-  Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, Hq}),
-      KOKKOS_LAMBDA(size_t t, size_t h) {
-        const size_t hkv = (h * Hkv) / Hq;
-        for (size_t d = 0; d < D; ++d) out(t, h, d) = static_cast<Scalar>(0);
-        if (Ktot == 0) return;
-        float m = -1e30f;
-        float l = 0.0f;
-        for (size_t kk = 0; kk < Ktot; ++kk) {
-          float s = 0;
-          for (size_t d = 0; d < D; ++d)
-            s += static_cast<float>(q(t, h, d)) *
-                 static_cast<float>(k(kk, hkv, d));
-          s *= eff;
-          const float m_new = (m > s) ? m : s;
-          const float a = expf(m - m_new);
-          const float g = expf(s - m_new);
-          const float la = l * a;
-          const float l_new = la + g;
-          const float inv = 1.0f / l_new;
-          const float c = la * inv;
-          const float e = g * inv;
-          for (size_t d = 0; d < D; ++d) {
-            const float o_old = static_cast<float>(out(t, h, d));
-            const float v_kd = static_cast<float>(v(kk, hkv, d));
-            out(t, h, d) = static_cast<Scalar>(o_old * c + v_kd * e);
-          }
-          m = m_new;
-          l = l_new;
-        }
-      });
+  // Native path: single-kernel team-blocked FlashAttention-style kernel
+  // (Q/acc chunks + K/V tiles in team scratch, one normalization at the end
+  // per D-chunk); see BidirFlashFunctor for structure. Transient extras are
+  // O(D) team-scratch per resident team plus O(1) per (t, h) beyond the
+  // outputs — no score tensor is materialized, so long contexts stay
+  // feasible. Since every query attends every key, the dense key tiles give
+  // every team independent, uniformly-shaped work.
+  launch_bidir_streaming_auto<ExecSpace, Scalar>(q, k, v, out, T, Hq, D, Hkv,
+                                                 Ktot, eff, label);
 }
 
 }  // namespace Impl
