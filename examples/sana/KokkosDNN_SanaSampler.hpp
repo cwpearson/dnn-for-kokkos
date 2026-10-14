@@ -25,8 +25,10 @@
 // code path. run_flow_euler() therefore takes no pag_scale.
 //
 // All helpers are host-side (std::vector<float>) except run_flow_euler(),
-// which bridges host latents/captions to the device Model::forward()
-// (B=1) once per DiT call.
+// which bridges host latents/captions to the device Model::forward().
+// Without guidance it runs one B=1 forward per step; with active CFG
+// (guidance > 1 and cond != uncond) it batches both branches into one B=2
+// forward per step (row 0 = cond, row 1 = uncond).
 
 #include <Kokkos_Core.hpp>
 
@@ -184,10 +186,35 @@ std::vector<float> run_flow_euler(
   using LatR = Kokkos::View<Scalar****, Kokkos::LayoutRight, ExecSpace>;
   using TokR = Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>;
   using TVec = Kokkos::View<float*, ExecSpace>;
+  const bool need_cfg = do_cfg && !same;
+  const size_t Oc = (size_t)cfg.out_channels;
   LatR x_d("sana_euler_x", 1, C, H, W);
-  LatR v_d("sana_euler_v", 1, (size_t)cfg.out_channels, H, W);
-  TVec t_d("sana_euler_t", 1);
-  TokR y_d("sana_euler_y", 1, L, Cc);
+  // Batched-CFG buffers (guidance path): one B=2 forward per step with
+  // row 0 = cond, row 1 = uncond. y_b is filled once (captions are static);
+  // x_b/t_b are refreshed per step (x evolves, t changes). v_b holds both
+  // branch predictions. L is shared by construction (unc.size() ==
+  // cond.size() is checked above).
+  LatR x_b, v_b;
+  TokR y_b;
+  TVec t_b;
+  // Single-branch buffers (guidance-disabled / cond == uncond fast path).
+  LatR vc_d;
+  TVec t_d;
+  TokR y_cond_d;
+  if (need_cfg) {
+    x_b = LatR("sana_euler_xb", 2, C, H, W);
+    v_b = LatR("sana_euler_vb", 2, Oc, H, W);
+    y_b = TokR("sana_euler_yb", 2, L, Cc);
+    t_b = TVec("sana_euler_tb", 2);
+  } else {
+    // Prediction buffer: a single conditional branch, matching FlowEuler's
+    // guidance-disabled path.
+    vc_d = LatR("sana_euler_vc", 1, Oc, H, W);
+    t_d = TVec("sana_euler_t", 1);
+    y_cond_d = TokR("sana_euler_y_cond", 1, L, Cc);
+  }
+  // Device residency: copy evolving state + captions once, keep x on device
+  // across steps (only the scalar timestep crosses host->device per step).
   {
     auto xh = Kokkos::create_mirror_view(x_d);
     size_t k = 0;
@@ -196,57 +223,107 @@ std::vector<float> run_flow_euler(
         for (size_t w = 0; w < W; ++w) xh(0, c, h, w) = (Scalar)x_init[k++];
     Kokkos::deep_copy(x_d, xh);
   }
-  auto set_caption = [&](const std::vector<float>& y) {
-    auto yh = Kokkos::create_mirror_view(y_d);
+  auto fill_caption = [](TokR& dst, const std::vector<float>& y, size_t Lc,
+                          size_t Cc_) {
+    auto yh = Kokkos::create_mirror_view(dst);
+    size_t k = 0;
+    for (size_t l = 0; l < Lc; ++l)
+      for (size_t c = 0; c < Cc_; ++c) yh(0, l, c) = (Scalar)y[k++];
+    Kokkos::deep_copy(dst, yh);
+  };
+  if (need_cfg) {
+    // Row 0 = cond, row 1 = uncond (must match the CFG combine below,
+    // which reads vc = v_b[0] as cond and vu = v_b[1] as uncond).
+    auto yh = Kokkos::create_mirror_view(y_b);
     size_t k = 0;
     for (size_t l = 0; l < L; ++l)
-      for (size_t c = 0; c < Cc; ++c) yh(0, l, c) = (Scalar)y[k++];
-    Kokkos::deep_copy(y_d, yh);
-  };
+      for (size_t c = 0; c < Cc; ++c) yh(0, l, c) = (Scalar)cond[k++];
+    k = 0;
+    for (size_t l = 0; l < L; ++l)
+      for (size_t c = 0; c < Cc; ++c) yh(1, l, c) = (Scalar)unc[k++];
+    Kokkos::deep_copy(y_b, yh);
+  } else {
+    fill_caption(y_cond_d, cond, L, Cc);
+  }
 
   const std::vector<float> sigmas = build_sigmas(s.steps, s.flow_shift);
   const std::vector<float> tvals = build_model_timesteps(sigmas);
-  std::vector<float> x = x_init, vc(C * T), vu(C * T), v(C * T);
-  for (int i = 0; i < s.steps; ++i) {
-    if (on_step) on_step(i, tvals[(size_t)i], sigmas[(size_t)i]);
-    {
-      Kokkos::View<float*, Kokkos::HostSpace,
-                   Kokkos::MemoryTraits<Kokkos::Unmanaged>>
-          th(const_cast<float*>(&tvals[(size_t)i]), 1);
-      Kokkos::deep_copy(t_d, th);
-    }
-    auto forward_branch = [&](const std::vector<float>& y,
-                              std::vector<float>& out) {
-      set_caption(y);
-      {
-        auto xh = Kokkos::create_mirror_view(x_d);
-        size_t k = 0;
-        for (size_t c = 0; c < C; ++c)
-          for (size_t h = 0; h < H; ++h)
-            for (size_t w = 0; w < W; ++w)
-              xh(0, c, h, w) = (Scalar)x[k++];
-        Kokkos::deep_copy(x_d, xh);
-      }
-      model.forward(x_d, t_d, y_d, v_d);
+  const float g = s.guidance_scale;
+  if (need_cfg) {
+    // CFG-active path: a single batched B=2 forward per step (cond row 0,
+    // uncond row 1), halving launch/host overhead and doubling GEMM rows
+    // versus two sequential B=1 forwards.
+    auto tb_h = Kokkos::create_mirror_view(t_b);
+    for (int i = 0; i < s.steps; ++i) {
+      if (on_step) on_step(i, tvals[(size_t)i], sigmas[(size_t)i]);
+      // Scalar timestep only: two floats host->device per step.
+      tb_h(0) = tvals[(size_t)i];
+      tb_h(1) = tvals[(size_t)i];
+      Kokkos::deep_copy(t_b, tb_h);
+      const float dt = sigmas[(size_t)i + 1] - sigmas[(size_t)i];
+      // Refresh the B=2 input from the evolving device state (on-device;
+      // x changes every step so this cannot be hoisted).
+      Kokkos::parallel_for(
+          "sana_euler_dup_x",
+          Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<4>>(
+              {(size_t)0, (size_t)0, (size_t)0, (size_t)0},
+              {(size_t)2, C, H, W}),
+          KOKKOS_LAMBDA(size_t b, size_t c, size_t h, size_t w) {
+            x_b(b, c, h, w) = x_d(0, c, h, w);
+          });
       Kokkos::fence();
-      auto vh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), v_d);
-      size_t k = 0;
-      for (size_t c = 0; c < C; ++c)
-        for (size_t h = 0; h < H; ++h)
-          for (size_t w = 0; w < W; ++w) out[k++] = (float)vh(0, c, h, w);
-    };
-    if (do_cfg && !same) {
-      forward_branch(cond, vc);
-      forward_branch(unc, vu);
-      guided_predict(vc, vu, s.guidance_scale, v);
-    } else {
+      model.forward(x_b, t_b, y_b, v_b);
+      Kokkos::fence();
+      // Fused CFG combine + Euler update, matching host order/precision:
+      //   v = uncond + g*(cond - uncond); x += dt*v   (all FP32),
+      // with vc = v_b[0] (cond), vu = v_b[1] (uncond).
+      Kokkos::parallel_for(
+          "sana_euler_cfg_step",
+          Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<4>>(
+              {(size_t)0, (size_t)0, (size_t)0, (size_t)0},
+              {(size_t)1, C, H, W}),
+          KOKKOS_LAMBDA(size_t b, size_t c, size_t h, size_t w) {
+            const float xc = static_cast<float>(x_d(b, c, h, w));
+            const float vcond = static_cast<float>(v_b(0, c, h, w));
+            const float vun = static_cast<float>(v_b(1, c, h, w));
+            const float v = vun + g * (vcond - vun);
+            x_d(b, c, h, w) = static_cast<Scalar>(xc + dt * v);
+          });
+      Kokkos::fence();
+    }
+  } else {
+    auto t_h = Kokkos::create_mirror_view(t_d);
+    for (int i = 0; i < s.steps; ++i) {
+      if (on_step) on_step(i, tvals[(size_t)i], sigmas[(size_t)i]);
+      // Scalar timestep only: single float host->device per step.
+      t_h(0) = tvals[(size_t)i];
+      Kokkos::deep_copy(t_d, t_h);
+      const float dt = sigmas[(size_t)i + 1] - sigmas[(size_t)i];
       // No guidance (or cond == uncond): a single conditional branch,
       // matching FlowEuler's guidance-disabled path.
-      forward_branch(cond, v);
+      model.forward(x_d, t_d, y_cond_d, vc_d);
+      Kokkos::fence();
+      Kokkos::parallel_for(
+          "sana_euler_step",
+          Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<4>>(
+              {(size_t)0, (size_t)0, (size_t)0, (size_t)0},
+              {(size_t)1, C, H, W}),
+          KOKKOS_LAMBDA(size_t b, size_t c, size_t h, size_t w) {
+            const float xc = static_cast<float>(x_d(b, c, h, w));
+            const float v = static_cast<float>(vc_d(b, c, h, w));
+            x_d(b, c, h, w) = static_cast<Scalar>(xc + dt * v);
+          });
+      Kokkos::fence();
     }
-    euler_step(x, v, sigmas[(size_t)i + 1] - sigmas[(size_t)i]);
   }
   Kokkos::fence();
+  // Single device->host copy of the final latents.
+  auto xh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), x_d);
+  std::vector<float> x(C * T);
+  size_t k = 0;
+  for (size_t c = 0; c < C; ++c)
+    for (size_t h = 0; h < H; ++h)
+      for (size_t w = 0; w < W; ++w) x[k++] = (float)xh(0, c, h, w);
   return x;
 }
 
