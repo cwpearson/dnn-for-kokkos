@@ -281,7 +281,9 @@ void gemm(const DNNHandle<ExecSpace>& handle, Scalar alpha,
     if (handle.use_cublas) {
       void* raw = handle.cublas_raw();
       if (raw != nullptr) {
-        Kokkos::fence();  // ensure prior Kokkos kernels completed
+        // No fence here: cublas_*_with_handle() re-selects the Kokkos CUDA
+        // stream on the cached handle every call, so cuBLAS work is ordered
+        // with surrounding Kokkos kernels on that stream.
         bool ok = false;
         auto h  = static_cast<cublasHandle_t>(raw);
         if constexpr (std::is_same_v<Scalar, float>) {
@@ -356,7 +358,9 @@ void gemv(const DNNHandle<ExecSpace>& handle,
     if (handle.use_cublas && N > 0 && K > 0) {
       void* raw = handle.cublas_raw();
       if (raw != nullptr) {
-        Kokkos::fence();  // ensure prior Kokkos kernels completed
+        // No fence here: cublas_*_with_handle() re-selects the Kokkos CUDA
+        // stream on the cached handle every call, so cuBLAS work is ordered
+        // with surrounding Kokkos kernels on that stream.
         bool ok = false;
         auto h  = static_cast<cublasHandle_t>(raw);
         if constexpr (std::is_same_v<Scalar, float>) {
