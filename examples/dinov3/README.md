@@ -1,74 +1,87 @@
 # DINOv3 example
 
-ViT-B/16 (`vitb16_lvd1689m`, `facebook/dinov3-vitb16-pretrain-lvd1689m`)
-image-encoder inference built on the core library.
+ViT-B/16 (`vitb16_lvd1689m`, `facebook/dinov3-vitb16-pretrain-lvd1689m`) image-encoder inference built on the core library. The `dinov3_encode` driver encodes one image (or deterministic synthetic pixels) into `[T, D]` tokens where row 0 is CLS.
 
-Target arch (per HF `dinov3_vit` modeling/config + convert script):
-patch 16, hidden 768, 12 layers, 12 heads (`head_dim=64`, MHA),
-MLP 3072 with `gelu` (no SwiGLU/gating), 1 CLS + 4 register tokens,
-biased `q/v/o/up/down` linears (`k` unbiased), LayerNorm `eps=1e-5`,
-2D axial RoPE (`theta=100`), per-block LayerScale, final LayerNorm.
-Single forward over `1+4+Np` tokens (201 @224px); no KV-cache, no sampling.
-
-This directory holds the Config/Weights/Model/Driver plus smoke and
-golden tests, wired into `examples/CMakeLists.txt` via
-`examples/dinov3/CMakeLists.txt`.
-
-## Weights
-
-`facebook/dinov3-vitb16-pretrain-lvd1689m` is gated — accept the
-conditions at <https://huggingface.co/facebook/dinov3-vitb16-pretrain-lvd1689m>
-once, then download with the `hf` CLI (`pip install -U huggingface_hub`):
+## Quickstart (0 to working)
 
 ```bash
+# From the repo root (/workspace). Real-image input needs KokkosDNN_ENABLE_IMAGE=ON;
+# without it --image is ignored (with a warning) and synthetic pixels are used.
+# Accept the gated-repo conditions once at
+# https://huggingface.co/facebook/dinov3-vitb16-pretrain-lvd1689m, then:
+pip install -U huggingface_hub  # plus torch transformers safetensors Pillow for the golden test
+
+cmake -S . -B build \
+  -DKokkos_ROOT=/path/to/kokkos-install \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DKokkosDNN_ENABLE_IMAGE=ON
+cmake --build build --parallel 8
+
 hf download facebook/dinov3-vitb16-pretrain-lvd1689m \
   --local-dir ./weights/dinov3-vitb16-pretrain-lvd1689m \
   --token "$HF_TOKEN"
 ls ./weights/dinov3-vitb16-pretrain-lvd1689m
 # expect model.safetensors (~343 MB) + config.json + preprocessor_config.json
+
+# Smoke path, no download needed:
+./build/examples/dinov3/dinov3_encode --tiny
+
+# Real weights on synthetic pixels:
+./build/examples/dinov3/dinov3_encode \
+  --weights ./weights/dinov3-vitb16-pretrain-lvd1689m/model.safetensors \
+  --config ./weights/dinov3-vitb16-pretrain-lvd1689m/config.json --fp32
+
+# Real weights on a real image (needs the IMAGE=ON build above):
+./build/examples/dinov3/dinov3_encode \
+  --weights ./weights/dinov3-vitb16-pretrain-lvd1689m/model.safetensors \
+  --config ./weights/dinov3-vitb16-pretrain-lvd1689m/config.json \
+  --image /path/to/img.jpg --fp32
 ```
 
-Keep the full snapshot: `config.json` defines the arch and
-`preprocessor_config.json` defines the image normalization, both needed
-by the future driver / golden test.
+## Example commands
 
-## TODO
+```bash
+# Tiny random model (default when no --weights): tiny_test() config + random weights.
+./build/examples/dinov3/dinov3_encode --tiny
 
-Core `src/` ops (all missing today):
+# Real checkpoint, synthetic gradient pixels (no image file needed).
+./build/examples/dinov3/dinov3_encode \
+  --weights ./weights/dinov3-vitb16-pretrain-lvd1689m/model.safetensors \
+  --config ./weights/dinov3-vitb16-pretrain-lvd1689m/config.json
 
-- [x] `layernorm_forward` (weight+bias, FP32 accum) — `RMSNorm` is not a substitute. Done: `src/KokkosDNN_LayerNorm.hpp` (`KokkosDNN::layernorm_forward`/`layernorm_row`).
-- [x] `gelu_forward` — pin HF `ACT2FN["gelu"]` erf-vs-tanh variant first. Done: `src/KokkosDNN_Activation.hpp` (`KokkosDNN::gelu_forward`, `GeluVariant::ExactErf` default = HF `gelu`, `Tanh` = `gelu_new`).
-- [x] Biased linear for inference (`gemm_bias`: `Y=X·Wᵀ+b`, reuse cuBLAS path). Done: `src/KokkosDNN_GemmBias.hpp` (`KokkosDNN::gemm_bias`/`gemv_bias`, empty bias = unbiased).
-- [x] Bidirectional full MHA (non-causal; current `attention_gqa_single` is causal-only; cuDNN graph is causal-only too). Done: `src/KokkosDNN_Attention.hpp` (`KokkosDNN::attention_mha_bidirectional`, native Kokkos, FP32 streaming softmax).
-- [x] 2D axial RoPE (`head_dim/4` inv_freq, dynamic H/W coords, `rotate_half`, patch-tokens-only, prefix skip). Done: `src/KokkosDNN_RoPE.hpp` (`KokkosDNN::rope2d_axial_forward`/`_inplace`, theta=100, prefix_skip=5).
-- [x] PatchEmbed Conv2d (`3→768`, `k=16/s=16`) or `im2col+gemm` helper. Done: `src/KokkosDNN_PatchEmbed.hpp` (`KokkosDNN::patchembed_forward`, `im2col+gemm_bias`).
-- [x] Token assembly + batching (`cat[cls,registers,patches]`, `[B,T,D]` policy). Done: `src/KokkosDNN_Tokens.hpp` (`KokkosDNN::tokens_assemble_forward`, broadcast + single-seq).
-- [x] `layerscale` broadcast multiply + residual-add helper (`DropPath` is inference identity). Done: `src/KokkosDNN_LayerScale.hpp` (`KokkosDNN::layerscale_residual_forward`/`layerscale_forward`).
+# Real checkpoint + real image (needs -DKokkosDNN_ENABLE_IMAGE=ON).
+./build/examples/dinov3/dinov3_encode \
+  --weights ./weights/dinov3-vitb16-pretrain-lvd1689m/model.safetensors \
+  --config ./weights/dinov3-vitb16-pretrain-lvd1689m/config.json \
+  --image /path/to/img.jpg --print-tokens 8
 
-Example support (`examples/dinov3/`):
+# Flags: --tiny | --config config.json (overlays HF config.json onto the
+# tiny_test()/vitb16() base) | --weights model.safetensors [...] (multi-shard
+# OK) | --image img.jpg | --fp32 (DefaultScalar is already float, so currently
+# a no-op) | --print-tokens N (prints first N CLS values, default 8).
+```
 
-- [x] `Config` for `dinov3_vit` fields (patch/hidden/layers/heads/registers/bias flags/layerscale/rope/image size). Done: `KokkosDNN_Dinov3Config.hpp` (`KokkosDNN::Dinov3::Config`: `vitb16()`/`tiny_test()`/`validate()`/`from_json_file`/`from_json_string`/`num_tokens()`/`num_patch_tokens()`, dependency-free JSON overlay).
-- [x] Safetensors loader map (`patch_embed/cls_token/register_tokens/norms/qkv-o/mlp/layerscale/final-norm` HF names; Llama loader names do not apply). Done: `KokkosDNN_Dinov3Weights.{hpp,cpp}` (`Weights<Exec,Scalar>::allocate`, `random_init`, `load_safetensors` with F32/F16/BF16 conversion, mmap-backed reads; k projection unbiased, no `bk` field).
-- [x] Image preprocessing (resize/crop, normalize, `HWC→CHW`, batching; no image I/O in repo today). Done: `src/images/` (`KokkosDNN::Image`, stb-backed I/O, opt-in `-DKokkosDNN_ENABLE_IMAGE=ON`, OFF by default).
-- [x] Encoder driver (`dinov3_forward(pixel) → cls/patch tokens`) + tiny-random smoke path (no download). Done: `KokkosDNN_Dinov3Model.hpp` (`Model<Exec,Scalar>::forward(pixels [C,H,W]) → tokens [T,D]`, row 0 = CLS, `cls_token()`/`patch_tokens()` aliases) + `dinov3_encode.cpp` driver (`--tiny` default random path, `--weights/--config/--image/--fp32/--print-tokens`) + `Test_Dinov3Smoke.cpp` (shape/finite/determinism + Config JSON round-trip, no image component needed).
-- [x] Golden test vs HF `facebook/dinov3-vitb16-pretrain-lvd1689m` (CLS + patch tokens, tolerance per scalar). Done: `generate_golden.py` (HF reference: full CLS [768] + first 4 patch rows + patch mean + reference pixel tensor) + `Test_Dinov3Golden.cpp` (FP32 max-abs-diff ≤ 1e-3 default, `KOKKOSDNN_DINOV3_TOL` override; SKIPs without files, never downloads). See "Golden test" below.
-- [x] Wire into `examples/CMakeLists.txt` + driver flags (`--weights/--image/--fp32`) once the above land. Done: `examples/dinov3/CMakeLists.txt` (static lib `kokkosdnn_dinov3`, alias `KokkosDNN::dinov3`; exe `dinov3_encode`; `test_dinov3_smoke` + `test_dinov3_golden` via `gtest_discover_tests`) + `add_subdirectory(dinov3)` in `examples/CMakeLists.txt`. Driver flags: `--tiny`, `--config config.json`, `--weights model.safetensors [...]`, `--image img.jpg` (needs `-DKokkosDNN_ENABLE_IMAGE=ON`, else synthetic with a warning), `--fp32`, `--print-tokens N`.
+## Notes
 
-## Golden test
+Target arch (per HF `dinov3_vit` modeling/config): patch 16, hidden 768, 12 layers, 12 heads (`head_dim=64`, MHA), MLP 3072 with exact-erf `gelu`, 1 CLS + 4 register tokens, biased `q/v/o/up/down` linears (`k` unbiased), LayerNorm `eps=1e-5`, 2D axial RoPE (`theta=100`, patch-tokens-only, 5-token prefix skip), per-block LayerScale, final LayerNorm. This example layers thin support code over existing core ops (`layernorm_forward`, `gelu_forward`, `gemm_bias`/`gemv_bias`, bidirectional `attention_mha_bidirectional`, `rope2d_axial_forward`, `patchembed_forward` via `im2col+gemm_bias`, token assembly, `layerscale_residual_forward`): `KokkosDNN_Dinov3Config.hpp` (`Config::vitb16()`/`tiny_test()`/`validate()`/`from_json_file`), `KokkosDNN_Dinov3Weights.{hpp,cpp}` (safetensors loader with F32/F16/BF16 conversion), `KokkosDNN_Dinov3Model.hpp` (`forward(pixels [C,H,W]) -> tokens [T,D]`, row 0 = CLS), and the `dinov3_encode.cpp` driver. Image I/O + preprocessing lives in the opt-in `src/images/` component (`-DKokkosDNN_ENABLE_IMAGE=ON`, OFF by default); without it the driver falls back to deterministic synthetic pixels `v(c,y,x) = ((y*S + x) % 256) / 255 + 0.01 * c`, shared bit-identically with the smoke and golden tests.
 
-Generate the reference (read-only on the weights snapshot; needs
-`torch` + `transformers`):
+## Verification
+
+No-download smoke test (shape `[1+R+Np, D]`, all-finite outputs, bit-for-bit determinism across two forwards, plus a Config JSON round-trip; runs without the image component):
+
+```bash
+ctest --test-dir build -R Dinov3 --output-on-failure
+./build/examples/dinov3/test_dinov3_smoke
+```
+
+Golden test against HF `transformers` on `facebook/dinov3-vitb16-pretrain-lvd1689m` (FP32 CLS vector + first 4 patch rows + patch mean; the C++ side never downloads and SKIPs gracefully without the files):
 
 ```bash
 python examples/dinov3/generate_golden.py \
   --weights-dir ./weights/dinov3-vitb16-pretrain-lvd1689m \
   --synthetic --out /tmp/golden_dinov3.json
 # or: --image /path/to/img.jpg  (HF-processed pixels stored verbatim)
-```
 
-Run the C++ check (never downloads; SKIPs gracefully without the files):
-
-```bash
 KOKKOSDNN_DINOV3_WEIGHTS=./weights/dinov3-vitb16-pretrain-lvd1689m/model.safetensors \
 KOKKOSDNN_DINOV3_GOLDEN_JSON=/tmp/golden_dinov3.json \
   ./build/examples/dinov3/test_dinov3_golden
@@ -77,8 +90,8 @@ KOKKOSDNN_DINOV3_GOLDEN_JSON=/tmp/golden_dinov3.json \
 #   KOKKOSDNN_DINOV3_CONFIG=.../config.json  (overlay onto vitb16())
 ```
 
-Synthetic inputs use the canonical formula
-`v(c,y,x) = ((y*S + x) % 256) / 255 + 0.01 * c`, shared by
-`dinov3_encode.cpp`, `Test_Dinov3Smoke.cpp`, `Test_Dinov3Golden.cpp` and
-`generate_golden.py --synthetic`, fed directly as `pixel_values` (no HF
-processor normalization) on both sides.
+Synthetic inputs are fed directly as `pixel_values` with no HF processor normalization on either side, so inputs match by construction (the C++ side additionally cross-checks its recomputation against the stored pixel tensor to `<= 1e-6`); `--image` goldens store the HF-preprocessed tensor verbatim so both sides compare on exactly the same floats.
+
+## Performance
+
+One forward pass covers all `1+4+Np` tokens (201 @224px: 1 CLS + 4 registers + 196 patches); there is no KV-cache, batching, or sampling. Compute defaults to float (`DefaultScalar`), and the golden file keeps only the full CLS `[768]`, the first 4 patch rows, and the patch mean instead of all 196x768 patch tokens to stay small (< ~5 MB).
