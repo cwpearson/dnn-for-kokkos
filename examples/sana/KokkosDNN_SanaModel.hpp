@@ -339,8 +339,9 @@ void litela_batch_qkv(const Mat& qkv, const V3& o, size_t nH, size_t hd,
     // (1024 threads on CUDA, of which only hd do work) and 2*hd team scratch
     // (K+V row segments), paying ~2*T wide-team barriers per launch at
     // single-block-per-SM occupancy (36 teams over 82 SMs). This form instead:
-    // (a) caps the team at one warp (32) on CUDA -- Serial still requires
-    // size 1, selected with a compile-time branch; (b) splits the T-key
+    // (a) caps the team at one warp (32), clamped at runtime via
+    // team_size_max for backends that cannot field a warp (Serial runs
+    // size 1) -- no backend branches; (b) splits the T-key
     // stream into nChunk chunks per head (288 teams at T=1024) for occupancy;
     // (c) shrinks scratch to a single hd-float V row-segment with K loaded
     // directly by its owner thread, fusing the K/V row loads under one
@@ -357,17 +358,14 @@ void litela_batch_qkv(const Mat& qkv, const V3& o, size_t nH, size_t hd,
     using member_type = typename team_policy::member_type;
     // V row-segment scratch only (hd floats); K is owner-loaded from global.
     const size_t shBytes = hd * sizeof(float);
-#if defined(KOKKOS_ENABLE_CUDA)
-    const int tsize = 32;
-#else
-    const int tsize = 1;
-#endif
+    // Portable team size (one warp where the backend can field it): every
+    // loop below strides on the runtime team size, so clamping the tuned
+    // size via team_size_max (scratch accounted) stays correct everywhere
+    // (Serial runs team_size 1) with no backend branches.
+    constexpr int kStage1Team = 32;
     const size_t league = nH * nChunk;
     if (nChunk == 1) {
-      team_policy policy(static_cast<int>(league), tsize);
-      policy.set_scratch_size(0, Kokkos::PerTeam(shBytes));
-      Kokkos::parallel_for(
-          label, policy, KOKKOS_LAMBDA(const member_type& member) {
+      auto stage1_body = KOKKOS_LAMBDA(const member_type& member) {
             const size_t h   = static_cast<size_t>(member.league_rank());
             const size_t tid = static_cast<size_t>(member.team_rank());
             const size_t tsz = static_cast<size_t>(member.team_size());
@@ -399,16 +397,22 @@ void litela_batch_qkv(const Mat& qkv, const V3& o, size_t nH, size_t hd,
                 for (size_t d = 0; d < hd; ++d) KV(h, d, eo) = vk_local[d];
               }
             }
-          });
+      };
+      team_policy probe1(1, 1);
+      probe1.set_scratch_size(0, Kokkos::PerTeam(shBytes));
+      const int tsize =
+          std::max(1, std::min(kStage1Team, probe1.team_size_max(
+                                                stage1_body,
+                                                Kokkos::ParallelForTag{})));
+      team_policy policy(static_cast<int>(league), tsize);
+      policy.set_scratch_size(0, Kokkos::PerTeam(shBytes));
+      Kokkos::parallel_for(label, policy, stage1_body);
     } else {
       Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace> Kpart(
           "sana_litela_kpart", league, hd);
       Kokkos::View<float***, Kokkos::LayoutRight, ExecSpace> KVpart(
           "sana_litela_kvpart", league, hd, hd);
-      team_policy policy(static_cast<int>(league), tsize);
-      policy.set_scratch_size(0, Kokkos::PerTeam(shBytes));
-      Kokkos::parallel_for(
-          label, policy, KOKKOS_LAMBDA(const member_type& member) {
+      auto stage1_chunked_body = KOKKOS_LAMBDA(const member_type& member) {
             const size_t lr  = static_cast<size_t>(member.league_rank());
             const size_t h    = lr / nChunk;
             const size_t c    = lr % nChunk;
@@ -442,7 +446,16 @@ void litela_batch_qkv(const Mat& qkv, const V3& o, size_t nH, size_t hd,
                 for (size_t d = 0; d < hd; ++d) KVpart(lr, d, eo) = vk_local[d];
               }
             }
-          });
+      };
+      team_policy probe1c(1, 1);
+      probe1c.set_scratch_size(0, Kokkos::PerTeam(shBytes));
+      const int tsize =
+          std::max(1, std::min(kStage1Team, probe1c.team_size_max(
+                                                 stage1_chunked_body,
+                                                 Kokkos::ParallelForTag{})));
+      team_policy policy(static_cast<int>(league), tsize);
+      policy.set_scratch_size(0, Kokkos::PerTeam(shBytes));
+      Kokkos::parallel_for(label, policy, stage1_chunked_body);
       // Fold chunk partials (chunking only changes fp32 summation order).
       Kokkos::parallel_for(
           label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {nH, hd}),
@@ -499,16 +512,12 @@ void litela_batch_qkv(const Mat& qkv, const V3& o, size_t nH, size_t hd,
     using team_policy = Kokkos::TeamPolicy<ExecSpace>;
     using member_type = typename team_policy::member_type;
     const size_t shBytes2 = (hd * hd + hd) * sizeof(float);
-#if defined(KOKKOS_ENABLE_CUDA)
-    const int tsize2 = 128;
-#else
-    const int tsize2 = 1;
-#endif
+    // Portable team size (tuned width where the backend can field it; every
+    // loop below strides on the runtime team size, so the clamped size stays
+    // correct -- Serial runs team_size 1 -- with no backend branches).
+    constexpr int kStage2Team = 128;
     const size_t league2 = nH * nChunkQ;
-    team_policy policy2(static_cast<int>(league2), tsize2);
-    policy2.set_scratch_size(0, Kokkos::PerTeam(shBytes2));
-    Kokkos::parallel_for(
-        label, policy2, KOKKOS_LAMBDA(const member_type& member) {
+    auto stage2_body = KOKKOS_LAMBDA(const member_type& member) {
           const size_t lr  = static_cast<size_t>(member.league_rank());
           const size_t tid = static_cast<size_t>(member.team_rank());
           const size_t tsz = static_cast<size_t>(member.team_size());
@@ -550,7 +559,16 @@ void litela_batch_qkv(const Mat& qkv, const V3& o, size_t nH, size_t hd,
               o(n, h, d) = static_cast<Scalar>(acc * inv);
             }
           }
-        });
+    };
+    team_policy probe2(1, 1);
+    probe2.set_scratch_size(0, Kokkos::PerTeam(shBytes2));
+    const int tsize2 =
+        std::max(1, std::min(kStage2Team, probe2.team_size_max(
+                                              stage2_body,
+                                              Kokkos::ParallelForTag{})));
+    team_policy policy2(static_cast<int>(league2), tsize2);
+    policy2.set_scratch_size(0, Kokkos::PerTeam(shBytes2));
+    Kokkos::parallel_for(label, policy2, stage2_body);
   } else {
     Kokkos::parallel_for(
         label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {nH, T}),
@@ -614,15 +632,12 @@ void depthwise3x3(const Mat& x, const W3& w, const Vec& bias, const Mat& y,
   const size_t shBytes = shElems * sizeof(float);
   using team_policy = Kokkos::TeamPolicy<ExecSpace>;
   using member_type = typename team_policy::member_type;
-#if defined(KOKKOS_ENABLE_CUDA)
-  const int tsize = 128;
-#else
-  const int tsize = 1;
-#endif
-  team_policy policy(static_cast<int>(league), tsize);
-  policy.set_scratch_size(0, Kokkos::PerTeam(shBytes));
-  Kokkos::parallel_for(
-      label, policy, KOKKOS_LAMBDA(const member_type& member) {
+  // Portable team size (tuned width where the backend can field it; every
+  // channel loop below strides on the runtime team size, so the clamped
+  // size stays correct -- Serial runs team_size 1 -- with no backend
+  // branches).
+  constexpr int kConvTeam = 128;
+  auto conv_body = KOKKOS_LAMBDA(const member_type& member) {
         const size_t lr  = static_cast<size_t>(member.league_rank());
         const size_t tid = static_cast<size_t>(member.team_rank());
         const size_t tsz = static_cast<size_t>(member.team_size());
@@ -684,7 +699,16 @@ void depthwise3x3(const Mat& x, const W3& w, const Vec& bias, const Mat& y,
                 static_cast<Scalar>(acc + bs);
           }
         }
-      });
+  };
+  team_policy probe(1, 1);
+  probe.set_scratch_size(0, Kokkos::PerTeam(shBytes));
+  const int tsize =
+      std::max(1, std::min(kConvTeam, probe.team_size_max(
+                                          conv_body,
+                                          Kokkos::ParallelForTag{})));
+  team_policy policy(static_cast<int>(league), tsize);
+  policy.set_scratch_size(0, Kokkos::PerTeam(shBytes));
+  Kokkos::parallel_for(label, policy, conv_body);
 }
 
 // GLU gating: out[r,h] = x[r,h] * silu(x[r,Hh+h]) over [R, 2Hh] -> [R, Hh].

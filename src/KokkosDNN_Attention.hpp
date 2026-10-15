@@ -3,6 +3,7 @@
 
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
+#include <algorithm>
 #include <cmath>
 #include <cstring>  // memcpy (bit tricks in bidir_expf)
 #include <stdexcept>
@@ -825,7 +826,9 @@ KOKKOS_INLINE_FUNCTION float bidir_expf(float x) {
 // polynomial (~3e-6 vs expf, no function calls). Cooperative loads use
 // vectorized 16-wide segments. FP32 accumulation throughout; the only
 // Scalar rounding is the single final write. Team size is one thread per
-// row (explicit, portable TeamPolicy API); GQA leader mapping shares KV
+// row (explicit, portable TeamPolicy API; the launcher probes
+// team_size_max and clamps, so Serial runs team_size 1 through the same
+// rank-strided loops); GQA leader mapping shares KV
 // tile rows the way the causal kernel does. K-tail keys and T-tail rows
 // are guarded; Ktot == 0 yields zeros per the documented contract.
 //
@@ -1190,6 +1193,84 @@ struct BidirFlashFunctor {
   }
 };
 
+// Naive obviously-correct fallback for backends that cannot field even a
+// single-thread team with the flash kernel's scratch (team_size_max < 1):
+// per-(t, h) scalar two-pass softmax over ALL keys in FP32, then normalize.
+// Only the fallback path runs this; team-capable backends always run the
+// flash kernel above. D-contiguous rows (the only layout the flat launcher
+// passes here) stream elementwise through the raw pointers; out is written
+// through its own strides. Ktot == 0 yields zeros, matching the flash path.
+template <class ExecSpace, class QP, class KP, class VP, class OView>
+void launch_bidir_naive(const QP* qbase, const KP* kbase, const VP* vbase,
+                        const OView& out, size_t T, size_t Hq, size_t D,
+                        size_t Hkv, size_t Ktot, size_t qs0, size_t qs1,
+                        size_t ks0, size_t ks1, size_t vs0, size_t vs1,
+                        size_t os0, size_t os1, size_t os2,
+                        typename std::remove_const_t<
+                            typename OView::value_type>* obase,
+                        float scale, const std::string& label) {
+  using Elem = std::remove_const_t<typename OView::value_type>;
+  if (T == 0 || Hq == 0 || D == 0) return;
+  (void)out;
+  Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace> row_m(
+      Kokkos::ViewAllocateWithoutInitializing("KokkosDNN::bidir_naive_m"), T,
+      Hq);
+  Kokkos::View<float***, Kokkos::LayoutRight, ExecSpace> acc(
+      Kokkos::ViewAllocateWithoutInitializing("KokkosDNN::bidir_naive_acc"), T,
+      Hq, D);
+  // Pass 1: per-row max score (+ zero the accumulator row).
+  Kokkos::parallel_for(
+      label + "_naive_max",
+      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, Hq}),
+      KOKKOS_LAMBDA(size_t t, size_t h) {
+        const size_t kvh = (h * Hkv) / Hq;
+        float m = -1e30f;
+        for (size_t kk = 0; kk < Ktot; ++kk) {
+          float s = 0.0f;
+          for (size_t d = 0; d < D; ++d)
+            s += static_cast<float>(qbase[t * qs0 + h * qs1 + d]) *
+                 static_cast<float>(kbase[kk * ks0 + kvh * ks1 + d]);
+          s *= scale;
+          if (s > m) m = s;
+        }
+        row_m(t, h) = m;
+        for (size_t d = 0; d < D; ++d) acc(t, h, d) = 0.0f;
+      });
+  // Pass 2: weights from the row max, FP32 accumulation, normalize on write.
+  Kokkos::parallel_for(
+      label + "_naive_update",
+      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, Hq}),
+      KOKKOS_LAMBDA(size_t t, size_t h) {
+        const size_t kvh = (h * Hkv) / Hq;
+        Elem* orow = obase + t * os0 + h * os1;
+        const float m = row_m(t, h);
+        if (Ktot == 0 || m <= -1e29f) {
+          for (size_t d = 0; d < D; ++d) orow[d * os2] = static_cast<Elem>(0);
+          return;
+        }
+        float l = 0.0f;
+        for (size_t kk = 0; kk < Ktot; ++kk) {
+          float s = 0.0f;
+          for (size_t d = 0; d < D; ++d)
+            s += static_cast<float>(qbase[t * qs0 + h * qs1 + d]) *
+                 static_cast<float>(kbase[kk * ks0 + kvh * ks1 + d]);
+          s *= scale;
+          const float w = expf(s - m);
+          l += w;
+          for (size_t d = 0; d < D; ++d)
+            acc(t, h, d) +=
+                w * static_cast<float>(vbase[kk * vs0 + kvh * vs1 + d]);
+        }
+        if (l > 0.0f) {
+          const float inv = 1.0f / l;
+          for (size_t d = 0; d < D; ++d)
+            orow[d * os2] = static_cast<Elem>(acc(t, h, d) * inv);
+        } else {
+          for (size_t d = 0; d < D; ++d) orow[d * os2] = static_cast<Elem>(0);
+        }
+      });
+}
+
 template <class ExecSpace, class QP, class KP, class VP, class OView, int HC,
           int DMAX>
 void launch_bidir_flash(const QP* qbase, const KP* kbase, const VP* vbase,
@@ -1240,24 +1321,44 @@ void launch_bidir_flash(const QP* qbase, const KP* kbase, const VP* vbase,
       ks1,   vs0,   vs1,   os0, os1, os2, obase, tchunk,  kt,  scale};
   const size_t nqr = static_cast<size_t>(tchunk) * HC;
   const size_t nchunks_t = (T + tchunk - 1) / tchunk;
-  // One thread per row: full warps stay lockstep-simple and barriers stay
-  // single-warp cheap (still portable: rank-strided loops stay correct for
-  // any team size, and team_size is core TeamPolicy API).
-  Kokkos::TeamPolicy<ExecSpace> policy(nchunks_t * (Hq / HC),
-                                       static_cast<int>(nqr), 1);
-  // Scratch mirror of the functor layout below (Q rows + optional acc
+  // Scratch footprint of the functor layout above (Q rows + optional acc
   // rows + K/V tiles); must match exactly. DMAX > 0 drops the shared acc
-  // rows (register array instead).
+  // rows (register array instead). Computed once here so the probe and the
+  // launch request identical scratch.
   size_t sqq = D + 1;
   if (sqq % 32 == 0) ++sqq;
   size_t sdd = D + 1;
   if (sdd % 32 == 0) ++sdd;
   if (DMAX > 0 && sdd < (size_t)DMAX) sdd = DMAX;
-  policy.set_scratch_size(
-      0, Kokkos::PerTeam((nqr * sqq + (DMAX > 0 ? 0 : nqr * sqq) +
-                          2 * HC * kt * sdd) *
-                         sizeof(float)));
-  Kokkos::parallel_for(label, policy, f);
+  const size_t shBytes =
+      (nqr * sqq + (DMAX > 0 ? 0 : nqr * sqq) + 2 * HC * kt * sdd) *
+      sizeof(float);
+  // Team-capability probe FIRST: constructing the TeamPolicy below aborts
+  // on backends that cannot field the team (e.g. Serial, max team size 1),
+  // so probe max team size from a team_size-1 policy (valid everywhere) and
+  // take the obviously-correct naive kernel when even a single-thread team
+  // does not fit. The query accounts for functor registers and the per-team
+  // scratch.
+  {
+    Kokkos::TeamPolicy<ExecSpace> probe(1, 1);
+    probe.set_scratch_size(0, Kokkos::PerTeam(shBytes));
+    const int max_team = probe.team_size_max(f, Kokkos::ParallelForTag{});
+    if (max_team < 1) {
+      launch_bidir_naive<ExecSpace>(qbase, kbase, vbase, out, T, Hq, D, Hkv,
+                                    Ktot, qs0, qs1, ks0, ks1, vs0, vs1, os0,
+                                    os1, os2, obase, scale, label);
+      return;
+    }
+    // One thread per row: full warps stay lockstep-simple and barriers stay
+    // single-warp cheap. Clamped at runtime to what the backend can field:
+    // every loop strides on the runtime team size, so the clamped size stays
+    // correct (Serial runs team_size 1); team-capable backends keep nqr
+    // unchanged, so the fast path is identical.
+    const int team = std::min(static_cast<int>(nqr), max_team);
+    Kokkos::TeamPolicy<ExecSpace> policy(nchunks_t * (Hq / HC), team, 1);
+    policy.set_scratch_size(0, Kokkos::PerTeam(shBytes));
+    Kokkos::parallel_for(label, policy, f);
+  }
 }
 
 template <class ExecSpace, class Scalar, class QView, class KView, class VView,
