@@ -1,0 +1,109 @@
+name: macOS ARM build
+
+# Apple Silicon CI: Kokkos Serial + Threads backends, build everything and run
+# the fast tests. macos-latest is an ARM64 (Apple Silicon) image
+# (macos-14 and later are ARM-only; Intel images carry an -intel suffix),
+# so this gives ARM coverage that the ubuntu-latest Serial CI does not.
+# Threads is Kokkos's plain-pthreads host parallel backend: no extra toolkit
+# is needed (unlike OpenMP, which wants brew libomp, or CUDA/HIP, which need
+# GPU toolkits), and it exercises the host-parallel paths in our kernels that
+# Serial alone never touches.
+on:
+  push:
+    paths-ignore:
+      - "docs/**"
+      - ".github/workflows/docs.yaml"
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+      - ".github/workflows/docs.yaml"
+
+jobs:
+  macos-arm:
+    # macos-latest tracks the newest stable ARM64 image (macos-26-arm64 as of
+    # 2026; Intel images are suffixed -intel). Unpinned on purpose: the build
+    # (Serial + Threads, no arch-specific flags) is portable across Apple
+    # Silicon generations, and tracking latest keeps Xcode/AppleClang fresh.
+    runs-on: macos-latest
+    env:
+      KOKKOS_VERSION: 5.2.1
+      KOKKOS_INSTALL: ${{ github.workspace }}/kokkos-install
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          # Runners already ship AppleClang, git, and usually cmake; install
+          # cmake via Homebrew only if missing. No sudo on macOS runners.
+          # There is no Homebrew `stb` formula (other formulae vendor stb
+          # headers as a resource; MacPorts/vcpkg do ship stb), so the
+          # optional image component just uses its FetchContent fallback on
+          # this runner — no extra install step needed.
+          brew list cmake >/dev/null 2>&1 || brew install cmake
+          cmake --version
+          c++ --version
+          uname -m
+
+      # Shallow checkout of the Kokkos release tag into kokkos-src.
+      # submodules: recursive is required: the build needs desul/mdspan,
+      # which git does not fetch by default.
+      - name: Check out Kokkos
+        uses: actions/checkout@v4
+        with:
+          repository: kokkos/kokkos
+          ref: ${{ env.KOKKOS_VERSION }}
+          path: kokkos-src
+          submodules: recursive
+
+      - name: Build and install Kokkos (Serial + Threads)
+        run: |
+          cmake -S kokkos-src -B kokkos-build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${KOKKOS_INSTALL}" \
+            -DKokkos_ENABLE_SERIAL=ON \
+            -DKokkos_ENABLE_THREADS=ON \
+            -DKokkos_ENABLE_TESTS=OFF
+          # Bare --parallel uses the native default job count; portable
+          # across Linux (nproc) and macOS (no nproc).
+          cmake --build kokkos-build --parallel
+          cmake --install kokkos-build
+
+      - name: Configure KokkosDNN
+        run: |
+          # KokkosDNN_ENABLE_IMAGE=ON builds src/images (KokkosDNN::Image,
+          # stb-backed I/O) and registers its unit tests (Test_Image).
+          # Missing system stb headers are fetched automatically.
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DKokkos_ROOT="${KOKKOS_INSTALL}" \
+            -DKokkosDNN_ENABLE_TESTS=ON \
+            -DKokkosDNN_ENABLE_EXAMPLES=ON \
+            -DKokkosDNN_ENABLE_BENCHMARKS=ON \
+            -DKokkosDNN_ENABLE_IMAGE=ON
+
+      # Build every target (library, tests, examples, benchmarks).
+      - name: Build everything
+        run: cmake --build build --parallel
+
+      # Run the full ctest suite: unit tests plus example tests, all on tiny
+      # configs that run in seconds. Tests needing real data
+      # (KOKKOSDNN_WEIGHTS / TOKENIZER_JSON / GOLDEN_JSON / LLAMA_CONFIG_JSON)
+      # self-skip via GTEST_SKIP when those files are absent. The
+      # kokkosdnn_bench_list entry only lists benchmarks (no kernels run).
+      # Deliberately NOT executed here: kokkosdnn_bench microbenchmarks run
+      # Llama 8B shapes whose naive native kernels take much longer than a
+      # CI step should (see README "Benchmarks").
+      # Unlike the CUDA/ROCm workflows (build-only, no GPU on runners), the
+      # macOS runner can execute host-backend binaries, so tests run here.
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure --timeout 300
+
+      # Example smoke runs, limited to configs suitable for shared CI cores:
+      # --tiny uses a 2-layer dim=64 random model (milliseconds); xor_train
+      # is a 2-layer MLP on 4 samples (milliseconds). Deliberately NOT run:
+      # full-shape random models and real checkpoints (large downloads and
+      # long runtimes).
+      - name: Run example smoke tests
+        run: |
+          ./build/examples/llama/llama_generate --tiny --prompt "Hello" --max-new 8
+          ./build/examples/xor/xor_train

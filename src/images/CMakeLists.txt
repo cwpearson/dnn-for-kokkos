@@ -26,9 +26,12 @@ if(JPEG_FOUND OR PNG_FOUND OR OpenCV_FOUND)
     " (informational only; canonical I/O path is stb)")
 endif()
 
-# Canonical path: stb (header-only). Look for a local stb_image.h first.
+# Canonical path: stb (header-only). Look for a local stb_image.h first,
+# including the default Homebrew (/opt/homebrew) and MacPorts (/opt/local)
+# prefixes on macOS, which find_path does not search by default.
 find_path(KokkosDNN_STB_INCLUDE_DIR stb_image.h
   HINTS $ENV{STB_ROOT} ${STB_ROOT} /usr/include /usr/local/include
+    /opt/homebrew/include /opt/local/include
   PATH_SUFFIXES stb)
 if(KokkosDNN_STB_INCLUDE_DIR)
   message(STATUS "KokkosDNN image: using local stb_image.h in ${KokkosDNN_STB_INCLUDE_DIR}")
