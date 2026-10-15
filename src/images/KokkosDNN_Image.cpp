@@ -7,24 +7,12 @@
 // folder actually containing stb_image.h, whether the headers live at the
 // top level of the stb repo or under a stb/ subdir, so no path tweaks here.
 
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-function"
-#pragma GCC diagnostic ignored "-Wunused-parameter"
-#pragma GCC diagnostic ignored "-Wunused-variable"
-#pragma GCC diagnostic ignored "-Wsign-compare"
-#pragma GCC diagnostic ignored "-Wtype-limits"
-#pragma GCC diagnostic ignored "-Wmisleading-indentation"
-#pragma GCC diagnostic ignored "-Wstringop-overflow"
-#pragma GCC diagnostic ignored "-Warray-bounds"
-#endif
-
+// stb warning suppression is handled at the build-system level: the stb
+// include dir is exposed as SYSTEM (-isystem, see src/images/CMakeLists.txt),
+// so only third-party stb code is muted; our own code in this TU keeps
+// normal warning flags.
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
-
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic pop
-#endif

@@ -51,16 +51,19 @@ endif()
 # Expose as an IMPORTED third-party target: imported targets linked PUBLICly
 # do not need to belong to our install export set. Only the build-tree path
 # is exposed; installing stb headers for a relocatable package is a TODO.
+# The stb dir is exposed as SYSTEM (-isystem) so third-party stb warnings
+# are silenced portably on GCC/Clang without per-warning pragmas (a blanket
+# `#pragma ... ignored "-w"` is rejected by both compilers).
 # The core umbrella (KokkosDNN.hpp) includes this component when
 # KOKKOSDNN_ENABLE_IMAGE is defined, and KokkosDNN_ImageIO.hpp needs
 # stb_image.h at compile time, so the stb dir is also exposed through the
 # core target (build tree only) for existing core consumers. This is not a
 # dependency on kokkosdnn_image itself: core never links it.
-target_include_directories(kokkosdnn PUBLIC
+target_include_directories(kokkosdnn SYSTEM PUBLIC
   $<BUILD_INTERFACE:${KokkosDNN_STB_INCLUDE_DIR}>)
 add_library(stb::stb INTERFACE IMPORTED GLOBAL)
 set_target_properties(stb::stb PROPERTIES
-  INTERFACE_INCLUDE_DIRECTORIES "$<BUILD_INTERFACE:${KokkosDNN_STB_INCLUDE_DIR}>")
+  INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "$<BUILD_INTERFACE:${KokkosDNN_STB_INCLUDE_DIR}>")
 
 # ---------------------------------------------------------------------------
 # Library target (stb implementation TU + header-inline I/O/preprocess).
@@ -77,6 +80,9 @@ target_include_directories(kokkosdnn_image PUBLIC
 )
 target_link_libraries(kokkosdnn_image PUBLIC Kokkos::kokkos stb::stb)
 
+# stb warnings are silenced via the SYSTEM (-isystem) include above, so this
+# target keeps normal warning flags: only third-party stb code is muted,
+# our own code (here and header-inline in consumers) is still checked.
 if(KokkosDNN_ENABLE_COMPILER_WARNINGS)
   target_compile_options(kokkosdnn_image PRIVATE -Wall -Wextra -Werror)
 endif()

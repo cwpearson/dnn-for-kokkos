@@ -19,23 +19,12 @@
 #include <vector>
 
 // stb declarations only (implementation is in KokkosDNN_Image.cpp).
-// Wrapped to keep -Wall -Wextra -Werror builds quiet about third-party code.
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-function"
-#pragma GCC diagnostic ignored "-Wunused-parameter"
-#pragma GCC diagnostic ignored "-Wunused-variable"
-#pragma GCC diagnostic ignored "-Wsign-compare"
-#pragma GCC diagnostic ignored "-Wtype-limits"
-#pragma GCC diagnostic ignored "-Wmisleading-indentation"
-#pragma GCC diagnostic ignored "-Wstringop-overflow"
-#pragma GCC diagnostic ignored "-Warray-bounds"
-#endif
+// stb warning suppression is handled at the build-system level: the stb
+// include dir is exposed as SYSTEM (-isystem) via stb::stb (see
+// src/images/CMakeLists.txt), which silences third-party warnings
+// portably on GCC/Clang without enumerating warning names here.
 #include "stb_image.h"
 #include "stb_image_write.h"
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
 
 namespace KokkosDNN::Image {
 
