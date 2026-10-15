@@ -25,6 +25,9 @@
 #include "KokkosDNN_Dense.hpp"
 #include "KokkosDNN_Loss.hpp"
 #include "KokkosDNN_Optimizer.hpp"
+#include "KokkosDNN_GGUF.hpp"
+#include "KokkosDNN_MoE.hpp"
+#include "KokkosDNN_Conv1D.hpp"
 
 #ifdef KOKKOSDNN_ENABLE_IMAGE
 #include "images/KokkosDNN_Image.hpp"

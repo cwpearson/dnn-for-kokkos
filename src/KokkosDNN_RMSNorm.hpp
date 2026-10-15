@@ -169,6 +169,66 @@ void rmsnorm_row_noscale(
       });
 }
 
+// Fused reshape + per-head QK RMSNorm (library counterpart of the
+// Gemma4 example-local qk_reshape_norm: the plain rmsnorm op works on
+// [tokens, dim] rows, while q/k norms run per attention head):
+//   out[t,h,d] = flat[t,h*D+d] / rms(flat[t,h*D:(h+1)*D]) * w[d]
+// Same FP32 formula as rmsnorm above, applied independently per (t, h).
+// Scalar-agnostic; backend-portable MDRange kernel.
+template <class ExecSpace, class Scalar>
+void qk_rmsnorm(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& flat,
+    const Kokkos::View<Scalar*, ExecSpace>& w, float eps,
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& out,
+    const std::string& label = "KokkosDNN::qk_rmsnorm") {
+  const size_t T = out.extent(0), H = out.extent(1), D = out.extent(2);
+  if (flat.extent(0) != T || flat.extent(1) != H * D || w.extent(0) != D)
+    throw std::invalid_argument("qk_rmsnorm: dimension mismatch");
+  if (T == 0 || H == 0 || D == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, H}),
+      KOKKOS_LAMBDA(size_t t, size_t h) {
+        float ss = 0;
+        for (size_t d = 0; d < D; ++d) {
+          float v = static_cast<float>(flat(t, h * D + d));
+          ss += v * v;
+        }
+        float inv = 1.0f / sqrt(ss / (float)D + eps);
+        for (size_t d = 0; d < D; ++d)
+          out(t, h, d) = static_cast<Scalar>(
+              static_cast<float>(flat(t, h * D + d)) * inv *
+              static_cast<float>(w(d)));
+      });
+}
+
+// Rank-3 overload for already-shaped q/k: q/out [T, H, D], w [D].
+// Same per-(t, h) math as qk_rmsnorm. In-place safe (q and out may alias).
+template <class ExecSpace, class Scalar>
+void qk_rmsnorm3d(
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& q,
+    const Kokkos::View<Scalar*, ExecSpace>& w, float eps,
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& out,
+    const std::string& label = "KokkosDNN::qk_rmsnorm3d") {
+  const size_t T = q.extent(0), H = q.extent(1), D = q.extent(2);
+  if (out.extent(0) != T || out.extent(1) != H || out.extent(2) != D ||
+      w.extent(0) != D)
+    throw std::invalid_argument("qk_rmsnorm3d: dimension mismatch");
+  if (T == 0 || H == 0 || D == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, H}),
+      KOKKOS_LAMBDA(size_t t, size_t h) {
+        float ss = 0;
+        for (size_t d = 0; d < D; ++d) {
+          float v = static_cast<float>(q(t, h, d));
+          ss += v * v;
+        }
+        float inv = 1.0f / sqrt(ss / (float)D + eps);
+        for (size_t d = 0; d < D; ++d)
+          out(t, h, d) = static_cast<Scalar>(
+              static_cast<float>(q(t, h, d)) * inv * static_cast<float>(w(d)));
+      });
+}
+
 }  // namespace KokkosDNN
 
 #endif
