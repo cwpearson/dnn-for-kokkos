@@ -62,7 +62,12 @@ endif()
 target_include_directories(kokkosdnn SYSTEM PUBLIC
   $<BUILD_INTERFACE:${KokkosDNN_STB_INCLUDE_DIR}>)
 add_library(stb::stb INTERFACE IMPORTED GLOBAL)
+# NOTE: INTERFACE_SYSTEM_INCLUDE_DIRECTORIES alone adds nothing: it only
+# marks entries of INTERFACE_INCLUDE_DIRECTORIES as SYSTEM. Both must list
+# the dir for it to propagate as -isystem (setting only the SYSTEM property
+# silently drops the include path and breaks the build).
 set_target_properties(stb::stb PROPERTIES
+  INTERFACE_INCLUDE_DIRECTORIES "$<BUILD_INTERFACE:${KokkosDNN_STB_INCLUDE_DIR}>"
   INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "$<BUILD_INTERFACE:${KokkosDNN_STB_INCLUDE_DIR}>")
 
 # ---------------------------------------------------------------------------
