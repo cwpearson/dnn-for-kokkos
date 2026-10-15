@@ -505,6 +505,13 @@ template void load_safetensors<Kokkos::Cuda>(const Config&, const std::string&,
                                             Weights<Kokkos::Cuda>&);
 template class Decoder<Kokkos::Cuda>;
 #endif
+#ifdef KOKKOS_ENABLE_HIP
+template void random_init<Kokkos::HIP>(const Config&, Weights<Kokkos::HIP>&,
+                                      uint64_t);
+template void load_safetensors<Kokkos::HIP>(const Config&, const std::string&,
+                                           Weights<Kokkos::HIP>&);
+template class Decoder<Kokkos::HIP>;
+#endif
 
 }  // namespace VAE
 }  // namespace Sana

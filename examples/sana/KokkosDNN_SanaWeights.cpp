@@ -593,6 +593,13 @@ template void random_init<Kokkos::Cuda, float>(const Config&,
 template void load_torch_pth<Kokkos::Cuda, float>(
     const Config&, const std::string&, Weights<Kokkos::Cuda, float>&);
 #endif
+#ifdef KOKKOS_ENABLE_HIP
+template void random_init<Kokkos::HIP, float>(const Config&,
+                                              Weights<Kokkos::HIP, float>&,
+                                              uint64_t);
+template void load_torch_pth<Kokkos::HIP, float>(
+    const Config&, const std::string&, Weights<Kokkos::HIP, float>&);
+#endif
 
 }  // namespace Sana
 }  // namespace KokkosDNN

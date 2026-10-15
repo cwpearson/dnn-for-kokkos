@@ -1780,6 +1780,16 @@ template void load_safetensors<Kokkos::Cuda, float>(
     Weights<Kokkos::Cuda, float>&);
 template class Model<Kokkos::Cuda, float>;
 #endif
+#ifdef KOKKOS_ENABLE_HIP
+template void Weights<Kokkos::HIP, float>::allocate(const Config&);
+template void random_init<Kokkos::HIP, float>(const Config&,
+                                             Weights<Kokkos::HIP, float>&,
+                                             uint64_t);
+template void load_safetensors<Kokkos::HIP, float>(
+    const Config&, const std::vector<std::string>&,
+    Weights<Kokkos::HIP, float>&);
+template class Model<Kokkos::HIP, float>;
+#endif
 
 }  // namespace SanaGemma
 }  // namespace KokkosDNN
