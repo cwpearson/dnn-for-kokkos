@@ -1751,45 +1751,19 @@ std::string sibling_file(const std::string& weights_path,
   return "";
 }
 
-// Explicit instantiations (float only; Serial always, others when enabled).
-template void Weights<Kokkos::Serial, float>::allocate(const Config&);
-template void random_init<Kokkos::Serial, float>(const Config&,
-                                                Weights<Kokkos::Serial, float>&,
+// Explicit instantiations (float only on DefaultExecutionSpace; other
+// ExecSpaces/Scalars instantiate implicitly from the header).
+// DefaultHostExecutionSpace is deliberately not instantiated: all callers
+// use DefaultExecutionSpace, and on CPU-only builds it aliases
+// DefaultExecutionSpace, where a second instantiation would be a duplicate.
+template void Weights<Kokkos::DefaultExecutionSpace, float>::allocate(const Config&);
+template void random_init<Kokkos::DefaultExecutionSpace, float>(const Config&,
+                                                Weights<Kokkos::DefaultExecutionSpace, float>&,
                                                 uint64_t);
-template void load_safetensors<Kokkos::Serial, float>(
+template void load_safetensors<Kokkos::DefaultExecutionSpace, float>(
     const Config&, const std::vector<std::string>&,
-    Weights<Kokkos::Serial, float>&);
-template class Model<Kokkos::Serial, float>;
-#ifdef KOKKOS_ENABLE_OPENMP
-template void Weights<Kokkos::OpenMP, float>::allocate(const Config&);
-template void random_init<Kokkos::OpenMP, float>(const Config&,
-                                                Weights<Kokkos::OpenMP, float>&,
-                                                uint64_t);
-template void load_safetensors<Kokkos::OpenMP, float>(
-    const Config&, const std::vector<std::string>&,
-    Weights<Kokkos::OpenMP, float>&);
-template class Model<Kokkos::OpenMP, float>;
-#endif
-#ifdef KOKKOS_ENABLE_CUDA
-template void Weights<Kokkos::Cuda, float>::allocate(const Config&);
-template void random_init<Kokkos::Cuda, float>(const Config&,
-                                              Weights<Kokkos::Cuda, float>&,
-                                              uint64_t);
-template void load_safetensors<Kokkos::Cuda, float>(
-    const Config&, const std::vector<std::string>&,
-    Weights<Kokkos::Cuda, float>&);
-template class Model<Kokkos::Cuda, float>;
-#endif
-#ifdef KOKKOS_ENABLE_HIP
-template void Weights<Kokkos::HIP, float>::allocate(const Config&);
-template void random_init<Kokkos::HIP, float>(const Config&,
-                                             Weights<Kokkos::HIP, float>&,
-                                             uint64_t);
-template void load_safetensors<Kokkos::HIP, float>(
-    const Config&, const std::vector<std::string>&,
-    Weights<Kokkos::HIP, float>&);
-template class Model<Kokkos::HIP, float>;
-#endif
+    Weights<Kokkos::DefaultExecutionSpace, float>&);
+template class Model<Kokkos::DefaultExecutionSpace, float>;
 
 }  // namespace SanaGemma
 }  // namespace KokkosDNN

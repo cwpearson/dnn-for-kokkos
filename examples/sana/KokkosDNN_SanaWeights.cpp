@@ -572,34 +572,17 @@ void load_torch_pth(const Config& cfg, const std::string& pth_path,
   (void)num_total;
 }
 
-// Explicit instantiations for float (the checkpoint dtype) on the common
-// spaces (other ExecSpaces/Scalars instantiate implicitly from the header).
-template void random_init<Kokkos::Serial, float>(const Config&,
-                                                 Weights<Kokkos::Serial, float>&,
+// Explicit instantiations for float (the checkpoint dtype) on
+// DefaultExecutionSpace (other ExecSpaces/Scalars instantiate implicitly
+// from the header). DefaultHostExecutionSpace is deliberately not
+// instantiated: all callers use DefaultExecutionSpace, and on CPU-only
+// builds it aliases DefaultExecutionSpace, where a second instantiation
+// would be a duplicate.
+template void random_init<Kokkos::DefaultExecutionSpace, float>(const Config&,
+                                                 Weights<Kokkos::DefaultExecutionSpace, float>&,
                                                  uint64_t);
-template void load_torch_pth<Kokkos::Serial, float>(
-    const Config&, const std::string&, Weights<Kokkos::Serial, float>&);
-#ifdef KOKKOS_ENABLE_OPENMP
-template void random_init<Kokkos::OpenMP, float>(const Config&,
-                                                 Weights<Kokkos::OpenMP, float>&,
-                                                 uint64_t);
-template void load_torch_pth<Kokkos::OpenMP, float>(
-    const Config&, const std::string&, Weights<Kokkos::OpenMP, float>&);
-#endif
-#ifdef KOKKOS_ENABLE_CUDA
-template void random_init<Kokkos::Cuda, float>(const Config&,
-                                               Weights<Kokkos::Cuda, float>&,
-                                               uint64_t);
-template void load_torch_pth<Kokkos::Cuda, float>(
-    const Config&, const std::string&, Weights<Kokkos::Cuda, float>&);
-#endif
-#ifdef KOKKOS_ENABLE_HIP
-template void random_init<Kokkos::HIP, float>(const Config&,
-                                              Weights<Kokkos::HIP, float>&,
-                                              uint64_t);
-template void load_torch_pth<Kokkos::HIP, float>(
-    const Config&, const std::string&, Weights<Kokkos::HIP, float>&);
-#endif
+template void load_torch_pth<Kokkos::DefaultExecutionSpace, float>(
+    const Config&, const std::string&, Weights<Kokkos::DefaultExecutionSpace, float>&);
 
 }  // namespace Sana
 }  // namespace KokkosDNN

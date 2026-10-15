@@ -660,9 +660,8 @@ void gemm(const DNNHandle<ExecSpace>& handle, Scalar alpha,
     throw std::invalid_argument("gemm: dimension mismatch");
 
 #if defined(KOKKOSDNN_ENABLE_CUBLAS) && defined(KOKKOS_ENABLE_CUDA)
-  constexpr bool is_cuda =
-      std::is_same_v<typename ExecSpace::memory_space, Kokkos::CudaSpace> ||
-      std::is_same_v<typename ExecSpace::memory_space, Kokkos::CudaUVMSpace>;
+  // Backend named deliberately: cuBLAS dispatch genuinely requires CUDA.
+  constexpr bool is_cuda = std::is_same_v<ExecSpace, Kokkos::Cuda>;
   if constexpr (is_cuda) {
     if (handle.use_cublas) {
       void* raw = handle.cublas_raw();
@@ -726,9 +725,8 @@ void gemv(const DNNHandle<ExecSpace>& handle,
   if (W.extent(1) != K || y.extent(0) != N)
     throw std::invalid_argument("gemv: dimension mismatch");
 #if defined(KOKKOSDNN_ENABLE_CUBLAS) && defined(KOKKOS_ENABLE_CUDA)
-  constexpr bool is_cuda =
-      std::is_same_v<typename ExecSpace::memory_space, Kokkos::CudaSpace> ||
-      std::is_same_v<typename ExecSpace::memory_space, Kokkos::CudaUVMSpace>;
+  // Backend named deliberately: cuBLAS dispatch genuinely requires CUDA.
+  constexpr bool is_cuda = std::is_same_v<ExecSpace, Kokkos::Cuda>;
   if constexpr (is_cuda) {
     if (handle.use_cublas && N > 0 && K > 0) {
       void* raw = handle.cublas_raw();

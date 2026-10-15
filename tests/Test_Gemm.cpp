@@ -94,10 +94,10 @@ void check_gemm_edges(int M, int N, int K, float tol) {
   Kokkos::deep_copy(X, hx);
   Kokkos::deep_copy(W, hw);
   Kokkos::deep_copy(Y, hy);
-  // Snapshot the beta input: on Serial the mirror hy aliases Y, so gemm
-  // would overwrite the reference values (same pattern as PortableSerial
-  // below; host mirrors of device views on team-capable backends are
-  // separate allocations, where this aliasing does not happen).
+  // Snapshot the beta input: on host execution spaces the mirror hy may
+  // alias Y, so gemm would overwrite the reference values (same pattern as
+  // PortableHost below; host mirrors of device views on team-capable
+  // backends are separate allocations, where this aliasing does not happen).
   Kokkos::View<Scalar**, Kokkos::LayoutRight, Kokkos::HostSpace> hy0("hy0", M,
                                                                     N);
   Kokkos::deep_copy(hy0, hy);
@@ -128,12 +128,13 @@ TEST(GemmEdges, BHalfSkinny) {
   check_gemm_edges<Kokkos::Experimental::bhalf_t>(13, 70, 67, 0.5f);
 }
 
-// Portability: Serial cannot field a team (max team size 1), so gemm must
-// take the naive fallback there -- same result, verified against the host
-// reference (team-capable backends, including CUDA above, run the tiled
-// kernel through the same gemm entry point).
-TEST(GemmEdges, PortableSerial) {
-  using Exec = Kokkos::Serial;
+// Portability: the host execution space cannot always field a team
+// (DefaultHostExecutionSpace is Serial with max team size 1 on CUDA and
+// Serial-only builds), so gemm must take the naive fallback there -- same
+// result, verified against the host reference (team-capable backends run
+// the tiled kernel through the same gemm entry point).
+TEST(GemmEdges, PortableHost) {
+  using Exec = Kokkos::DefaultHostExecutionSpace;
   KokkosDNN::DNNHandle<Exec> h;
   const int M = 13, N = 70, K = 67;
   Kokkos::View<float**, Kokkos::LayoutRight, Exec> X("X", M, K), W("W", N, K),
@@ -152,9 +153,10 @@ TEST(GemmEdges, PortableSerial) {
   Kokkos::deep_copy(X, hx);
   Kokkos::deep_copy(W, hw);
   Kokkos::deep_copy(Y, hy);
-  // Snapshot the beta input: on Serial the mirror hy aliases Y, so gemm
-  // would overwrite the reference values (host mirrors of device views
-  // are separate allocations, where this aliasing does not happen).
+  // Snapshot the beta input: on host execution spaces the mirror hy may
+  // alias Y, so gemm would overwrite the reference values (host mirrors of
+  // device views are separate allocations, where this aliasing does not
+  // happen).
   Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> hy0("hy0", M,
                                                                     N);
   Kokkos::deep_copy(hy0, hy);
@@ -168,6 +170,6 @@ TEST(GemmEdges, PortableSerial) {
       for (int k = 0; k < K; ++k) acc += hx(i, k) * hw(j, k);
       float want = 2.0f * acc + 0.5f * hy0(i, j);
       EXPECT_NEAR(got(i, j), want, 2e-3f)
-          << "serial gemm mismatch at (" << i << "," << j << ")";
+          << "host gemm mismatch at (" << i << "," << j << ")";
     }
 }

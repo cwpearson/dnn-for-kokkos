@@ -47,14 +47,11 @@ struct DNNHandle {
   mutable void* cudnn_ptr_  = nullptr;
 
   DNNHandle() {
-#if defined(KOKKOSDNN_ENABLE_CUBLAS) || defined(KOKKOSDNN_ENABLE_CUDNN)
-    constexpr bool is_cuda =
-        std::is_same_v<typename ExecSpace::memory_space,
-                       Kokkos::CudaSpace> ||
-        std::is_same_v<typename ExecSpace::memory_space,
-                       Kokkos::CudaUVMSpace> ||
-        std::is_same_v<typename ExecSpace::memory_space,
-                       Kokkos::CudaHostPinnedSpace>;
+#if (defined(KOKKOSDNN_ENABLE_CUBLAS) || defined(KOKKOSDNN_ENABLE_CUDNN)) && \
+    defined(KOKKOS_ENABLE_CUDA)
+    // Naming the backend here is deliberate: the TPL handles below are
+    // CUDA-only, so dispatch must key off the CUDA execution space itself.
+    constexpr bool is_cuda = std::is_same_v<ExecSpace, Kokkos::Cuda>;
     if constexpr (is_cuda) {
 #ifdef KOKKOSDNN_ENABLE_CUBLAS
       use_cublas = true;
@@ -103,11 +100,8 @@ struct DNNHandle {
   // Lifecycle in tpl/cublas/KokkosDNN_CuBLAS_Handle.hpp.
   void* cublas_raw() const {
 #if defined(KOKKOSDNN_ENABLE_CUBLAS) && defined(KOKKOS_ENABLE_CUDA)
-    constexpr bool is_cuda =
-        std::is_same_v<typename ExecSpace::memory_space,
-                       Kokkos::CudaSpace> ||
-        std::is_same_v<typename ExecSpace::memory_space,
-                       Kokkos::CudaUVMSpace>;
+    // See ctor: backend named deliberately, this handle is CUDA-only.
+    constexpr bool is_cuda = std::is_same_v<ExecSpace, Kokkos::Cuda>;
     if constexpr (is_cuda) {
       if (use_cublas && cublas_ptr_ == nullptr) {
         cublas_ptr_ = Impl::cublas_handle_create();
@@ -122,11 +116,8 @@ struct DNNHandle {
   // Lifecycle in tpl/cudnn/KokkosDNN_CuDNN_Handle.hpp.
   void* cudnn_raw() const {
 #if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)
-    constexpr bool is_cuda =
-        std::is_same_v<typename ExecSpace::memory_space,
-                       Kokkos::CudaSpace> ||
-        std::is_same_v<typename ExecSpace::memory_space,
-                       Kokkos::CudaUVMSpace>;
+    // See ctor: backend named deliberately, this handle is CUDA-only.
+    constexpr bool is_cuda = std::is_same_v<ExecSpace, Kokkos::Cuda>;
     if constexpr (is_cuda) {
       if (use_cudnn && cudnn_ptr_ == nullptr) {
         cudnn_ptr_ = Impl::cudnn_handle_create();

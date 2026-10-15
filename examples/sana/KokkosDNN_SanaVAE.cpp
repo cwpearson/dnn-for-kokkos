@@ -485,33 +485,16 @@ std::vector<float> Decoder<ExecSpace>::decode(const std::vector<float>& lat,
   return rgb;
 }
 
-// Explicit instantiations (float = checkpoint dtype).
-template void random_init<Kokkos::Serial>(const Config&, Weights<Kokkos::Serial>&,
+// Explicit instantiations (float = checkpoint dtype) on
+// DefaultExecutionSpace; other ExecSpaces instantiate implicitly from the
+// header. DefaultHostExecutionSpace is deliberately not instantiated: all
+// callers use DefaultExecutionSpace, and on CPU-only builds it aliases
+// DefaultExecutionSpace, where a second instantiation would be a duplicate.
+template void random_init<Kokkos::DefaultExecutionSpace>(const Config&, Weights<Kokkos::DefaultExecutionSpace>&,
                                          uint64_t);
-template void load_safetensors<Kokkos::Serial>(const Config&, const std::string&,
-                                              Weights<Kokkos::Serial>&);
-template class Decoder<Kokkos::Serial>;
-#ifdef KOKKOS_ENABLE_OPENMP
-template void random_init<Kokkos::OpenMP>(const Config&, Weights<Kokkos::OpenMP>&,
-                                         uint64_t);
-template void load_safetensors<Kokkos::OpenMP>(const Config&, const std::string&,
-                                              Weights<Kokkos::OpenMP>&);
-template class Decoder<Kokkos::OpenMP>;
-#endif
-#ifdef KOKKOS_ENABLE_CUDA
-template void random_init<Kokkos::Cuda>(const Config&, Weights<Kokkos::Cuda>&,
-                                       uint64_t);
-template void load_safetensors<Kokkos::Cuda>(const Config&, const std::string&,
-                                            Weights<Kokkos::Cuda>&);
-template class Decoder<Kokkos::Cuda>;
-#endif
-#ifdef KOKKOS_ENABLE_HIP
-template void random_init<Kokkos::HIP>(const Config&, Weights<Kokkos::HIP>&,
-                                      uint64_t);
-template void load_safetensors<Kokkos::HIP>(const Config&, const std::string&,
-                                           Weights<Kokkos::HIP>&);
-template class Decoder<Kokkos::HIP>;
-#endif
+template void load_safetensors<Kokkos::DefaultExecutionSpace>(const Config&, const std::string&,
+                                              Weights<Kokkos::DefaultExecutionSpace>&);
+template class Decoder<Kokkos::DefaultExecutionSpace>;
 
 }  // namespace VAE
 }  // namespace Sana
