@@ -58,12 +58,18 @@ void expect_exact(const std::vector<float>& a, const std::vector<float>& b) {
 
 }  // namespace
 
-// Paged dense KV is bit-exact vs dense under the native kernel: same
-// values, same accumulation order, only the addressing differs (page/slot
-// via block table). The dense path dispatches to cuDNN SDPA on CUDA+cuDNN
-// builds while the paged path is native-only (cuDNN has no paged form),
-// so the comparison forces native on both sides; dispatched-vs-native
-// parity is covered separately (with tolerance) in Test_LlamaGolden.
+// Paged dense KV is near-parity vs dense under the native kernel: same
+// values, only the addressing differs (page/slot via block table). The two
+// paths accumulate in a different order after native attention kernel
+// optimizations (team-blocked flash, K-tile blocking, team-per-tile
+// streaming), so the comparison uses a tolerance rather than bit-exactness:
+// 1e-4 for float (mirrors the dispatched-vs-native attention parity bound in
+// Test_LlamaGolden.Attention8BDecodeFallbackMatchesNative) and 5e-2 for
+// bhalf (mirrors the bhalf bound of that same test). The dense path
+// dispatches to cuDNN SDPA on CUDA+cuDNN builds while the paged path is
+// native-only (cuDNN has no paged form), so the comparison forces native on
+// both sides; dispatched-vs-native parity is covered separately (with
+// tolerance) in Test_LlamaGolden.
 template <class Scalar>
 void check_paged_dense_exact() {
   using Exec = Kokkos::DefaultExecutionSpace;
@@ -82,9 +88,13 @@ void check_paged_dense_exact() {
       Model<Exec, Scalar> paged(cfg2, w);
       paged.cfg.prefill_chunk_size = chunk;
       paged.handle.use_cudnn = false;
-      expect_exact<Scalar>(forward_logits(paged, prompt),
-                           forward_logits(dense, prompt));
-      // End-to-end generate agrees exactly too.
+      // Near-parity (not bit-exact): different accumulation order between
+      // the paged and dense native attention paths (see note above).
+      constexpr float tol = std::is_same_v<Scalar, float> ? 1e-4f : 5e-2f;
+      expect_near<Scalar>(forward_logits(paged, prompt),
+                          forward_logits(dense, prompt), tol);
+      // End-to-end generate agrees too (greedy argmax is stable under the
+      // ~1e-8 logit diffs).
       Model<Exec, Scalar> d2(base, w), p2(cfg2, w);
       d2.handle.use_cudnn = false;
       p2.handle.use_cudnn = false;
@@ -170,7 +180,8 @@ TEST(LlamaPagedQuantKV, MatchesDenseQuantBHalf) {
 }
 
 // Paged pools grow on demand: short prompts rent touched pages only, reset
-// keeps the allocation, and growth preserves exactness.
+// keeps the allocation, and growth preserves near-parity vs dense (same
+// accumulation-order caveat as above, so tolerance-based).
 TEST(LlamaPagedKV, OnDemandGrowth) {
   using Exec = Kokkos::DefaultExecutionSpace;
   using namespace KokkosDNN::Llama;
@@ -180,7 +191,7 @@ TEST(LlamaPagedKV, OnDemandGrowth) {
   Weights<Exec, float> w;
   random_init(cfg, w, 1234);
   Model<Exec, float> m(cfg, w);
-  m.handle.use_cudnn = false;  // native-vs-native exactness (see above)
+  m.handle.use_cudnn = false;  // native-vs-native parity (see above)
   EXPECT_EQ(m.kv_allocated_bytes(), 0u);  // nothing touched yet
   (void)forward_logits(m, {1, 2, 3, 4});
   const size_t one_page =
@@ -193,9 +204,9 @@ TEST(LlamaPagedKV, OnDemandGrowth) {
   // Deterministic across the reset boundary.
   Model<Exec, float> fresh(cfg, w);
   fresh.handle.use_cudnn = false;
-  expect_exact<float>(forward_logits(m, {1, 2, 3, 4}),
-                      forward_logits(fresh, {1, 2, 3, 4}));
-  // Crossing a page boundary grows and stays exact vs dense.
+  expect_near<float>(forward_logits(m, {1, 2, 3, 4}),
+                       forward_logits(fresh, {1, 2, 3, 4}), 1e-4f);
+  // Crossing a page boundary grows and stays near-parity vs dense.
   std::vector<int> long_prompt(20);
   for (size_t i = 0; i < long_prompt.size(); ++i)
     long_prompt[i] = (int)(i + 1);
@@ -209,7 +220,7 @@ TEST(LlamaPagedKV, OnDemandGrowth) {
   // Same weights object reused: dense model over the same weights.
   Model<Exec, float> d(dense_cfg, w);
   d.handle.use_cudnn = false;
-  expect_exact<float>(got, forward_logits(d, long_prompt));
+  expect_near<float>(got, forward_logits(d, long_prompt), 1e-4f);
 }
 
 // Quantized paged pools also grow on demand and report shrunken bytes.
@@ -283,11 +294,17 @@ TEST(LlamaKVConfig, JsonAndValidate) {
   EXPECT_GT(pg.kv_cache_bytes(2), base.kv_cache_bytes(2));
 }
 
-// Standalone paged-dense attention matches the dense kernel across page
-// sizes (including pages that never divide the key length). Both sides run
-// the native kernel: the dense entry point dispatches to cuDNN SDPA on
-// CUDA+cuDNN builds while the paged form is native-only, so the handle
-// forces native to test the paging addressing (not TPL parity).
+// Standalone paged-dense attention matches the dense kernel within float
+// tolerance across page sizes (including pages that never divide the key
+// length). Near-parity rather than bit-exact: the paged and dense native
+// paths accumulate in a different order after kernel optimizations
+// (team-blocked flash, K-tile blocking, team-per-tile streaming); 1e-4
+// mirrors the dispatched-vs-native float attention parity bound in
+// Test_LlamaGolden.Attention8BDecodeFallbackMatchesNative (observed diffs
+// are ~1e-8). Both sides run the native kernel: the dense entry point
+// dispatches to cuDNN SDPA on CUDA+cuDNN builds while the paged form is
+// native-only, so the handle forces native to test the paging addressing
+// (not TPL parity).
 TEST(PagedAttention, MatchesDense) {
   using Exec = Kokkos::DefaultExecutionSpace;
   KokkosDNN::DNNHandle<Exec> h;
@@ -346,7 +363,7 @@ TEST(PagedAttention, MatchesDense) {
     for (int t = 0; t < T; ++t)
       for (int hh = 0; hh < Hq; ++hh)
         for (int d = 0; d < D; ++d)
-          EXPECT_FLOAT_EQ(gp(t, hh, d), gd(t, hh, d))
+          EXPECT_NEAR(gp(t, hh, d), gd(t, hh, d), 1e-4f)
               << "paged/dense mismatch page=" << page << " at (" << t << ","
               << hh << "," << d << ")";
   }

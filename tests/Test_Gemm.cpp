@@ -94,6 +94,13 @@ void check_gemm_edges(int M, int N, int K, float tol) {
   Kokkos::deep_copy(X, hx);
   Kokkos::deep_copy(W, hw);
   Kokkos::deep_copy(Y, hy);
+  // Snapshot the beta input: on Serial the mirror hy aliases Y, so gemm
+  // would overwrite the reference values (same pattern as PortableSerial
+  // below; host mirrors of device views on team-capable backends are
+  // separate allocations, where this aliasing does not happen).
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, Kokkos::HostSpace> hy0("hy0", M,
+                                                                    N);
+  Kokkos::deep_copy(hy0, hy);
   const float alpha = 2.0f, beta = 0.5f;
   KokkosDNN::gemm(h, static_cast<Scalar>(alpha), X, W,
                   static_cast<Scalar>(beta), Y);
@@ -105,7 +112,7 @@ void check_gemm_edges(int M, int N, int K, float tol) {
       float acc = 0;
       for (int k = 0; k < K; ++k)
         acc += static_cast<float>(hx(i, k)) * static_cast<float>(hw(j, k));
-      float want = alpha * acc + beta * static_cast<float>(hy(i, j));
+      float want = alpha * acc + beta * static_cast<float>(hy0(i, j));
       EXPECT_NEAR(static_cast<float>(got(i, j)), want, tol)
           << "gemm edge mismatch at (" << i << "," << j << ") M=" << M
           << " N=" << N << " K=" << K;
