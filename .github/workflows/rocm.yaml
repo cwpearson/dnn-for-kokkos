@@ -17,6 +17,10 @@ on:
       - "docs/**"
       - ".github/workflows/docs.yaml"
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rocm:
     # Pinned to 24.04 (noble) to match the AMD package repositories below.

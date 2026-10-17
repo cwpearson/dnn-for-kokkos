@@ -18,6 +18,10 @@ on:
       - "docs/**"
       - ".github/workflows/docs.yaml"
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   cuda:
     runs-on: ubuntu-latest
