@@ -13,6 +13,9 @@
 #ifdef KOKKOSDNN_ENABLE_CUDNN
 #include "tpl/cudnn/KokkosDNN_CuDNN.hpp"
 #endif
+#if defined(KOKKOSDNN_ENABLE_MIOPEN) && defined(KOKKOS_ENABLE_HIP)
+#include "tpl/miopen/KokkosDNN_MIOpen.hpp"
+#endif
 
 namespace KokkosDNN {
 namespace Impl {
@@ -558,6 +561,31 @@ void attention_gqa_streaming(const DNNHandle<ExecSpace>& handle, const QView& q,
 #else
   (void)handle;
 #endif
+#if defined(KOKKOSDNN_ENABLE_MIOPEN) && defined(KOKKOS_ENABLE_HIP)
+  if constexpr (std::is_same_v<Scalar, float> ||
+                std::is_same_v<Scalar, Kokkos::Experimental::bhalf_t>) {
+    // HIP/MIOpen branch (mirrors the cuDNN block above): MIOpen exposes
+    // no fused SDPA (see tpl/miopen/KokkosDNN_MIOpen_Forward.hpp), so the
+    // try_miopen_* entry points decline by construction and execution
+    // falls through to the native kernel below. Wired for a future
+    // hipBLAS + MIOpen-softmax composition path.
+    constexpr bool is_hip = std::is_same_v<ExecSpace, Kokkos::HIP>;
+    if constexpr (is_hip) {
+      if (handle.use_miopen) {
+        if (sliding_window == 0) {
+          if (try_miopen_sdpa_gqa<Scalar>(handle, q, k, v, q_off, out, scale))
+            return;
+        } else {
+          if (try_miopen_sdpa_gqa_sliding<Scalar>(handle, q, k, v, q_off, out,
+                                                  scale, sliding_window))
+            return;
+        }
+      }
+    }
+  } else {
+    (void)handle;
+  }
+#endif
   const size_t T = q.extent(0), Hq = q.extent(1), D = q.extent(2);
   const size_t Hkv = k.extent(1);
   const size_t Ktot = k.extent(0);
@@ -693,7 +721,10 @@ void attention_gqa_softcap_streaming(const DNNHandle<ExecSpace>& handle,
   // validity alongside pad query rows. Emulating the mask with a bias
   // tensor would materialize O(T*K) mask state and still leave the tanh
   // unfused, so the native kernel below is the only path (exact by
-  // construction, no version-gated fallback to validate).
+  // construction, no version-gated fallback to validate). MIOpen likewise
+  // exposes no fused SDPA/softcap path (checked miopen.h 3.5.2: no
+  // attention/flash/SDPA API), so no HIP/MIOpen dispatch is attempted
+  // here either — native-only on every backend by construction.
   (void)handle;
   const size_t T = q.extent(0), Hq = q.extent(1), D = q.extent(2);
   const size_t Hkv = k.extent(1);
@@ -1478,6 +1509,24 @@ void attention_bidirectional_streaming(const DNNHandle<ExecSpace>& handle,
   }
 #else
   (void)handle;
+#endif
+#if defined(KOKKOSDNN_ENABLE_MIOPEN) && defined(KOKKOS_ENABLE_HIP)
+  if constexpr (std::is_same_v<Scalar, float> ||
+                std::is_same_v<Scalar, Kokkos::Experimental::bhalf_t>) {
+    // HIP/MIOpen branch (mirrors the cuDNN block above): MIOpen exposes
+    // no fused SDPA (see tpl/miopen/KokkosDNN_MIOpen_Forward.hpp), so
+    // try_miopen_sdpa_bidir declines by construction and execution falls
+    // through to the native kernel below. Wired for a future hipBLAS +
+    // MIOpen-softmax composition path.
+    constexpr bool is_hip = std::is_same_v<ExecSpace, Kokkos::HIP>;
+    if constexpr (is_hip) {
+      if (handle.use_miopen &&
+          try_miopen_sdpa_bidir<Scalar>(handle, q, k, v, out, eff))
+        return;
+    }
+  } else {
+    (void)handle;
+  }
 #endif
 
   // Native path: single-kernel team-blocked FlashAttention-style kernel
