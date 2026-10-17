@@ -18,6 +18,8 @@ option(KokkosDNN_ENABLE_EXAMPLES "Build examples" ON)
 option(KokkosDNN_ENABLE_BENCHMARKS "Build benchmarks (Google Benchmark)" OFF)
 option(KokkosDNN_ENABLE_CUBLAS "Dispatch GEMM to cuBLAS when ExecSpace is CUDA" OFF)
 option(KokkosDNN_ENABLE_CUDNN "Dispatch attention to cuDNN SDPA when ExecSpace is CUDA" OFF)
+option(KokkosDNN_ENABLE_HIPBLAS "Dispatch GEMM to hipBLAS when ExecSpace is HIP" OFF)
+option(KokkosDNN_ENABLE_MIOPEN "Dispatch conv/attention-helpers to MIOpen when ExecSpace is HIP" OFF)
 option(KokkosDNN_ENABLE_IMAGE "Build optional image I/O component (stb-based decode, JPEG/PNG/BMP)" OFF)
 option(KokkosDNN_ENABLE_COMPILER_WARNINGS "Enable compiler warnings" OFF)
 option(BUILD_SHARED_LIBS "Build shared libraries" OFF)
@@ -37,6 +39,32 @@ function(kokkosdnn_discover_tests TARGET)
     gtest_discover_tests(${TARGET} ${ARGN})
   endif()
 endfunction()
+
+# ---------------------------------------------------------------------------
+# Options are mixed-case (KokkosDNN_ENABLE_*) but the config header and
+# compile definitions use ALL_CAPS (KOKKOSDNN_ENABLE_*). CMake variables are
+# case-sensitive, so #cmakedefine KOKKOSDNN_ENABLE_* would otherwise always
+# see an undefined variable and emit /* #undef ... */ even when the option
+# is ON. Bridge explicitly. Also accept the all-caps -D spelling (a common
+# mistake given the macro name) by promoting it to the canonical option.
+# NOTE: this must run before the find_package calls below, so the promoted
+# option value is what the dependency search sees.
+# ---------------------------------------------------------------------------
+if(KOKKOSDNN_ENABLE_CUBLAS AND NOT KokkosDNN_ENABLE_CUBLAS)
+  set(KokkosDNN_ENABLE_CUBLAS ON)
+endif()
+if(KOKKOSDNN_ENABLE_CUDNN AND NOT KokkosDNN_ENABLE_CUDNN)
+  set(KokkosDNN_ENABLE_CUDNN ON)
+endif()
+if(KOKKOSDNN_ENABLE_HIPBLAS AND NOT KokkosDNN_ENABLE_HIPBLAS)
+  set(KokkosDNN_ENABLE_HIPBLAS ON)
+endif()
+if(KOKKOSDNN_ENABLE_MIOPEN AND NOT KokkosDNN_ENABLE_MIOPEN)
+  set(KokkosDNN_ENABLE_MIOPEN ON)
+endif()
+if(KOKKOSDNN_ENABLE_IMAGE AND NOT KokkosDNN_ENABLE_IMAGE)
+  set(KokkosDNN_ENABLE_IMAGE ON)
+endif()
 
 # ---------------------------------------------------------------------------
 # Dependencies
@@ -83,26 +111,41 @@ if(KokkosDNN_ENABLE_CUDNN)
   find_package(CUDAToolkit REQUIRED)
 endif()
 
+if(KokkosDNN_ENABLE_HIPBLAS)
+  # hipblas ships hipblas-config.cmake under ${ROCM_PATH}/lib/cmake/hipblas.
+  # ROCM_PATH=/opt/rocm/core-7.14 is in the environment on our ROCm runners;
+  # add it to the search prefix so a bare find_package works without -D flags.
+  if(DEFINED ENV{ROCM_PATH})
+    list(APPEND CMAKE_PREFIX_PATH $ENV{ROCM_PATH})
+  endif()
+  find_package(hipblas REQUIRED)
+endif()
+
+if(KokkosDNN_ENABLE_MIOPEN)
+  # MIOpen ships miopen-config.cmake in recent releases; fall back to manual find.
+  find_package(miopen QUIET)
+  if(NOT miopen_FOUND)
+    if(DEFINED ENV{ROCM_PATH})
+      list(APPEND CMAKE_PREFIX_PATH $ENV{ROCM_PATH})
+    endif()
+    find_path(MIOPEN_INCLUDE_DIR miopen/miopen.h
+      HINTS ${MIOPEN_ROOT} $ENV{MIOPEN_ROOT} $ENV{ROCM_PATH}/include /opt/rocm/include)
+    find_library(MIOPEN_LIBRARY MIOpen
+      HINTS ${MIOPEN_ROOT} $ENV{MIOPEN_ROOT} $ENV{ROCM_PATH}/lib /opt/rocm/lib)
+    include(FindPackageHandleStandardArgs)
+    find_package_handle_standard_args(MIOpen DEFAULT_MSG MIOPEN_LIBRARY MIOPEN_INCLUDE_DIR)
+  endif()
+endif()
+
 # ---------------------------------------------------------------------------
 # Generated config header
 # ---------------------------------------------------------------------------
-# Options are mixed-case (KokkosDNN_ENABLE_*) but the config header and
-# compile definitions use ALL_CAPS (KOKKOSDNN_ENABLE_*). CMake variables are
-# case-sensitive, so #cmakedefine KOKKOSDNN_ENABLE_* would otherwise always
-# see an undefined variable and emit /* #undef ... */ even when the option
-# is ON. Bridge explicitly. Also accept the all-caps -D spelling (a common
-# mistake given the macro name) by promoting it to the canonical option.
-if(KOKKOSDNN_ENABLE_CUBLAS AND NOT KokkosDNN_ENABLE_CUBLAS)
-  set(KokkosDNN_ENABLE_CUBLAS ON)
-endif()
-if(KOKKOSDNN_ENABLE_CUDNN AND NOT KokkosDNN_ENABLE_CUDNN)
-  set(KokkosDNN_ENABLE_CUDNN ON)
-endif()
-if(KOKKOSDNN_ENABLE_IMAGE AND NOT KokkosDNN_ENABLE_IMAGE)
-  set(KokkosDNN_ENABLE_IMAGE ON)
-endif()
+# KOKKOSDNN_ENABLE_* spelling bridged to the canonical options above;
+# here we just copy the values to the ALL_CAPS names configure_file sees.
 set(KOKKOSDNN_ENABLE_CUBLAS ${KokkosDNN_ENABLE_CUBLAS})
 set(KOKKOSDNN_ENABLE_CUDNN ${KokkosDNN_ENABLE_CUDNN})
+set(KOKKOSDNN_ENABLE_HIPBLAS ${KokkosDNN_ENABLE_HIPBLAS})
+set(KOKKOSDNN_ENABLE_MIOPEN ${KokkosDNN_ENABLE_MIOPEN})
 set(KOKKOSDNN_ENABLE_IMAGE ${KokkosDNN_ENABLE_IMAGE})
 configure_file(cmake/KokkosDNN_config.h.in
   ${CMAKE_CURRENT_BINARY_DIR}/KokkosDNN_config.h @ONLY)
@@ -137,6 +180,18 @@ if(KokkosDNN_ENABLE_CUDNN)
   # The frontend's experimental engines call NVRTC; link it so consumers
   # of libkokkosdnn (tests, examples, benchmarks) resolve nvrtc* symbols.
   target_link_libraries(kokkosdnn PUBLIC CUDA::nvrtc CUDA::cudart)
+endif()
+
+if(KokkosDNN_ENABLE_HIPBLAS)
+  target_link_libraries(kokkosdnn PUBLIC roc::hipblas)
+endif()
+if(KokkosDNN_ENABLE_MIOPEN)
+  if(TARGET MIOpen)
+    target_link_libraries(kokkosdnn PUBLIC MIOpen)
+  elseif(MIOPEN_LIBRARY)
+    target_include_directories(kokkosdnn PUBLIC ${MIOPEN_INCLUDE_DIR})
+    target_link_libraries(kokkosdnn PUBLIC ${MIOPEN_LIBRARY})
+  endif()
 endif()
 
 if(KokkosDNN_ENABLE_COMPILER_WARNINGS)

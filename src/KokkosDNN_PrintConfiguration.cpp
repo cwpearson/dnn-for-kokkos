@@ -17,6 +17,16 @@ void print_configuration(std::ostream& os) {
 #else
   os << "  cuDNN SDPA dispatch: OFF (native Kokkos attention)\n";
 #endif
+#ifdef KOKKOSDNN_ENABLE_HIPBLAS
+  os << "  hipBLAS dispatch: ON\n";
+#else
+  os << "  hipBLAS dispatch: OFF (native Kokkos GEMM)\n";
+#endif
+#ifdef KOKKOSDNN_ENABLE_MIOPEN
+  os << "  MIOpen dispatch: ON\n";
+#else
+  os << "  MIOpen dispatch: OFF (native Kokkos conv/attention)\n";
+#endif
   os << "  Kokkos backends:";
 #ifdef KOKKOS_ENABLE_SERIAL
   os << " Serial";
