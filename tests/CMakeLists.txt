@@ -28,6 +28,7 @@ kokkosdnn_add_test(test_gemmaops Test_GemmaOps.cpp)
 kokkosdnn_add_test(test_gguf Test_GGUF.cpp)
 kokkosdnn_add_test(test_moe Test_MoE.cpp)
 kokkosdnn_add_test(test_conv1d Test_Conv1D.cpp)
+kokkosdnn_add_test(test_mossimage Test_MossImageOps.cpp)
 
 if(KokkosDNN_ENABLE_IMAGE)
   kokkosdnn_add_test(test_image Test_Image.cpp)
