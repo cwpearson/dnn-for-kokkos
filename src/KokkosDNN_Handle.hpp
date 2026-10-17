@@ -15,6 +15,12 @@
 #ifdef KOKKOSDNN_ENABLE_CUDNN
 #include "tpl/cudnn/KokkosDNN_CuDNN_Handle.hpp"
 #endif
+#ifdef KOKKOSDNN_ENABLE_HIPBLAS
+#include "tpl/hipblas/KokkosDNN_HIPBLAS_Handle.hpp"
+#endif
+#ifdef KOKKOSDNN_ENABLE_MIOPEN
+#include "tpl/miopen/KokkosDNN_MIOpen_Handle.hpp"
+#endif
 
 namespace KokkosDNN {
 
@@ -35,16 +41,29 @@ namespace KokkosDNN {
 // Ownership: non-copyable, movable (transfers the cached handles).
 // Destroying the handle after Kokkos::finalize() is a programming error;
 // TPL teardown may fail silently there, matching plain cuBLAS/cuDNN usage.
+//
+// The AMD contract mirrors the CUDA one: use_hipblas/use_miopen record
+// whether hipBLAS/MIOpen dispatch is active (HIP execution space with the
+// matching TPL enabled); hipblas_raw()/miopen_raw() lazily create one
+// cached handle each via Impl::hipblas_handle_create() /
+// Impl::miopen_handle_create() (see tpl/hipblas/KokkosDNN_HIPBLAS_Handle.hpp
+// and tpl/miopen/KokkosDNN_MIOpen_Handle.hpp), re-selecting the Kokkos HIP
+// stream per use. Opaque void* keeps this header free of TPL types.
 template <class ExecSpace>
 struct DNNHandle {
-  bool use_cublas = false;
-  bool use_cudnn  = false;
+  bool use_cublas  = false;
+  bool use_cudnn   = false;
+  bool use_hipblas = false;
+  bool use_miopen  = false;
 
-  // Opaque cached TPL handles (cublasHandle_t / cudnnHandle_t when the
-  // matching TPL is enabled on a CUDA build, nullptr otherwise). void*
-  // keeps this header free of TPL types on builds that lack them.
-  mutable void* cublas_ptr_ = nullptr;
-  mutable void* cudnn_ptr_  = nullptr;
+  // Opaque cached TPL handles (cublasHandle_t / cudnnHandle_t /
+  // hipblasHandle_t / miopenHandle_t when the matching TPL is enabled on a
+  // matching-backend build, nullptr otherwise). void* keeps this header
+  // free of TPL types on builds that lack them.
+  mutable void* cublas_ptr_  = nullptr;
+  mutable void* cudnn_ptr_   = nullptr;
+  mutable void* hipblas_ptr_ = nullptr;
+  mutable void* miopen_ptr_  = nullptr;
 
   DNNHandle() {
 #if (defined(KOKKOSDNN_ENABLE_CUBLAS) || defined(KOKKOSDNN_ENABLE_CUDNN)) && \
@@ -61,6 +80,20 @@ struct DNNHandle {
 #endif
     }
 #endif
+#if (defined(KOKKOSDNN_ENABLE_HIPBLAS) || defined(KOKKOSDNN_ENABLE_MIOPEN)) && \
+    defined(KOKKOS_ENABLE_HIP)
+    // Naming the backend here is deliberate: the TPL handles below are
+    // HIP-only, so dispatch must key off the HIP execution space itself.
+    constexpr bool is_hip = std::is_same_v<ExecSpace, Kokkos::HIP>;
+    if constexpr (is_hip) {
+#ifdef KOKKOSDNN_ENABLE_HIPBLAS
+      use_hipblas = true;
+#endif
+#ifdef KOKKOSDNN_ENABLE_MIOPEN
+      use_miopen = true;
+#endif
+    }
+#endif
   }
 
   ~DNNHandle() { destroy(); }
@@ -71,25 +104,41 @@ struct DNNHandle {
   DNNHandle(DNNHandle&& other) noexcept
       : use_cublas(other.use_cublas),
         use_cudnn(other.use_cudnn),
+        use_hipblas(other.use_hipblas),
+        use_miopen(other.use_miopen),
         cublas_ptr_(other.cublas_ptr_),
-        cudnn_ptr_(other.cudnn_ptr_) {
-    other.use_cublas  = false;
-    other.use_cudnn   = false;
-    other.cublas_ptr_ = nullptr;
-    other.cudnn_ptr_  = nullptr;
+        cudnn_ptr_(other.cudnn_ptr_),
+        hipblas_ptr_(other.hipblas_ptr_),
+        miopen_ptr_(other.miopen_ptr_) {
+    other.use_cublas   = false;
+    other.use_cudnn    = false;
+    other.use_hipblas  = false;
+    other.use_miopen   = false;
+    other.cublas_ptr_  = nullptr;
+    other.cudnn_ptr_   = nullptr;
+    other.hipblas_ptr_ = nullptr;
+    other.miopen_ptr_  = nullptr;
   }
 
   DNNHandle& operator=(DNNHandle&& other) noexcept {
     if (this != &other) {
       destroy();
-      use_cublas  = other.use_cublas;
-      use_cudnn   = other.use_cudnn;
-      cublas_ptr_ = other.cublas_ptr_;
-      cudnn_ptr_  = other.cudnn_ptr_;
-      other.use_cublas  = false;
-      other.use_cudnn   = false;
-      other.cublas_ptr_ = nullptr;
-      other.cudnn_ptr_  = nullptr;
+      use_cublas   = other.use_cublas;
+      use_cudnn    = other.use_cudnn;
+      use_hipblas  = other.use_hipblas;
+      use_miopen   = other.use_miopen;
+      cublas_ptr_  = other.cublas_ptr_;
+      cudnn_ptr_   = other.cudnn_ptr_;
+      hipblas_ptr_ = other.hipblas_ptr_;
+      miopen_ptr_  = other.miopen_ptr_;
+      other.use_cublas   = false;
+      other.use_cudnn    = false;
+      other.use_hipblas  = false;
+      other.use_miopen   = false;
+      other.cublas_ptr_  = nullptr;
+      other.cudnn_ptr_   = nullptr;
+      other.hipblas_ptr_ = nullptr;
+      other.miopen_ptr_  = nullptr;
     }
     return *this;
   }
@@ -128,8 +177,40 @@ struct DNNHandle {
     return nullptr;
   }
 
- private:
-  void destroy() {
+  // Lazily created cached hipBLAS handle (nullptr contract as above).
+  // Lifecycle in tpl/hipblas/KokkosDNN_HIPBLAS_Handle.hpp.
+  void* hipblas_raw() const {
+#if defined(KOKKOSDNN_ENABLE_HIPBLAS) && defined(KOKKOS_ENABLE_HIP)
+    // See ctor: backend named deliberately, this handle is HIP-only.
+    constexpr bool is_hip = std::is_same_v<ExecSpace, Kokkos::HIP>;
+    if constexpr (is_hip) {
+      if (use_hipblas && hipblas_ptr_ == nullptr) {
+        hipblas_ptr_ = Impl::hipblas_handle_create();
+      }
+      return hipblas_ptr_;
+    }
+#endif
+    return nullptr;
+  }
+
+  // Lazily created cached MIOpen handle (nullptr contract as above).
+  // Lifecycle in tpl/miopen/KokkosDNN_MIOpen_Handle.hpp.
+  void* miopen_raw() const {
+#if defined(KOKKOSDNN_ENABLE_MIOPEN) && defined(KOKKOS_ENABLE_HIP)
+    // See ctor: backend named deliberately, this handle is HIP-only.
+    constexpr bool is_hip = std::is_same_v<ExecSpace, Kokkos::HIP>;
+    if constexpr (is_hip) {
+      if (use_miopen && miopen_ptr_ == nullptr) {
+        miopen_ptr_ = Impl::miopen_handle_create();
+      }
+      return miopen_ptr_;
+    }
+#endif
+    return nullptr;
+  }
+
+  private:
+   void destroy() {
 #if defined(KOKKOSDNN_ENABLE_CUBLAS) && defined(KOKKOS_ENABLE_CUDA)
     Impl::cublas_handle_destroy(cublas_ptr_);
 #else
@@ -139,6 +220,16 @@ struct DNNHandle {
     Impl::cudnn_handle_destroy(cudnn_ptr_);
 #else
     cudnn_ptr_ = nullptr;
+#endif
+#if defined(KOKKOSDNN_ENABLE_HIPBLAS) && defined(KOKKOS_ENABLE_HIP)
+    Impl::hipblas_handle_destroy(hipblas_ptr_);
+#else
+    hipblas_ptr_ = nullptr;
+#endif
+#if defined(KOKKOSDNN_ENABLE_MIOPEN) && defined(KOKKOS_ENABLE_HIP)
+    Impl::miopen_handle_destroy(miopen_ptr_);
+#else
+    miopen_ptr_ = nullptr;
 #endif
   }
 };
