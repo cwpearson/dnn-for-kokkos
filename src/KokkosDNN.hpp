@@ -28,6 +28,7 @@
 #include "KokkosDNN_GGUF.hpp"
 #include "KokkosDNN_MoE.hpp"
 #include "KokkosDNN_Conv1D.hpp"
+#include "KokkosDNN_MossImage.hpp"
 
 #ifdef KOKKOSDNN_ENABLE_IMAGE
 #include "images/KokkosDNN_Image.hpp"
