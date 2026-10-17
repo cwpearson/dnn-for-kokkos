@@ -11,6 +11,9 @@
 #ifdef KOKKOSDNN_ENABLE_CUBLAS
 #include "tpl/cublas/KokkosDNN_CuBLAS.hpp"
 #endif
+#ifdef KOKKOSDNN_ENABLE_HIPBLAS
+#include "tpl/hipblas/KokkosDNN_HIPBLAS.hpp"
+#endif
 
 namespace KokkosDNN {
 namespace Impl {
@@ -21,6 +24,8 @@ namespace Impl {
 // Dispatch ladder for gemm() below:
 //   1. cuBLAS on CUDA with handle.use_cublas: sgemm for float,
 //      cublasGemmEx (R_16BF I/O, FP32 accumulate) for bhalf_t -- TPL.
+//      hipBLAS on HIP with handle.use_hipblas mirrors this (hipblasSgemm /
+//      hipblasGemmEx, HIP_R_16BF I/O, FP32 accumulate) -- TPL.
 //   2. Portable tiled TeamPolicy kernel (all team-capable backends, all
 //      scalars) -- TeamPolicy + team scratch, no backend-gated code, no raw
 //      CUDA/cub/wmma intrinsics. FP32 accumulation, result cast to Scalar.
@@ -643,7 +648,9 @@ void gemv_native(
 // result is cast back to Scalar. Dispatch ladder on CUDA: float goes to
 // cuBLAS sgemm and bhalf_t to cublasGemmEx (BF16 I/O, FP32 accumulate)
 // on the handle's cached cuBLAS handle (created once per DNNHandle, stream
-// re-selected per call); anything else (or a cuBLAS failure) uses the
+// re-selected per call); on HIP the same ladder runs through hipBLAS
+// (hipblasSgemm / hipblasGemmEx via the handle's cached hipBLAS handle);
+// anything else (or a TPL failure) uses the
 // portable shared-memory tiled kernel in Impl (design notes there), with
 // thin-fine/mid small-M specializations (TM=16/TN=32/TK=64 for M <= 16,
 // TM=32/TN=64/TK=32 for M <= 64) -- except rank-2 M == 1, which reuses the
@@ -693,6 +700,40 @@ void gemm(const DNNHandle<ExecSpace>& handle, Scalar alpha,
 #else
   (void)handle;
 #endif
+#if defined(KOKKOSDNN_ENABLE_HIPBLAS) && defined(KOKKOS_ENABLE_HIP)
+  // Backend named deliberately: hipBLAS dispatch genuinely requires HIP.
+  // Mirror of the cuBLAS block above (hipblasSgemm / hipblasGemmEx on the
+  // handle's cached hipBLAS handle, stream re-selected per call).
+  constexpr bool is_hip = std::is_same_v<ExecSpace, Kokkos::HIP>;
+  if constexpr (is_hip) {
+    if (handle.use_hipblas) {
+      void* raw = handle.hipblas_raw();
+      if (raw != nullptr) {
+        // No fence here: hipblas_*_with_handle() re-selects the Kokkos HIP
+        // stream on the cached handle every call, so hipBLAS work is ordered
+        // with surrounding Kokkos kernels on that stream.
+        bool ok = false;
+        auto h  = static_cast<hipblasHandle_t>(raw);
+        if constexpr (std::is_same_v<Scalar, float>) {
+          ok = Impl::hipblas_gemm_nt_with_handle(
+              h, static_cast<int>(M), static_cast<int>(N),
+              static_cast<int>(K), alpha, X.data(), W.data(), beta, Y.data());
+        } else if constexpr (std::is_same_v<
+                                 Scalar, Kokkos::Experimental::bhalf_t>) {
+          // FP32 alpha/beta: hipblasGemmEx with HIPBLAS_COMPUTE_32F matches
+          // the native kernel's FP32 accumulation.
+          ok = Impl::hipblas_gemm_nt_bf16_with_handle(
+              h, static_cast<int>(M), static_cast<int>(N),
+              static_cast<int>(K), static_cast<float>(alpha), X.data(),
+              W.data(), static_cast<float>(beta), Y.data());
+        }
+        if (ok) return;
+        // else fall through to native (unsupported scalar or hipBLAS failure,
+        // e.g. no BF16 support on the arch)
+      }
+    }
+  }
+#endif
   // Native: rank-2 M == 1 is the same working set as GEMV (lm_head/vocab
   // row), so it reuses the team-per-row GEMV kernel with alpha/beta (one
   // team per N-row, vector-parallel K) instead of the tiled GEMM; M > 1
@@ -712,8 +753,8 @@ void gemm(const DNNHandle<ExecSpace>& handle, Scalar alpha,
 // Rank-1 (single token) variant used in decode: y[n] = sum_k x[k]*W[n,k].
 // This is GEMM with M=1 at the pointer level, so it shares gemm's full
 // dispatch ladder: cuBLAS on the handle's cached handle for float/bhalf_t
-// on CUDA (sgemm / cublasGemmEx, FP32 accumulation), native kernel
-// otherwise. The Llama lm_head (last-token hidden -> vocab logits) calls
+// on CUDA (sgemm / cublasGemmEx, FP32 accumulation), hipBLAS mirror on HIP,
+// native kernel otherwise. The Llama lm_head (last-token hidden -> vocab logits) calls
 // this, replacing the old naive parallel_for(vocab) head.
 template <class ExecSpace, class Scalar>
 void gemv(const DNNHandle<ExecSpace>& handle,
@@ -754,6 +795,36 @@ void gemv(const DNNHandle<ExecSpace>& handle,
   }
 #else
   (void)handle;
+#endif
+#if defined(KOKKOSDNN_ENABLE_HIPBLAS) && defined(KOKKOS_ENABLE_HIP)
+  // Backend named deliberately: hipBLAS dispatch genuinely requires HIP.
+  // Mirror of the cuBLAS block above (M=1 path).
+  constexpr bool is_hip = std::is_same_v<ExecSpace, Kokkos::HIP>;
+  if constexpr (is_hip) {
+    if (handle.use_hipblas && N > 0 && K > 0) {
+      void* raw = handle.hipblas_raw();
+      if (raw != nullptr) {
+        // No fence here: hipblas_*_with_handle() re-selects the Kokkos HIP
+        // stream on the cached handle every call, so hipBLAS work is ordered
+        // with surrounding Kokkos kernels on that stream.
+        bool ok = false;
+        auto h  = static_cast<hipblasHandle_t>(raw);
+        if constexpr (std::is_same_v<Scalar, float>) {
+          ok = Impl::hipblas_gemm_nt_with_handle(h, 1, static_cast<int>(N),
+                                                static_cast<int>(K), 1.0f,
+                                                x.data(), W.data(), 0.0f,
+                                                y.data());
+        } else if constexpr (std::is_same_v<
+                                 Scalar, Kokkos::Experimental::bhalf_t>) {
+          ok = Impl::hipblas_gemm_nt_bf16_with_handle(
+              h, 1, static_cast<int>(N), static_cast<int>(K), 1.0f, x.data(),
+              W.data(), 0.0f, y.data());
+        }
+        if (ok) return;
+        // else fall through to native (unsupported scalar or hipBLAS failure)
+      }
+    }
+  }
 #endif
   if (N == 0 || K == 0) return;
   // Native: team-per-row GEMV (one team per N-row, vector-parallel K over
