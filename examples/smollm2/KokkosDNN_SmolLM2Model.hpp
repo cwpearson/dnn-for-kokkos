@@ -50,7 +50,7 @@ template <class ExecSpace, class Scalar = DefaultScalar>
 class Model {
  public:
   using MatR = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
-  using View3 = Kokkos::View<Scalar***, ExecSpace>;
+  using View3 = Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>;
   using View1 = Kokkos::View<Scalar*, ExecSpace>;
   using ViewInt = Kokkos::View<int*, ExecSpace>;
   using HostInt = typename ViewInt::host_mirror_type;
