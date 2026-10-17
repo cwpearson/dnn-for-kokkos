@@ -1,5 +1,5 @@
-// MoE routing (top-k select + softmax weights), expert weighted-sum helper,
-// and fused per-head QK RMSNorm vs host references.
+// MoE routing (top-k select + softmax/sigmoid weights), expert weighted-sum
+// helper, and fused per-head QK RMSNorm vs host references.
 #include <gtest/gtest.h>
 
 #include <Kokkos_Core.hpp>
@@ -252,6 +252,183 @@ TEST(MoE, RejectsBadArgs) {
       bad_y("bad_y", 2, 4);
   EXPECT_THROW(
       (KokkosDNN::moe_expert_weighted_sum<Exec, float>(eo, w, bad_y)),
+      std::invalid_argument);
+}
+
+// Independent host reference for sigmoid routing (HF Lfm2MoeTopKRouter):
+// selection over sigmoid(logit) + bias, weights are gathered sigmoids
+// (bias excluded), renormalized over K with the HF 1e-6 epsilon when
+// norm_topk, times scale.
+void host_moe_sigmoid_ref(const std::vector<std::vector<float>>& logits,
+                          const std::vector<float>& bias, int K, bool norm_topk,
+                          float scale, std::vector<std::vector<int>>& idx,
+                          std::vector<std::vector<float>>& w) {
+  const size_t T = logits.size(), E = logits[0].size();
+  auto sig = [](float s) { return 1.0f / (1.0f + std::exp(-s)); };
+  idx.assign(T, std::vector<int>(K, -1));
+  w.assign(T, std::vector<float>(K, 0));
+  for (size_t t = 0; t < T; ++t) {
+    std::vector<int> order(E);
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+      float sa = sig(logits[t][a]) + (bias.empty() ? 0.0f : bias[a]);
+      float sb = sig(logits[t][b]) + (bias.empty() ? 0.0f : bias[b]);
+      return sa > sb;
+    });
+    float denom = 1e-6f;
+    if (norm_topk) {
+      for (int k = 0; k < K; ++k) denom += sig(logits[t][order[k]]);
+    }
+    for (int k = 0; k < K; ++k) {
+      idx[t][k] = order[k];
+      const float s = sig(logits[t][order[k]]);
+      w[t][k]     = norm_topk ? s / denom * scale : s * scale;
+    }
+  }
+}
+
+void run_route_sigmoid(const std::vector<std::vector<float>>& logits,
+                       const std::vector<float>& bias, int K, bool norm_topk,
+                       float scale,
+                       Kokkos::View<int**, Kokkos::LayoutRight, Exec>& idx,
+                       Kokkos::View<float**, Kokkos::LayoutRight, Exec>& w) {
+  const size_t T = logits.size(), E = logits[0].size();
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> lg("lg", T, E);
+  auto hlg = Kokkos::create_mirror_view(lg);
+  for (size_t t = 0; t < T; ++t)
+    for (size_t e = 0; e < E; ++e) hlg(t, e) = logits[t][e];
+  Kokkos::deep_copy(lg, hlg);
+  Kokkos::View<float*, Exec> b("b", bias.size());
+  if (!bias.empty()) {
+    auto hb = Kokkos::create_mirror_view(b);
+    for (size_t e = 0; e < bias.size(); ++e) hb(e) = bias[e];
+    Kokkos::deep_copy(b, hb);
+  }
+  KokkosDNN::moe_route_sigmoid<Exec, float>(lg, b, K, norm_topk, scale, idx, w);
+  Kokkos::fence();
+}
+
+TEST(MoE, SigmoidMatchesHost) {
+  const auto logits = fixed_logits();
+  const size_t T = logits.size(), E = logits[0].size();
+  const int K = 2;
+  for (bool norm_topk : {true, false}) {
+    Kokkos::View<int**, Kokkos::LayoutRight, Exec> idx("idx", T, K);
+    Kokkos::View<float**, Kokkos::LayoutRight, Exec> w("w", T, K);
+    run_route_sigmoid(logits, {}, K, norm_topk, 1.0f, idx, w);
+    std::vector<std::vector<int>> ridx;
+    std::vector<std::vector<float>> rw;
+    host_moe_sigmoid_ref(logits, {}, K, norm_topk, 1.0f, ridx, rw);
+    auto gidx = Kokkos::create_mirror_view(idx);
+    auto gw   = Kokkos::create_mirror_view(w);
+    Kokkos::deep_copy(gidx, idx);
+    Kokkos::deep_copy(gw, w);
+    for (size_t t = 0; t < T; ++t) {
+      for (int k = 0; k < K; ++k) {
+        EXPECT_EQ(gidx(t, k), ridx[t][k])
+            << " at (" << t << "," << k << ") norm_topk=" << norm_topk;
+        EXPECT_NEAR(gw(t, k), rw[t][k], 1e-5f)
+            << " at (" << t << "," << k << ") norm_topk=" << norm_topk;
+      }
+      if (norm_topk) {
+        float sum = 0.0f;
+        for (int k = 0; k < K; ++k) sum += gw(t, k);
+        // HF renormalizes by sum + 1e-6, so weights sum to just under 1.
+        EXPECT_NEAR(sum, 1.0f, 2e-5f) << " at t=" << t;
+      }
+    }
+  }
+  (void)E;
+}
+
+TEST(MoE, SigmoidBiasSelectsButDoesNotWeight) {
+  // Bias shifts selection (expert 3 wins) but the weights are pure
+  // renormalized sigmoids: zeroing the bias of a non-selected expert must
+  // not change the weights, and the biased run must match a host reference
+  // that excludes the bias from the weights.
+  const auto logits = fixed_logits();
+  const size_t T = logits.size(), E = logits[0].size();
+  const int K = 2;
+  std::vector<float> bias(E, 0.0f);
+  bias[3] = 10.0f;
+  Kokkos::View<int**, Kokkos::LayoutRight, Exec> idx("idx", T, K);
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> w("w", T, K);
+  run_route_sigmoid(logits, bias, K, true, 1.0f, idx, w);
+  std::vector<std::vector<int>> ridx;
+  std::vector<std::vector<float>> rw;
+  host_moe_sigmoid_ref(logits, bias, K, true, 1.0f, ridx, rw);
+  auto gidx = Kokkos::create_mirror_view(idx);
+  auto gw   = Kokkos::create_mirror_view(w);
+  Kokkos::deep_copy(gidx, idx);
+  Kokkos::deep_copy(gw, w);
+  for (size_t t = 0; t < T; ++t) {
+    EXPECT_EQ(gidx(t, 0), 3) << " biased expert must win at t=" << t;
+    for (int k = 0; k < K; ++k) {
+      EXPECT_EQ(gidx(t, k), ridx[t][k]);
+      EXPECT_NEAR(gw(t, k), rw[t][k], 1e-5f) << " at (" << t << "," << k << ")";
+    }
+    // Weights are bias-free sigmoids: sigmoid(l)/(sigmoid(l0)+sigmoid(l1)).
+    auto sig = [](float s) { return 1.0f / (1.0f + std::exp(-s)); };
+    const float s0 = sig(logits[t][static_cast<size_t>(gidx(t, 0))]);
+    const float s1 = sig(logits[t][static_cast<size_t>(gidx(t, 1))]);
+    EXPECT_NEAR(gw(t, 0), s0 / (s0 + s1 + 1e-6f), 1e-5f)
+        << " weight must exclude bias at t=" << t;
+  }
+}
+
+TEST(MoE, SigmoidMatchesSoftmaxOnTiesOnlyInSelection) {
+  // Sigmoid routing and softmax routing select the same experts on unbiased
+  // ties (both monotonic in the logits) but produce different weights;
+  // this guards against regressing the LFM path back to softmax weights.
+  const std::vector<std::vector<float>> logits = {{0.3f, -0.7f, 1.1f, 0.0f}};
+  const int K = 3;
+  Kokkos::View<int**, Kokkos::LayoutRight, Exec> idx_sig("is", 1, K),
+      idx_sm("im", 1, K);
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> w_sig("ws", 1, K),
+      w_sm("wm", 1, K);
+  run_route_sigmoid(logits, {}, K, true, 1.0f, idx_sig, w_sig);
+  run_route(logits, {}, K, true, 1.0f, idx_sm, w_sm);
+  auto gs = Kokkos::create_mirror_view(w_sig);
+  auto gm = Kokkos::create_mirror_view(w_sm);
+  Kokkos::deep_copy(gs, w_sig);
+  Kokkos::deep_copy(gm, w_sm);
+  auto is = Kokkos::create_mirror_view(idx_sig);
+  auto im = Kokkos::create_mirror_view(idx_sm);
+  Kokkos::deep_copy(is, idx_sig);
+  Kokkos::deep_copy(im, idx_sm);
+  for (int k = 0; k < K; ++k) EXPECT_EQ(is(0, k), im(0, k));
+  bool any_diff = false;
+  for (int k = 0; k < K; ++k)
+    if (std::abs(gs(0, k) - gm(0, k)) > 1e-3f) any_diff = true;
+  EXPECT_TRUE(any_diff) << "sigmoid and softmax weights must differ";
+}
+
+TEST(MoE, SigmoidRejectsBadArgs) {
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> lg("lg", 2, 4);
+  Kokkos::View<float*, Exec> b("b", 4), bad_b("bad_b", 3), empty_b;
+  Kokkos::View<int**, Kokkos::LayoutRight, Exec> idx("idx", 2, 2),
+      bad_idx("bad_idx", 2, 3);
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> w("w", 2, 2);
+  EXPECT_NO_THROW(
+      (KokkosDNN::moe_route_sigmoid<Exec, float>(lg, empty_b, 2, true, 1.0f,
+                                                 idx, w)));
+  EXPECT_NO_THROW((KokkosDNN::moe_route_sigmoid<Exec, float>(lg, b, 2, true,
+                                                             1.0f, idx, w)));
+  EXPECT_THROW(
+      (KokkosDNN::moe_route_sigmoid<Exec, float>(lg, bad_b, 2, true, 1.0f, idx,
+                                                 w)),
+      std::invalid_argument);
+  EXPECT_THROW(
+      (KokkosDNN::moe_route_sigmoid<Exec, float>(lg, empty_b, 0, true, 1.0f,
+                                                 idx, w)),
+      std::invalid_argument);
+  EXPECT_THROW(
+      (KokkosDNN::moe_route_sigmoid<Exec, float>(lg, empty_b, 5, true, 1.0f,
+                                                 idx, w)),
+      std::invalid_argument);
+  EXPECT_THROW(
+      (KokkosDNN::moe_route_sigmoid<Exec, float>(lg, empty_b, 2, true, 1.0f,
+                                                 bad_idx, w)),
       std::invalid_argument);
 }
 
