@@ -47,11 +47,22 @@ const Gguf::GgufTensorInfo* resolve(const Gguf::GgufFile& file,
 }
 
 const Gguf::GgufTensorInfo& require(const Gguf::GgufFile& file,
-                                    const std::string& stem,
-                                    const char* suffix) {
+                                     const std::string& stem,
+                                     const char* suffix) {
   if (const auto* info = resolve(file, stem, suffix)) return *info;
   throw std::runtime_error("tensor not found in checkpoint: '" + stem +
                            suffix + "' (also tried '" + stem + "')");
+}
+
+// Prefer the llama.cpp `lfm2moe` leaf name; fall back to the legacy alias
+// (the loader's require() below reports the missing tensor either way).
+// Real LFM2.5-24B-A2B GGUFs name the final norm `token_embd_norm` (not
+// `output_norm`) and the MoE routing bias `blk.{l}.exp_probs_b` (not
+// `blk.{l}.ffn_exp_probs_b`).
+std::string pick_stem(const Gguf::GgufFile& file, const std::string& primary,
+                      const std::string& fallback, const char* suffix) {
+  if (resolve(file, primary, suffix)) return primary;
+  return fallback;
 }
 
 // Load one 2-D dense tensor: validate [rows, cols], dequantize on the host,
@@ -238,8 +249,9 @@ void load_gguf(const Config& cfg, const std::string& path,
 
   load_dense_mat<ExecSpace, Scalar>(file, "token_embd", (size_t)cfg.vocab_size,
                                    D, w.embed);
-  load_dense_vec<ExecSpace, Scalar>(file, "output_norm", ".weight",
-                                   w.final_norm);
+  load_dense_vec<ExecSpace, Scalar>(
+      file, pick_stem(file, "token_embd_norm", "output_norm", ".weight"),
+      ".weight", w.final_norm);
   // Tied embeddings fallback (LFM2.5 ships tie_word_embeddings=true).
   if (resolve(file, "output", ".weight") != nullptr) {
     load_dense_mat<ExecSpace, Scalar>(file, "output", (size_t)cfg.vocab_size,
@@ -298,8 +310,11 @@ void load_gguf(const Config& cfg, const std::string& path,
         b.down_exps[e] = load_expert_slice<ExecSpace>(file, di, e, D, MI, E);
       }
       if (cfg.use_expert_bias) {
-        load_dense_vec<ExecSpace, Scalar>(file, blk(l, "ffn_exp_probs_b"),
-                                         ".bias", b.exp_bias);
+        load_dense_vec<ExecSpace, Scalar>(
+            file,
+            pick_stem(file, blk(l, "exp_probs_b"), blk(l, "ffn_exp_probs_b"),
+                      ".bias"),
+            ".bias", b.exp_bias);
       }
     }
   }

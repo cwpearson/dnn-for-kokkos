@@ -10,15 +10,23 @@ From repo root `/workspace` — build, fetch checkpoint files, run:
 cmake -S . -B build -DKokkos_ROOT=/path/to/kokkos-install -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel 8 --target lfm2_5_generate
 
-# HF retrieval: no repo ID is recorded in the driver/config files, so
-# download the LFM2.5-24B-A2B-Instruct Q4_K_M GGUF + tokenizer.json yourself,
-# e.g. (placeholder — substitute the real repo ID):
+# HF retrieval: official GGUF repo + base repo for the tokenizer.
+# GGUF repo `LiquidAI/LFM2.5-24B-A2B-GGUF` holds only .gguf files
+# (no tokenizer.json); fetch `tokenizer.json` from the base repo
+# `LiquidAI/LFM2.5-24B-A2B`. Both repos are public (no auth needed).
+# Q4_K_M file is ~14.5 GB, tokenizer.json is ~17 MB.
 pip install -U huggingface_hub  # provides the `hf` CLI
-#   hf download <HF_REPO_ID> --local-dir ./weights/lfm2_5
-#   ls ./weights/lfm2_5  # expect *.gguf + tokenizer.json (+ config.json)
+hf download LiquidAI/LFM2.5-24B-A2B-GGUF \
+  --include "LFM2.5-24B-A2B-Q4_K_M.gguf" \
+  --local-dir ./weights/lfm2_5
+hf download LiquidAI/LFM2.5-24B-A2B \
+  --include "tokenizer.json" \
+  --local-dir ./weights/lfm2_5
+ls ./weights/lfm2_5  # expect LFM2.5-24B-A2B-Q4_K_M.gguf + tokenizer.json
+# (fallback mirror: ggml-org/LFM2.5-24B-A2B-GGUF, same filenames)
 
 ./build/examples/lfm2_5/lfm2_5_generate \
-  --weights ./weights/lfm2_5/lfm2_5-24b-a2b-q4_k_m.gguf \
+  --weights ./weights/lfm2_5/LFM2.5-24B-A2B-Q4_K_M.gguf \
   --tokenizer ./weights/lfm2_5/tokenizer.json \
   --config examples/lfm2_5/config-lfm2_5-24b-a2b.json \
   --prompt "Explain attention in one sentence." --max-new 64
@@ -36,7 +44,7 @@ pip install -U huggingface_hub  # provides the `hf` CLI
 
 # Chat (Instruct ChatML + optional system turn):
 ./build/examples/lfm2_5/lfm2_5_generate \
-  --weights ./weights/lfm2_5/lfm2_5-24b-a2b-q4_k_m.gguf \
+  --weights ./weights/lfm2_5/LFM2.5-24B-A2B-Q4_K_M.gguf \
   --tokenizer ./weights/lfm2_5/tokenizer.json \
   --config examples/lfm2_5/config-lfm2_5-24b-a2b.json \
   --chat --system "You are a concise assistant." \
@@ -53,7 +61,7 @@ pip install -U huggingface_hub  # provides the `hf` CLI
 - Flags (see `lfm2_5_generate.cpp` header): `--tiny` (default on; `--weights` opts out), `--weights model.gguf`, `--tokenizer tok.json`, `--config config.json` (HF overlay, present keys win), `--prompt`, `--max-new`, `--max-seq-len`, `--prefill-chunk N` (`0` = single-shot), `--chat` / `--system` / `--role`, `--add-bos` (default) / `--no-add-bos`, `--stop <id> ...`, `--stop-string ...`, `--fp32` (default bfloat16), `--temperature` / `--top-k` / `--top-p` / `--min-p` / `--repetition-penalty` / `--seed`.
 - Sampling defaults: `temperature=0.1`, `top_k=50`, `repetition_penalty=1.05` (`top_p=1.0`, `min_p=0.0`); `--temperature 0` = greedy; seed defaults to `0`.
 - Tokenizer/chat: byte-level BPE `tokenizer.json` (128k); `bos=<|startoftext|>` (124894), stop `eos=<|im_end|>` (124900); `--chat` renders one `role` turn via LFM2.5-Instruct ChatML with open assistant header; `--system` implies chat; exactly-one-BOS invariant; decoded-text stop strings default to `{"<|im_end|>"}`.
-- GGUF tensors (llama.cpp names, `.weight`/`.bias` suffix or bare stem): `token_embd`, `output_norm`, `output`, `blk.{l}.attn_norm` / `blk.{l}.ffn_norm`, attention `blk.{l}.attn_q/k/v/output` + `blk.{l}.attn_q_norm/k_norm`, conv `blk.{l}.shortconv.in_proj/conv/out_proj`, dense `blk.{l}.ffn_gate/up/down`, MoE `blk.{l}.ffn_gate_inp` + `blk.{l}.ffn_gate_exps/up_exps/down_exps` (stacked 3-D, ggml order `{cols,rows,experts}`) + `blk.{l}.ffn_exp_probs_b`. Tie note: `tie_word_embeddings=true` aliases the embedding table as `lm_head` when no `output` tensor exists; with `false` that checkpoint errors.
+- GGUF tensors (llama.cpp `lfm2moe` names, `.weight`/`.bias` suffix or bare stem): `token_embd`, `token_embd_norm` (final norm; legacy alias `output_norm` also accepted), `output` (absent in the official Q4_K_M file — covered by the tie fallback below), `blk.{l}.attn_norm` / `blk.{l}.ffn_norm`, attention `blk.{l}.attn_q/k/v/output` + `blk.{l}.attn_q_norm/k_norm`, conv `blk.{l}.shortconv.in_proj/conv/out_proj`, dense `blk.{l}.ffn_gate/up/down`, MoE `blk.{l}.ffn_gate_inp` + `blk.{l}.ffn_gate_exps/up_exps/down_exps` (stacked 3-D, ggml order `{cols,rows,experts}`) + `blk.{l}.exp_probs_b` (legacy alias `blk.{l}.ffn_exp_probs_b` also accepted). Tie note: `tie_word_embeddings=true` aliases the embedding table as `lm_head` when no `output` tensor exists; with `false` that checkpoint errors.
 - GGUF dtype matrix (per-tensor; dense dequantized on host, MoE experts stay packed via `quant_gemm`):
 
   | dtype | dense | MoE expert |
@@ -70,7 +78,7 @@ pip install -U huggingface_hub  # provides the `hf` CLI
 ## Verification
 
 ```bash
-ctest --test-dir build -R lfm25 --output-on-failure
+ctest --test-dir build -R LFM25 --output-on-failure
 ./build/examples/lfm2_5/lfm2_5_generate --tiny --prompt "Hello" --max-new 8
 ```
 

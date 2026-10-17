@@ -168,7 +168,10 @@ template <class ExecSpace, class Scalar = DefaultScalar>
 class Model {
  public:
   using MatR = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
-  using View3 = Kokkos::View<Scalar***, ExecSpace>;
+  // Explicit LayoutRight: qk_rmsnorm() takes LayoutRight views, and the
+  // default layout is LayoutLeft when CUDA is enabled (LayoutRight on host
+  // backends), so the default-layout alias breaks CUDA builds.
+  using View3 = Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>;
   using View1 = Kokkos::View<Scalar*, ExecSpace>;
   using ViewInt = Kokkos::View<int*, ExecSpace>;
   using HostInt = typename ViewInt::host_mirror_type;
