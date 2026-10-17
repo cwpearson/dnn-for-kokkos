@@ -77,6 +77,18 @@ void check_forward(const Fixture& f, float tol) {
                                               << ")";
 }
 
+// Gather row t of x into xt. Free function (not inside TEST body): NVCC
+// rejects extended __host__ __device__ lambdas whose enclosing parent
+// function (gtest's TestBody) has private access.
+template <typename ExecSpace, typename Scalar>
+void gather_row(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x, size_t t,
+    const Kokkos::View<Scalar*, ExecSpace>& xt) {
+  Kokkos::parallel_for(
+      "gather", Kokkos::RangePolicy<ExecSpace>(0, xt.extent(0)),
+      KOKKOS_LAMBDA(size_t c) { xt(c) = x(t, c); });
+}
+
 // Step through all T tokens with a zero-initialized cache; every step output
 // must equal the corresponding prefill row.
 void check_stepwise(const Fixture& f, float tol) {
@@ -91,9 +103,7 @@ void check_stepwise(const Fixture& f, float tol) {
   Kokkos::deep_copy(cache, 0.0f);
   Kokkos::View<float*, Exec> xt("xt", f.C), yt("yt", f.C);
   for (size_t t = 0; t < f.T; ++t) {
-    Kokkos::parallel_for(
-        "gather", Kokkos::RangePolicy<Exec>(0, f.C),
-        KOKKOS_LAMBDA(size_t c) { xt(c) = x(t, c); });
+    gather_row<Exec, float>(x, t, xt);
     KokkosDNN::depthwise_conv1d_causal_step<Exec, float>(xt, w, b, cache, yt);
     Kokkos::fence();
     auto got = Kokkos::create_mirror_view(yt);
@@ -148,9 +158,7 @@ TEST(Conv1D, StepwiseBHalfConsistent) {
   Kokkos::deep_copy(cache, Scalar(0));
   Kokkos::View<Scalar*, Exec> xt("xt", C), yt("yt", C);
   for (size_t t = 0; t < T; ++t) {
-    Kokkos::parallel_for(
-        "gather", Kokkos::RangePolicy<Exec>(0, C),
-        KOKKOS_LAMBDA(size_t c) { xt(c) = x(t, c); });
+    gather_row<Exec, Scalar>(x, t, xt);
     KokkosDNN::depthwise_conv1d_causal_step<Exec, Scalar>(xt, w, b, cache, yt);
     Kokkos::fence();
     auto got = Kokkos::create_mirror_view(yt);
