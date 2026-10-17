@@ -1,8 +1,12 @@
 name: ROCm build
 
 # GPU build-only CI: Kokkos HIP backend, compile everything but run
-# nothing (GitHub-hosted runners have no GPU). Mirrors the Serial CI
-# (.github/workflows/serial.yaml) in structure, minus the test execution.
+# nothing (GitHub-hosted runners have no GPU). Two legs via matrix:
+#  - tpl=OFF: pure build check with no extra toolkit version coupling.
+#  - tpl=ON: exercises the hipBLAS GEMM and MIOpen conv dispatch paths
+#    (KokkosDNN_ENABLE_HIPBLAS/MIOPEN).
+# Mirrors the CUDA CI (.github/workflows/cuda.yaml) in structure,
+# minus the container (ROCm is installed via AMD's apt repositories).
 on:
   push:
     paths-ignore:
@@ -17,6 +21,19 @@ jobs:
   rocm:
     # Pinned to 24.04 (noble) to match the AMD package repositories below.
     runs-on: ubuntu-24.04
+    name: rocm (tpl=${{ matrix.tpl }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # TPL-disabled leg keeps a pure build check with no extra toolkit
+          # version coupling.
+          # (Quotes are load-bearing: unquoted ON/OFF parse as YAML
+          # booleans, which would break the matrix.tpl comparison below.)
+          - tpl: 'OFF'
+          # TPL-enabled leg exercises the hipBLAS GEMM and MIOpen conv
+          # dispatch paths (KokkosDNN_ENABLE_HIPBLAS/MIOPEN).
+          - tpl: 'ON'
     # /opt/rocm is the default install prefix; Kokkos's find_package(hip)
     # honors ROCM_PATH, and kokkos_arch uses $ROCM_PATH for --rocm-path.
     env:
@@ -57,10 +74,20 @@ jobs:
           # rocthrust-config.cmake does find_dependency(rocprim). Install the
           # dev packages so Kokkos configure can find them under /opt/rocm.
           sudo apt-get install -y rocm-hip-sdk rocprim-dev rocthrust-dev hipcub-dev
+          # TPL leg: hipBLAS (GEMM dispatch) and MIOpen (conv dispatch).
+          # Installed only when needed so the TPL-disabled leg stays free
+          # of extra toolkit version coupling.
+          if [ "${{ matrix.tpl }}" = "ON" ]; then
+            sudo apt-get install -y hipblas-dev miopen-hip-dev
+          fi
           # Fail fast with a clear log if the install did not land.
           /opt/rocm/bin/hipcc --version
           ls /opt/rocm/lib/cmake/hip/
           ls /opt/rocm/lib/cmake/rocthrust/ /opt/rocm/lib/cmake/rocprim/ /opt/rocm/lib/cmake/hipcub/
+          if [ "${{ matrix.tpl }}" = "ON" ]; then
+            ls /opt/rocm/lib/cmake/hipblas/
+            ls /opt/rocm/lib/cmake/ | grep -i miopen
+          fi
 
       # Shallow checkout of the Kokkos release tag into kokkos-src.
       # submodules: recursive is required: the build needs desul/mdspan,
@@ -102,12 +129,20 @@ jobs:
           # Build-only: TESTS=ON + EXAMPLES=ON + BENCHMARKS=ON maximize
           # compile coverage. The whole project must compile
           # with hipcc against a HIP Kokkos (device code in headers).
+          # tpl=ON enables the hipBLAS GEMM and MIOpen conv dispatch paths;
+          # tpl=OFF keeps a pure build check with no extra toolkit version
+          # coupling.
           # CMAKE_PREFIX_PATH keeps downstream find_package(Kokkos) ->
           # find_dependency(hip/rocthrust) resolving under /opt/rocm.
           # TEST_DISCOVERY=OFF: gtest_discover_tests executes test binaries
           # at build time, but the runner has no GPU, so every test binary
           # aborts inside Kokkos::initialize. This workflow is compile
           # coverage only.
+          if [ "${{ matrix.tpl }}" = "ON" ]; then
+            TPL_FLAGS="-DKokkosDNN_ENABLE_HIPBLAS=ON -DKokkosDNN_ENABLE_MIOPEN=ON"
+          else
+            TPL_FLAGS="-DKokkosDNN_ENABLE_HIPBLAS=OFF -DKokkosDNN_ENABLE_MIOPEN=OFF"
+          fi
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_PREFIX_PATH="${ROCM_PATH}" \
@@ -116,7 +151,8 @@ jobs:
             -DKokkosDNN_ENABLE_TESTS=ON \
             -DKokkosDNN_ENABLE_TEST_DISCOVERY=OFF \
             -DKokkosDNN_ENABLE_EXAMPLES=ON \
-            -DKokkosDNN_ENABLE_BENCHMARKS=ON
+            -DKokkosDNN_ENABLE_BENCHMARKS=ON \
+            ${TPL_FLAGS}
 
       # Build every target (library, tests, examples). Deliberately does
       # NOT run ctest or any example binary: there is no GPU on the runner,
