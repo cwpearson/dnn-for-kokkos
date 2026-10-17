@@ -1,8 +1,13 @@
 name: CUDA build
 
 # GPU build-only CI: Kokkos CUDA backend, compile everything but run
-# nothing (GitHub-hosted runners have no GPU). Mirrors the Serial CI
-# (.github/workflows/serial.yaml) in structure, minus the test execution.
+# nothing (GitHub-hosted runners have no GPU). Two legs via matrix:
+#  - tpl=OFF in the plain devel image: pure build check with no extra
+#    toolkit version coupling.
+#  - tpl=ON in the cudnn-devel image: exercises the cuBLAS GEMM and cuDNN
+#    SDPA dispatch paths (KokkosDNN_ENABLE_CUBLAS/CUDNN).
+# Mirrors the Serial CI (.github/workflows/serial.yaml) in structure,
+# minus the test execution.
 on:
   push:
     paths-ignore:
@@ -16,10 +21,24 @@ on:
 jobs:
   cuda:
     runs-on: ubuntu-latest
-    # nvidia/cuda devel image provides nvcc + CUDAToolkit; build-only
-    # (no GPU at runtime) so no --gpus flag is needed.
+    name: cuda (tpl=${{ matrix.tpl }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Plain devel image provides nvcc + CUDAToolkit; keeps the
+          # TPL-disabled leg free of cuBLAS/cuDNN version coupling.
+          # (Quotes are load-bearing: unquoted ON/OFF parse as YAML
+          # booleans, which would break the matrix.tpl comparison below.)
+          - tpl: 'OFF'
+            image: nvidia/cuda:12.8.1-devel-ubuntu24.04
+          # cudnn-devel image adds cuDNN on top of the devel image; needed
+          # for the TPL-enabled leg (cuBLAS ships in both images).
+          - tpl: 'ON'
+            image: nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+    # Build-only (no GPU at runtime) so no --gpus flag is needed.
     container:
-      image: nvidia/cuda:12.8.1-devel-ubuntu24.04
+      image: ${{ matrix.image }}
     env:
       KOKKOS_VERSION: 5.2.1
       # NOTE: do NOT derive paths from ${{ github.workspace }} here.
@@ -74,16 +93,22 @@ jobs:
       - name: Configure KokkosDNN
         run: |
           # Build-only: TESTS=ON + EXAMPLES=ON + BENCHMARKS=ON maximize
-          # compile coverage, CUBLAS/CUDNN=OFF keeps this a pure build
-          # check with no extra toolkit version coupling. The
-          # whole project must compile with nvcc_wrapper against a CUDA
-          # Kokkos (device code in headers).
+          # compile coverage. The whole project must compile with
+          # nvcc_wrapper against a CUDA Kokkos (device code in headers).
+          # tpl=ON enables the cuBLAS GEMM and cuDNN SDPA dispatch paths;
+          # tpl=OFF keeps a pure build check with no extra toolkit version
+          # coupling.
           # TEST_DISCOVERY=OFF: gtest_discover_tests executes test binaries
           # at build time, but the runner has no GPU (libcuda.so.1 is
           # absent), so every test binary fails to start. This workflow is
           # compile coverage only.
           KOKKOS_INSTALL="$GITHUB_WORKSPACE/kokkos-install"
           NVCC_WRAPPER="$GITHUB_WORKSPACE/kokkos-src/bin/nvcc_wrapper"
+          if [ "${{ matrix.tpl }}" = "ON" ]; then
+            TPL_FLAGS="-DKokkosDNN_ENABLE_CUBLAS=ON -DKokkosDNN_ENABLE_CUDNN=ON"
+          else
+            TPL_FLAGS="-DKokkosDNN_ENABLE_CUBLAS=OFF -DKokkosDNN_ENABLE_CUDNN=OFF"
+          fi
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_COMPILER="${NVCC_WRAPPER}" \
@@ -91,7 +116,8 @@ jobs:
             -DKokkosDNN_ENABLE_TESTS=ON \
             -DKokkosDNN_ENABLE_TEST_DISCOVERY=OFF \
             -DKokkosDNN_ENABLE_EXAMPLES=ON \
-            -DKokkosDNN_ENABLE_BENCHMARKS=ON
+            -DKokkosDNN_ENABLE_BENCHMARKS=ON \
+            ${TPL_FLAGS}
 
       # Build every target (library, tests, examples). Deliberately does
       # NOT run ctest or any example binary: there is no GPU on the runner,
