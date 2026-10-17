@@ -18,6 +18,10 @@ on:
       - "docs/**"
       - ".github/workflows/docs.yaml"
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   macos-arm:
     # macos-latest tracks the newest stable ARM64 image (macos-26-arm64 as of
