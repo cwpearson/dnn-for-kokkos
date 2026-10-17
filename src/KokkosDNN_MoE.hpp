@@ -8,13 +8,22 @@
 
 // Sparse Mixture-of-Experts routing (gating) ops.
 //
-// The missing piece for MoE inference is the routing decision: per token,
-// pick the top-k experts from the router logits and turn their scores into
-// combination weights. The expert FFNs themselves reuse the existing
-// gemm()/swiglu() ops, so no dedicated expert-GEMM kernel lives here.
+// Two routing activations are supported because different model families
+// gate differently:
+//   * softmax (moe_route): Qwen3-style. Weights are softmaxed logits
+//     (bias, when present, shifts the scores inside the softmax).
+//   * sigmoid (moe_route_sigmoid): LFM2-MoE-style (HF transformers
+//     Lfm2MoeTopKRouter). Weights are sigmoided logits; the expert bias,
+//     when present, is added to the sigmoid outputs for top-k *selection*
+//     only and is NOT part of the combination weights. With
+//     norm_topk=true the gathered sigmoids are renormalized (over the K
+//     selected experts, denominator carries a 1e-6 epsilon exactly as in
+//     HF); otherwise the raw gathered sigmoids are the weights.
+// The expert FFNs themselves reuse the existing gemm()/swiglu() ops, so no
+// dedicated expert-GEMM kernel lives here.
 //
 // Canonical per-token usage with existing ops (E experts, top-k):
-//   moe_route<Exec,Scalar>(logits, bias, K, norm_topk, scale, idx, w);
+//   moe_route_sigmoid<Exec,Scalar>(logits, bias, K, norm_topk, scale, idx, w);
 //   for (int k = 0; k < K; ++k) {
 //     // gather tokens with idx(t,k) == e into xe  (token mask / compaction)
 //     gemm(handle, 1, xe, Wgate[e], 0, gate);   // per-expert SwiGLU FFN
@@ -116,6 +125,69 @@ KOKKOS_INLINE_FUNCTION void moe_topk_softmax(
   }
 }
 
+// Sigmoid helper for the LFM2-MoE router (host- and device-callable).
+KOKKOS_INLINE_FUNCTION float moe_sigmoid(float s) {
+  return 1.0f / (1.0f + expf(-s));
+}
+
+// Device fragment: top-k selection + sigmoid weights over one token row.
+//   score[e] = sigmoid(logits[t,e]) (+ bias[e] when have_bias) drives the
+//   greedy top-k selection (descending); ties keep the lower expert id.
+// Weight convention (FP32, then cast on write):
+//   the combination weights are the gathered *sigmoids* (bias excluded):
+//   norm_topk=true  -> sigmoids renormalized over the K selected experts,
+//                      w = sig / (sum + 1e-6), matching HF Lfm2MoeTopKRouter;
+//   norm_topk=false -> raw gathered sigmoids (sums to <= K).
+// Either way the weights are multiplied by routed_scale.
+template <class ExecSpace, class Scalar>
+KOKKOS_INLINE_FUNCTION void moe_topk_sigmoid(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& logits,
+    const Kokkos::View<Scalar*, ExecSpace>& bias, bool have_bias, size_t t,
+    size_t E, int K,
+    const Kokkos::View<int**, Kokkos::LayoutRight, ExecSpace>& top_idx,
+    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& top_w,
+    bool norm_topk, float routed_scale) {
+  // -- pass 1: greedy top-k (descending); ties keep the lower expert id --
+  for (int k = 0; k < K; ++k) {
+    float best = -3.4028235e38f;
+    int be     = -1;
+    for (size_t e = 0; e < E; ++e) {
+      bool taken = false;
+      for (int j = 0; j < k; ++j)
+        if (top_idx(t, j) == static_cast<int>(e)) {
+          taken = true;
+          break;
+        }
+      if (taken) continue;
+      const float s =
+          moe_sigmoid(static_cast<float>(logits(t, e))) +
+          (have_bias ? static_cast<float>(bias(e)) : 0.0f);
+      if (s > best) {
+        best = s;
+        be   = static_cast<int>(e);
+      }
+    }
+    top_idx(t, k) = be;
+  }
+  // -- pass 2: weights are gathered sigmoids (bias excluded) --
+  if (norm_topk) {
+    float sum = 0.0f;
+    for (int k = 0; k < K; ++k)
+      sum += moe_sigmoid(static_cast<float>(
+          logits(t, static_cast<size_t>(top_idx(t, k)))));
+    const float denom = sum + 1e-6f;
+    for (int k = 0; k < K; ++k)
+      top_w(t, k) = moe_sigmoid(static_cast<float>(
+                        logits(t, static_cast<size_t>(top_idx(t, k))))) /
+                    denom * routed_scale;
+  } else {
+    for (int k = 0; k < K; ++k)
+      top_w(t, k) = moe_sigmoid(static_cast<float>(
+                        logits(t, static_cast<size_t>(top_idx(t, k))))) *
+                    routed_scale;
+  }
+}
+
 }  // namespace Impl
 
 // MoE routing: per-token top-k expert select + softmax weights.
@@ -157,11 +229,54 @@ void moe_route(
       });
 }
 
+// MoE routing with sigmoid gating (LFM2-MoE-style, HF Lfm2MoeTopKRouter):
+// per-token top-k expert select + sigmoid weights.
+//   logits      [T, E] router logits (any Scalar; sigmoid computed in FP32)
+//   expert_bias [E]    additive bias applied to the sigmoid outputs for
+//               top-k *selection* only (auxiliary-loss-free routing); the
+//               combination weights below exclude it. Empty = no bias.
+//   top_k       number of experts per token (1 <= top_k <= E)
+//   norm_topk   true: renormalize the K gathered sigmoids (sums to ~1,
+//               denominator carries the HF 1e-6 epsilon, then scaled);
+//               false: raw gathered sigmoids times routed_scale
+//   routed_scale multiplier on the weights (LFM2.5: 1.0)
+//   top_idx     [T, top_k] output expert ids (descending score)
+//   top_w       [T, top_k] float output weights (sigmoid [+ renorm/scale])
+// Scalar-agnostic; FP32 accumulation. Backend-portable RangePolicy kernel;
+// T=1 decode is the same kernel with one iteration (host-friendly).
+template <class ExecSpace, class Scalar>
+void moe_route_sigmoid(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& logits,
+    const Kokkos::View<Scalar*, ExecSpace>& expert_bias, int top_k,
+    bool norm_topk, float routed_scale,
+    const Kokkos::View<int**, Kokkos::LayoutRight, ExecSpace>& top_idx,
+    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& top_w,
+    const std::string& label = "KokkosDNN::moe_route_sigmoid") {
+  const size_t T = logits.extent(0), E = logits.extent(1);
+  const size_t K = top_k < 0 ? 0 : static_cast<size_t>(top_k);
+  const bool have_bias = (expert_bias.extent(0) != 0);
+  if (have_bias && expert_bias.extent(0) != E)
+    throw std::invalid_argument(
+        "moe_route_sigmoid: expert_bias extent must be E");
+  if (top_idx.extent(0) != T || top_idx.extent(1) != K || top_w.extent(0) != T ||
+      top_w.extent(1) != K)
+    throw std::invalid_argument("moe_route_sigmoid: output dimension mismatch");
+  if (T == 0) return;
+  if (top_k <= 0 || K > E)
+    throw std::invalid_argument("moe_route_sigmoid: need 1 <= top_k <= E");
+  Kokkos::parallel_for(
+      label, Kokkos::RangePolicy<ExecSpace>(0, T), KOKKOS_LAMBDA(size_t t) {
+        Impl::moe_topk_sigmoid<ExecSpace, Scalar>(
+            logits, expert_bias, have_bias, t, E, top_k, top_idx, top_w,
+            norm_topk, routed_scale);
+      });
+}
+
 // Weighted sum of stacked per-(token, expert) outputs:
 //   y[t,d] = sum_k top_w[t,k] * expert_out[t,k,d]
 // expert_out [T, K, D] holds each selected expert's output for the token
 // (gathered/scattered by the caller around per-expert gemm/swiglu calls),
-// top_w [T, K] comes from moe_route, y [T, D]. Scalar-agnostic (weights are
+// top_w [T, K] comes from moe_route / moe_route_sigmoid, y [T, D]. Scalar-agnostic (weights are
 // float); FP32 accumulation; backend-portable MDRange kernel.
 template <class ExecSpace, class Scalar>
 void moe_expert_weighted_sum(

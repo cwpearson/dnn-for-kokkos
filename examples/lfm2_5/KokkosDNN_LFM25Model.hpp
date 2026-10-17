@@ -153,9 +153,10 @@ void moe_masked_accumulate(
 //   conv layer: in_proj -> split B/C/X -> bx = B*X -> causal depthwise conv
 //     over bx (chunk history = persistent conv state) -> gate by C ->
 //     out_proj; then residual, ffn_norm, and
-//   dense SwiGLU FFN, or MoE (router gemm -> moe_route with the optional
-//     expert bias, top-k norm and routing scale -> per-expert SwiGLU via
-//     quant_gemm -> bias-weighted accumulation); then residual.
+//   dense SwiGLU FFN, or MoE (router gemm -> sigmoid moe_route_sigmoid
+//     with the optional expert bias for selection only, top-k norm and
+//     routing scale -> per-expert SwiGLU via
+//     quant_gemm -> weight-masked accumulation); then residual.
 // Final rmsnorm + (possibly tied) lm_head gemv.
 //
 // KV cache: dense FP per attention layer ([max_seq_len, n_kv, head_dim],
@@ -552,11 +553,11 @@ class Model {
           gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), act, b.wdown,
                                   static_cast<Scalar>(0), down);
         } else {
-          // MoE: router -> top-k route (optional expert bias, top-k norm,
-          // routing scale) -> per-expert SwiGLU via packed quant_gemm ->
-          // weight-masked accumulation. O(n_experts) GEMMs per layer: the
-          // PoC trades kernel count for zero host synchronization (no
-          // gather/scatter index juggling).
+          // MoE: router -> sigmoid top-k route (optional expert bias for
+          // selection only, top-k norm, routing scale) -> per-expert SwiGLU
+          // via packed quant_gemm -> weight-masked accumulation. O(n_experts)
+          // GEMMs per layer: the PoC trades kernel count for zero host
+          // synchronization (no gather/scatter index juggling).
           auto mlogits = Kokkos::subview(moe_logits_buf_,
                                          std::make_pair(size_t(0), C),
                                          Kokkos::ALL);
@@ -577,8 +578,9 @@ class Model {
                                       std::make_pair(size_t(0), MI));
           gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), tmp2,
                                   b.gate_inp, static_cast<Scalar>(0), mlogits);
-          moe_route<ExecSpace, Scalar>(mlogits, b.exp_bias, TOP_K,
-                                       ROT_NORM_TOPK, ROUTED_SCALE, midx, mw);
+          moe_route_sigmoid<ExecSpace, Scalar>(mlogits, b.exp_bias, TOP_K,
+                                                ROT_NORM_TOPK, ROUTED_SCALE,
+                                                midx, mw);
           Kokkos::deep_copy(down, static_cast<Scalar>(0));
           const size_t NE = b.gate_exps.size();
           for (size_t e = 0; e < NE; ++e) {
