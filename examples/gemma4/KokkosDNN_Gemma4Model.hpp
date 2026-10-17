@@ -35,7 +35,7 @@ template <class ExecSpace, class Scalar>
 void qk_reshape_norm(
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& flat,
     const Kokkos::View<Scalar*, ExecSpace>& w, float eps,
-    const Kokkos::View<Scalar***, ExecSpace>& out,
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& out,
     const std::string& label = "Gemma4::qk_reshape_norm") {
   const size_t T = out.extent(0), H = out.extent(1), D = out.extent(2);
   if (flat.extent(0) != T || flat.extent(1) != H * D || w.extent(0) != D)
@@ -63,7 +63,8 @@ void qk_reshape_norm(
 template <class ExecSpace, class Scalar>
 void v_reshape_norm_noscale(
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& flat,
-    float eps, const Kokkos::View<Scalar***, ExecSpace>& out,
+    float eps,
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& out,
     const std::string& label = "Gemma4::v_reshape_norm") {
   const size_t T = out.extent(0), D = out.extent(2);
   if (flat.extent(0) != T || flat.extent(1) != D || out.extent(1) != 1)
@@ -174,7 +175,7 @@ template <class ExecSpace, class Scalar = DefaultScalar>
 class Model {
  public:
   using MatR = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
-  using View3 = Kokkos::View<Scalar***, ExecSpace>;
+  using View3 = Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>;
   using View1 = Kokkos::View<Scalar*, ExecSpace>;
   using ViewInt = Kokkos::View<int*, ExecSpace>;
   using HostInt = typename ViewInt::host_mirror_type;
