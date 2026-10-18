@@ -16,6 +16,8 @@
 // in KokkosDNN_MIOpen_Forward.hpp stays valid.
 #include "KokkosDNN_config.h"
 
+#include <Kokkos_Core.hpp>
+
 #include "tpl/miopen/KokkosDNN_MIOpen_Forward.hpp"
 
 #if defined(KOKKOSDNN_ENABLE_MIOPEN) && defined(KOKKOS_ENABLE_HIP)
