@@ -424,7 +424,8 @@ std::vector<double> href_forward_sample(const HostModel& m,
               double v = x[((size_t)t * Vh + hh) * Kd + dd];
               ss += v * v;
             }
-            double inv = 1.0 / std::sqrt(ss / Kd + 1e-6) * sc;
+            // FLA l2norm(): sum-based 1/sqrt(ss + eps), NOT mean-based.
+            double inv = 1.0 / std::sqrt(ss + 1e-6) * sc;
             for (int dd = 0; dd < Kd; ++dd)
               x[((size_t)t * Vh + hh) * Kd + dd] *= inv;
           }
@@ -654,8 +655,9 @@ TEST(Qwen35Safetensors, RoundTripTiny) {
       ts.push_back(t);
       snap2(p + "linear_attn.out_proj.weight", L.lin.out_proj);
       snap1(p + "linear_attn.norm.weight", L.lin.norm);
-      snap1(p + "linear_attn.A_log.weight", L.lin.a_log);
-      snap1(p + "linear_attn.dt_bias.weight", L.lin.dt_bias);
+      // Real-checkpoint naming: these two vectors have no .weight suffix.
+      snap1(p + "linear_attn.A_log", L.lin.a_log);
+      snap1(p + "linear_attn.dt_bias", L.lin.dt_bias);
     }
   }
   // Exercise both dtype paths: embed as BF16, everything else F32.

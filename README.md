@@ -52,7 +52,7 @@ Options:
 - [xor](examples/xor/) — 2-layer MLP that learns the XOR truth table with full-batch Adam.
 - [dinov3](examples/dinov3/) — DINOv3 ViT-B/16 image-encoder inference.
 - [sana](examples/sana/) — Sana-0.6B (SanaMS_600M_P1_D28) text-to-image with FlowEuler + CFG (DiT weights load directly from the `.pth` checkpoint; native Gemma-2-2B-IT text encoder via `--text-weights` and native DC-AE f32c32 decoder via `--vae-safetensors`; without them conditioning falls back to the checkpoint null embedding unless `--prompt-embeds` is given, and output is raw latents plus a channel-mean grayscale preview).
-- [moss_image](examples/moss_image/) — MOSS-Image-SFT text-to-image with FlowEuler + CFG + staged encode/sample (`--staged` keeps the MiB embeds resident on-device while the 16.8 GB text encoder and 10.2 GB DiT are never resident together on a 24 GB GPU; `--prompt-embeds-in` loads precomputed file embeds, e.g. from `scripts/moss_encode.py`).
+- [moss_image](examples/moss_image/) — MOSS-Image-SFT text-to-image, fully in-process: in-repo BPE tokenizer + on-device Qwen3.5 encoder, FlowEuler + CFG DiT (`--staged` keeps the MiB embeds resident on-device while the 16.8 GB text encoder and 10.2 GB DiT are never resident together on a 24 GB GPU; `--prompt-embeds-in` loads precomputed file embeds, e.g. from `scripts/moss_encode.py`).
 
 See each directory's README for flags, run commands, and design notes.
 

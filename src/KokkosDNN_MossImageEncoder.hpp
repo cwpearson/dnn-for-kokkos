@@ -167,6 +167,10 @@ KOKKOS_INLINE_FUNCTION float qwen_l2inv(float ss, int n, float eps) {
   return 1.0f / sqrtf(ss / static_cast<float>(n) + eps);
 }
 
+// FLA sum-based L2 norm (NOT an RMSNorm): 1/sqrt(sum + eps), matching the
+// transformers l2norm() used with use_qk_l2norm_in_kernel=True. Deliberately
+// different from the mean-based qwen_l2inv above.
+
 // bfloat16 -> float (host; safetensors BF16 payloads).
 inline float bf16_to_float(uint16_t b) {
   uint32_t x = static_cast<uint32_t>(b) << 16;
@@ -336,9 +340,9 @@ void qwen_head_repeat(const XView& x, const YView& y, int rep,
 }
 
 // -- QK L2-norm (+ optional scale for q) ----------------------------------------
-// l2norm(x, eps) per (t,h) row (FLA kernel convention); q is additionally
-// scaled by 1/sqrt(Kdim) by passing scale != 1. In-place safe.
-// Dispatch: native elementwise (no TPL).
+// FLA l2norm(x, eps) per (t,h) row: x/sqrt(sum(x^2) + eps) (sum, NOT mean),
+// then q is additionally scaled by 1/sqrt(Kdim) by passing scale != 1.
+// In-place safe. Dispatch: native elementwise (no TPL).
 template <class ExecSpace, class Scalar, class XView>
 void qwen_qk_l2norm(const XView& x, float eps, float scale,
                     const std::string& label = "Qwen35::qk_l2norm") {
@@ -354,7 +358,7 @@ void qwen_qk_l2norm(const XView& x, float eps, float scale,
           float v = static_cast<float>(x(t, h, d));
           ss += v * v;
         }
-        float inv = qwen_l2inv(ss, static_cast<int>(D), eps) * scale;
+        float inv = (1.0f / sqrtf(ss + eps)) * scale;
         for (size_t d = 0; d < D; ++d)
           x(t, h, d) =
               static_cast<Scalar>(static_cast<float>(x(t, h, d)) * inv);
@@ -1019,9 +1023,12 @@ void load_weights_safetensors(Weights<ExecSpace, Scalar>& w,
                        1});
       needs.push_back({p + "linear_attn.norm.weight",
                        {(int64_t)cfg.lin_v_dim}, 0});
-      needs.push_back({p + "linear_attn.A_log.weight",
+      // NOTE: the MOSS-Image-SFT checkpoint stores these two vectors WITHOUT
+      // the .weight suffix (verified against the published safetensors
+      // index: BF16 [32] each).
+      needs.push_back({p + "linear_attn.A_log",
                        {(int64_t)cfg.lin_v_heads}, 0});
-      needs.push_back({p + "linear_attn.dt_bias.weight",
+      needs.push_back({p + "linear_attn.dt_bias",
                        {(int64_t)cfg.lin_v_heads}, 0});
     }
   }
@@ -1075,8 +1082,8 @@ void load_weights_safetensors(Weights<ExecSpace, Scalar>& w,
     if (tail == "self_attn.q_norm.weight") return L.full.q_norm;
     if (tail == "self_attn.k_norm.weight") return L.full.k_norm;
     if (tail == "linear_attn.norm.weight") return L.lin.norm;
-    if (tail == "linear_attn.A_log.weight") return L.lin.a_log;
-    if (tail == "linear_attn.dt_bias.weight") return L.lin.dt_bias;
+    if (tail == "linear_attn.A_log") return L.lin.a_log;
+    if (tail == "linear_attn.dt_bias") return L.lin.dt_bias;
     throw std::runtime_error("no destination: " + nd.name);
     return V1();
   };
@@ -1173,12 +1180,23 @@ void forward_full_layer(
   View2 k2("Qwen35::k", T, Nk * Hd), v2("Qwen35::v", T, Nk * Hd);
   gemm(handle, Scalar(1), n, L.full.k_proj, Scalar(0), k2, "Qwen35::k");
   gemm(handle, Scalar(1), n, L.full.v_proj, Scalar(0), v2, "Qwen35::v");
-  UView3 q(qg.data(), T, Nq, Hd);
-  UView2 gate(qg.data() + T * Qd, T, Qd);
+  // Pack the query/gate slices into contiguous buffers (same stride
+  // rationale as the q/k/v packs below): qg rows are 2*Qd wide.
+  View2 q2("Qwen35::q", T, Qd), gate2("Qwen35::gate", T, Qd);
+  Kokkos::parallel_for(
+      "Qwen35::pack_qg",
+      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, Qd}),
+      KOKKOS_LAMBDA(size_t t, size_t d) {
+        q2(t, d) = qg(t, d);
+        gate2(t, d) = qg(t, Qd + d);
+      });
+  Kokkos::fence();
+  UView3 q(q2.data(), T, Nq, Hd);
+  UView2 gate(gate2.data(), T, Qd);
+  Impl::qk_rmsnorm_oneplus_3d<ExecSpace, Scalar>(q, L.full.q_norm, cfg.rms_eps,
+                                                 q, "Qwen35::qn");
   UView3 k(k2.data(), T, Nk, Hd);
   UView3 v(v2.data(), T, Nk, Hd);
-  Impl::qk_rmsnorm_oneplus_3d<ExecSpace, Scalar>(q, L.full.q_norm, cfg.rms_eps,
-                                                q, "Qwen35::qn");
   Impl::qk_rmsnorm_oneplus_3d<ExecSpace, Scalar>(k, L.full.k_norm, cfg.rms_eps,
                                                 k, "Qwen35::kn");
   Impl::qwen_partial_rope_inplace<ExecSpace, Scalar>(q, rope_inv,
@@ -1246,9 +1264,27 @@ void forward_linear_layer(
   depthwise_conv1d_causal_forward<ExecSpace, Scalar>(qkv, L.lin.conv, no_bias,
                                                     cv, "Qwen35::conv");
   silu_forward<ExecSpace, Scalar>(cv, cv, "Qwen35::conv_silu");
-  UView3 q16(cv.data(), T, Kh, Kdh);
-  UView3 k16(cv.data() + T * Kd, T, Kh, Kdh);
-  UView3 vv(cv.data() + T * 2 * Kd, T, Vh, Vdh);
+  // Pack the q/k/v slices into contiguous buffers: cv rows are
+  // (2*Kd+Vd) wide, so rank-3 views constructed directly over cv would
+  // stride every row past the first incorrectly (same as q/gate above).
+  // Explicit elementwise copies (subview pair ranges proved unreliable).
+  View2 q16p("Qwen35::q16", T, Kd), k16p("Qwen35::k16", T, Kd),
+      vvp("Qwen35::vv", T, Vd);
+  Kokkos::parallel_for(
+      "Qwen35::pack_qkv",
+      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, Kd}),
+      KOKKOS_LAMBDA(size_t t, size_t d) {
+        q16p(t, d) = cv(t, d);
+        k16p(t, d) = cv(t, Kd + d);
+      });
+  Kokkos::parallel_for(
+      "Qwen35::pack_v",
+      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, Vd}),
+      KOKKOS_LAMBDA(size_t t, size_t d) { vvp(t, d) = cv(t, 2 * Kd + d); });
+  Kokkos::fence();
+  UView3 q16(q16p.data(), T, Kh, Kdh);
+  UView3 k16(k16p.data(), T, Kh, Kdh);
+  UView3 vv(vvp.data(), T, Vh, Vdh);
   UView3 z3(z.data(), T, Vh, Vdh);
   FView2 beta("Qwen35::beta", T, Vh), gg("Qwen35::g", T, Vh);
   Impl::qwen_gdn_gates<ExecSpace, Scalar>(a, b, L.lin.a_log, L.lin.dt_bias,
