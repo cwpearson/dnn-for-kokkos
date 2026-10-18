@@ -27,8 +27,11 @@
 // build does not support) returns false; never throws.
 #include "KokkosDNN_config.h"
 
-#if defined(KOKKOSDNN_ENABLE_MIOPEN) && defined(KOKKOS_ENABLE_HIP)
 #include <Kokkos_Core.hpp>
+
+#include "tpl/miopen/KokkosDNN_MIOpen_ConvForward.hpp"
+
+#if defined(KOKKOSDNN_ENABLE_MIOPEN) && defined(KOKKOS_ENABLE_HIP)
 
 #include <miopen/miopen.h>
 
@@ -36,8 +39,6 @@
 
 #include <cstddef>
 #include <cstdint>
-
-#include "tpl/miopen/KokkosDNN_MIOpen_ConvForward.hpp"
 
 namespace KokkosDNN {
 namespace Impl {
@@ -217,6 +218,31 @@ bool miopen_grouped1x1_forward(void* cached_handle, MiopenConvScalar dtype,
   } catch (...) {
     return false;
   }
+}
+
+}  // namespace Impl
+}  // namespace KokkosDNN
+
+#else
+
+namespace KokkosDNN {
+namespace Impl {
+
+bool miopen_conv3x3_forward(void*, MiopenConvScalar, const void*, const void*,
+                            const void*, void*, int, int, int, int) {
+  return false;
+}
+
+bool miopen_depthwise_forward(void*, MiopenConvScalar, const void*,
+                              const void*, const void*, void*, int, int, int,
+                              int) {
+  return false;
+}
+
+bool miopen_grouped1x1_forward(void*, MiopenConvScalar, const void*,
+                               const void*, const void*, void*, int, int, int,
+                               int) {
+  return false;
 }
 
 }  // namespace Impl

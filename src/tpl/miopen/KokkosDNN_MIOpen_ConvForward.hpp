@@ -39,19 +39,16 @@
 // Never throws.
 #include "KokkosDNN_config.h"
 
-#if defined(KOKKOSDNN_ENABLE_MIOPEN) && defined(KOKKOS_ENABLE_HIP)
-#include <Kokkos_Core.hpp>
-#include <Kokkos_Half.hpp>
-#include <cstddef>
-#include <type_traits>
-
-#include "KokkosDNN_Handle.hpp"
-
 namespace KokkosDNN {
 namespace Impl {
 
-// Scalar selector for the raw-pointer entry points (keeps the .cpp free
-// of Kokkos scalar types; mirrors CudnnSdpaScalar).
+// Scalar selector for the raw-pointer entry points (kept free of Kokkos
+// scalar types; mirrors CudnnSdpaScalar). Declared unconditionally (like
+// tpl/miopen/KokkosDNN_MIOpen_Forward.hpp) so the .cpp can always provide
+// definitions: the real MIOpen path when the guard below holds, stubs
+// returning false otherwise. This guarantees the symbols exist whenever a
+// caller (guarded on the same macros) references them, regardless of
+// include order for KOKKOS_ENABLE_HIP.
 enum class MiopenConvScalar { Float, BFloat16 };
 
 // Raw-pointer MIOpen forwards, implemented in
@@ -72,6 +69,20 @@ bool miopen_depthwise_forward(void* cached_handle, MiopenConvScalar dtype,
 bool miopen_grouped1x1_forward(void* cached_handle, MiopenConvScalar dtype,
                                const void* x, const void* w, const void* b,
                                void* y, int T, int Cin, int Cout, int groups);
+
+}  // namespace Impl
+}  // namespace KokkosDNN
+
+#if defined(KOKKOSDNN_ENABLE_MIOPEN) && defined(KOKKOS_ENABLE_HIP)
+#include <Kokkos_Core.hpp>
+#include <Kokkos_Half.hpp>
+#include <cstddef>
+#include <type_traits>
+
+#include "KokkosDNN_Handle.hpp"
+
+namespace KokkosDNN {
+namespace Impl {
 
 // Dense 3x3, stride 1, pad 1: view-based dispatch over x [T,Cin],
 // w [Cout,Cin,3,3], b [Cout] (or empty), y [T,Cout] with T = H*W.
