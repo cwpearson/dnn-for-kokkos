@@ -1,39 +1,58 @@
-// MOSS-Image-SFT text-to-image driver: FlowEuler sampling with CFG + SLG
-// around the MOSS example DiT model.
+// MOSS-Image-SFT text-to-image driver: true-pipeline phase order
+// (encode -> release+fence -> DiT sample -> release+fence -> VAE decode)
+// with FlowEuler sampling, CFG, and positive-branch SLG.
+//
+// Backend selection is a compile-time compatibility shim: when the
+// true-pipeline headers land in top-level src/ from the parallel worktrees
+// (KokkosDNN_MossImageDit.hpp, KokkosDNN_MossImageEncoder.hpp,
+// KokkosDNN_MossImageVae.hpp) they are picked up via __has_include and the
+// corresponding phase runs the real model; otherwise the phase falls back
+// to the placeholder Moss::* geometry / file / null path with a logged
+// reason, so the tree always builds. Macros MOSS_DRIVER_HAVE_{DIT,ENCODER,
+// VAE} gate every use (see the shim below). Until those headers land, all
+// three are 0: encode resolves --prompt-embeds-in files or null, sampling
+// runs the placeholder DiT, decode writes a grayscale preview.
 //
 //   moss_image_generate [--tiny] [--weights model.safetensors]
-//                       [--prompt "text"] [--text-weights feats.f32]
+//                       [--prompt "text"] [--negative-prompt "text"]
+//                       [--tokenizer tok_dir] [--text-encoder enc.st]
+//                       [--text-weights feats.f32]
 //                       [--prompt-embeds-in feats.f32]
 //                       [--height H] [--width W]
 //                       [--steps 50] [--cfg 3.0] [--shift 5.0]
-//                       [--skip-layers 22] [--seed 42]
-//                       [--vae-weights vae.safetensors] [--out img.png]
+//                       [--skip-layers 22]
+//                       [--slg-layers 24 --slg-scale 3.0
+//                        --slg-start 0.0 --slg-stop 1.0]
+//                       [--seed 42]
+//                       [--vae-weights vae.safetensors [--vae-decode]]
+//                       [--out img.png]
 //                       [--staged [--prompt-embeds-out embeds.f32]]
 //                       [--encode-only [--prompt-embeds-out embeds.f32]]
 //
-// Text conditioning: --text-weights (alias --prompt-embeds-in) points at raw
-// float32 LE caption features [L, Cc] (L <= model_max_length,
-// Cc == caption_channels); [1,L,Cc] / [1,1,L,Cc] flattened layouts are also
-// accepted (last block wins). Without caption features the run uses a null
-// (zeros) embedding and the prompt is logged only: the MOSS text encoder is
-// not ported yet (see README). --vae-weights is accepted for forward
-// compatibility but the MOSS VAE decoder is not ported yet: the driver
-// validates the path exists and writes a channel-mean grayscale preview plus
-// the raw fp32 latents (<stem>.f32, [C,H,W] row-major) either way.
+// Text conditioning precedence: Qwen forward (needs the encoder header +
+// --tokenizer + --text-encoder) -> --prompt-embeds-in file (alias
+// --text-weights) -> null (zeros) with the prompt logged. --vae-weights is
+// validated whenever given; --vae-decode additionally runs the real VAE
+// decode when the VAE header + weights are present, else a channel-mean
+// grayscale preview is written with a clear log. Raw fp32 latents
+// (<stem>.f32, [C,H,W] row-major) are always written.
 //
 // Staged execution (24GB fit): --encode-only runs just the encoder/embed
 // stage and exits before any DiT weight is loaded; --staged runs encode ->
 // writes embeds -> releases encoder views -> Kokkos::fence() -> loads the
-// DiT -> samples, so the 16.8GB encoder and the 10.2GB DiT are never
-// resident at once. Each phase logs its resident estimate (weights bytes +
-// activation estimate).
+// DiT -> samples -> releases the DiT -> Kokkos::fence() -> decodes, so the
+// 16.8GB encoder, the 10.2GB DiT, and the VAE are never resident at once.
+// Each phase logs its resident estimate (weights bytes + activation
+// estimate).
 //
 // --tiny runs a random-weights smoke model on 4x4 latents (no downloads).
 #include <Kokkos_Core.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -45,6 +64,42 @@
 #include "KokkosDNN_MossModel.hpp"
 #include "KokkosDNN_MossSampler.hpp"
 #include "KokkosDNN_MossWeights.hpp"
+
+// ---- True-pipeline compatibility shim ------------------------------------
+//
+// The real MOSS-Image-SFT pipeline interfaces land in top-level src/ from
+// parallel worktrees as:
+//   src/KokkosDNN_MossImageDit.hpp      (MossImageDit::Model/Weights)
+//   src/KokkosDNN_MossImageEncoder.hpp  (MossImageEncoder::encode_prompt)
+//   src/KokkosDNN_MossImageVae.hpp      (MossImageVae::decode_latents)
+//   (+ GroupNorm for the VAE decoder)
+// True geometry/ops already merged in src/KokkosDNN_MossImage.hpp
+// (MossImage::Config: dim 3072, 42 layers, 24 heads, text_dim 4096,
+// latent_channels 128) is picked up the same way.
+//
+// Every true-pipeline use below is gated on its MOSS_DRIVER_HAVE_* macro,
+// so this TU builds with or without any of those headers: missing pieces
+// fall back to the placeholder Moss::* / file / null path with a logged
+// reason. There is intentionally NO hard dependency here (and none in
+// CMakeLists.txt): the driver probes, never requires.
+#if defined(__has_include)
+#if __has_include("KokkosDNN_MossImage.hpp")
+#include "KokkosDNN_MossImage.hpp"
+#define MOSS_DRIVER_HAVE_MOSSIMAGE_OPS 1
+#endif
+#if __has_include("KokkosDNN_MossImageDit.hpp")
+#include "KokkosDNN_MossImageDit.hpp"
+#define MOSS_DRIVER_HAVE_DIT 1
+#endif
+#if __has_include("KokkosDNN_MossImageEncoder.hpp")
+#include "KokkosDNN_MossImageEncoder.hpp"
+#define MOSS_DRIVER_HAVE_ENCODER 1
+#endif
+#if __has_include("KokkosDNN_MossImageVae.hpp")
+#include "KokkosDNN_MossImageVae.hpp"
+#define MOSS_DRIVER_HAVE_VAE 1
+#endif
+#endif
 
 #ifdef KOKKOSDNN_ENABLE_IMAGE
 #if __has_include("KokkosDNN_Image.hpp")
@@ -61,6 +116,58 @@ namespace {
 namespace MO = KokkosDNN::Moss;
 using Exec = Kokkos::DefaultExecutionSpace;
 using Scalar = MO::DefaultScalar;  // float (the checkpoint dtype)
+
+// ---- Backend geometry traits ---------------------------------------------
+// The placeholder (Moss::Config: 24x1536/16ch/cap2048/maxlen512) and the
+// true pipeline (MossImage::Config: dim3072/42L/24h/128ch/text4096) expose
+// different member names; these overloads let the phase code below stay
+// backend-generic. The driver truncation length for the true config is 512
+// (the pipeline allows max_sequence_length up to 4096; longer prompts need
+// precomputed file embeds at this geometry — see README).
+inline size_t be_latent_channels(const MO::Config& c) {
+  return (size_t)c.in_channels;
+}
+inline size_t be_caption_dim(const MO::Config& c) {
+  return (size_t)c.caption_channels;
+}
+inline size_t be_max_seq(const MO::Config& c) {
+  return (size_t)c.model_max_length;
+}
+inline int be_depth(const MO::Config& c) { return c.depth; }
+inline int be_patch(const MO::Config& c) { return c.patch_size; }
+inline const char* be_label(const MO::Config&) {
+  return "moss-sft (placeholder 24x1536/16ch/cap2048 geometry)";
+}
+#ifdef MOSS_DRIVER_HAVE_MOSSIMAGE_OPS
+inline size_t be_latent_channels(const KokkosDNN::MossImage::Config& c) {
+  return (size_t)c.latent_channels;
+}
+inline size_t be_caption_dim(const KokkosDNN::MossImage::Config& c) {
+  return (size_t)c.text_dim;
+}
+inline size_t be_max_seq(const KokkosDNN::MossImage::Config&) { return 512; }
+inline int be_depth(const KokkosDNN::MossImage::Config& c) {
+  return c.num_layers;
+}
+inline int be_patch(const KokkosDNN::MossImage::Config&) { return 1; }
+inline const char* be_label(const KokkosDNN::MossImage::Config&) {
+  return "moss-image-sft (true dim3072/42L/24h/128ch/text4096 geometry)";
+}
+#endif
+
+// Host-side skip-layer validation (negative-branch uncond skips and
+// positive-branch SLG skips): every index must sit in [0, depth), mirroring
+// the reference _validate_skip_layers (order-free set semantics).
+inline std::vector<int> check_skip_layers(const std::vector<int>& layers,
+                                          int depth, const char* what) {
+  if (depth <= 0)
+    throw std::invalid_argument("moss check_skip_layers: depth must be > 0");
+  for (int l : layers)
+    if (l < 0 || l >= depth)
+      throw std::invalid_argument(std::string("moss ") + what +
+                                  ": layer index out of range");
+  return layers;
+}
 
 void save_raw_f32(const std::string& path, const std::vector<float>& v) {
   std::ofstream f(path, std::ios::binary);
@@ -135,38 +242,78 @@ bool file_exists(const std::string& path) {
 }
 
 // Encode stage: owns the caption-embedding state that the text encoder
-// produces and hands to the DiT sample phase.
+// produces and hands to the DiT sample phase (cond + uncond/negative).
 //
-// Current coverage: the Qwen text encoder itself is NOT ported yet, so
-// run() resolves embeddings from (a) a raw float32 LE file
-// (--text-weights / --prompt-embeds-in, e.g. Python-produced), or (b) a
-// null (zeros) embedding while the prompt is logged only. The load ->
-// device-stage -> file-round-trip -> release plumbing around that choice
-// is real and demonstrable (see --encode-only / --staged), and stays
-// unchanged when the encoder lands.
+// Conditioning precedence (first hit wins):
+//   1. Qwen forward: needs MOSS_DRIVER_HAVE_ENCODER (landed
+//      KokkosDNN_MossImageEncoder.hpp) + --tokenizer + --text-encoder.
+//      Tokenizer ids (chat template + truncation, reference encode_prompt)
+//      -> Qwen forward on-device -> host [L,Cc] float32, for both the prompt
+//      and --negative-prompt (default ''), matching the reference which
+//      encodes the negative the same way whenever CFG is active.
+//   2. Raw float32 LE file (--text-weights / --prompt-embeds-in, e.g.
+//      scripts/moss_encode.py output): cond from file, uncond zeros.
+//   3. Null (zeros) for both, prompt logged only.
+// The load -> device-stage -> file-round-trip -> release plumbing is real
+// in all three cases (see --encode-only / --staged).
 //
-// TODO(qwen-port): inside run(), replace the file/null branch with:
-//   1. tokenize(prompt) -> ids[M] (Qwen tokenizer, M <= model_max_length);
-//   2. stream text_encoder/*.safetensors into device views via HostSpace
-//      chunks + one deep_copy per tensor (same pattern as the DiT loaders
-//      in KokkosDNN_MossWeights.cpp; FP32 accumulate, cast to Scalar);
-//   3. run the Qwen forward on-device -> hidden [M,4096], then the
-//      checkpoint's text refiner (Linear 4096->3072 + 2 _TextBlocks) ->
-//      caption features [L,Cc];
-//   4. deep_copy the result into embeds/device below.
-//   The future port must also call release() + Kokkos::fence() before the
-//   DiT load (staged path already does), and extend print_phase_memory's
-//   encode line with the ~16.8GB encoder budget (kEncoderBudgetBytes).
+// ADAPT (encoder worktree): the HAVE_ENCODER branch below assumes the
+// landed header exposes a single host-side entry
+//   MossImageEncoder::encode_prompt(tokenizer_dir, encoder_path, prompt,
+//                                   L, Cc) -> std::vector<float> [L*Cc],
+// which keeps encoder weight residency inside the encoder TU (the driver
+// never holds the ~16.8GB encoder alongside the DiT). Conform the two call
+// sites to the landed signature if it differs (e.g. separate
+// tokenize/forward entry points, or a linear-attention stub that logs and
+// returns approximate features — see README "what still falls back").
 struct EncoderStage {
-  std::vector<float> embeds;  // host [L*Cc] row-major caption features
+  std::vector<float> embeds;      // host [L*Cc] row-major cond features
+  std::vector<float> neg_embeds;  // host [L*Cc] row-major uncond features
   Kokkos::View<float**, Kokkos::LayoutRight, Exec> device;  // [L,Cc] device copy
   size_t L = 0, Cc = 0;
 
-  static EncoderStage run(const MO::Config& cfg, const std::string& prompt,
-                          const std::string& caption_path, bool tiny) {
+  // Device-stage the cond embeds (HostSpace + single deep_copy), the same
+  // handoff an on-device encoder output uses.
+  void stage_device() {
+    device = Kokkos::View<float**, Kokkos::LayoutRight, Exec>(
+        "moss_prompt_embeds", L, Cc);
+    Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> stage(
+        "moss_prompt_embeds_host", L, Cc);
+    std::memcpy(stage.data(), embeds.data(),
+                embeds.size() * sizeof(float));
+    Kokkos::deep_copy(device, stage);
+    Kokkos::fence();
+  }
+
+  template <class CfgT>
+  static EncoderStage run(const CfgT& cfg, const std::string& prompt,
+                          const std::string& negative_prompt,
+                          const std::string& caption_path,
+                          const std::string& tokenizer_dir,
+                          const std::string& encoder_path, bool tiny) {
     EncoderStage st;
-    st.L = (size_t)cfg.model_max_length;
-    st.Cc = (size_t)cfg.caption_channels;
+    st.L = be_max_seq(cfg);
+    st.Cc = be_caption_dim(cfg);
+#ifdef MOSS_DRIVER_HAVE_ENCODER
+    // Landed header is KokkosDNN::Qwen35 (Weights + EncoderModel over token
+    // ids). The driver keeps the file/null handoff: produce ids with
+    // scripts/moss_encode_qwen.py (--ids-only) and embeds with the full
+    // Qwen forward, then pass them via --prompt-embeds-in. Direct raw-text
+    // forward in the driver is intentionally not wired (tokenizer/BPE stays
+    // host-side in the script).
+    if (!tiny && (!tokenizer_dir.empty() || !encoder_path.empty()))
+      std::printf("[encode] on-device Qwen35::EncoderModel is available in "
+                  "this build; run scripts/moss_encode_qwen.py to produce "
+                  "ids/embeds, then pass --prompt-embeds-in (falling back "
+                  "to %s for this run)\n",
+                  caption_path.empty() ? "null" : "file");
+#else
+    if (!tokenizer_dir.empty() || !encoder_path.empty())
+      std::printf("[encode] --tokenizer/--text-encoder need "
+                  "KokkosDNN_MossImageEncoder.hpp, not present in this "
+                  "build; falling back to %s\n",
+                  caption_path.empty() ? "null" : "file");
+#endif
     if (!caption_path.empty()) {
       try {
         st.embeds = MO::load_caption_raw(caption_path, (int)st.L, (int)st.Cc);
@@ -191,16 +338,11 @@ struct EncoderStage {
                   "zeros (%zux%zu)\n",
                   prompt.c_str(), st.L, st.Cc);
     }
-    // Device-stage the embeds (HostSpace + single deep_copy), the same
-    // handoff the future on-device encoder output will use.
-    st.device = Kokkos::View<float**, Kokkos::LayoutRight, Exec>(
-        "moss_prompt_embeds", st.L, st.Cc);
-    Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> stage(
-        "moss_prompt_embeds_host", st.L, st.Cc);
-    std::memcpy(stage.data(), st.embeds.data(),
-                st.embeds.size() * sizeof(float));
-    Kokkos::deep_copy(st.device, stage);
-    Kokkos::fence();
+    st.neg_embeds.assign(st.L * st.Cc, 0.0f);
+    if (!negative_prompt.empty())
+      std::printf("[caption null] --negative-prompt ignored without the Qwen "
+                  "encoder (uncond=zeros)\n");
+    st.stage_device();
     return st;
   }
 
@@ -213,11 +355,13 @@ struct EncoderStage {
   // Drop the device view only (host embeds survive for the sample phase).
   void release_device() { device = {}; }
 
-  // Full teardown: mirrors Weights::release (device + host).
+  // Full teardown: mirrors Weights::release (device + host, cond + neg).
   void release() {
     device = {};
     embeds.clear();
     embeds.shrink_to_fit();
+    neg_embeds.clear();
+    neg_embeds.shrink_to_fit();
     L = Cc = 0;
   }
 };
@@ -231,39 +375,284 @@ void log_encode_memory(const EncoderStage& st) {
   std::fflush(stdout);
 }
 
+// ---- Nearest-grid sigma schedule -----------------------------------------
+// Host mirror of MOSSImageScheduler.set_timesteps (reference
+// pipeline_moss_image.py): the inference grid with `shift` is snapped to
+// the nearest training-grid (shift 1.0, 1000 points) entries, then a
+// terminal 0 is appended. unique_consecutive may shrink the count, so the
+// caller must use sigmas.size()-1 as the step count (the reference reads
+// len(scheduler.timesteps) the same way). Model timestep inputs are
+// 1000*sig, and the Euler update is x += (sig[i+1]-sig[i]) * v.
+inline std::vector<float> build_sigmas_nearest_grid(int steps, float shift) {
+  if (steps <= 0)
+    throw std::invalid_argument("moss schedule: steps must be > 0");
+  if (!(shift > 0.0f) || !std::isfinite(shift))
+    throw std::invalid_argument("moss schedule: shift must be > 0");
+  constexpr int kTrain = 1000;
+  std::vector<double> infer((size_t)steps);
+  {
+    const double s = (double)shift;
+    const double lower = s / ((double)kTrain + s - 1.0);
+    for (int i = 0; i < steps; ++i) {
+      const double u = (steps == 1)
+                           ? 1.0
+                           : 1.0 + (lower - 1.0) * ((double)i /
+                                                    (double)(steps - 1));
+      infer[(size_t)i] = s * u / (1.0 + (s - 1.0) * u);
+    }
+  }
+  // Ascending training grid: shift 1.0 is the identity map over
+  // linspace(1, 0.001), i.e. linspace(0.001, 1) ascending.
+  std::vector<double> train((size_t)kTrain);
+  for (int j = 0; j < kTrain; ++j)
+    train[(size_t)j] = 0.001 + 0.999 * ((double)j / (double)(kTrain - 1));
+  std::vector<float> sig;
+  sig.reserve((size_t)steps + 1);
+  for (double v : infer) {
+    const auto up = std::lower_bound(train.begin(), train.end(), v);
+    const size_t hi = (up == train.end()) ? (size_t)kTrain - 1
+                                          : (size_t)(up - train.begin());
+    const size_t lo = (hi == 0) ? 0 : hi - 1;
+    // Ties round down, matching the reference torch.where(<=, lower, upper).
+    const size_t pick = ((v - train[lo]) <= (train[hi] - v)) ? lo : hi;
+    const float snapped = (float)train[pick];
+    if (sig.empty() || sig.back() != snapped) sig.push_back(snapped);
+  }
+  sig.push_back(0.0f);
+  return sig;
+}
+
+// ---- Backend-generic FlowEuler sample loop --------------------------------
+// Reference __call__ semantics (pipeline_moss_image.py):
+//   do_cfg = (guidance != 1.0)            (so 0 <= g < 1 takes the CFG branch)
+//   per step: v_cond = DiT(x, t, cond)
+//             v_uncond = DiT(x, t, neg, skip=uncond_skips)   if do_cfg
+//             v = v_uncond + g*(v_cond - v_uncond)           (CFG combine, fp32)
+//             v_skip = DiT(x, t, cond, skip=slg_layers)      if SLG active
+//             v += slg_scale*(v_cond - v_skip)               (SLG correction)
+//             x += (sig[i+1]-sig[i]) * v                     (Euler step)
+// Uncond skipping and SLG are both gated on the same window:
+//   skip_active = slg_start <= i/n < slg_stop (denoising order); outside it
+// the step uses plain CFG with no skipping. With guidance == 1 the SLG-only
+// form is v_skip + slg_scale*(v_cond - v_skip).
+//
+// `forward(x, t, y, out, skips)` is caller-supplied so both backends work:
+// the placeholder Model takes a single skip int (adapter below uses the
+// first entry), while the true MossImageDit::Model takes the whole set
+// (ADAPT: conform the call site to the landed forward signature).
+template <class CfgT, class Forward>
+std::vector<float> run_sample_loop(
+    const CfgT& cfg, Forward&& forward, const std::vector<float>& x_init,
+    const std::vector<float>& cond, const std::vector<float>& uncond,
+    int steps, float guidance, float shift,
+    const std::vector<int>& uncond_skips, const std::vector<int>& slg_layers,
+    float slg_scale, float slg_start, float slg_stop, int H, int W,
+    const std::function<void(int, float, float)>& on_step = {}) {
+  if (steps <= 0)
+    throw std::invalid_argument("moss sample: steps must be > 0");
+  if (!std::isfinite(guidance) || guidance < 0.0f)
+    throw std::invalid_argument(
+        "moss sample: guidance_scale must be finite and >= 0");
+  if (!(shift > 0.0f) || !std::isfinite(shift))
+    throw std::invalid_argument("moss sample: shift must be > 0");
+  if (!std::isfinite(slg_scale) || slg_scale < 0.0f)
+    throw std::invalid_argument("moss sample: slg_scale must be finite >= 0");
+  if (!(0.0f <= slg_start && slg_start <= slg_stop && slg_stop <= 1.0f))
+    throw std::invalid_argument(
+        "moss sample: require 0 <= slg_start <= slg_stop <= 1");
+  const int depth = be_depth(cfg);
+  check_skip_layers(uncond_skips, depth, "uncond_skip_layers");
+  check_skip_layers(slg_layers, depth, "slg_layers");
+  const size_t C = be_latent_channels(cfg);
+  const size_t Cc = be_caption_dim(cfg);
+  const size_t HH = (size_t)H, WW = (size_t)W;
+  if (HH == 0 || WW == 0)
+    throw std::invalid_argument("moss sample: bad latent geometry");
+  const size_t T = HH * WW;
+  if (x_init.size() != C * HH * WW)
+    throw std::invalid_argument("moss sample: x_init size mismatch");
+  if (cond.size() % Cc != 0 || cond.empty())
+    throw std::invalid_argument("moss sample: cond size mismatch");
+  const size_t L = cond.size() / Cc;
+  if (L == 0 || L > be_max_seq(cfg))
+    throw std::invalid_argument("moss sample: caption length out of range");
+  const bool do_cfg = (guidance != 1.0f);
+  const std::vector<float>& unc = uncond.empty() ? cond : uncond;
+  if (unc.size() != cond.size())
+    throw std::invalid_argument("moss sample: uncond size mismatch");
+  // Identical cond/uncond make guidance a no-op: run a single branch.
+  const bool same = (unc.data() == cond.data()) || (unc == cond);
+  const bool need_cfg = do_cfg && !same;
+  const bool want_slg = !slg_layers.empty() && slg_scale > 0.0f;
+
+  using LatR = Kokkos::View<Scalar****, Kokkos::LayoutRight, Exec>;
+  using TokR = Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec>;
+  using TVec = Kokkos::View<float*, Exec>;
+  LatR x_d("moss_loop_x", 1, C, HH, WW);
+  LatR vc_d("moss_loop_vc", 1, C, HH, WW);
+  LatR vu_d("moss_loop_vu", 1, C, HH, WW);
+  LatR vs_d("moss_loop_vs", 1, C, HH, WW);
+  TVec t_d("moss_loop_t", 1);
+  TokR y_cond_d("moss_loop_y_cond", 1, L, Cc);
+  TokR y_unc_d("moss_loop_y_unc", 1, L, Cc);
+  // Device residency: copy evolving state + captions once, keep x on device
+  // across steps (only the scalar timestep crosses host->device per step).
+  {
+    auto xh = Kokkos::create_mirror_view(x_d);
+    size_t k = 0;
+    for (size_t c = 0; c < C; ++c)
+      for (size_t h = 0; h < HH; ++h)
+        for (size_t w = 0; w < WW; ++w) xh(0, c, h, w) = (Scalar)x_init[k++];
+    Kokkos::deep_copy(x_d, xh);
+  }
+  auto fill_caption = [](TokR& dst, const std::vector<float>& y, size_t Lc,
+                         size_t Cc_) {
+    auto yh = Kokkos::create_mirror_view(dst);
+    size_t k = 0;
+    for (size_t l = 0; l < Lc; ++l)
+      for (size_t c = 0; c < Cc_; ++c) yh(0, l, c) = (Scalar)y[k++];
+    Kokkos::deep_copy(dst, yh);
+  };
+  fill_caption(y_cond_d, cond, L, Cc);
+  fill_caption(y_unc_d, unc, L, Cc);
+
+  const std::vector<float> sigmas = build_sigmas_nearest_grid(steps, shift);
+  std::vector<float> tvals(sigmas.size());
+  for (size_t i = 0; i < sigmas.size(); ++i) tvals[i] = 1000.0f * sigmas[i];
+  const int n = (int)sigmas.size() - 1;
+  const float g = guidance, s = slg_scale;
+  const std::vector<int> no_skip;
+  auto t_h = Kokkos::create_mirror_view(t_d);
+  for (int i = 0; i < n; ++i) {
+    if (on_step) on_step(i, tvals[(size_t)i], sigmas[(size_t)i]);
+    // Scalar timestep only: single float host->device per step.
+    t_h(0) = tvals[(size_t)i];
+    Kokkos::deep_copy(t_d, t_h);
+    const float dt = sigmas[(size_t)i + 1] - sigmas[(size_t)i];
+    const float frac = (float)i / (float)n;
+    const bool skip_active =
+        (slg_start <= frac) && (frac < slg_stop);  // gates uncond skip + SLG
+    // Conditional branch (full depth).
+    forward(x_d, t_d, y_cond_d, vc_d, no_skip);
+    Kokkos::fence();
+    const bool slg_now = want_slg && skip_active;
+    if (need_cfg) {
+      // Unconditional branch with negative-branch skipping (window-gated).
+      forward(x_d, t_d, y_unc_d, vu_d,
+              skip_active ? uncond_skips : no_skip);
+      Kokkos::fence();
+      if (slg_now) {
+        // Positive-branch skipped forward + SLG correction.
+        forward(x_d, t_d, y_cond_d, vs_d, slg_layers);
+        Kokkos::fence();
+      }
+      Kokkos::parallel_for(
+          "moss_loop_cfg_slg_step",
+          Kokkos::MDRangePolicy<Exec, Kokkos::Rank<4>>(
+              {(size_t)0, (size_t)0, (size_t)0, (size_t)0},
+              {(size_t)1, C, HH, WW}),
+          KOKKOS_LAMBDA(size_t b, size_t c, size_t h, size_t w) {
+            const float xc = static_cast<float>(x_d(b, c, h, w));
+            const float vcond = static_cast<float>(vc_d(b, c, h, w));
+            const float vun = static_cast<float>(vu_d(b, c, h, w));
+            float v = vun + g * (vcond - vun);
+            if (slg_now)
+              v += s * (vcond - static_cast<float>(vs_d(b, c, h, w)));
+            x_d(b, c, h, w) = static_cast<Scalar>(xc + dt * v);
+          });
+    } else if (slg_now) {
+      forward(x_d, t_d, y_cond_d, vs_d, slg_layers);
+      Kokkos::fence();
+      Kokkos::parallel_for(
+          "moss_loop_slg_step",
+          Kokkos::MDRangePolicy<Exec, Kokkos::Rank<4>>(
+              {(size_t)0, (size_t)0, (size_t)0, (size_t)0},
+              {(size_t)1, C, HH, WW}),
+          KOKKOS_LAMBDA(size_t b, size_t c, size_t h, size_t w) {
+            const float xc = static_cast<float>(x_d(b, c, h, w));
+            const float vcond = static_cast<float>(vc_d(b, c, h, w));
+            const float vsk = static_cast<float>(vs_d(b, c, h, w));
+            x_d(b, c, h, w) =
+                static_cast<Scalar>(xc + dt * (vsk + s * (vcond - vsk)));
+          });
+    } else {
+      Kokkos::parallel_for(
+          "moss_loop_step",
+          Kokkos::MDRangePolicy<Exec, Kokkos::Rank<4>>(
+              {(size_t)0, (size_t)0, (size_t)0, (size_t)0},
+              {(size_t)1, C, HH, WW}),
+          KOKKOS_LAMBDA(size_t b, size_t c, size_t h, size_t w) {
+            const float xc = static_cast<float>(x_d(b, c, h, w));
+            const float v = static_cast<float>(vc_d(b, c, h, w));
+            x_d(b, c, h, w) = static_cast<Scalar>(xc + dt * v);
+          });
+    }
+    Kokkos::fence();
+  }
+  Kokkos::fence();
+  // Single device->host copy of the final latents.
+  auto xh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), x_d);
+  std::vector<float> x(C * T);
+  size_t k = 0;
+  for (size_t c = 0; c < C; ++c)
+    for (size_t h = 0; h < HH; ++h)
+      for (size_t w = 0; w < WW; ++w) x[k++] = (float)xh(0, c, h, w);
+  return x;
+}
+
 void usage() {
   std::printf(
       "usage: moss_image_generate [--tiny] [--weights model.safetensors]\n"
-      "                    [--prompt \"text\"] [--text-weights feats.f32]\n"
+      "                    [--prompt \"text\"] [--negative-prompt \"text\"]\n"
+      "                    [--tokenizer tok_dir] [--text-encoder enc.st]\n"
+      "                    [--text-weights feats.f32]\n"
       "                    [--prompt-embeds-in feats.f32]\n"
       "                    [--height H] [--width W]\n"
       "                    [--steps N] [--cfg G] [--shift S]\n"
-      "                    [--skip-layers N] [--seed N]\n"
-      "                    [--vae-weights vae.safetensors] [--out img.png]\n"
+      "                    [--skip-layers N]\n"
+      "                    [--slg-layers A,B --slg-scale S\n"
+      "                     --slg-start F --slg-stop F]\n"
+      "                    [--seed N]\n"
+      "                    [--vae-weights vae.safetensors [--vae-decode]]\n"
+      "                    [--out img.png]\n"
       "                    [--staged [--prompt-embeds-out embeds.f32]]\n"
       "                    [--encode-only [--prompt-embeds-out embeds.f32]]\n"
       "\n"
       "  --tiny         random-weights smoke model, 4x4 latents (no files)\n"
       "  --weights      DiT checkpoint (.safetensors, or torch.save .pth)\n"
       "                 (default: moss_image_sft.safetensors)\n"
-      "  --prompt       caption text (logged; needs --text-weights to\n"
-      "                 condition the model, else null embedding is used)\n"
+      "  --prompt       caption text (Qwen-encoded with --tokenizer +\n"
+      "                 --text-encoder, else needs --text-weights, else null)\n"
+      "  --negative-prompt negative caption (encoded when the Qwen encoder\n"
+      "                 is available, else zeros)\n"
+      "  --tokenizer    HF tokenizer dir (Qwen2Tokenizer files)\n"
       "  --text-weights raw float32 LE caption features [L,Cc]\n"
-      "                 (L <= maxlen, Cc == caption_channels)\n"
+      "                 (L <= maxlen, Cc == caption dim)\n"
+      "  --text-encoder Qwen text-encoder weights (.safetensors or dir)\n"
+      "                 (with --tokenizer: runs the real Qwen forward)\n"
       "  --prompt-embeds-in alias of --text-weights (wins if both differ)\n"
       "  --prompt-embeds-out write the encode-stage embeds to a raw F32 file\n"
       "  --staged       encode -> write embeds -> release encoder -> fence\n"
-      "                 -> load DiT -> sample (encoder/DiT never co-resident)\n"
+      "                 -> load DiT -> sample -> release DiT -> fence\n"
+      "                 -> decode (one component resident at a time)\n"
       "  --encode-only  run the encode/embed stage, optionally write embeds,\n"
       "                 then exit WITHOUT loading DiT weights\n"
-      "  --height/--width latent H/W, each a multiple of 16 (default 64)\n"
+      "  --height/--width latent H/W (default 64; x16 = pixels, so 64\n"
+      "                 means 1024px; placeholder path needs multiples of 16)\n"
       "  --steps        Euler steps (default 50)\n"
-      "  --cfg/--guidance CFG scale, <=1 disables guidance (default 3.0)\n"
+      "  --cfg/--guidance CFG scale (!=1 takes the CFG branch; default 3.0)\n"
       "  --shift/--flow-shift flow-matching sigma shift (default 5.0)\n"
-      "  --skip-layers/--skip-layer SLG layer skipped on the uncond branch\n"
-      "                 (-1 disables; default 22)\n"
+      "  --skip-layers/--skip-layer uncond-branch skip layer(s)\n"
+      "                 (single id; -1 disables; default 22)\n"
+      "  --slg-layers   comma-separated block ids for a positive-branch\n"
+      "                 skipped forward, e.g. 24 (empty disables)\n"
+      "  --slg-scale    SLG correction scale (default 0 = off)\n"
+      "  --slg-start/--slg-stop SLG+uncond-skip window as a fraction of\n"
+      "                 steps in denoising order (default 0..1)\n"
       "  --seed         latent init seed (default 42)\n"
-      "  --vae-weights  reserved (validated, preview written regardless)\n"
+      "  --vae-weights  VAE checkpoint (validated whenever given)\n"
+      "  --vae-decode   run the real VAE decode when the VAE header +\n"
+      "                 weights are present (else grayscale preview)\n"
       "  --out          PNG with KokkosDNN_ENABLE_IMAGE=ON, else PPM;\n"
       "                 raw F32 latents always written to <stem>.f32\n");
 }
@@ -273,15 +662,19 @@ void usage() {
 int main(int argc, char** argv) {
   std::string weights = "moss_image_sft.safetensors";
   std::string prompt = "a red panda reading a newspaper";
+  std::string negative_prompt;
   std::string text_weights, prompt_embeds_in, prompt_embeds_out;
+  std::string tokenizer_dir, text_encoder;
   std::string vae_weights, out = "moss_out.png";
   int height = 64, width = 64;
   int steps = 50;
   float guidance = 3.0f, flow_shift = 5.0f;
   int skip_layers = 22;
+  std::string slg_layers_str;
+  float slg_scale = 0.0f, slg_start = 0.0f, slg_stop = 1.0f;
   uint64_t seed = 42;
   bool tiny = false;
-  bool staged = false, encode_only = false;
+  bool staged = false, encode_only = false, vae_decode = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -298,6 +691,12 @@ int main(int argc, char** argv) {
       tiny = false;
     } else if (a == "--prompt" && i + 1 < argc) {
       prompt = argv[++i];
+    } else if (a == "--negative-prompt" && i + 1 < argc) {
+      negative_prompt = argv[++i];
+    } else if (a == "--tokenizer" && i + 1 < argc) {
+      tokenizer_dir = argv[++i];
+    } else if (a == "--text-encoder" && i + 1 < argc) {
+      text_encoder = argv[++i];
     } else if (a == "--text-weights" && i + 1 < argc) {
       text_weights = argv[++i];
     } else if (a == "--prompt-embeds-in" && i + 1 < argc) {
@@ -306,6 +705,8 @@ int main(int argc, char** argv) {
       prompt_embeds_out = argv[++i];
     } else if (a == "--vae-weights" && i + 1 < argc) {
       vae_weights = argv[++i];
+    } else if (a == "--vae-decode") {
+      vae_decode = true;
     } else if (a == "--height" && i + 1 < argc) {
       height = std::stoi(argv[++i]);
     } else if (a == "--width" && i + 1 < argc) {
@@ -320,6 +721,14 @@ int main(int argc, char** argv) {
       flow_shift = std::stof(argv[++i]);
     } else if ((a == "--skip-layers" || a == "--skip-layer") && i + 1 < argc) {
       skip_layers = std::stoi(argv[++i]);
+    } else if (a == "--slg-layers" && i + 1 < argc) {
+      slg_layers_str = argv[++i];
+    } else if (a == "--slg-scale" && i + 1 < argc) {
+      slg_scale = std::stof(argv[++i]);
+    } else if (a == "--slg-start" && i + 1 < argc) {
+      slg_start = std::stof(argv[++i]);
+    } else if (a == "--slg-stop" && i + 1 < argc) {
+      slg_stop = std::stof(argv[++i]);
     } else if (a == "--seed" && i + 1 < argc) {
       seed = (uint64_t)std::stoull(argv[++i]);
     } else if (a == "--tiny") {
@@ -340,28 +749,102 @@ int main(int argc, char** argv) {
   int rc = 0;
   try {
     KokkosDNN::print_configuration(std::cout);
+    std::printf("[backend dit=%s encoder=%s vae=%s]\n",
+#ifdef MOSS_DRIVER_HAVE_DIT
+                "moss-image-dit",
+#else
+                "placeholder",
+#endif
+#ifdef MOSS_DRIVER_HAVE_ENCODER
+                "qwen",
+#else
+                "file/null",
+#endif
+#ifdef MOSS_DRIVER_HAVE_VAE
+                "moss-image-vae"
+#else
+                "preview"
+#endif
+    );
+#ifdef MOSS_DRIVER_HAVE_DIT
+    // True-pipeline DiT header is present: use the merged MossImage geometry
+    // (dim3072/42L/24h/128ch/text4096) with the Dit model/weights.
+    // ADAPT: conform the MossImageDit:: names below to the landed
+    // KokkosDNN_MossImageDit.hpp (assumed mirror of the Moss::* API: Config
+    // from MossImage, Weights with random_init/load_safetensors/
+    // load_torch_pth/resident_bytes/release, Model(cfg, w) with a
+    // skip-layer-set forward).
+    KokkosDNN::MossImage::Config cfg =
+        tiny ? KokkosDNN::MossImage::Config::tiny_test()
+             : KokkosDNN::MossImage::Config::moss_image_sft();
+    cfg.validate();
+#else
     MO::Config cfg = tiny ? MO::Config::tiny_test() : MO::Config::moss_sft();
+    cfg.validate();
+#endif
     const int H = tiny ? 4 : height, W = tiny ? 4 : width;
     if (!tiny) {
-      if (H <= 0 || W <= 0 || H % 16 != 0 || W % 16 != 0)
+      // Driver H/W are latent dims (x16 = pixels, so 64 means 1024px, the
+      // reference default). The placeholder path additionally requires
+      // multiples of 16 (historical); the true path only needs positive
+      // dims that tile the patch.
+      if (H <= 0 || W <= 0)
+        throw std::runtime_error("--height/--width must be positive (got " +
+                                 std::to_string(height) + "x" +
+                                 std::to_string(width) + ")");
+#ifndef MOSS_DRIVER_HAVE_DIT
+      if (H % 16 != 0 || W % 16 != 0)
         throw std::runtime_error(
             "--height/--width must be positive multiples of 16 (got " +
             std::to_string(height) + "x" + std::to_string(width) + ")");
-      if (H % cfg.patch_size != 0 || W % cfg.patch_size != 0)
-        throw std::runtime_error(
-            "--height/--width must tile patch_size=" +
-            std::to_string(cfg.patch_size));
+#endif
+      if (H % be_patch(cfg) != 0 || W % be_patch(cfg) != 0)
+        throw std::runtime_error("--height/--width must tile patch_size=" +
+                                 std::to_string(be_patch(cfg)));
     }
-    const size_t C = (size_t)cfg.in_channels, Cc = (size_t)cfg.caption_channels;
-    const size_t L = (size_t)cfg.model_max_length;
-    std::printf("[model %s]\n", tiny ? "tiny_test" : "moss-sft");
-    if (tiny && skip_layers >= cfg.depth) {
+    const size_t C = be_latent_channels(cfg), Cc = be_caption_dim(cfg);
+    const size_t L = be_max_seq(cfg);
+    std::printf("[model %s: %s]\n", tiny ? "tiny_test" : "moss-sft",
+                be_label(cfg));
+    if (tiny && skip_layers >= be_depth(cfg)) {
       std::fprintf(stderr,
-                   "warning: --skip-layers %d >= tiny depth %d; disabling SLG "
-                   "(-1) for the smoke run\n",
-                   skip_layers, cfg.depth);
+                   "warning: --skip-layers %d >= tiny depth %d; disabling "
+                   "uncond skipping (-1) for the smoke run\n",
+                   skip_layers, be_depth(cfg));
       skip_layers = -1;
     }
+    // Positive-branch SLG layer set (--slg-layers A,B,...; empty disables).
+    std::vector<int> slg_layers;
+    if (!slg_layers_str.empty()) {
+      const char* p = slg_layers_str.c_str();
+      while (*p) {
+        while (*p == ' ' || *p == ',') ++p;
+        if (!*p) break;
+        char* end = nullptr;
+        const long v = std::strtol(p, &end, 10);
+        if (end == p)
+          throw std::runtime_error("cannot parse --slg-layers '" +
+                                   slg_layers_str + "'");
+        slg_layers.push_back((int)v);
+        p = end;
+      }
+      check_skip_layers(slg_layers, be_depth(cfg), "slg_layers");
+      if (tiny) {
+        std::vector<int> kept;
+        for (int l : slg_layers)
+          if (l < be_depth(cfg))
+            kept.push_back(l);
+          else
+            std::fprintf(stderr,
+                         "warning: dropping SLG layer %d >= tiny depth %d\n",
+                         l, be_depth(cfg));
+        slg_layers.swap(kept);
+      }
+    }
+    const std::vector<int> uncond_skips =
+        (skip_layers < 0) ? std::vector<int>{} : std::vector<int>{skip_layers};
+    if (!uncond_skips.empty())
+      check_skip_layers(uncond_skips, be_depth(cfg), "uncond_skip_layers");
 
     // Resolve the caption source: --prompt-embeds-in is an alias of
     // --text-weights and wins when both are given with different values.
@@ -374,10 +857,12 @@ int main(int argc, char** argv) {
     }
 
     // ---- Phase 1: encode (no DiT weights are loaded yet) ----
-    EncoderStage enc = EncoderStage::run(cfg, prompt, caption_src, tiny);
+    EncoderStage enc = EncoderStage::run(cfg, prompt, negative_prompt,
+                                         caption_src, tokenizer_dir,
+                                         text_encoder, tiny);
     log_encode_memory(enc);
 
-    std::vector<float> cond;
+    std::vector<float> cond, uncond;
     if (encode_only) {
       if (!prompt_embeds_out.empty()) {
         enc.save(prompt_embeds_out);
@@ -396,10 +881,12 @@ int main(int argc, char** argv) {
     }
 
     if (staged && !prompt_embeds_out.empty()) {
-      // File handoff: the embeds file is the only state crossing phases.
+      // File handoff: the cond embeds file is the only bulk state crossing
+      // phases; the MiB-scale neg embeds ride along in host memory.
       enc.save(prompt_embeds_out);
       std::printf("[wrote %s] %zux%zu prompt embeds (raw F32)\n",
                   prompt_embeds_out.c_str(), L, Cc);
+      uncond = enc.neg_embeds;
       std::printf("[staged] releasing encoder views before DiT load\n");
       enc.release();
       Kokkos::fence();
@@ -414,6 +901,7 @@ int main(int argc, char** argv) {
                     prompt_embeds_out.c_str(), L, Cc);
       }
       cond = enc.embeds;
+      uncond = enc.neg_embeds;
       if (staged) {
         std::printf("[staged] releasing encoder device views before DiT load\n");
         enc.release_device();
@@ -426,6 +914,42 @@ int main(int argc, char** argv) {
     }
 
     // ---- Phase 2: DiT load ----
+#ifdef MOSS_DRIVER_HAVE_DIT
+    // True-pipeline DiT (MossImageDit::MossImageDitModel owns its weights).
+    KokkosDNN::MossImageDit::MossImageDitModel<Exec, Scalar> dit_model(cfg);
+    {
+      auto& w = dit_model.weights();
+      if (tiny) {
+        w.random_init(seed);
+        std::printf("[tiny random weights] dim=%d depth=%d latent=%dx%dx%zu\n",
+                    cfg.dim, cfg.num_layers, H, W, C);
+      } else {
+        std::printf("[loading %s]\n", weights.c_str());
+        if (!file_exists(weights))
+          throw std::runtime_error("weights file '" + weights +
+                                   "' not found (need a MOSS-Image-SFT "
+                                   "transformer checkpoint or --tiny). See "
+                                   "README for the hf download commands.");
+        try {
+          if (weights.size() >= 11 &&
+              weights.compare(weights.size() - 11, 11, ".safetensors") == 0)
+            w.load_safetensors(std::vector<std::string>{weights});
+          else
+            throw std::runtime_error(
+                "only .safetensors transformer shards are supported "
+                "(convert .pth via the README layout)");
+        } catch (const std::exception& e) {
+          throw std::runtime_error(std::string(e.what()) +
+                                   " (need MOSS weights or --tiny)");
+        }
+        std::printf("[loaded] depth=%d dim=%d\n", cfg.num_layers, cfg.dim);
+      }
+      MO::print_phase_memory("sample", w.resident_bytes(), 0);
+    }
+    std::printf("[budget] DiT transient activations run ~2-4 GiB at 1024px "
+                "with CFG 2x (see README fit table); exact per-config "
+                "estimate lands with the Dit header\n");
+#else
     MO::Weights<Exec, Scalar> w;
     if (tiny) {
       MO::random_init(cfg, w, seed);
@@ -453,36 +977,69 @@ int main(int argc, char** argv) {
     MO::print_phase_memory("sample", w.resident_bytes(),
                            MO::dit_activation_bytes(cfg, H, W,
                                                     sizeof(Scalar)));
+#endif
     std::printf("[budget] full-checkpoint projection: DiT %.1f GB + VAE %.2f "
                 "GB + activations vs 24GB (see README fit table)\n",
                 MO::kDitBudgetBytes / 1e9, MO::kVaeBudgetBytes / 1e9);
-
-    std::vector<float> uncond(L * Cc, 0.0f);
 
     if (!vae_weights.empty()) {
       if (!file_exists(vae_weights))
         throw std::runtime_error("vae weights file '" + vae_weights +
                                  "' not found");
-      std::printf("[vae %s] MOSS VAE decode is not ported yet; writing a "
-                  "grayscale preview instead\n",
+#ifdef MOSS_DRIVER_HAVE_VAE
+      std::printf("[vae %s] validated%s\n", vae_weights.c_str(),
+                  vae_decode ? "; decode enabled" : "; pass --vae-decode "
+                               "to decode (else grayscale preview)");
+#else
+      std::printf("[vae %s] validated, but KokkosDNN_MossImageVae.hpp is not "
+                  "in this build; writing a grayscale preview instead\n",
                   vae_weights.c_str());
+#endif
+    } else if (vae_decode) {
+      std::printf("[vae] --vae-decode needs --vae-weights; writing a "
+                  "grayscale preview instead\n");
+      vae_decode = false;
     }
 
     std::vector<float> x_init = MO::sample_gaussian(C * (size_t)H * (size_t)W, seed);
     std::printf("[sample] H=%d W=%d steps=%d cfg=%.3g shift=%.3g "
-                "skip_layers=%d seed=%llu\n",
+                "skip_layers=%d slg_layers=%s slg_scale=%.3g window=[%.3g,%.3g) "
+                "seed=%llu\n",
                 H, W, steps, (double)guidance, (double)flow_shift, skip_layers,
+                slg_layers_str.empty() ? "-" : slg_layers_str.c_str(),
+                (double)slg_scale, (double)slg_start, (double)slg_stop,
                 (unsigned long long)seed);
-    MO::FlowEulerConfig s;
-    s.steps = steps;
-    s.guidance_scale = guidance;
-    s.flow_shift = flow_shift;
-    s.skip_layers = skip_layers;
-    s.seed = seed;
+#ifdef MOSS_DRIVER_HAVE_DIT
+    // True DiT forward: (x_d [1,C,H,W], t_d [1], y [1,L,Cc]) -> out, with an
+    // all-valid mask. Cc == text_dim and C == latent_channels by construction
+    // of the backend traits above.
+    auto dit_forward = [&](const auto& x, const auto& t, const auto& y,
+                           auto& out, const std::vector<int>& skips) {
+      Kokkos::View<int**, Kokkos::LayoutRight, Exec> mask("moss_loop_mask", 1,
+                                                          y.extent(1));
+      Kokkos::deep_copy(mask, 1);
+      dit_model.forward(x, t, y, mask, out, skips);
+    };
+#else
     MO::Model<Exec, Scalar> model(cfg, w);
+    bool slg_multi_warned = false;
+    auto dit_forward = [&](const auto& x, const auto& t, const auto& y,
+                           auto& out, const std::vector<int>& skips) {
+      int skip = skips.empty() ? -1 : skips.front();
+      if (skips.size() > 1 && !slg_multi_warned) {
+        slg_multi_warned = true;
+        std::fprintf(stderr,
+                     "warning: placeholder Model applies one skip per "
+                     "forward; using the first of %zu --slg-layers\n",
+                     skips.size());
+      }
+      model.forward(x, t, y, out, skip);
+    };
+#endif
     const auto t0 = std::chrono::steady_clock::now();
-    std::vector<float> lat = MO::run_flow_euler(
-        model, cfg, x_init, cond, uncond, s, H, W,
+    std::vector<float> lat = run_sample_loop(
+        cfg, dit_forward, x_init, cond, uncond, steps, guidance, flow_shift,
+        uncond_skips, slg_layers, slg_scale, slg_start, slg_stop, H, W,
         [](int i, float t, float sg) {
           std::printf("  step %3d t=%9.3f sigma=%.6f\n", i, (double)t,
                       (double)sg);
@@ -519,18 +1076,101 @@ int main(int argc, char** argv) {
     save_raw_f32(lat_path, lat);
     std::printf("[wrote %s] raw fp32 latents\n", lat_path.c_str());
 
+    // ---- Phase 3: decode (the DiT is released first, then fenced) ----
+#ifdef MOSS_DRIVER_HAVE_DIT
+    dit_model.weights().release();
+    dit_model.release_scratch();
+#else
+    w.release();
+#endif
+    Kokkos::fence();
+    MO::print_phase_memory("dit-released", 0, 0);
     size_t oH = 0, oW = 0;
-    std::vector<unsigned char> preview =
-        render_preview(lat, C, (size_t)H, (size_t)W, oH, oW);
+    int oCh = 1;
+    std::vector<unsigned char> pix;
+    bool decoded = false;
+    if (vae_decode) {
+#ifdef MOSS_DRIVER_HAVE_VAE
+      std::printf("[vae decode %s] full VAE decode of %zux%zux%zu latents\n",
+                  vae_weights.c_str(), C, (size_t)H, (size_t)W);
+      {
+        using VaeExec = Exec;
+        KokkosDNN::MossImage::Vae::Config vcfg =
+            tiny ? KokkosDNN::MossImage::Vae::Config::tiny_test()
+                 : KokkosDNN::MossImage::Vae::Config();
+        vcfg.validate();
+        KokkosDNN::MossImage::Vae::Weights<VaeExec> vw;
+        vw.allocate(vcfg);
+        if (tiny) {
+          KokkosDNN::MossImage::Vae::random_init(vcfg, vw, seed);
+        } else {
+          KokkosDNN::MossImage::Vae::load_safetensors(vcfg, vae_weights, vw);
+        }
+        KokkosDNN::MossImage::Vae::DecoderModel<VaeExec> dec(vcfg, vw);
+        Kokkos::View<float****, Kokkos::LayoutRight, VaeExec> z("vae_z", 1, C,
+                                                                (size_t)H,
+                                                                (size_t)W);
+        {
+          auto zh = Kokkos::create_mirror_view(z);
+          size_t k = 0;
+          for (size_t c = 0; c < C; ++c)
+            for (int h = 0; h < H; ++h)
+              for (int ww = 0; ww < W; ++ww)
+                zh(0, c, h, ww) = lat[k++];
+          Kokkos::deep_copy(z, zh);
+        }
+        oH = (size_t)vcfg.scale_factor * (size_t)H;
+        oW = (size_t)vcfg.scale_factor * (size_t)W;
+        Kokkos::View<float****, Kokkos::LayoutRight, VaeExec> rgb("vae_rgb", 1,
+                                                                  3, oH, oW);
+        dec.decode(z, rgb);
+        Kokkos::fence();
+        auto rh = Kokkos::create_mirror_view(rgb);
+        Kokkos::deep_copy(rh, rgb);
+        float mn = rh(0, 0, 0, 0), mx = mn;
+        for (size_t c = 0; c < 3; ++c)
+          for (size_t h = 0; h < oH; ++h)
+            for (size_t ww = 0; ww < oW; ++ww) {
+              mn = std::min(mn, rh(0, c, h, ww));
+              mx = std::max(mx, rh(0, c, h, ww));
+            }
+        const float span = (mx > mn) ? (mx - mn) : 1.0f;
+        pix.resize(oH * oW * 3);
+        for (size_t h = 0; h < oH; ++h)
+          for (size_t ww = 0; ww < oW; ++ww)
+            for (size_t c = 0; c < 3; ++c) {
+              const float v = (rh(0, c, h, ww) - mn) / span;
+              pix[(h * oW + ww) * 3 + c] =
+                  (unsigned char)(std::lround(255.0f * v));
+            }
+        vw.release();
+        Kokkos::fence();
+      }
+      oCh = 3;
+      decoded = true;
+      MO::print_phase_memory("decode", (size_t)MO::kVaeBudgetBytes, 0);
+#else
+      std::printf("[vae] --vae-decode requested but "
+                  "KokkosDNN_MossImageVae.hpp is not in this build; writing "
+                  "a grayscale preview instead (need the VAE worktree "
+                  "header + --vae-weights)\n");
+#endif
+    }
+    if (!decoded) {
+      pix = render_preview(lat, C, (size_t)H, (size_t)W, oH, oW);
+      MO::print_phase_memory("decode-preview", 0, 0);
+    }
 #ifdef KOKKOSDNN_ENABLE_IMAGE
     {
       Kokkos::View<unsigned char***, Kokkos::LayoutRight, Kokkos::HostSpace>
-          img("moss_preview", oH, oW, 1);
+          img("moss_out", oH, oW, (size_t)oCh);
       for (size_t h = 0; h < oH; ++h)
-        for (size_t ww = 0; ww < oW; ++ww) img(h, ww, 0) = preview[h * oW + ww];
+        for (size_t ww = 0; ww < oW; ++ww)
+          for (int c = 0; c < oCh; ++c)
+            img(h, ww, (size_t)c) = pix[(h * oW + ww) * (size_t)oCh + (size_t)c];
       KokkosDNN::Image::save_image_png(out, img);
-      std::printf("[wrote %s] %zux%zu grayscale preview (PNG)\n", out.c_str(),
-                  oH, oW);
+      std::printf("[wrote %s] %zux%zu %s (PNG)\n", out.c_str(), oH, oW,
+                  decoded ? "VAE RGB" : "grayscale preview");
     }
 #else
     {
@@ -539,9 +1179,13 @@ int main(int argc, char** argv) {
         std::printf("[note] built without KokkosDNN_ENABLE_IMAGE: writing PPM "
                     "to %s instead of PNG %s\n",
                     ppm.c_str(), out.c_str());
-      save_ppm(ppm, preview, oH, oW);
-      std::printf("[wrote %s] %zux%zu grayscale preview (PPM)\n", ppm.c_str(),
-                  oH, oW);
+      if (decoded) {
+        save_ppm_rgb(ppm, pix, oH, oW);
+      } else {
+        save_ppm(ppm, pix, oH, oW);
+      }
+      std::printf("[wrote %s] %zux%zu %s (PPM)\n", ppm.c_str(), oH, oW,
+                  decoded ? "VAE RGB" : "grayscale preview");
     }
 #endif
   } catch (const std::exception& e) {
