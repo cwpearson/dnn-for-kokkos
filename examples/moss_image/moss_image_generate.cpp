@@ -26,8 +26,7 @@
 //                       [--seed 42]
 //                       [--vae-weights vae.safetensors [--vae-decode]]
 //                       [--out img.png]
-//                       [--staged [--prompt-embeds-out embeds.f32]]
-//                       [--encode-only [--prompt-embeds-out embeds.f32]]
+//                       [--staged]
 //
 // Text conditioning precedence: Qwen forward (needs the encoder header +
 // --tokenizer + --text-encoder) -> --prompt-embeds-in file (alias
@@ -37,13 +36,16 @@
 // grayscale preview is written with a clear log. Raw fp32 latents
 // (<stem>.f32, [C,H,W] row-major) are always written.
 //
-// Staged execution (24GB fit): --encode-only runs just the encoder/embed
-// stage and exits before any DiT weight is loaded; --staged runs encode ->
-// writes embeds -> releases encoder views -> Kokkos::fence() -> loads the
-// DiT -> samples -> releases the DiT -> Kokkos::fence() -> decodes, so the
-// 16.8GB encoder, the 10.2GB DiT, and the VAE are never resident at once.
-// Each phase logs its resident estimate (weights bytes + activation
-// estimate).
+// Staged execution (24GB fit): --staged runs encode -> releases the encoder
+// weights (the MiB-scale embeds stay resident on the device) ->
+// Kokkos::fence() -> loads the DiT -> samples straight from the
+// device-resident embeds -> releases the DiT -> Kokkos::fence() -> decodes,
+// so the 16.8GB encoder, the 10.2GB DiT, and the VAE are never resident at
+// once. No disk round-trip and no second process: the embeds are separate
+// (MiB) allocations from the (GiB) encoder weights. --prompt-embeds-in
+// remains for loading precomputed file embeds (e.g. from
+// scripts/moss_encode.py). Each phase logs its resident estimate (weights
+// bytes + activation estimate).
 //
 // --tiny runs a random-weights smoke model on 4x4 latents (no downloads).
 #include <Kokkos_Core.hpp>
@@ -254,8 +256,9 @@ bool file_exists(const std::string& path) {
 //   2. Raw float32 LE file (--text-weights / --prompt-embeds-in, e.g.
 //      scripts/moss_encode.py output): cond from file, uncond zeros.
 //   3. Null (zeros) for both, prompt logged only.
-// The load -> device-stage -> file-round-trip -> release plumbing is real
-// in all three cases (see --encode-only / --staged).
+// All three paths device-stage both branches into EncoderStage::device /
+// device_neg; the sample phase reads straight from those device views, so
+// the --staged handoff never touches disk (see main).
 //
 // ADAPT (encoder worktree): the HAVE_ENCODER branch below assumes the
 // landed header exposes a single host-side entry
@@ -269,19 +272,28 @@ bool file_exists(const std::string& path) {
 struct EncoderStage {
   std::vector<float> embeds;      // host [L*Cc] row-major cond features
   std::vector<float> neg_embeds;  // host [L*Cc] row-major uncond features
-  Kokkos::View<float**, Kokkos::LayoutRight, Exec> device;  // [L,Cc] device copy
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> device;  // [L,Cc] cond
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> device_neg;  // [L,Cc] uncond
   size_t L = 0, Cc = 0;
 
-  // Device-stage the cond embeds (HostSpace + single deep_copy), the same
-  // handoff an on-device encoder output uses.
+  // Device-stage both cond and uncond embeds (HostSpace + one deep_copy
+  // each), the same handoff an on-device encoder output uses. The two views
+  // are ~L*Cc floats each (MiB-scale: 512x4096 fp32 ~= 8 MiB) and are
+  // separate allocations from the GiB-scale encoder weights, so they can
+  // stay resident on the device while the encoder weights are released and
+  // the DiT is loaded.
   void stage_device() {
     device = Kokkos::View<float**, Kokkos::LayoutRight, Exec>(
         "moss_prompt_embeds", L, Cc);
+    device_neg = Kokkos::View<float**, Kokkos::LayoutRight, Exec>(
+        "moss_neg_embeds", L, Cc);
     Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> stage(
         "moss_prompt_embeds_host", L, Cc);
-    std::memcpy(stage.data(), embeds.data(),
-                embeds.size() * sizeof(float));
+    std::memcpy(stage.data(), embeds.data(), embeds.size() * sizeof(float));
     Kokkos::deep_copy(device, stage);
+    std::memcpy(stage.data(), neg_embeds.data(),
+                neg_embeds.size() * sizeof(float));
+    Kokkos::deep_copy(device_neg, stage);
     Kokkos::fence();
   }
 
@@ -346,18 +358,16 @@ struct EncoderStage {
     return st;
   }
 
-  void save(const std::string& path) const { save_raw_f32(path, embeds); }
-
   size_t device_bytes() const {
-    return device.extent(0) * device.extent(1) * sizeof(float);
+    return (device.extent(0) * device.extent(1) +
+            device_neg.extent(0) * device_neg.extent(1)) *
+           sizeof(float);
   }
-
-  // Drop the device view only (host embeds survive for the sample phase).
-  void release_device() { device = {}; }
 
   // Full teardown: mirrors Weights::release (device + host, cond + neg).
   void release() {
     device = {};
+    device_neg = {};
     embeds.clear();
     embeds.shrink_to_fit();
     neg_embeds.clear();
@@ -600,6 +610,181 @@ std::vector<float> run_sample_loop(
   return x;
 }
 
+// ---- Device-resident variant -----------------------------------------------
+// Same reference CFG/SLG/nearest-grid semantics as run_sample_loop, but the
+// captions are sourced from the EncoderStage device views (rank-2 [L,Cc])
+// that stayed resident on the device across the encoder-release / DiT-load
+// boundary. The only copies are device->device (one parallel_for per
+// branch into the [1,L,Cc] loop views); nothing round-trips through host
+// or disk. Falls back to the host-vector path is intentionally NOT done
+// here: callers must guarantee cond_d/uncond_d are allocated.
+template <class CfgT, class Forward>
+std::vector<float> run_sample_loop_from_device(
+    const CfgT& cfg, Forward&& forward, const std::vector<float>& x_init,
+    const Kokkos::View<float**, Kokkos::LayoutRight, Exec>& cond_d,
+    const Kokkos::View<float**, Kokkos::LayoutRight, Exec>& uncond_d,
+    int steps, float guidance, float shift,
+    const std::vector<int>& uncond_skips, const std::vector<int>& slg_layers,
+    float slg_scale, float slg_start, float slg_stop, int H, int W,
+    const std::function<void(int, float, float)>& on_step = {}) {
+  if (steps <= 0)
+    throw std::invalid_argument("moss sample: steps must be > 0");
+  if (!std::isfinite(guidance) || guidance < 0.0f)
+    throw std::invalid_argument(
+        "moss sample: guidance_scale must be finite and >= 0");
+  if (!(shift > 0.0f) || !std::isfinite(shift))
+    throw std::invalid_argument("moss sample: shift must be > 0");
+  if (!std::isfinite(slg_scale) || slg_scale < 0.0f)
+    throw std::invalid_argument("moss sample: slg_scale must be finite >= 0");
+  if (!(0.0f <= slg_start && slg_start <= slg_stop && slg_stop <= 1.0f))
+    throw std::invalid_argument(
+        "moss sample: require 0 <= slg_start <= slg_stop <= 1");
+  if (!cond_d.is_allocated() || !uncond_d.is_allocated())
+    throw std::invalid_argument("moss sample: device captions not staged");
+  const int depth = be_depth(cfg);
+  check_skip_layers(uncond_skips, depth, "uncond_skip_layers");
+  check_skip_layers(slg_layers, depth, "slg_layers");
+  const size_t C = be_latent_channels(cfg);
+  const size_t Cc = be_caption_dim(cfg);
+  const size_t HH = (size_t)H, WW = (size_t)W;
+  if (HH == 0 || WW == 0)
+    throw std::invalid_argument("moss sample: bad latent geometry");
+  const size_t T = HH * WW;
+  if (x_init.size() != C * HH * WW)
+    throw std::invalid_argument("moss sample: x_init size mismatch");
+  const size_t L = cond_d.extent(0);
+  if (cond_d.extent(1) != Cc || uncond_d.extent(0) != L ||
+      uncond_d.extent(1) != Cc)
+    throw std::invalid_argument("moss sample: device caption dim mismatch");
+  if (L == 0 || L > be_max_seq(cfg))
+    throw std::invalid_argument("moss sample: caption length out of range");
+  const bool do_cfg = (guidance != 1.0f);
+  // Same no-op rule as the host path: identical cond/uncond make guidance
+  // a no-op. The captions are MiB-scale, so mirror once for the equality
+  // test (the sample loop itself never touches the host).
+  bool same = false;
+  {
+    auto hc = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), cond_d);
+    auto hu =
+        Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), uncond_d);
+    same = true;
+    for (size_t l = 0; same && l < L; ++l)
+      for (size_t c = 0; c < Cc; ++c)
+        if (hc(l, c) != hu(l, c)) {
+          same = false;
+          break;
+        }
+  }
+  const bool use_cfg = do_cfg && !same;
+  const bool want_slg = !slg_layers.empty() && slg_scale > 0.0f;
+
+  using LatR = Kokkos::View<Scalar****, Kokkos::LayoutRight, Exec>;
+  using TokR = Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec>;
+  using TVec = Kokkos::View<float*, Exec>;
+  LatR x_d("moss_loop_x", 1, C, HH, WW);
+  LatR vc_d("moss_loop_vc", 1, C, HH, WW);
+  LatR vu_d("moss_loop_vu", 1, C, HH, WW);
+  LatR vs_d("moss_loop_vs", 1, C, HH, WW);
+  TVec t_d("moss_loop_t", 1);
+  TokR y_cond_d("moss_loop_y_cond", 1, L, Cc);
+  TokR y_unc_d("moss_loop_y_unc", 1, L, Cc);
+  {
+    auto xh = Kokkos::create_mirror_view(x_d);
+    size_t k = 0;
+    for (size_t c = 0; c < C; ++c)
+      for (size_t h = 0; h < HH; ++h)
+        for (size_t w = 0; w < WW; ++w) xh(0, c, h, w) = (Scalar)x_init[k++];
+    Kokkos::deep_copy(x_d, xh);
+  }
+  // Device->device caption staging: no host or disk round-trip.
+  Kokkos::parallel_for(
+      "moss_stage_cond",
+      Kokkos::MDRangePolicy<Exec, Kokkos::Rank<2>>({0, 0}, {L, Cc}),
+      KOKKOS_LAMBDA(size_t l, size_t c) {
+        y_cond_d(0, l, c) = static_cast<Scalar>(cond_d(l, c));
+        y_unc_d(0, l, c) = static_cast<Scalar>(uncond_d(l, c));
+      });
+  Kokkos::fence();
+
+  const std::vector<float> sigmas = build_sigmas_nearest_grid(steps, shift);
+  std::vector<float> tvals(sigmas.size());
+  for (size_t i = 0; i < sigmas.size(); ++i) tvals[i] = 1000.0f * sigmas[i];
+  const int n = (int)sigmas.size() - 1;
+  const float g = guidance, s = slg_scale;
+  const std::vector<int> no_skip;
+  auto t_h = Kokkos::create_mirror_view(t_d);
+  for (int i = 0; i < n; ++i) {
+    if (on_step) on_step(i, tvals[(size_t)i], sigmas[(size_t)i]);
+    t_h(0) = tvals[(size_t)i];
+    Kokkos::deep_copy(t_d, t_h);
+    const float dt = sigmas[(size_t)i + 1] - sigmas[(size_t)i];
+    const float frac = (float)i / (float)n;
+    const bool skip_active =
+        (slg_start <= frac) && (frac < slg_stop);
+    forward(x_d, t_d, y_cond_d, vc_d, no_skip);
+    Kokkos::fence();
+    const bool slg_now = want_slg && skip_active;
+    if (use_cfg) {
+      forward(x_d, t_d, y_unc_d, vu_d,
+              skip_active ? uncond_skips : no_skip);
+      Kokkos::fence();
+      if (slg_now) {
+        forward(x_d, t_d, y_cond_d, vs_d, slg_layers);
+        Kokkos::fence();
+      }
+      Kokkos::parallel_for(
+          "moss_loop_cfg_slg_step",
+          Kokkos::MDRangePolicy<Exec, Kokkos::Rank<4>>(
+              {(size_t)0, (size_t)0, (size_t)0, (size_t)0},
+              {(size_t)1, C, HH, WW}),
+          KOKKOS_LAMBDA(size_t b, size_t c, size_t h, size_t w) {
+            const float xc = static_cast<float>(x_d(b, c, h, w));
+            const float vcond = static_cast<float>(vc_d(b, c, h, w));
+            const float vun = static_cast<float>(vu_d(b, c, h, w));
+            float v = vun + g * (vcond - vun);
+            if (slg_now)
+              v += s * (vcond - static_cast<float>(vs_d(b, c, h, w)));
+            x_d(b, c, h, w) = static_cast<Scalar>(xc + dt * v);
+          });
+    } else if (slg_now) {
+      forward(x_d, t_d, y_cond_d, vs_d, slg_layers);
+      Kokkos::fence();
+      Kokkos::parallel_for(
+          "moss_loop_slg_step",
+          Kokkos::MDRangePolicy<Exec, Kokkos::Rank<4>>(
+              {(size_t)0, (size_t)0, (size_t)0, (size_t)0},
+              {(size_t)1, C, HH, WW}),
+          KOKKOS_LAMBDA(size_t b, size_t c, size_t h, size_t w) {
+            const float xc = static_cast<float>(x_d(b, c, h, w));
+            const float vcond = static_cast<float>(vc_d(b, c, h, w));
+            const float vsk = static_cast<float>(vs_d(b, c, h, w));
+            x_d(b, c, h, w) =
+                static_cast<Scalar>(xc + dt * (vsk + s * (vcond - vsk)));
+          });
+    } else {
+      Kokkos::parallel_for(
+          "moss_loop_step",
+          Kokkos::MDRangePolicy<Exec, Kokkos::Rank<4>>(
+              {(size_t)0, (size_t)0, (size_t)0, (size_t)0},
+              {(size_t)1, C, HH, WW}),
+          KOKKOS_LAMBDA(size_t b, size_t c, size_t h, size_t w) {
+            const float xc = static_cast<float>(x_d(b, c, h, w));
+            const float v = static_cast<float>(vc_d(b, c, h, w));
+            x_d(b, c, h, w) = static_cast<Scalar>(xc + dt * v);
+          });
+    }
+    Kokkos::fence();
+  }
+  Kokkos::fence();
+  auto xh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), x_d);
+  std::vector<float> x(C * T);
+  size_t k = 0;
+  for (size_t c = 0; c < C; ++c)
+    for (size_t h = 0; h < HH; ++h)
+      for (size_t w = 0; w < WW; ++w) x[k++] = (float)xh(0, c, h, w);
+  return x;
+}
+
 void usage() {
   std::printf(
       "usage: moss_image_generate [--tiny] [--weights model.safetensors]\n"
@@ -615,8 +800,7 @@ void usage() {
       "                    [--seed N]\n"
       "                    [--vae-weights vae.safetensors [--vae-decode]]\n"
       "                    [--out img.png]\n"
-      "                    [--staged [--prompt-embeds-out embeds.f32]]\n"
-      "                    [--encode-only [--prompt-embeds-out embeds.f32]]\n"
+      "                    [--staged]\n"
       "\n"
       "  --tiny         random-weights smoke model, 4x4 latents (no files)\n"
       "  --weights      DiT checkpoint (.safetensors, or torch.save .pth)\n"
@@ -631,12 +815,10 @@ void usage() {
       "  --text-encoder Qwen text-encoder weights (.safetensors or dir)\n"
       "                 (with --tokenizer: runs the real Qwen forward)\n"
       "  --prompt-embeds-in alias of --text-weights (wins if both differ)\n"
-      "  --prompt-embeds-out write the encode-stage embeds to a raw F32 file\n"
-      "  --staged       encode -> write embeds -> release encoder -> fence\n"
-      "                 -> load DiT -> sample -> release DiT -> fence\n"
-      "                 -> decode (one component resident at a time)\n"
-      "  --encode-only  run the encode/embed stage, optionally write embeds,\n"
-      "                 then exit WITHOUT loading DiT weights\n"
+      "  --staged       encode -> release encoder weights (MiB embeds stay\n"
+      "                 resident on device) -> fence -> load DiT -> sample\n"
+      "                 from device embeds -> release DiT -> fence -> decode\n"
+      "                 (one component resident at a time, no disk round-trip)\n"
       "  --height/--width latent H/W (default 64; x16 = pixels, so 64\n"
       "                 means 1024px; placeholder path needs multiples of 16)\n"
       "  --steps        Euler steps (default 50)\n"
@@ -663,7 +845,7 @@ int main(int argc, char** argv) {
   std::string weights = "moss_image_sft.safetensors";
   std::string prompt = "a red panda reading a newspaper";
   std::string negative_prompt;
-  std::string text_weights, prompt_embeds_in, prompt_embeds_out;
+  std::string text_weights, prompt_embeds_in;
   std::string tokenizer_dir, text_encoder;
   std::string vae_weights, out = "moss_out.png";
   int height = 64, width = 64;
@@ -674,7 +856,7 @@ int main(int argc, char** argv) {
   float slg_scale = 0.0f, slg_start = 0.0f, slg_stop = 1.0f;
   uint64_t seed = 42;
   bool tiny = false;
-  bool staged = false, encode_only = false, vae_decode = false;
+  bool staged = false, vae_decode = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -701,8 +883,6 @@ int main(int argc, char** argv) {
       text_weights = argv[++i];
     } else if (a == "--prompt-embeds-in" && i + 1 < argc) {
       prompt_embeds_in = argv[++i];
-    } else if (a == "--prompt-embeds-out" && i + 1 < argc) {
-      prompt_embeds_out = argv[++i];
     } else if (a == "--vae-weights" && i + 1 < argc) {
       vae_weights = argv[++i];
     } else if (a == "--vae-decode") {
@@ -735,8 +915,6 @@ int main(int argc, char** argv) {
       tiny = true;
     } else if (a == "--staged") {
       staged = true;
-    } else if (a == "--encode-only") {
-      encode_only = true;
     } else if (a == "--help" || a == "-h") {
       usage();
       return 0;
@@ -802,8 +980,7 @@ int main(int argc, char** argv) {
         throw std::runtime_error("--height/--width must tile patch_size=" +
                                  std::to_string(be_patch(cfg)));
     }
-    const size_t C = be_latent_channels(cfg), Cc = be_caption_dim(cfg);
-    const size_t L = be_max_seq(cfg);
+    const size_t C = be_latent_channels(cfg);
     std::printf("[model %s: %s]\n", tiny ? "tiny_test" : "moss-sft",
                 be_label(cfg));
     if (tiny && skip_layers >= be_depth(cfg)) {
@@ -862,55 +1039,24 @@ int main(int argc, char** argv) {
                                          text_encoder, tiny);
     log_encode_memory(enc);
 
-    std::vector<float> cond, uncond;
-    if (encode_only) {
-      if (!prompt_embeds_out.empty()) {
-        enc.save(prompt_embeds_out);
-        std::printf("[wrote %s] %zux%zu prompt embeds (raw F32)\n",
-                    prompt_embeds_out.c_str(), L, Cc);
-      } else {
-        std::printf("[encode-only] no --prompt-embeds-out; embeds discarded\n");
-      }
-      enc.release();
+    // In-memory handoff: the embeds (~L*Cc floats per branch, MiB-scale) are
+    // separate device allocations from the GiB-scale encoder weights, so they
+    // stay resident on the device while the encoder weights are released and
+    // the DiT is loaded. No disk round-trip and no second process.
+    if (staged) {
+      // When the real Qwen encoder lands in this TU, its EncoderModel weights
+      // are released here; the EncoderStage embeds are independent Views and
+      // survive. Today the weights live in scripts/moss_encode_qwen.py, so
+      // this is a fence + accounting point only.
       Kokkos::fence();
-      MO::print_phase_memory("encode-released", 0, 0);
-      std::printf("[encode-only] exiting before DiT load (encoder and DiT "
-                  "never co-resident)\n");
-      Kokkos::finalize();
-      return 0;
-    }
-
-    if (staged && !prompt_embeds_out.empty()) {
-      // File handoff: the cond embeds file is the only bulk state crossing
-      // phases; the MiB-scale neg embeds ride along in host memory.
-      enc.save(prompt_embeds_out);
-      std::printf("[wrote %s] %zux%zu prompt embeds (raw F32)\n",
-                  prompt_embeds_out.c_str(), L, Cc);
-      uncond = enc.neg_embeds;
-      std::printf("[staged] releasing encoder views before DiT load\n");
-      enc.release();
-      Kokkos::fence();
-      MO::print_phase_memory("encode-released", 0, 0);
-      cond = MO::load_caption_raw(prompt_embeds_out, (int)L, (int)Cc);
-      std::printf("[staged] re-read embeds from %s for the sample phase\n",
-                  prompt_embeds_out.c_str());
+      MO::print_phase_memory("encode-released", enc.device_bytes(), 0);
+      std::printf("[staged] keeping %.1f MiB of embeds resident on device "
+                  "across the DiT load (no disk round-trip)\n",
+                  (double)enc.device_bytes() / (1024.0 * 1024.0));
     } else {
-      if (!prompt_embeds_out.empty()) {
-        enc.save(prompt_embeds_out);
-        std::printf("[wrote %s] %zux%zu prompt embeds (raw F32)\n",
-                    prompt_embeds_out.c_str(), L, Cc);
-      }
-      cond = enc.embeds;
-      uncond = enc.neg_embeds;
-      if (staged) {
-        std::printf("[staged] releasing encoder device views before DiT load\n");
-        enc.release_device();
-        Kokkos::fence();
-        MO::print_phase_memory("encode-released", 0, 0);
-      } else {
-        std::printf("[note] single-phase run: encoder embeds stay live "
-                    "across the DiT load (use --staged to release them)\n");
-      }
+      std::printf("[note] single-phase run: encoder embeds stay live "
+                  "across the DiT load (pass --staged for the fenced, logged "
+                  "encoder-release point)\n");
     }
 
     // ---- Phase 2: DiT load ----
@@ -1037,10 +1183,14 @@ int main(int argc, char** argv) {
     };
 #endif
     const auto t0 = std::chrono::steady_clock::now();
-    std::vector<float> lat = run_sample_loop(
-        cfg, dit_forward, x_init, cond, uncond, steps, guidance, flow_shift,
-        uncond_skips, slg_layers, slg_scale, slg_start, slg_stop, H, W,
-        [](int i, float t, float sg) {
+    // Sample straight from the device-resident embeds staged above: no host
+    // reload, no disk re-read. The host vectors (enc.embeds/neg_embeds) stay
+    // as the fallback for the --prompt-embeds-in file path, which also lands
+    // staged on-device via EncoderStage::run.
+    std::vector<float> lat = run_sample_loop_from_device(
+        cfg, dit_forward, x_init, enc.device, enc.device_neg, steps,
+        guidance, flow_shift, uncond_skips, slg_layers, slg_scale, slg_start,
+        slg_stop, H, W, [](int i, float t, float sg) {
           std::printf("  step %3d t=%9.3f sigma=%.6f\n", i, (double)t,
                       (double)sg);
           std::fflush(stdout);
@@ -1064,18 +1214,11 @@ int main(int argc, char** argv) {
                 C, (size_t)H, (size_t)W, mean, std::sqrt(var), mn, mx);
 
     std::string lat_path = with_extension(out, ".f32");
-    if (!prompt_embeds_out.empty() && lat_path == prompt_embeds_out) {
-      // The sample-phase latents dump would otherwise clobber the staged
-      // embeds handoff file; redirect it.
-      lat_path = with_extension(out, "_latents.f32");
-      std::fprintf(stderr,
-                   "warning: latents dump would overwrite --prompt-embeds-out; "
-                   "redirecting to '%s'\n",
-                   lat_path.c_str());
-    }
     save_raw_f32(lat_path, lat);
     std::printf("[wrote %s] raw fp32 latents\n", lat_path.c_str());
 
+    // Captions are no longer needed: drop host + device copies before decode.
+    enc.release();
     // ---- Phase 3: decode (the DiT is released first, then fenced) ----
 #ifdef MOSS_DRIVER_HAVE_DIT
     dit_model.weights().release();

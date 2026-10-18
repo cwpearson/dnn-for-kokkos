@@ -36,28 +36,21 @@ cmake --build build --target moss_image_generate --parallel 8
   --out moss_out.png
 ```
 
-Staged 24GB runs (encoder and DiT are never resident at once):
+Staged 24GB runs (encoder and DiT are never resident at once; the MiB-scale
+embeds stay resident on the device while the GiB encoder weights are
+released, so there is no disk round-trip and no second command):
 
 ```bash
-# 1. encode only: resolves caption embeds, writes them, exits before any
-#    DiT weight is loaded
 ./build/examples/moss_image/moss_image_generate \
   --weights moss_image_sft.safetensors --prompt "a red panda" \
-  --encode-only --prompt-embeds-out embeds.f32
-# 2. sample from the staged embeds (alias of --text-weights)
+  --staged --steps 50 --out moss_out.png
+# sample from precomputed file embeds instead (alias of --text-weights):
 ./build/examples/moss_image/moss_image_generate \
   --weights moss_image_sft.safetensors --prompt-embeds-in embeds.f32 \
   --steps 50 --out moss_out.png
-# ... or both phases in one process (encode -> write -> release -> fence
-#     -> load DiT -> sample):
-./build/examples/moss_image/moss_image_generate \
-  --weights moss_image_sft.safetensors --prompt "a red panda" \
-  --staged --prompt-embeds-out embeds.f32 --steps 50 --out moss_out.png
 # tiny staged smoke (no downloads; exercises the same plumbing):
 ./build/examples/moss_image/moss_image_generate \
-  --tiny --steps 2 --encode-only --prompt-embeds-out /tmp/staged_embeds.f32
-./build/examples/moss_image/moss_image_generate \
-  --tiny --steps 2 --prompt-embeds-in /tmp/staged_embeds.f32
+  --tiny --steps 2 --staged
 ```
 
 ## Complete pipeline (real weights)
@@ -128,26 +121,20 @@ default 64 means the reference 1024px; true geometry writes
 
 ```bash
 GEN=build/examples/moss_image/moss_image_generate
-# 1. encode only: Qwen forward when the encoder header + weights are
-#    present, else --prompt-embeds-in file, else null. Exits before any
-#    DiT weight is loaded.
+# Single process, one component resident at a time: encode (Qwen forward
+# when the encoder header + weights are present, else --prompt-embeds-in
+# file, else null) -> release encoder weights, keeping the MiB embeds
+# resident on device -> fence -> sample (DiT only) -> release + fence ->
+# VAE decode.
 $GEN --tokenizer moss-sft/tokenizer --text-encoder moss-sft/text_encoder \
   --prompt "a red panda reading a newspaper" --negative-prompt "" \
-  --encode-only --prompt-embeds-out embeds.f32
-# 2. sample (DiT only) + 3. VAE decode (DiT released + fenced first).
-$GEN --weights moss-sft/transformer --prompt-embeds-in embeds.f32 \
-  --height 64 --width 64 --steps 50 --cfg 3.0 --shift 5.0 \
+  --weights moss-sft/transformer \
+  --staged --height 64 --width 64 --steps 50 --cfg 3.0 --shift 5.0 \
   --skip-layers 22 --seed 42 \
   --vae-weights moss-sft/vae --vae-decode --out moss_out.png
-# ... or all three phases in one process (one component resident at a time):
-$GEN --tokenizer moss-sft/tokenizer --text-encoder moss-sft/text_encoder \
-  --prompt "a red panda reading a newspaper" \
-  --weights moss-sft/transformer \
-  --staged --prompt-embeds-out embeds.f32 \
-  --steps 50 --out moss_out.png \
-  --vae-weights moss-sft/vae --vae-decode
-# ... with positive-branch SLG (reference: slg_layers=[24], slg_scale=3.0):
-$GEN --weights moss-sft/transformer --prompt-embeds-in embeds.f32 \
+# ... with positive-branch SLG (reference: slg_layers=[24], slg_scale=3.0),
+# sampling from the script-produced file embeds:
+$GEN --weights moss-sft/transformer --prompt-embeds-in /tmp/tool_embeds.f32 \
   --steps 50 --slg-layers 24 --slg-scale 3.0 --out moss_slg.png
 # tiny smoke (no downloads; exercises encode/sample/decode plumbing):
 $GEN --tiny --steps 2
@@ -250,9 +237,7 @@ only with `--vae-decode`.
 | `--text-encoder` | — | Qwen text-encoder weights (`.safetensors` or dir); with `--tokenizer` runs the real Qwen forward |
 | `--text-weights` | — | raw F32 caption features `[L,Cc]` |
 | `--prompt-embeds-in` | — | alias of `--text-weights` (wins if both differ) |
-| `--prompt-embeds-out` | — | write the encode-stage embeds to a raw F32 file |
-| `--staged` | off | encode → write embeds → release encoder → fence → load DiT → sample (encoder/DiT never co-resident) |
-| `--encode-only` | off | run the encode/embed stage, optionally write embeds, then exit WITHOUT loading DiT weights |
+| `--staged` | off | encode → release encoder weights (MiB embeds stay resident on device) → fence → load DiT → sample (encoder/DiT never co-resident, no disk round-trip) |
 | `--height`/`--width` | 64 | latent H/W (x16 = pixels, so 64 means 1024px; placeholder path needs multiples of 16, must tile `patch_size`) |
 | `--steps` | 50 | Euler steps (nearest-grid schedule; count may shrink via `unique_consecutive`) |
 | `--cfg` (`--guidance`) | 3.0 | CFG scale (`!=1` takes the CFG branch, matching the reference) |
@@ -287,8 +272,11 @@ only with `--vae-decode`.
 - Staged plumbing status: safetensors/`.pth` loaders stream through
   HostSpace chunks with one `deep_copy` per tensor (no 2x residency, float +
   bhalf_t); `Weights`/`BlockWeights` expose `release()`; the driver runs an
-  `EncoderStage` (file/null embeds today) with `--encode-only` / `--staged`
-  / `--prompt-embeds-{in,out}` and per-phase `[memory phase=...]` logging.
+  `EncoderStage` (file/null embeds today) with `--staged` /
+  `--prompt-embeds-in` and per-phase `[memory phase=...]` logging. The
+  embeds stay resident on the device across the encoder-release / DiT-load
+  boundary (device-to-device staging into the sample loop, no disk, no
+  second process).
   What the future Qwen port must fill in: tokenize the prompt, stream
   `text_encoder/*.safetensors` into device views with the same HostSpace
   pattern, run the Qwen forward + text refiner on-device into the
@@ -353,11 +341,9 @@ matching the model's patchify order).
 ```bash
 ./build/examples/moss_image/moss_image_generate --tiny --steps 2
 ./build/examples/moss_image/moss_image_generate --help
-# staged plumbing on the smoke model (encode-only -> file handoff -> sample):
+# staged plumbing on the smoke model (in-memory device handoff):
 ./build/examples/moss_image/moss_image_generate \
-  --tiny --steps 2 --encode-only --prompt-embeds-out /tmp/staged_embeds.f32
-./build/examples/moss_image/moss_image_generate \
-  --tiny --steps 2 --prompt-embeds-in /tmp/staged_embeds.f32
+  --tiny --steps 2 --staged
 # unit tests for the merged MossImage ops (tests-enabled build):
 ctest -R Moss
 ```
