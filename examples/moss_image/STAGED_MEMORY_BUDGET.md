@@ -72,7 +72,8 @@ Copy the tiny embed file (MiB) to the GPU box instead of the 16.8 GB encoder.
 ## 5. In-process `--staged` phase diagram
 
 Single `moss_image_generate --staged` process, one component resident at a
-time; only the MiB-scale `[L, Cc]` embed buffer (host) crosses phases:
+time; the MiB-scale `[L, Cc]` cond/uncond embeds stay resident on the device
+across the encoder-release / DiT-load boundary (no host spill, no disk):
 
 ```
 --staged
@@ -81,13 +82,13 @@ time; only the MiB-scale `[L, Cc]` embed buffer (host) crosses phases:
 [1] load text encoder (15.6 GiB) + tokenizer
   |
   v
-[2] encode prompt -> device [1, S, Cc] -> deep_copy to host [L, Cc] f32
+[2] encode prompt -> device [L, Cc] cond + [L, Cc] uncond (stay resident)
   |
   v
 [3] release encoder views/weights + Kokkos fence -> free ~15.6 GiB
   |
   v
-[4] load DiT (9.5 GiB); upload host embeds -> device cap features
+[4] load DiT (9.5 GiB); embeds already resident on device
   |
   v
 [5] flow-Euler sample, CFG 2x (cond + skip-22 uncond), 50 steps, fp32 updates
@@ -105,9 +106,7 @@ The staged implementation of `moss_image_generate` MUST accept:
 | Flag | Meaning |
 |---|---|
 | `--prompt-embeds-in <file>` | load raw float32 LE `[L, Cc]` caption features (same format as today's `--text-weights`); keep `--text-weights` as a deprecated alias |
-| `--prompt-embeds-out <file>` | write the (possibly padded) `[L, Cc]` features actually used, for reuse/verification |
-| `--encode-only` | run the encode phase only (load encoder, write `--prompt-embeds-out`), then exit without loading DiT/VAE or sampling |
-| `--staged` | in-process staging per the diagram above (encode -> spill embeds to host -> release encoder + fence -> load DiT -> sample -> VAE) |
+| `--staged` | in-process staging per the diagram above (encode -> release encoder weights, embeds stay resident on device -> fence -> load DiT -> sample from device embeds -> VAE) |
 
 Compatibility: `scripts/moss_encode.py --out X.f32` output must load via
 `--prompt-embeds-in X.f32`; `--null` output (zeros) must reproduce today's
