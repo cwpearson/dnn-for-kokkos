@@ -1182,13 +1182,23 @@ void forward_full_layer(
   gemm(handle, Scalar(1), n, L.full.v_proj, Scalar(0), v2, "Qwen35::v");
   // Pack the query/gate slices into contiguous buffers (same stride
   // rationale as the q/k/v packs below): qg rows are 2*Qd wide.
+  //
+  // The reference splits the query projection PER HEAD, not as a global
+  // [q | gate] halves: q_proj(h) is viewed as [T, Nq, 2*Hd] and chunked on
+  // the last axis (modeling_qwen3_5.py Qwen3_5Attention.forward:
+  //   query_states, gate = torch.chunk(q_proj(h).view(*shape, -1, 2*Hd),
+  //                                    2, dim=-1))
+  // so head h's query occupies qg[t, h*2*Hd : h*2*Hd + Hd] and its gate
+  // occupies the following Hd columns. A global [0, Qd)/[Qd, 2*Qd) split
+  // silently mixes head boundaries and diverges from torch.
   View2 q2("Qwen35::q", T, Qd), gate2("Qwen35::gate", T, Qd);
   Kokkos::parallel_for(
       "Qwen35::pack_qg",
       Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, Qd}),
       KOKKOS_LAMBDA(size_t t, size_t d) {
-        q2(t, d) = qg(t, d);
-        gate2(t, d) = qg(t, Qd + d);
+        const size_t h = d / Hd, dd = d % Hd;
+        q2(t, d) = qg(t, h * 2 * Hd + dd);
+        gate2(t, d) = qg(t, h * 2 * Hd + Hd + dd);
       });
   Kokkos::fence();
   UView3 q(q2.data(), T, Nq, Hd);

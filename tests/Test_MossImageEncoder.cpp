@@ -364,8 +364,18 @@ std::vector<double> href_forward_sample(const HostModel& m,
       hgemm(n, L.q, qg, T, H, 2 * Qd);
       hgemm(n, L.k, k2, T, H, Nk * Hd);
       hgemm(n, L.v, v2, T, H, Nk * Hd);
-      std::vector<double> q(qg.begin(), qg.begin() + (size_t)T * Qd);
-      std::vector<double> gate(qg.begin() + (size_t)T * Qd, qg.end());
+      // Query/gate split is per head (reference torch.chunk on the
+      // [.., -1, 2*Hd] view), NOT a global [q | gate] halves split: head h
+      // owns qg[t, h*2*Hd .. h*2*Hd+Hd) for q and the following Hd for gate.
+      std::vector<double> q((size_t)T * Qd), gate((size_t)T * Qd);
+      for (int t = 0; t < T; ++t)
+        for (int h = 0; h < Nq; ++h)
+          for (int d = 0; d < Hd; ++d) {
+            const size_t src = ((size_t)t * Nq + h) * 2 * Hd + d;
+            const size_t dst = ((size_t)t * Nq + h) * Hd + d;
+            q[dst] = qg[src];
+            gate[dst] = qg[src + Hd];
+          }
       hqknorm(q, L.qn, c.rms_eps, T, Nq, Hd);
       hqknorm(k2, L.kn, c.rms_eps, T, Nk, Hd);
       hrope(q, rinv, T, Nq, Hd);
@@ -552,11 +562,12 @@ TEST(Qwen35Forward, TinyGoldenAndLengths) {
     std::vector<double> want = href_forward_sample(hm, sub);
     for (size_t s = 0; s < lens[b]; ++s)
       for (int d = 0; d < cfg.hidden; ++d)
-        // Tolerance: device is fp32, reference is double; drift ~1e-3
-        // accumulates through the GDN recurrence (state feedback over T)
-        // and 4 layers of fp32 GEMM/softmax. Wiring bugs (wrong scale,
-        // swapped split, missing gate) show up as O(0.1-1) diffs.
-        EXPECT_NEAR(got(b, s, d), want[s * (size_t)cfg.hidden + d], 5e-3)
+        // Device is fp32 vs a double reference: measured drift is ~2e-7
+        // on both Serial and CUDA. The tolerance is kept well above that
+        // but tight enough to catch wiring bugs: e.g. a global [q|gate]
+        // split instead of the reference per-head split shifts this tiny
+        // model's outputs by ~9e-4.
+        EXPECT_NEAR(got(b, s, d), want[s * (size_t)cfg.hidden + d], 1e-4)
             << "b" << b << " s" << s << " d" << d;
     for (size_t s = lens[b]; s < S; ++s)
       for (int d = 0; d < cfg.hidden; ++d)
