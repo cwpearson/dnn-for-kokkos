@@ -24,16 +24,20 @@ cmake --build build --target moss_image_generate --parallel 8
 ./build/examples/moss_image/moss_image_generate --tiny --steps 2
 # help
 ./build/examples/moss_image/moss_image_generate --help
-# full geometry, null conditioning (prompt logged only; SLOW on serial CPU)
+# complete in-process run (needs the checkpoint from §(a) below):
+# tokenize + Qwen encode -> release encoder -> DiT sample -> VAE decode,
+# one component resident at a time (SLOW on serial CPU; see §(c))
 ./build/examples/moss_image/moss_image_generate \
-  --weights moss_image_sft.safetensors --height 64 --width 64 \
-  --steps 50 --cfg 3.0 --shift 5.0 --skip-layers 22 --seed 42 \
-  --out moss_out.png
-# + precomputed caption features (highest precedence)
+  --tokenizer moss-sft/tokenizer --text-encoder moss-sft/text_encoder \
+  --prompt "a red panda reading a newspaper" \
+  --weights moss-sft/transformer \
+  --vae-weights moss-sft/vae/diffusion_pytorch_model.safetensors \
+  --vae-decode --staged --steps 50 --seed 42 --out moss_out.png
+# + precomputed caption features instead of the in-process encode
+# (alias of --text-weights; cross-machine / offline path)
 ./build/examples/moss_image/moss_image_generate \
-  --weights moss_image_sft.safetensors --text-weights feats.f32 \
-  --prompt "a red panda reading a newspaper" --steps 50 \
-  --out moss_out.png
+  --weights moss-sft/transformer --prompt-embeds-in feats.f32 \
+  --steps 50 --out moss_out.png
 ```
 
 Staged 24GB runs (encoder and DiT are never resident at once; the MiB-scale
@@ -108,10 +112,13 @@ cmake --build build --target moss_image_generate --parallel 8
 
 Configure logs which true-pipeline headers are visible
 (`moss_image: KokkosDNN_MossImageDit.hpp absent/visible`, same for
-Encoder/Vae) — status only, never a hard dependency. FP32-first
-throughout; on CUDA builds with `KokkosDNN_ENABLE_CUBLAS=ON` /
-`KokkosDNN_ENABLE_CUDNN=ON` the GEMMs/attention dispatch to cuBLAS/cuDNN
-via the core handles (no backend-gated code in the driver).
+Encoder/Vae) — status only, never a hard dependency. bf16 weights
+throughout (fp32 compute accumulation); on CUDA builds with
+`KokkosDNN_ENABLE_CUBLAS=ON` / `KokkosDNN_ENABLE_CUDNN=ON` the GEMMs/attention
+dispatch to cuBLAS/cuDNN via the core handles (no backend-gated code in the
+driver). Serial-CPU full runs are slow; the 9B text encoder additionally
+needs ~32 GB host RAM in fp32 (Kokkos `bhalf_t` is `float` without a GPU
+backend), so prefer a CUDA/HIP build for real-weights runs.
 
 ### (c) Staged 24GB run
 
@@ -121,38 +128,45 @@ default 64 means the reference 1024px; true geometry writes
 
 ```bash
 GEN=build/examples/moss_image/moss_image_generate
-# Single process, one component resident at a time: encode (Qwen forward
-# when the encoder header + weights are present, else --prompt-embeds-in
-# file, else null) -> release encoder weights, keeping the MiB embeds
-# resident on device -> fence -> sample (DiT only) -> release + fence ->
-# VAE decode.
+# Complete in-process run, one component resident at a time: tokenize +
+# Qwen forward (bhalf weights) -> release encoder, keeping the MiB embeds
+# resident on device -> fence -> sample (DiT only, bhalf) -> release +
+# fence -> VAE decode (fp32). --tokenizer is the HF `tokenizer/` dir
+# (needs tokenizer.json); --text-encoder is the `text_encoder/` dir
+# (or a single .safetensors); --weights is the `transformer/` dir
+# (or a single .safetensors).
 $GEN --tokenizer moss-sft/tokenizer --text-encoder moss-sft/text_encoder \
   --prompt "a red panda reading a newspaper" --negative-prompt "" \
   --weights moss-sft/transformer \
   --staged --height 64 --width 64 --steps 50 --cfg 3.0 --shift 5.0 \
   --skip-layers 22 --seed 42 \
-  --vae-weights moss-sft/vae --vae-decode --out moss_out.png
-# ... with positive-branch SLG (reference: slg_layers=[24], slg_scale=3.0),
-# sampling from the script-produced file embeds:
-$GEN --weights moss-sft/transformer --prompt-embeds-in /tmp/tool_embeds.f32 \
-  --steps 50 --slg-layers 24 --slg-scale 3.0 --out moss_slg.png
+  --vae-weights moss-sft/vae/diffusion_pytorch_model.safetensors \
+  --vae-decode --out moss_out.png
+# ... with positive-branch SLG (reference: slg_layers=[24], slg_scale=3.0):
+$GEN --tokenizer moss-sft/tokenizer --text-encoder moss-sft/text_encoder \
+  --prompt "a red panda reading a newspaper" \
+  --weights moss-sft/transformer \
+  --staged --steps 50 --slg-layers 24 --slg-scale 3.0 --out moss_slg.png
 # tiny smoke (no downloads; exercises encode/sample/decode plumbing):
 $GEN --tiny --steps 2
+# file-embed path instead of the in-process encode (cross-machine /
+# offline; embeds produced by scripts/moss_encode_qwen.py or the --null
+# fallback below, [L,Cc] = [512,4096] for the true geometry):
+$GEN --weights moss-sft/transformer --prompt-embeds-in /tmp/tool_embeds.f32 \
+  --steps 50 --out moss_out.png
 # offline file-embed fallback (no torch/diffusers/weights/GPU): the --null
 # output reproduces the null-embedding path bit-for-bit.
 python3 scripts/moss_encode.py --null \
-  --prompt "smoke" --out /tmp/tool_embeds.f32 --L 512 --Cc 2048
-$GEN --weights moss_image_sft.safetensors \
-  --prompt-embeds-in /tmp/tool_embeds.f32 --steps 50 --out moss_out.png
+  --prompt "smoke" --out /tmp/tool_embeds.f32 --L 512 --Cc 4096
 ```
 
 ### (d) New-flag deltas
 
 | flag | default | meaning |
 |---|---|---|
-| `--tokenizer` | — | HF tokenizer dir (Qwen2Tokenizer files; needs `--text-encoder` + encoder header for a real forward) |
-| `--text-encoder` | — | Qwen text-encoder weights (`.safetensors` or dir) |
-| `--negative-prompt` | `""` | negative caption (Qwen-encoded when the encoder is available, else zeros) |
+| `--tokenizer` | — | dir holding `tokenizer.json` (Qwen2Tokenizer files); with `--text-encoder` runs the in-process Qwen forward (byte-level BPE + chat template, verified against transformers 5.12.1) |
+| `--text-encoder` | — | Qwen text-encoder weights: `text_encoder/` shard dir or single `.safetensors` |
+| `--negative-prompt` | `""` | negative caption, encoded in-process alongside the prompt (else zeros on the file/null paths) |
 | `--slg-layers` | — | comma-separated block ids for a positive-branch skipped forward (e.g. `24`; empty disables) |
 | `--slg-scale` | 0.0 | SLG correction scale (`>0` + non-empty `--slg-layers` enables the third forward) |
 | `--slg-start`/`--slg-stop` | 0.0/1.0 | window gating uncond skipping AND SLG, as a fraction of steps in denoising order |
@@ -185,13 +199,15 @@ Landed in this tree: all three true-pipeline headers are present, so runs
 print `[backend dit=moss-image-dit encoder=qwen vae=moss-image-vae]` —
 sampling runs the true 42x3072 MMDiT (per-sample text mask, 4D RoPE, SiTU),
 decode runs the FLUX.2-small VAE when `--vae-weights --vae-decode` are
-given (else grayscale preview). Encode: the on-device Qwen35::EncoderModel
-(full + Gated-DeltaNet linear attention, no stubs) is in
-`src/KokkosDNN_MossImageEncoder.hpp`; the driver keeps the file/null
-handoff — produce ids/embeds with `scripts/moss_encode_qwen.py`
-(`--ids-only` / full forward) and pass `--prompt-embeds-in`, or run the
-EncoderModel from your own TU. `--negative-prompt` without precomputed
-neg embeds still yields zeros for the uncond branch.
+given (else grayscale preview). Encode runs fully in-process: the repo's
+byte-level BPE (`src/KokkosDNN_QwenTokenizer.hpp`, NFC + pre-tokenizer +
+merges verified id-for-id against transformers 5.12.1) tokenizes the
+prompt, and the on-device Qwen35::EncoderModel (full + Gated-DeltaNet
+linear attention, no stubs, `src/KokkosDNN_MossImageEncoder.hpp`) encodes
+the prompt and `--negative-prompt` in one batched forward; its weights are
+released before the DiT load. `--prompt-embeds-in` remains as the
+file-embed fallback (cross-machine / offline; produce with
+`scripts/moss_encode_qwen.py` or `scripts/moss_encode.py`).
 
 ## 24GB fit table (staged text-encoder/DiT split)
 
@@ -214,27 +230,25 @@ numbers than the table above (the example DiT is ~0.8B params, not the full
 5B checkpoint); the table governs real-checkpoint runs.
 
 Checkpoint → flag mapping: `--weights` = DiT transformer checkpoint
-(single `.safetensors` shard file; the HF `transformer/` dir ships 3 shards
-— pass them as one concatenated download or point at each shard in turn,
-see `MossImageDitWeights::load_safetensors` which also accepts a shard
-list); `--text-weights` = raw float32 LE caption features `[L,Cc]`
-(`[1,L,Cc]`/`[1,1,L,Cc]` flattened also accepted, last block wins; produce
-with `scripts/moss_encode_qwen.py` or `scripts/moss_encode.py`);
-`--tokenizer`/`--text-encoder` document the Qwen tokenizer/encoder source
-for the script path (the driver stages file embeds on-device);
-`--vae-weights` = FLUX.2 VAE `.safetensors` (single 250MB file), decoded
-only with `--vae-decode`.
+(`transformer/` shard dir or single `.safetensors`); `--tokenizer` = dir
+holding `tokenizer.json` (the HF `tokenizer/` dir works as-is);
+`--text-encoder` = `text_encoder/` shard dir or single `.safetensors`;
+`--text-weights` / `--prompt-embeds-in` = raw float32 LE caption features
+`[L,Cc]` (produce with `scripts/moss_encode_qwen.py` or
+`scripts/moss_encode.py`; `[1,L,Cc]`/`[1,1,L,Cc]` flattened also accepted,
+last block wins); `--vae-weights` = FLUX.2 VAE `.safetensors` (single
+250MB file), decoded only with `--vae-decode`.
 
 ## Driver flags (`moss_image_generate`)
 
 | flag | default | meaning |
 |---|---|---|
 | `--tiny` | off | random-weights smoke model, 4x4 latents; ignores `--text-weights`/`--vae-weights`/geometry |
-| `--weights` | `moss_image_sft.safetensors` | DiT checkpoint (`.safetensors`, or torch.save `.pth`) |
-| `--prompt` | `a red panda reading a newspaper` | Qwen-encoded with `--tokenizer` + `--text-encoder` (true header), else needs `--text-weights`, else null |
-| `--negative-prompt` | `""` | negative caption (encoded when the Qwen encoder is available, else zeros) |
-| `--tokenizer` | — | HF tokenizer dir (Qwen2Tokenizer files) |
-| `--text-encoder` | — | Qwen text-encoder weights (`.safetensors` or dir); with `--tokenizer` runs the real Qwen forward |
+| `--weights` | `moss_image_sft.safetensors` | DiT transformer checkpoint: `transformer/` shard dir or single `.safetensors` (torch.save `.pth` on the placeholder path) |
+| `--prompt` | `a red panda reading a newspaper` | Qwen-encoded in-process with `--tokenizer` + `--text-encoder`, else needs `--text-weights`, else null |
+| `--negative-prompt` | `""` | negative caption (encoded in-process alongside the prompt, else zeros) |
+| `--tokenizer` | — | dir holding `tokenizer.json` (Qwen2Tokenizer files); with `--text-encoder` runs the in-process Qwen forward |
+| `--text-encoder` | — | Qwen text-encoder weights: `text_encoder/` shard dir or single `.safetensors` |
 | `--text-weights` | — | raw F32 caption features `[L,Cc]` |
 | `--prompt-embeds-in` | — | alias of `--text-weights` (wins if both differ) |
 | `--staged` | off | encode → release encoder weights (MiB embeds stay resident on device) → fence → load DiT → sample (encoder/DiT never co-resident, no disk round-trip) |
@@ -264,30 +278,18 @@ only with `--vae-decode`.
   (shift 5.0 snapped to the training grid, `unique_consecutive`),
   `v = uncond + g·(cond−uncond)[+ slg·(cond−cond_skip)]`, mt19937
   Box-Muller init; default uncond skip {22}, window-gated with SLG.
-- Limitations: FP32-first latents/scheduler (DiT/encoder weights load
-  BF16+F32, compute accumulates FP32); on-device Qwen forward takes token
-  ids (BPE/chat-template stays in `scripts/moss_encode_qwen.py`);
-  serial-CPU full runs are slow — CUDA parallelizes the same kernels
-  (GEMMs→cuBLAS, attentions→cuDNN, norms/convs elementwise-native).
-- Staged plumbing status: safetensors/`.pth` loaders stream through
-  HostSpace chunks with one `deep_copy` per tensor (no 2x residency, float +
-  bhalf_t); `Weights`/`BlockWeights` expose `release()`; the driver runs an
-  `EncoderStage` (file/null embeds today) with `--staged` /
-  `--prompt-embeds-in` and per-phase `[memory phase=...]` logging. The
-  embeds stay resident on the device across the encoder-release / DiT-load
-  boundary (device-to-device staging into the sample loop, no disk, no
-  second process).
-  What the future Qwen port must fill in: tokenize the prompt, stream
-  `text_encoder/*.safetensors` into device views with the same HostSpace
-  pattern, run the Qwen forward + text refiner on-device into the
-  `EncoderStage` embeds, and keep the existing `release()` + `fence()`
-  before the DiT load (the ~16.8GB encoder budget in the fit table then
-  becomes live weights instead of a projection). The driver side is done:
-  `EncoderStage::run` already prefers the Qwen forward (header +
-  `--tokenizer` + `--text-encoder`), the sample loop already runs the
-  reference CFG/SLG/nearest-grid semantics through a backend-generic
-  forward, and decode already releases the DiT before the VAE phase (see
-  "Complete pipeline" above).
+- Limitations: bf16 weights (encoder + DiT; fp32 latents/scheduler,
+  fp32 compute accumulation; fp32 VAE); serial-CPU full runs are slow AND
+  the 9B text encoder needs ~32 GB host RAM there (`bhalf_t` is `float`
+  without a GPU backend) — prefer a CUDA/HIP build for real-weights runs.
+  Chat template covers the reference single-user-turn path only.
+- Staged plumbing: safetensors loaders stream per tensor with one
+  `deep_copy` each (no 2x residency) and accept F32/BF16; `Weights`
+  exposes `release()`; the driver runs an `EncoderStage` (in-process Qwen
+  forward, else `--prompt-embeds-in` file, else null) with `--staged` and
+  per-phase `[memory phase=...]` logging. The embeds stay resident on the
+  device across the encoder-release / DiT-load boundary (device-to-device
+  staging into the sample loop, no disk, no second process).
 - Targets (`CMakeLists.txt`): `kokkosdnn_moss` lib + `moss_image_generate`.
   Sources: `KokkosDNN_Moss{Config,Weights,Model,Sampler}` + driver.
   Wired into `examples/CMakeLists.txt` (`add_subdirectory(moss_image)`,
@@ -311,30 +313,33 @@ only with `--vae-decode`.
   otherwise. Scratch is grow-only (steady state performs no View
   allocations).
 
-## Canonical checkpoint key layout
+## Checkpoint key layout (MOSS-Image-SFT `transformer/`)
 
-`.safetensors` keys are suffix-matched (a `model.`-style prefix is fine):
+`.safetensors` keys are suffix-matched (a `model.`-style prefix is fine);
+`rope.bands` is skipped (rebuilt as an fp32 constant). 463 tensors total
+(`diffusion_pytorch_model.safetensors.index.json`):
 
 ```text
-patch_embed.proj.{weight,bias}
-time_embed.mlp.0.{weight,bias}, time_embed.mlp.2.{weight,bias}
-time_embed.block.{weight,bias}            # Linear(D -> 6D)
-cap_embed.proj.{weight,bias}, cap_embed.norm.weight
-blocks.{i}.scale_shift_table              # [6, D]
-blocks.{i}.attn.qkv.weight                # [3D, D]
-blocks.{i}.attn.cap_kv.weight             # [2D, D]
-blocks.{i}.attn.proj.{weight,bias}        # [D, D]
-blocks.{i}.mlp.fc1.{weight,bias}          # [H, D]
-blocks.{i}.mlp.fc2.{weight,bias}          # [D, H]
-final.scale_shift_table                    # [2, D]
-final.linear.{weight,bias}                 # [out_ch*P*P, D] (== [out_ch, D] at P=1)
+video_embedder.{weight,bias}              # latent patch embed
+text_embedder.proj.{weight,bias}          # caption Linear 4096->3072
+text_embedder.blocks.{0,1}.qkv.{weight,bias} ...
+text_embedder.blocks.{0,1}.proj.{weight,bias}
+text_embedder.blocks.{0,1}.{q_norm,k_norm,norm1,norm2}.weight
+text_embedder.blocks.{0,1}.ffn_{gate,up,down}.{weight,bias}
+time_embedding.{0,2}.{weight,bias}        # timestep MLP (float64 sinusoid in)
+shared_block_modulation.{weight,bias}     # shared modulation
+video_head_modulation.{weight,bias}
+layers.{i}.proj.{q,k,v,o}.weight          # joint self+cross attention (no bias)
+layers.{i}.{q_norm,k_norm}.weight          # per-head QK RMSNorm
+layers.{i}.{norm1,norm2}.weight
+layers.{i}.proj.ffn_{up_gate,down}.weight  # SiTU FFN (no bias)
+final_norm_video.weight
+final_linear_video.weight
 ```
 
-The `.pth` loader maps the same list positionally (Nth key ↔ Nth
-`data/{N}` float32 storage, key order validated as suffix matches). All
-tensors are float32. `patch_embed.proj.weight` is `[D, in_ch*P*P]`
-row-major (torch `[D, in_ch, P, P]` flattened with `col=(c*P+kh)*P+kw`,
-matching the model's patchify order).
+The placeholder-geometry path (no true-pipeline headers) instead uses the
+legacy `blocks.{i}.attn.qkv.weight`-style layout with `.pth` positional
+mapping; see "Design notes" in the git history.
 
 ## Verification
 
@@ -344,17 +349,19 @@ matching the model's patchify order).
 # staged plumbing on the smoke model (in-memory device handoff):
 ./build/examples/moss_image/moss_image_generate \
   --tiny --steps 2 --staged
-# unit tests for the merged MossImage ops (tests-enabled build):
-ctest -R Moss
+# unit tests (tests-enabled build): tokenizer goldens need the real
+# tokenizer.json (skipped without it), encoder/DiT/VAE suites run anywhere
+KOKKOSDNN_QWEN_TOKENIZER_JSON=/path/to/tokenizer.json ctest -R "wen|Moss"
 ```
 
 exercises config → random init → model forward → FlowEuler + CFG/SLG loop
-→ preview + `.f32` dump with no downloads, plus the 15-test
-`Test_MossImageOps` suite (`ctest -R Moss`: 15/15 pass). Real-weight
-verification is pending the landed Dit/Encoder/Vae headers plus a
-checkpoint: load the transformer with `--weights`, the encoder with
-`--tokenizer`/`--text-encoder` (or file embeds from
-`scripts/moss_encode.py`), decode with `--vae-weights --vae-decode`,
-compare against the reference sampler (tolerances TBD once dtypes/layouts
-are pinned), and add golden tests mirroring
-`examples/sana/Test_SanaGolden.cpp`.
+→ preview + `.f32` dump with no downloads, plus `Test_MossImageOps`,
+`Test_MossImageDit`, `Test_MossImageEncoder` (incl. tiny forward goldens
+and the safetensors round-trip) and `Test_QwenTokenizer` (10 golden
+id-sequences vs transformers 5.12.1, NFC/pre-tokenizer edge cases).
+Real-weights verification: tokenize parity is covered by the golden tests;
+the encoder loader is checked tensor-by-tensor against the published
+`text_encoder` index (names/shapes/dtypes); end-to-end, run §(c) on a
+CUDA/HIP build and compare latents against the reference
+`pipeline_moss_image.py` (tolerances TBD once dtypes/layouts are pinned),
+mirroring `examples/sana/Test_SanaGolden.cpp`.

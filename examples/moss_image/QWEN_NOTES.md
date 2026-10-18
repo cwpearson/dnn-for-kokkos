@@ -77,7 +77,10 @@ Config matches `transformers_version 5.12.1`, `model_type qwen3_5`,
   3. Split q/k [B,S,16,128], v [B,S,32,128]; `beta = sigmoid(b)`;
      `g = -exp(A_log) * softplus(a + dt_bias)` (fp32; line 518).
   4. repeat_interleave q,k 16 → 32 heads (ratio 2, line 519–521).
-  5. QK L2-norm eps 1e-6, then `q *= 1/sqrt(128)` (lines 258–276).
+  5. QK L2-norm is the FLA sum-based `l2norm` (line 248): `x/sqrt(sum(x^2)
+  + eps)`, eps 1e-6, NOT mean-based; then `q *= 1/sqrt(128)` (lines
+  258–276). The C++ port uses a dedicated sum-based kernel for this
+  (the mean-based `qwen_l2inv` is only for the two RMSNorms).
   6. Recurrent gated delta rule, fp32, per (batch, head) state
      S [128,128] = 0; per token t (lines 352–363):
      `S *= exp(g_t); kv = (S·k_t).sum_k; delta = (v_t − kv)·beta_t;`

@@ -31,6 +31,7 @@ kokkosdnn_add_test(test_conv1d Test_Conv1D.cpp)
 kokkosdnn_add_test(test_mossimage Test_MossImageOps.cpp)
 kokkosdnn_add_test(test_mossimageddit Test_MossImageDit.cpp)
 kokkosdnn_add_test(test_mossimage_encoder Test_MossImageEncoder.cpp)
+kokkosdnn_add_test(test_qwen_tokenizer Test_QwenTokenizer.cpp)
 kokkosdnn_add_test(test_mossimagevae Test_MossImageVae.cpp)
 
 if(KokkosDNN_ENABLE_IMAGE)

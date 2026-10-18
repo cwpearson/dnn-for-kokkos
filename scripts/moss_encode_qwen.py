@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Qwen3.5 prompt-frontend for the MOSS-Image staged split.
+"""Qwen3.5 prompt-frontend reference for the MOSS-Image staged split.
 
-Host-side glue (tokenizer/BPE stays here by design): uses transformers
-AutoTokenizer + the checkpoint chat template to produce the token ids
-consumed by the C++ Qwen3.5 encoder
+Reference implementation of the host-side frontend (tokenizer/BPE +
+chat template via transformers AutoTokenizer) whose exact outputs the
+in-process C++ tokenizer (`src/KokkosDNN_QwenTokenizer.hpp`, used by
+`moss_image_generate --tokenizer/--text-encoder`) reproduces id-for-id
+(see tests/Test_QwenTokenizer.cpp goldens). It also produces the token
+ids consumed by the C++ Qwen3.5 encoder
 (`KokkosDNN::Qwen35::EncoderModel::forward`, ids [B, S] + valid lengths),
 plus an optional raw .f32 embed handoff compatible with
-`Moss::load_caption_raw` ([L, Cc] + sidecar json) for parity checks.
+`Moss::load_caption_raw` ([L, Cc] + sidecar json) for parity checks and
+for the `--prompt-embeds-in` cross-machine/offline path.
 
 Pipeline fidelity (verified against pipeline_moss_image.py encode_prompt):
   - per-prompt: apply_chat_template([{role:user, content}], tokenize=False,

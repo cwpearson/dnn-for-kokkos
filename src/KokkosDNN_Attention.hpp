@@ -20,6 +20,11 @@
 namespace KokkosDNN {
 namespace Impl {
 
+// Portable per-team scratch ceiling. The Serial backend aborts above
+// 32 KiB of team scratch; CUDA/HIP/SYCL allow more, but every tuner below
+// sizes to this minimum so one binary runs on all backends.
+inline constexpr size_t kMaxTeamScratchBytes = 32 * 1024;
+
 // Team-scratch footprint (in floats) of GqaStreamingFunctor below: scaled Q
 // rows plus FP32 accumulator rows ([nqr x SS] each), one K/V tile row pair
 // per (tile slot, distinct-KV-head row), and per-row (m, l) state. SS carries
@@ -467,7 +472,8 @@ void launch_gqa_streaming_auto(const QView& q, const KView& k, const VView& v,
   // 32 query rows; keys stream in tiles of up to 8 (one cooperative tile
   // load plus two barriers per tile instead of per key). Smaller chunks and
   // tiles keep team scratch (see gqa_scratch_floats) within the portable
-  // 48 KiB per-team budget for large head dims. The K/V tile only carries
+  // per-team budget (kMaxTeamScratchBytes) for large head dims. The K/V
+  // tile only carries
   // the head chunk's distinct KV rows (1 under standard GQA), so wide tiles
   // stay affordable where they matter. UF == 8 unrolls D in consecutive
   // octuples (D % 8 == 0), UF == 4 in quadruples (D % 4 == 0); all branches
@@ -481,11 +487,11 @@ void launch_gqa_streaming_auto(const QView& q, const KView& k, const VView& v,
   // Shrink tokens first (KT drives the barrier/load-width win), then tiles.
   while (tchunk > 1 &&
          gqa_scratch_floats(tchunk, hchunk, ktiles, kvmax, D) * sizeof(float) >
-             size_t(48 * 1024))
+             kMaxTeamScratchBytes)
     tchunk /= 2;
   while (ktiles > 1 &&
          gqa_scratch_floats(tchunk, hchunk, ktiles, kvmax, D) * sizeof(float) >
-             size_t(48 * 1024))
+             kMaxTeamScratchBytes)
     ktiles /= 2;
   const int uf = (D % 8 == 0) ? 8 : ((D % 4 == 0) ? 4 : 1);
   if (hchunk == 4) {
@@ -1314,13 +1320,14 @@ void launch_bidir_flash(const QP* qbase, const KP* kbase, const VP* vbase,
   // on long sequences (fewer teams, more K/V reuse per tile load) and more
   // teams on short ones (fill the machine): T >= 320 uses 24-token chunks,
   // else 16. KT starts at 12 and shrinks (gradually, then by halves) with
-  // TC so scratch stays within the portable 48 KiB per-team budget.
+  // TC so scratch stays within the portable per-team budget
+  // (kMaxTeamScratchBytes).
   int tchunk = (T < 16) ? static_cast<int>(T) : ((T >= 320) ? 24 : 16);
   int kt = 12;
   // Scratch mirror of the functor layout (Q rows + optional acc rows +
   // K/V tiles); must match exactly. DMAX > 0 drops the shared acc rows.
   // KT shrinks gradually (then by halves) and TC by halves so scratch
-  // stays within the portable 48 KiB per-team budget.
+  // stays within the portable per-team budget (kMaxTeamScratchBytes).
   auto bidir_scratch_floats = [&](int tc, int kkt) -> size_t {
     size_t sq = D + 1;
     if (sq % 32 == 0) ++sq;
@@ -1332,13 +1339,13 @@ void launch_bidir_flash(const QP* qbase, const KP* kbase, const VP* vbase,
     return nq * sq + (reg ? 0 : nq * sq) + 2 * HC * kkt * sd;
   };
   while (kt > 8 && bidir_scratch_floats(tchunk, kt) * sizeof(float) >
-                        size_t(48 * 1024))
+                        kMaxTeamScratchBytes)
     --kt;
   while (kt > 1 && bidir_scratch_floats(tchunk, kt) * sizeof(float) >
-                        size_t(48 * 1024))
+                        kMaxTeamScratchBytes)
     kt /= 2;
   while (tchunk > 1 && bidir_scratch_floats(tchunk, kt) * sizeof(float) >
-                            size_t(48 * 1024))
+                            kMaxTeamScratchBytes)
     tchunk /= 2;
   // Mutable out base via a non-const handle copy (avoids a const_cast; the
   // caller's allocation is mutable — out is only ever written here).

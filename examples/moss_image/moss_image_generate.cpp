@@ -13,9 +13,9 @@
 // three are 0: encode resolves --prompt-embeds-in files or null, sampling
 // runs the placeholder DiT, decode writes a grayscale preview.
 //
-//   moss_image_generate [--tiny] [--weights model.safetensors]
+//   moss_image_generate [--tiny] [--weights transformer_dir]
 //                       [--prompt "text"] [--negative-prompt "text"]
-//                       [--tokenizer tok_dir] [--text-encoder enc.st]
+//                       [--tokenizer tok_dir] [--text-encoder enc_dir]
 //                       [--text-weights feats.f32]
 //                       [--prompt-embeds-in feats.f32]
 //                       [--height H] [--width W]
@@ -28,13 +28,16 @@
 //                       [--out img.png]
 //                       [--staged]
 //
-// Text conditioning precedence: Qwen forward (needs the encoder header +
-// --tokenizer + --text-encoder) -> --prompt-embeds-in file (alias
-// --text-weights) -> null (zeros) with the prompt logged. --vae-weights is
-// validated whenever given; --vae-decode additionally runs the real VAE
-// decode when the VAE header + weights are present, else a channel-mean
-// grayscale preview is written with a clear log. Raw fp32 latents
-// (<stem>.f32, [C,H,W] row-major) are always written.
+// Text conditioning precedence: in-process Qwen forward (--tokenizer dir
+// with tokenizer.json + --text-encoder weights: BPE + chat template +
+// on-device Qwen35 forward for prompt and negative prompt, weights
+// released before the DiT load) -> --prompt-embeds-in file (alias
+// --text-weights) -> null (zeros) with the prompt logged. --tokenizer /
+// --text-encoder must be given together. --tiny skips the Qwen forward.
+// --vae-weights is validated whenever given; --vae-decode additionally runs
+// the real VAE decode when the VAE header + weights are present, else a
+// channel-mean grayscale preview is written with a clear log. Raw fp32
+// latents (<stem>.f32, [C,H,W] row-major) are always written.
 //
 // Staged execution (24GB fit): --staged runs encode -> releases the encoder
 // weights (the MiB-scale embeds stay resident on the device) ->
@@ -49,6 +52,7 @@
 //
 // --tiny runs a random-weights smoke model on 4x4 latents (no downloads).
 #include <Kokkos_Core.hpp>
+#include <Kokkos_Half.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -56,6 +60,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -103,6 +108,10 @@
 #endif
 #endif
 
+// In-repo host-side BPE tokenizer for the Qwen text encoder (always
+// available; no backend probe needed).
+#include "KokkosDNN_QwenTokenizer.hpp"
+
 #ifdef KOKKOSDNN_ENABLE_IMAGE
 #if __has_include("KokkosDNN_Image.hpp")
 #include "KokkosDNN_Image.hpp"
@@ -117,7 +126,15 @@ namespace {
 
 namespace MO = KokkosDNN::Moss;
 using Exec = Kokkos::DefaultExecutionSpace;
-using Scalar = MO::DefaultScalar;  // float (the checkpoint dtype)
+using Scalar = MO::DefaultScalar;  // float (host-side / latent dtype)
+#ifdef MOSS_DRIVER_HAVE_DIT
+// DiT + encoder checkpoints are bf16 on disk; running them in bhalf_t
+// (fp32 accumulation in every kernel) halves residency vs fp32 and is what
+// the 24GB fit table assumes. Host-side embeds and latents stay float.
+using DScalar = Kokkos::Experimental::bhalf_t;
+#else
+using DScalar = Scalar;  // placeholder model is float-only
+#endif
 
 // ---- Backend geometry traits ---------------------------------------------
 // The placeholder (Moss::Config: 24x1536/16ch/cap2048/maxlen512) and the
@@ -243,16 +260,40 @@ bool file_exists(const std::string& path) {
   return (bool)f;
 }
 
+// Weights source: a single .safetensors file or a directory of shards
+// (sorted). Shared by --text-encoder and --weights.
+inline std::vector<std::string> resolve_shard_list(const std::string& path,
+                                                   const std::string& flag) {
+  std::vector<std::string> shards;
+  std::error_code ec;
+  if (std::filesystem::is_directory(path, ec)) {
+    for (const auto& e : std::filesystem::directory_iterator(path, ec)) {
+      if (e.is_regular_file() && e.path().extension() == ".safetensors")
+        shards.push_back(e.path().string());
+    }
+    std::sort(shards.begin(), shards.end());
+    if (shards.empty())
+      throw std::runtime_error(flag + " dir '" + path +
+                               "' holds no *.safetensors shards");
+  } else {
+    if (!file_exists(path))
+      throw std::runtime_error(flag + " file '" + path + "' not found");
+    shards.push_back(path);
+  }
+  return shards;
+}
+
 // Encode stage: owns the caption-embedding state that the text encoder
 // produces and hands to the DiT sample phase (cond + uncond/negative).
 //
 // Conditioning precedence (first hit wins):
-//   1. Qwen forward: needs MOSS_DRIVER_HAVE_ENCODER (landed
-//      KokkosDNN_MossImageEncoder.hpp) + --tokenizer + --text-encoder.
-//      Tokenizer ids (chat template + truncation, reference encode_prompt)
-//      -> Qwen forward on-device -> host [L,Cc] float32, for both the prompt
-//      and --negative-prompt (default ''), matching the reference which
-//      encodes the negative the same way whenever CFG is active.
+//   1. In-process Qwen forward: --tokenizer (dir with tokenizer.json) +
+//      --text-encoder (weights file or shard dir), not --tiny. The repo's
+//      byte-level BPE (chat template + truncation, reference encode_prompt)
+//      tokenizes the prompt and --negative-prompt (default ''), then the
+//      Qwen35::EncoderModel forward runs on-device for both branches,
+//      matching the reference which encodes the negative the same way
+//      whenever CFG is active. Weights are released before the DiT load.
 //   2. Raw float32 LE file (--text-weights / --prompt-embeds-in, e.g.
 //      scripts/moss_encode.py output): cond from file, uncond zeros.
 //   3. Null (zeros) for both, prompt logged only.
@@ -260,15 +301,6 @@ bool file_exists(const std::string& path) {
 // device_neg; the sample phase reads straight from those device views, so
 // the --staged handoff never touches disk (see main).
 //
-// ADAPT (encoder worktree): the HAVE_ENCODER branch below assumes the
-// landed header exposes a single host-side entry
-//   MossImageEncoder::encode_prompt(tokenizer_dir, encoder_path, prompt,
-//                                   L, Cc) -> std::vector<float> [L*Cc],
-// which keeps encoder weight residency inside the encoder TU (the driver
-// never holds the ~16.8GB encoder alongside the DiT). Conform the two call
-// sites to the landed signature if it differs (e.g. separate
-// tokenize/forward entry points, or a linear-attention stub that logs and
-// returns approximate features — see README "what still falls back").
 struct EncoderStage {
   std::vector<float> embeds;      // host [L*Cc] row-major cond features
   std::vector<float> neg_embeds;  // host [L*Cc] row-major uncond features
@@ -297,6 +329,91 @@ struct EncoderStage {
     Kokkos::fence();
   }
 
+// In-process Qwen forward (needs MOSS_DRIVER_HAVE_ENCODER): tokenize the
+// prompt and negative prompt with the repo's byte-level BPE
+// (KokkosDNN_QwenTokenizer, verified against transformers 5.12.1), run the
+// batched Qwen35::EncoderModel forward on-device, and fill zero-padded
+// [L*Cc] host embeds for both branches. The encoder weights are released
+// before returning; only the embeds survive (staged to device by the
+// caller), so the encoder and DiT are never resident together.
+#ifdef MOSS_DRIVER_HAVE_ENCODER
+  static void run_qwen(EncoderStage& st, const std::string& prompt,
+                       const std::string& negative_prompt,
+                       const std::string& tokenizer_dir,
+                       const std::string& encoder_path) {
+    namespace QT = KokkosDNN::QwenTokenizer;
+    const std::string tok_json = tokenizer_dir + "/tokenizer.json";
+    if (!file_exists(tok_json))
+      throw std::runtime_error(
+          "--tokenizer '" + tokenizer_dir +
+          "' has no tokenizer.json (need the MOSS-Image-SFT tokenizer/ dir; "
+          "see README)");
+    QT::Tokenizer tok;
+    tok.load(tok_json);
+    const std::vector<int> ids0 = tok.encode(prompt, true, st.L);
+    const std::vector<int> ids1 =
+        tok.encode(negative_prompt, true, st.L);
+    std::printf("[tokenize] prompt seq_len=%zu neg seq_len=%zu (thinking, "
+                "truncated to L=%zu)\n",
+                ids0.size(), ids1.size(), st.L);
+
+    KokkosDNN::Qwen35::Config qcfg =
+        KokkosDNN::Qwen35::Config::moss_image_sft();
+    qcfg.validate();
+    if ((size_t)qcfg.hidden != st.Cc)
+      throw std::runtime_error(
+          "Qwen hidden (" + std::to_string(qcfg.hidden) +
+          ") != caption dim (" + std::to_string(st.Cc) + ")");
+    KokkosDNN::Qwen35::EncoderModel<Exec, Kokkos::Experimental::bhalf_t> enc(
+        qcfg);
+    const std::vector<std::string> shards =
+        resolve_shard_list(encoder_path, "--text-encoder");
+    std::printf("[loading %s]%s\n", encoder_path.c_str(),
+                shards.size() > 1 ? " (shards)" : "");
+    enc.load_safetensors(shards);
+    std::printf("[encode] Qwen weights resident: %.1f GB\n",
+                (double)enc.resident_bytes() / 1e9);
+
+    // Batched forward over (prompt, negative): one unpadded forward per row
+    // with explicit valid lengths, matching the reference encode_prompt
+    // (zero-padded batch + bool mask).
+    const size_t S = std::max(ids0.size(), ids1.size());
+    Kokkos::View<int**, Kokkos::LayoutRight, Exec> ids("moss_qwen_ids", 2, S);
+    {
+      auto hm = Kokkos::create_mirror_view(ids);
+      for (size_t b = 0; b < 2; ++b) {
+        const std::vector<int>& src = (b == 0) ? ids0 : ids1;
+        for (size_t s = 0; s < S; ++s)
+          hm(b, s) = (s < src.size()) ? src[s] : 0;
+      }
+      Kokkos::deep_copy(ids, hm);
+    }
+    // bhalf device out (matches the encoder model); converted to float embeds.
+    Kokkos::View<Kokkos::Experimental::bhalf_t***, Kokkos::LayoutRight, Exec>
+        out("moss_qwen_out", 2, S, (size_t)qcfg.hidden);
+    Kokkos::deep_copy(out, Kokkos::Experimental::bhalf_t(0));
+    KokkosDNN::DNNHandle<Exec> handle;
+    enc.forward(handle, ids, {ids0.size(), ids1.size()}, out);
+    Kokkos::fence();
+    auto hout = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), out);
+    st.embeds.assign(st.L * st.Cc, 0.0f);
+    st.neg_embeds.assign(st.L * st.Cc, 0.0f);
+    for (size_t t = 0; t < ids0.size(); ++t)
+      for (size_t h = 0; h < st.Cc; ++h)
+        st.embeds[t * st.Cc + h] = (float)hout(0, t, h);
+    for (size_t t = 0; t < ids1.size(); ++t)
+      for (size_t h = 0; h < st.Cc; ++h)
+        st.neg_embeds[t * st.Cc + h] = (float)hout(1, t, h);
+    const size_t wbytes = enc.resident_bytes();
+    enc.release();
+    Kokkos::fence();
+    std::printf("[encode] released %.1f GB Qwen weights; %.1f MiB embeds "
+                "survive for the sample phase\n",
+                (double)wbytes / 1e9,
+                (double)(2 * st.L * st.Cc * sizeof(float)) / (1024.0 * 1024.0));
+  }
+#endif
+
   template <class CfgT>
   static EncoderStage run(const CfgT& cfg, const std::string& prompt,
                           const std::string& negative_prompt,
@@ -307,17 +424,21 @@ struct EncoderStage {
     st.L = be_max_seq(cfg);
     st.Cc = be_caption_dim(cfg);
 #ifdef MOSS_DRIVER_HAVE_ENCODER
-    // Landed header is KokkosDNN::Qwen35 (Weights + EncoderModel over token
-    // ids). The driver keeps the file/null handoff: produce ids with
-    // scripts/moss_encode_qwen.py (--ids-only) and embeds with the full
-    // Qwen forward, then pass them via --prompt-embeds-in. Direct raw-text
-    // forward in the driver is intentionally not wired (tokenizer/BPE stays
-    // host-side in the script).
-    if (!tiny && (!tokenizer_dir.empty() || !encoder_path.empty()))
-      std::printf("[encode] on-device Qwen35::EncoderModel is available in "
-                  "this build; run scripts/moss_encode_qwen.py to produce "
-                  "ids/embeds, then pass --prompt-embeds-in (falling back "
-                  "to %s for this run)\n",
+    // In-process Qwen forward when --tokenizer + --text-encoder are given
+    // (and not --tiny: the smoke model uses random weights at test geometry,
+    // which real token ids cannot address).
+    if (!tiny && (!tokenizer_dir.empty() || !encoder_path.empty())) {
+      if (tokenizer_dir.empty() || encoder_path.empty())
+        throw std::runtime_error(
+            "--tokenizer and --text-encoder must be given together for the "
+            "in-process Qwen forward");
+      run_qwen(st, prompt, negative_prompt, tokenizer_dir, encoder_path);
+      st.stage_device();
+      return st;
+    }
+    if (tiny && (!tokenizer_dir.empty() || !encoder_path.empty()))
+      std::printf("[encode] --tiny skips the Qwen forward (random-weights "
+                  "smoke model); falling back to %s\n",
                   caption_path.empty() ? "null" : "file");
 #else
     if (!tokenizer_dir.empty() || !encoder_path.empty())
@@ -495,8 +616,8 @@ std::vector<float> run_sample_loop(
   const bool need_cfg = do_cfg && !same;
   const bool want_slg = !slg_layers.empty() && slg_scale > 0.0f;
 
-  using LatR = Kokkos::View<Scalar****, Kokkos::LayoutRight, Exec>;
-  using TokR = Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec>;
+  using LatR = Kokkos::View<DScalar****, Kokkos::LayoutRight, Exec>;
+  using TokR = Kokkos::View<DScalar***, Kokkos::LayoutRight, Exec>;
   using TVec = Kokkos::View<float*, Exec>;
   LatR x_d("moss_loop_x", 1, C, HH, WW);
   LatR vc_d("moss_loop_vc", 1, C, HH, WW);
@@ -512,7 +633,7 @@ std::vector<float> run_sample_loop(
     size_t k = 0;
     for (size_t c = 0; c < C; ++c)
       for (size_t h = 0; h < HH; ++h)
-        for (size_t w = 0; w < WW; ++w) xh(0, c, h, w) = (Scalar)x_init[k++];
+        for (size_t w = 0; w < WW; ++w) xh(0, c, h, w) = (DScalar)x_init[k++];
     Kokkos::deep_copy(x_d, xh);
   }
   auto fill_caption = [](TokR& dst, const std::vector<float>& y, size_t Lc,
@@ -520,7 +641,7 @@ std::vector<float> run_sample_loop(
     auto yh = Kokkos::create_mirror_view(dst);
     size_t k = 0;
     for (size_t l = 0; l < Lc; ++l)
-      for (size_t c = 0; c < Cc_; ++c) yh(0, l, c) = (Scalar)y[k++];
+      for (size_t c = 0; c < Cc_; ++c) yh(0, l, c) = (DScalar)y[k++];
     Kokkos::deep_copy(dst, yh);
   };
   fill_caption(y_cond_d, cond, L, Cc);
@@ -568,7 +689,7 @@ std::vector<float> run_sample_loop(
             float v = vun + g * (vcond - vun);
             if (slg_now)
               v += s * (vcond - static_cast<float>(vs_d(b, c, h, w)));
-            x_d(b, c, h, w) = static_cast<Scalar>(xc + dt * v);
+            x_d(b, c, h, w) = static_cast<DScalar>(xc + dt * v);
           });
     } else if (slg_now) {
       forward(x_d, t_d, y_cond_d, vs_d, slg_layers);
@@ -583,7 +704,7 @@ std::vector<float> run_sample_loop(
             const float vcond = static_cast<float>(vc_d(b, c, h, w));
             const float vsk = static_cast<float>(vs_d(b, c, h, w));
             x_d(b, c, h, w) =
-                static_cast<Scalar>(xc + dt * (vsk + s * (vcond - vsk)));
+                static_cast<DScalar>(xc + dt * (vsk + s * (vcond - vsk)));
           });
     } else {
       Kokkos::parallel_for(
@@ -594,7 +715,7 @@ std::vector<float> run_sample_loop(
           KOKKOS_LAMBDA(size_t b, size_t c, size_t h, size_t w) {
             const float xc = static_cast<float>(x_d(b, c, h, w));
             const float v = static_cast<float>(vc_d(b, c, h, w));
-            x_d(b, c, h, w) = static_cast<Scalar>(xc + dt * v);
+            x_d(b, c, h, w) = static_cast<DScalar>(xc + dt * v);
           });
     }
     Kokkos::fence();
@@ -606,7 +727,7 @@ std::vector<float> run_sample_loop(
   size_t k = 0;
   for (size_t c = 0; c < C; ++c)
     for (size_t h = 0; h < HH; ++h)
-      for (size_t w = 0; w < WW; ++w) x[k++] = (float)xh(0, c, h, w);
+      for (size_t w = 0; w < WW; ++w) x[k++] = static_cast<float>(xh(0, c, h, w));
   return x;
 }
 
@@ -678,8 +799,8 @@ std::vector<float> run_sample_loop_from_device(
   const bool use_cfg = do_cfg && !same;
   const bool want_slg = !slg_layers.empty() && slg_scale > 0.0f;
 
-  using LatR = Kokkos::View<Scalar****, Kokkos::LayoutRight, Exec>;
-  using TokR = Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec>;
+  using LatR = Kokkos::View<DScalar****, Kokkos::LayoutRight, Exec>;
+  using TokR = Kokkos::View<DScalar***, Kokkos::LayoutRight, Exec>;
   using TVec = Kokkos::View<float*, Exec>;
   LatR x_d("moss_loop_x", 1, C, HH, WW);
   LatR vc_d("moss_loop_vc", 1, C, HH, WW);
@@ -693,7 +814,7 @@ std::vector<float> run_sample_loop_from_device(
     size_t k = 0;
     for (size_t c = 0; c < C; ++c)
       for (size_t h = 0; h < HH; ++h)
-        for (size_t w = 0; w < WW; ++w) xh(0, c, h, w) = (Scalar)x_init[k++];
+        for (size_t w = 0; w < WW; ++w) xh(0, c, h, w) = (DScalar)x_init[k++];
     Kokkos::deep_copy(x_d, xh);
   }
   // Device->device caption staging: no host or disk round-trip.
@@ -701,8 +822,8 @@ std::vector<float> run_sample_loop_from_device(
       "moss_stage_cond",
       Kokkos::MDRangePolicy<Exec, Kokkos::Rank<2>>({0, 0}, {L, Cc}),
       KOKKOS_LAMBDA(size_t l, size_t c) {
-        y_cond_d(0, l, c) = static_cast<Scalar>(cond_d(l, c));
-        y_unc_d(0, l, c) = static_cast<Scalar>(uncond_d(l, c));
+        y_cond_d(0, l, c) = static_cast<DScalar>(cond_d(l, c));
+        y_unc_d(0, l, c) = static_cast<DScalar>(uncond_d(l, c));
       });
   Kokkos::fence();
 
@@ -744,7 +865,7 @@ std::vector<float> run_sample_loop_from_device(
             float v = vun + g * (vcond - vun);
             if (slg_now)
               v += s * (vcond - static_cast<float>(vs_d(b, c, h, w)));
-            x_d(b, c, h, w) = static_cast<Scalar>(xc + dt * v);
+            x_d(b, c, h, w) = static_cast<DScalar>(xc + dt * v);
           });
     } else if (slg_now) {
       forward(x_d, t_d, y_cond_d, vs_d, slg_layers);
@@ -759,7 +880,7 @@ std::vector<float> run_sample_loop_from_device(
             const float vcond = static_cast<float>(vc_d(b, c, h, w));
             const float vsk = static_cast<float>(vs_d(b, c, h, w));
             x_d(b, c, h, w) =
-                static_cast<Scalar>(xc + dt * (vsk + s * (vcond - vsk)));
+                static_cast<DScalar>(xc + dt * (vsk + s * (vcond - vsk)));
           });
     } else {
       Kokkos::parallel_for(
@@ -770,7 +891,7 @@ std::vector<float> run_sample_loop_from_device(
           KOKKOS_LAMBDA(size_t b, size_t c, size_t h, size_t w) {
             const float xc = static_cast<float>(x_d(b, c, h, w));
             const float v = static_cast<float>(vc_d(b, c, h, w));
-            x_d(b, c, h, w) = static_cast<Scalar>(xc + dt * v);
+            x_d(b, c, h, w) = static_cast<DScalar>(xc + dt * v);
           });
     }
     Kokkos::fence();
@@ -781,15 +902,54 @@ std::vector<float> run_sample_loop_from_device(
   size_t k = 0;
   for (size_t c = 0; c < C; ++c)
     for (size_t h = 0; h < HH; ++h)
-      for (size_t w = 0; w < WW; ++w) x[k++] = (float)xh(0, c, h, w);
+      for (size_t w = 0; w < WW; ++w) x[k++] = static_cast<float>(xh(0, c, h, w));
   return x;
 }
 
+#ifdef MOSS_DRIVER_HAVE_DIT
+// True DiT forward: (x_d [1,C,H,W], t_d [1], y [1,L,Cc]) -> out, with an
+// all-valid mask. Cc == text_dim and C == latent_channels by construction
+// of the backend traits above. Namespace scope: NVCC rejects function-local
+// closure types as the Forward template argument above extended device
+// lambdas, so the forward callable is a named functor.
+struct DitForward {
+  KokkosDNN::MossImageDit::MossImageDitModel<Exec, DScalar>* model;
+  template <class X, class T, class Y, class Out>
+  void operator()(const X& x, const T& t, const Y& y, Out& out,
+                  const std::vector<int>& skips) const {
+    Kokkos::View<int**, Kokkos::LayoutRight, Exec> mask("moss_loop_mask", 1,
+                                                        y.extent(1));
+    Kokkos::deep_copy(mask, 1);
+    model->forward(x, t, y, mask, out, skips);
+  }
+};
+#else
+// Placeholder-model forward (single skip per forward). Same namespace-scope
+// requirement as above.
+struct DitForward {
+  MO::Model<Exec, DScalar>* model;
+  mutable bool slg_multi_warned = false;
+  template <class X, class T, class Y, class Out>
+  void operator()(const X& x, const T& t, const Y& y, Out& out,
+                  const std::vector<int>& skips) const {
+    const int skip = skips.empty() ? -1 : skips.front();
+    if (skips.size() > 1 && !slg_multi_warned) {
+      slg_multi_warned = true;
+      std::fprintf(stderr,
+                   "warning: placeholder Model applies one skip per "
+                   "forward; using the first of %zu --slg-layers\n",
+                   skips.size());
+    }
+    model->forward(x, t, y, out, skip);
+  }
+};
+#endif
+
 void usage() {
   std::printf(
-      "usage: moss_image_generate [--tiny] [--weights model.safetensors]\n"
+      "usage: moss_image_generate [--tiny] [--weights transformer_dir]\n"
       "                    [--prompt \"text\"] [--negative-prompt \"text\"]\n"
-      "                    [--tokenizer tok_dir] [--text-encoder enc.st]\n"
+      "                    [--tokenizer tok_dir] [--text-encoder enc_dir]\n"
       "                    [--text-weights feats.f32]\n"
       "                    [--prompt-embeds-in feats.f32]\n"
       "                    [--height H] [--width W]\n"
@@ -803,17 +963,19 @@ void usage() {
       "                    [--staged]\n"
       "\n"
       "  --tiny         random-weights smoke model, 4x4 latents (no files)\n"
-      "  --weights      DiT checkpoint (.safetensors, or torch.save .pth)\n"
-      "                 (default: moss_image_sft.safetensors)\n"
-      "  --prompt       caption text (Qwen-encoded with --tokenizer +\n"
-      "                 --text-encoder, else needs --text-weights, else null)\n"
-      "  --negative-prompt negative caption (encoded when the Qwen encoder\n"
-      "                 is available, else zeros)\n"
-      "  --tokenizer    HF tokenizer dir (Qwen2Tokenizer files)\n"
+      "  --weights      DiT transformer checkpoint: transformer/ shard dir\n"
+      "                 or single .safetensors (default: moss_image_sft.safetensors)\n"
+      "  --prompt       caption text (Qwen-encoded in-process with\n"
+      "                 --tokenizer + --text-encoder, else needs\n"
+      "                 --text-weights, else null)\n"
+      "  --negative-prompt negative caption (encoded in-process alongside\n"
+      "                 the prompt, else zeros)\n"
+      "  --tokenizer    dir holding tokenizer.json (Qwen2Tokenizer files);\n"
+      "                 with --text-encoder runs the in-process Qwen forward\n"
       "  --text-weights raw float32 LE caption features [L,Cc]\n"
       "                 (L <= maxlen, Cc == caption dim)\n"
-      "  --text-encoder Qwen text-encoder weights (.safetensors or dir)\n"
-      "                 (with --tokenizer: runs the real Qwen forward)\n"
+      "  --text-encoder Qwen text-encoder weights: text_encoder/ shard dir\n"
+      "                 or single .safetensors\n"
       "  --prompt-embeds-in alias of --text-weights (wins if both differ)\n"
       "  --staged       encode -> release encoder weights (MiB embeds stay\n"
       "                 resident on device) -> fence -> load DiT -> sample\n"
@@ -1062,7 +1224,7 @@ int main(int argc, char** argv) {
     // ---- Phase 2: DiT load ----
 #ifdef MOSS_DRIVER_HAVE_DIT
     // True-pipeline DiT (MossImageDit::MossImageDitModel owns its weights).
-    KokkosDNN::MossImageDit::MossImageDitModel<Exec, Scalar> dit_model(cfg);
+    KokkosDNN::MossImageDit::MossImageDitModel<Exec, DScalar> dit_model(cfg);
     {
       auto& w = dit_model.weights();
       if (tiny) {
@@ -1071,19 +1233,21 @@ int main(int argc, char** argv) {
                     cfg.dim, cfg.num_layers, H, W, C);
       } else {
         std::printf("[loading %s]\n", weights.c_str());
-        if (!file_exists(weights))
-          throw std::runtime_error("weights file '" + weights +
-                                   "' not found (need a MOSS-Image-SFT "
-                                   "transformer checkpoint or --tiny). See "
-                                   "README for the hf download commands.");
         try {
-          if (weights.size() >= 11 &&
-              weights.compare(weights.size() - 11, 11, ".safetensors") == 0)
-            w.load_safetensors(std::vector<std::string>{weights});
-          else
+          const std::vector<std::string> shards =
+              resolve_shard_list(weights, "--weights");
+          if (shards.size() > 1)
+            std::printf("[loading %zu shards]\n", shards.size());
+          bool is_st = false;
+          for (const auto& s : shards)
+            if (s.size() >= 12 &&
+                s.compare(s.size() - 12, 12, ".safetensors") == 0)
+              is_st = true;
+          if (!is_st)
             throw std::runtime_error(
                 "only .safetensors transformer shards are supported "
                 "(convert .pth via the README layout)");
+          w.load_safetensors(shards);
         } catch (const std::exception& e) {
           throw std::runtime_error(std::string(e.what()) +
                                    " (need MOSS weights or --tiny)");
@@ -1096,7 +1260,7 @@ int main(int argc, char** argv) {
                 "with CFG 2x (see README fit table); exact per-config "
                 "estimate lands with the Dit header\n");
 #else
-    MO::Weights<Exec, Scalar> w;
+    MO::Weights<Exec, DScalar> w;
     if (tiny) {
       MO::random_init(cfg, w, seed);
       std::printf("[tiny random weights] hidden=%d depth=%d latent=%dx%d\n",
@@ -1122,7 +1286,7 @@ int main(int argc, char** argv) {
     }
     MO::print_phase_memory("sample", w.resident_bytes(),
                            MO::dit_activation_bytes(cfg, H, W,
-                                                    sizeof(Scalar)));
+                                                    sizeof(DScalar)));
 #endif
     std::printf("[budget] full-checkpoint projection: DiT %.1f GB + VAE %.2f "
                 "GB + activations vs 24GB (see README fit table)\n",
@@ -1156,31 +1320,10 @@ int main(int argc, char** argv) {
                 (double)slg_scale, (double)slg_start, (double)slg_stop,
                 (unsigned long long)seed);
 #ifdef MOSS_DRIVER_HAVE_DIT
-    // True DiT forward: (x_d [1,C,H,W], t_d [1], y [1,L,Cc]) -> out, with an
-    // all-valid mask. Cc == text_dim and C == latent_channels by construction
-    // of the backend traits above.
-    auto dit_forward = [&](const auto& x, const auto& t, const auto& y,
-                           auto& out, const std::vector<int>& skips) {
-      Kokkos::View<int**, Kokkos::LayoutRight, Exec> mask("moss_loop_mask", 1,
-                                                          y.extent(1));
-      Kokkos::deep_copy(mask, 1);
-      dit_model.forward(x, t, y, mask, out, skips);
-    };
+    DitForward dit_forward{&dit_model};
 #else
-    MO::Model<Exec, Scalar> model(cfg, w);
-    bool slg_multi_warned = false;
-    auto dit_forward = [&](const auto& x, const auto& t, const auto& y,
-                           auto& out, const std::vector<int>& skips) {
-      int skip = skips.empty() ? -1 : skips.front();
-      if (skips.size() > 1 && !slg_multi_warned) {
-        slg_multi_warned = true;
-        std::fprintf(stderr,
-                     "warning: placeholder Model applies one skip per "
-                     "forward; using the first of %zu --slg-layers\n",
-                     skips.size());
-      }
-      model.forward(x, t, y, out, skip);
-    };
+    MO::Model<Exec, DScalar> model(cfg, w);
+    DitForward dit_forward{&model};
 #endif
     const auto t0 = std::chrono::steady_clock::now();
     // Sample straight from the device-resident embeds staged above: no host
