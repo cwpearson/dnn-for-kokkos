@@ -15,6 +15,15 @@ namespace Impl {
 // Separate efficient device kernel (one element per thread), not a host
 // loop. Called after gemm() so the cuBLAS/TPL dispatch inside gemm() is
 // reused as-is (cuBLAS has no bias operand; same split as dense_forward).
+//
+// Flat 1D RangePolicy with j innermost (e = i*N + j): consecutive GPU
+// threads step along j, the LayoutRight-contiguous dimension, so the
+// Y read-modify-write is coalesced. A Rank<2> MDRangePolicy must NOT be
+// used here: on CUDA its default tile steps the leftmost index with
+// threadIdx.x (tile {64,4} steps i), i.e. consecutive threads would step
+// along i (stride N) -- measured ~8x sector waste on this streaming
+// kernel (nsys: bias adds alone cost ~48 ms of a VAE decode's GEMM
+// traffic before this fix).
 template <class ExecSpace, class Scalar>
 void add_bias_2d(
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& Y,
@@ -23,8 +32,9 @@ void add_bias_2d(
   const size_t M = Y.extent(0), N = Y.extent(1);
   if (M == 0 || N == 0) return;
   Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {M, N}),
-      KOKKOS_LAMBDA(size_t i, size_t j) {
+      label, Kokkos::RangePolicy<ExecSpace>(0, M * N),
+      KOKKOS_LAMBDA(size_t e) {
+        const size_t i = e / N, j = e % N;
         Y(i, j) = static_cast<Scalar>(static_cast<float>(Y(i, j)) +
                                       static_cast<float>(b(j)));
       });
