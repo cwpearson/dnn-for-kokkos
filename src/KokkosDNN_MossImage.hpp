@@ -220,10 +220,13 @@ void moss_gate_residual_forward(
       gate.extent(0) != B || gate.extent(1) != D)
     throw std::invalid_argument("moss_gate_residual_forward: dim mismatch");
   if (B == 0 || T == 0 || D == 0) return;
+  // Flat 1D range with one thread per element: the default MDRange tiling
+  // oversubscribes degenerate extents (e.g. B == 1 launches ~16x threads,
+  // most exiting immediately). Per-element math unchanged.
   Kokkos::parallel_for(
-      label,
-      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<3>>({0, 0, 0}, {B, T, D}),
-      KOKKOS_LAMBDA(size_t b, size_t t, size_t d) {
+      label, Kokkos::RangePolicy<ExecSpace>(0, B * T * D),
+      KOKKOS_LAMBDA(size_t i) {
+        const size_t d = i % D, tmp = i / D, t = tmp % T, b = tmp / T;
         out(b, t, d) = static_cast<Scalar>(
             static_cast<float>(x(b, t, d)) +
             static_cast<float>(gate(b, d)) *
@@ -351,17 +354,20 @@ void moss_rope_apply_forward(
         "moss_rope_apply_forward: head_dim must be even");
   if (B == 0 || S == 0 || H == 0) return;
   const size_t Hh = Dh / 2;
+  // Flat 1D range with one thread per (b, s, h, d<Hh) pair: each pair of
+  // outputs is independent, and the default MDRange tiling oversubscribes
+  // degenerate extents (e.g. B == 1 launches ~16x threads, most exiting
+  // immediately). Per-element math unchanged.
   Kokkos::parallel_for(
-      label,
-      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<3>>({0, 0, 0}, {B, S, H}),
-      KOKKOS_LAMBDA(size_t b, size_t s, size_t h) {
-        for (size_t d = 0; d < Hh; ++d) {
-          const float sn = rope(0, s, d), cs = rope(0, s, d + Hh);
-          const float a = static_cast<float>(x(b, s, h, d));
-          const float bv = static_cast<float>(x(b, s, h, d + Hh));
-          out(b, s, h, d) = static_cast<Scalar>(a * cs - bv * sn);
-          out(b, s, h, d + Hh) = static_cast<Scalar>(bv * cs + a * sn);
-        }
+      label, Kokkos::RangePolicy<ExecSpace>(0, B * S * H * Hh),
+      KOKKOS_LAMBDA(size_t i) {
+        const size_t d = i % Hh, tmp = i / Hh, h = tmp % H, tmp2 = tmp / H,
+                     s = tmp2 % S, b = tmp2 / S;
+        const float sn = rope(0, s, d), cs = rope(0, s, d + Hh);
+        const float a = static_cast<float>(x(b, s, h, d));
+        const float bv = static_cast<float>(x(b, s, h, d + Hh));
+        out(b, s, h, d) = static_cast<Scalar>(a * cs - bv * sn);
+        out(b, s, h, d + Hh) = static_cast<Scalar>(bv * cs + a * sn);
       });
 }
 

@@ -364,6 +364,32 @@ void dit_split6(
       });
 }
 
+// Fused column-split + SiTU for the main-block FFN up/gate projection:
+//   out[i,j] = situ_scalar(src[i,j], src[i,j+N]), src [R,2N], out [R,N].
+// Bitwise identical to dit_split2(src, h, g) followed by
+// moss_situ_forward(h, g, out): same values through the same scalar op in
+// the same order, minus the h/g round-trip through global memory. Used only
+// by the DiT main blocks (the text refiner projects gate/up separately).
+template <class ExecSpace, class Scalar>
+void dit_ug_split_situ(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& src,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& out,
+    const std::string& label = "KokkosDNN::dit_ug_split_situ") {
+  const size_t R = src.extent(0), N = out.extent(1);
+  if (src.extent(1) != 2 * N || out.extent(0) != R)
+    throw std::invalid_argument("dit_ug_split_situ: dim mismatch");
+  if (R == 0 || N == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::RangePolicy<ExecSpace>(0, R * N),
+      KOKKOS_LAMBDA(size_t i) {
+        const size_t j = i % N, r = i / N;
+        out(r, j) = static_cast<Scalar>(
+            KokkosDNN::MossImage::Impl::moss_situ_scalar(
+                static_cast<float>(src(r, j)),
+                static_cast<float>(src(r, j + N))));
+      });
+}
+
 // Flat copy between same-space buffers (rank reshuffles with identical
 // row-major element order, e.g. [S,D] <-> [1,S,H,Dh] with D=H*Dh).
 // Pure Kokkos::deep_copy on unmanaged rank-1 aliases: no new math kernel.
@@ -1600,7 +1626,7 @@ class MossImageDitModel {
     V3 prao3 = Sc.c3.get("prao3", 1, Sj, D);
     V3 fd3 = Sc.c3.get("fd3", 1, Sj, D);
     V2 ug = Sc.c2.get("ug", Sj, 2 * F);
-    V2 fh = Sc.c2.get("fh", Sj, F), fg = Sc.c2.get("fg", Sj, F);
+    V2 fh = Sc.c2.get("fh", Sj, F);
     for (int li = 0; li < cfg_.num_layers; ++li) {
       if (std::find(skips.begin(), skips.end(), li) != skips.end()) continue;
       const auto& L = W.blocks[(size_t)li];
@@ -1639,9 +1665,7 @@ class MossImageDitModel {
       gemm<ExecSpace, Scalar>(handle_, static_cast<Scalar>(1), nrm2,
                               L.up_gate_W, static_cast<Scalar>(0), ug,
                               label + "_ug");
-      Impl::dit_split2<ExecSpace, Scalar>(ug, fh, fg, label + "_ugs");
-      MossImage::moss_situ_forward<ExecSpace, Scalar>(fh, fg, fh,
-                                                      label + "_situ");
+      Impl::dit_ug_split_situ<ExecSpace, Scalar>(ug, fh, label + "_situ");
       gemm<ExecSpace, Scalar>(handle_, static_cast<Scalar>(1), fh, L.down_W,
                               static_cast<Scalar>(0), fd, label + "_down");
       Impl::dit_copy_flat<ExecSpace, Scalar>(fd3.data(), fd.data(), Sj * D);
