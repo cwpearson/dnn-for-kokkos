@@ -12,6 +12,11 @@
 // KV-cache prefix and pass through zero-copy when already D-contiguous
 // (the Llama model stores caches LayoutRight); otherwise they are
 // repacked as well. Any cuDNN failure still falls back to native.
+//
+// The fused SDPA node has no engine for head_dim > 128, so the
+// bidirectional entry point additionally tries a single-head FP32 TPL math
+// composition (cuBLAS S = scale*Q*K^T, stable row-softmax, cuBLAS O = P*V)
+// before giving up to native; see cudnn_sdpa_math_forward.
 #include "KokkosDNN_config.h"
 
 #if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)
@@ -299,8 +304,34 @@ inline bool try_cudnn_sdpa_bidir(const DNNHandle<Exec>& handle, const QView& q,
   const bool ok = cudnn_sdpa_forward_noncausal(
       handle.cudnn_raw(), dtype, qp, kp, vp, op, T, Ktot, Hq, Hkv, D, q_sT,
       q_sH, q_sD, k_sT, k_sH, k_sD, v_sT, v_sH, v_sD, o_sT, o_sH, o_sD, scale);
-  if (ok && repack_out) Kokkos::deep_copy(out, o_tmp);
-  return ok;
+  if (ok) {
+    if (repack_out) Kokkos::deep_copy(out, o_tmp);
+    return true;
+  }
+#if defined(KOKKOSDNN_ENABLE_CUBLAS)
+  // Fused fallback: the cuDNN SDPA node has no engine for head_dim > 128
+  // (graph build fails; D <= 128 succeeds), which covers single-head
+  // wide-dim shapes like the VAE mid-block (H == 1, D == 384). Those take
+  // this TPL math composition (cuBLAS S = scale*Q*K^T, stable row-softmax,
+  // cuBLAS O = P*V -- the same FP32 op sequence as torch's SDPA math
+  // backend) instead of the slow native kernel. Multi-head or strided
+  // shapes the math path declines still fall through to native below.
+  if constexpr (std::is_same_v<Scalar, float>) {
+    if (Hq == 1 && Hkv == 1 && q_sT == D && k_sT == D && v_sT == D &&
+        o_sT == D) {
+      void* ch = handle.cublas_raw();
+      if (ch != nullptr &&
+          cudnn_sdpa_math_forward(
+              ch, static_cast<const float*>(qp), static_cast<const float*>(kp),
+              static_cast<const float*>(vp), static_cast<float*>(op), T, Ktot,
+              D, q_sT, k_sT, v_sT, o_sT, scale)) {
+        if (repack_out) Kokkos::deep_copy(out, o_tmp);
+        return true;
+      }
+    }
+  }
+#endif
+  return false;
 }
 
 }  // namespace Impl
