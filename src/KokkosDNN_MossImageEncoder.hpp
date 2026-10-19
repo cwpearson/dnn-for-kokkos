@@ -1286,13 +1286,89 @@ void load_weights_safetensors(Weights<ExecSpace, Scalar>& w,
   }
 }
 // ---- encoder forward --------------------------------------------------------
+// Per-model layer scratch: persistent managed buffers carved per call into
+// T-row subviews (metadata-only, no allocation). Rationale: this Kokkos/CUDA
+// build funnels every >= 40 kB allocation through cudaMallocAsync plus a
+// stream/device fence, so ~550 per-layer temporaries per forward cost
+// ~250 ms of host-side API latency (nsys); persistent S-row buffers (grown
+// only when S grows) leave zero steady-state allocations on the hot path.
+// Subviews of managed views bind to the core ops' managed-type parameters
+// (same as the existing toks row-prefix subview). Every region is fully
+// overwritten before any read (same contract as the previous per-call
+// owning views, several of which already relied on it).
+namespace Impl {
+template <class ExecSpace, class Scalar>
+struct LinScratch {
+  using View2 = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
+  using FView2 = Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>;
+  using FView3 = Kokkos::View<float***, Kokkos::LayoutRight, ExecSpace>;
+  View2 n, qkv, z, a, b, cv, q16p, k16p, vvp, qe, ke, core, o, g, u, d;
+  FView2 beta, gg;
+  FView3 state;
+  size_t S = 0;
+  void ensure(const Config& cfg, size_t Snew) {
+    if (Snew <= S && n.extent(0) == S) return;
+    S = Snew;
+    const size_t H = (size_t)cfg.hidden, I = (size_t)cfg.intermediate;
+    const size_t Kd = (size_t)cfg.lin_key_dim(), Vd = (size_t)cfg.lin_value_dim();
+    const size_t Vh = (size_t)cfg.lin_v_heads, Kdh = (size_t)cfg.lin_k_dim;
+    const size_t Vdh = (size_t)cfg.lin_v_dim;
+    n = View2("Qwen35::n", S, H);
+    qkv = View2("Qwen35::qkv", S, 2 * Kd + Vd);
+    z = View2("Qwen35::z", S, Vd);
+    a = View2("Qwen35::a", S, Vh);
+    b = View2("Qwen35::b", S, Vh);
+    cv = View2("Qwen35::cv", S, 2 * Kd + Vd);
+    q16p = View2("Qwen35::q16", S, Kd);
+    k16p = View2("Qwen35::k16", S, Kd);
+    vvp = View2("Qwen35::vv", S, Vd);
+    qe = View2("Qwen35::qe", S, Vh * Kdh);
+    ke = View2("Qwen35::ke", S, Vh * Kdh);
+    core = View2("Qwen35::core", S, Vd);
+    o = View2("Qwen35::o", S, H);
+    g = View2("Qwen35::g", S, I);
+    u = View2("Qwen35::u", S, I);
+    d = View2("Qwen35::d", S, H);
+    beta = FView2("Qwen35::beta", S, Vh);
+    gg = FView2("Qwen35::g", S, Vh);
+    state = FView3("Qwen35::state", Vh, Kdh, Vdh);
+  }
+  void release() { *this = LinScratch(); }
+};
+template <class ExecSpace, class Scalar>
+struct FullScratch {
+  using View2 = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
+  View2 n, qg, k, v, q, gate, ao, o, g, u, d;
+  size_t S = 0;
+  void ensure(const Config& cfg, size_t Snew) {
+    if (Snew <= S && n.extent(0) == S) return;
+    S = Snew;
+    const size_t H = (size_t)cfg.hidden, I = (size_t)cfg.intermediate;
+    const size_t Nq = (size_t)cfg.num_q_heads, Nk = (size_t)cfg.num_kv_heads;
+    const size_t Hd = (size_t)cfg.head_dim, Qd = Nq * Hd;
+    n = View2("Qwen35::n", S, H);
+    qg = View2("Qwen35::qg", S, 2 * Qd);
+    k = View2("Qwen35::k", S, Nk * Hd);
+    v = View2("Qwen35::v", S, Nk * Hd);
+    q = View2("Qwen35::q", S, Qd);
+    gate = View2("Qwen35::gate", S, Qd);
+    ao = View2("Qwen35::ao", S, Qd);
+    o = View2("Qwen35::o", S, H);
+    g = View2("Qwen35::g", S, I);
+    u = View2("Qwen35::u", S, I);
+    d = View2("Qwen35::d", S, H);
+  }
+  void release() { *this = FullScratch(); }
+};
+}  // namespace Impl
 // One full-attention decoder layer on h [T, H] (in-place residual updates).
 // Reference: Qwen3_5DecoderLayer (full path) + Qwen3_5Attention.
 template <class ExecSpace, class Scalar, class HView>
 void forward_full_layer(
     const DNNHandle<ExecSpace>& handle, const Config& cfg,
     const typename Weights<ExecSpace, Scalar>::Layer& L,
-    const Kokkos::View<float*, ExecSpace>& rope_inv, HView& h) {
+    const Kokkos::View<float*, ExecSpace>& rope_inv, HView& h,
+    const Impl::FullScratch<ExecSpace, Scalar>& sc) {
   using View2 = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
   using UView2 = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace,
                               Kokkos::MemoryUnmanaged>;
@@ -1302,12 +1378,14 @@ void forward_full_layer(
   const size_t Nq = (size_t)cfg.num_q_heads, Nk = (size_t)cfg.num_kv_heads;
   const size_t Hd = (size_t)cfg.head_dim, Qd = Nq * Hd;
   const size_t I = (size_t)cfg.intermediate;
-  View2 n("Qwen35::n", T, H);
+  const auto rT = std::make_pair(size_t{0}, T);
+  View2 n = Kokkos::subview(sc.n, rT, Kokkos::ALL);
   rmsnorm_one_plus<ExecSpace, Scalar>(h, L.input_norm, cfg.rms_eps, n,
                                      "Qwen35::in_norm");
-  View2 qg("Qwen35::qg", T, 2 * Qd);
+  View2 qg = Kokkos::subview(sc.qg, rT, Kokkos::ALL);
   gemm(handle, Scalar(1), n, L.full.q_proj, Scalar(0), qg, "Qwen35::q");
-  View2 k2("Qwen35::k", T, Nk * Hd), v2("Qwen35::v", T, Nk * Hd);
+  View2 k2 = Kokkos::subview(sc.k, rT, Kokkos::ALL);
+  View2 v2 = Kokkos::subview(sc.v, rT, Kokkos::ALL);
   gemm(handle, Scalar(1), n, L.full.k_proj, Scalar(0), k2, "Qwen35::k");
   gemm(handle, Scalar(1), n, L.full.v_proj, Scalar(0), v2, "Qwen35::v");
   // Pack the query/gate slices into contiguous buffers (same stride
@@ -1321,7 +1399,8 @@ void forward_full_layer(
   // so head h's query occupies qg[t, h*2*Hd : h*2*Hd + Hd] and its gate
   // occupies the following Hd columns. A global [0, Qd)/[Qd, 2*Qd) split
   // silently mixes head boundaries and diverges from torch.
-  View2 q2("Qwen35::q", T, Qd), gate2("Qwen35::gate", T, Qd);
+  View2 q2 = Kokkos::subview(sc.q, rT, Kokkos::ALL);
+  View2 gate2 = Kokkos::subview(sc.gate, rT, Kokkos::ALL);
   Kokkos::parallel_for(
       "Qwen35::pack_qg",
       Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, Qd}),
@@ -1345,24 +1424,25 @@ void forward_full_layer(
   Impl::qwen_partial_rope_inplace<ExecSpace, Scalar>(k, rope_inv,
                                                     cfg.rotary_dim(),
                                                     "Qwen35::rope_k");
-  View2 ao("Qwen35::ao", T, Nq * Hd);
+  View2 ao = Kokkos::subview(sc.ao, rT, Kokkos::ALL);
   UView3 ao3(ao.data(), T, Nq, Hd);
   const float scale =
       1.0f / std::sqrt(static_cast<float>(cfg.head_dim));
   attention_gqa_single<ExecSpace, Scalar>(handle, q, k, v, 0, ao3, scale,
                                           "Qwen35::attn");
   Impl::qwen_gate_multiply<ExecSpace, Scalar>(ao, gate, ao, "Qwen35::gate");
-  View2 o("Qwen35::o", T, H);
+  View2 o = Kokkos::subview(sc.o, rT, Kokkos::ALL);
   gemm(handle, Scalar(1), ao, L.full.o_proj, Scalar(0), o, "Qwen35::o");
   Impl::qwen_residual_add<ExecSpace, Scalar>(h, o, "Qwen35::res1");
   // MLP: down(silu(gate) * up).
   rmsnorm_one_plus<ExecSpace, Scalar>(h, L.post_norm, cfg.rms_eps, n,
                                      "Qwen35::post_norm");
-  View2 g("Qwen35::g", T, I), u("Qwen35::u", T, I);
+  View2 g = Kokkos::subview(sc.g, rT, Kokkos::ALL);
+  View2 u = Kokkos::subview(sc.u, rT, Kokkos::ALL);
   gemm(handle, Scalar(1), n, L.gate_proj, Scalar(0), g, "Qwen35::mg");
   gemm(handle, Scalar(1), n, L.up_proj, Scalar(0), u, "Qwen35::mu");
   swiglu<ExecSpace, Scalar>(g, u, g, "Qwen35::swiglu");
-  View2 d("Qwen35::d", T, H);
+  View2 d = Kokkos::subview(sc.d, rT, Kokkos::ALL);
   gemm(handle, Scalar(1), g, L.down_proj, Scalar(0), d, "Qwen35::md");
   Impl::qwen_residual_add<ExecSpace, Scalar>(h, d, "Qwen35::res2");
 }
@@ -1374,7 +1454,8 @@ void forward_full_layer(
 template <class ExecSpace, class Scalar, class HView>
 void forward_linear_layer(
     const DNNHandle<ExecSpace>& handle, const Config& cfg,
-    const typename Weights<ExecSpace, Scalar>::Layer& L, HView& h) {
+    const typename Weights<ExecSpace, Scalar>::Layer& L, HView& h,
+    const Impl::LinScratch<ExecSpace, Scalar>& sc) {
   using View1 = Kokkos::View<Scalar*, ExecSpace>;
   using View2 = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
   using UView2 = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace,
@@ -1389,17 +1470,20 @@ void forward_linear_layer(
   const size_t Kdh = (size_t)cfg.lin_k_dim, Vdh = (size_t)cfg.lin_v_dim;
   const size_t I = (size_t)cfg.intermediate;
   const int rep = cfg.lin_v_heads / cfg.lin_k_heads;
-  View2 n("Qwen35::n", T, H);
+  const auto rT = std::make_pair(size_t{0}, T);
+  View2 n = Kokkos::subview(sc.n, rT, Kokkos::ALL);
   rmsnorm_one_plus<ExecSpace, Scalar>(h, L.input_norm, cfg.rms_eps, n,
                                      "Qwen35::in_norm");
-  View2 qkv("Qwen35::qkv", T, Kd * 2 + Vd);
+  View2 qkv = Kokkos::subview(sc.qkv, rT, Kokkos::ALL);
   gemm(handle, Scalar(1), n, L.lin.in_qkv, Scalar(0), qkv, "Qwen35::qkv");
-  View2 z("Qwen35::z", T, Vd), a("Qwen35::a", T, Vh), b("Qwen35::b", T, Vh);
+  View2 z = Kokkos::subview(sc.z, rT, Kokkos::ALL);
+  View2 a = Kokkos::subview(sc.a, rT, Kokkos::ALL);
+  View2 b = Kokkos::subview(sc.b, rT, Kokkos::ALL);
   gemm(handle, Scalar(1), n, L.lin.in_z, Scalar(0), z, "Qwen35::z");
   gemm(handle, Scalar(1), n, L.lin.in_a, Scalar(0), a, "Qwen35::a");
   gemm(handle, Scalar(1), n, L.lin.in_b, Scalar(0), b, "Qwen35::b");
   // Depthwise causal conv k + SiLU (reference applies silu after conv).
-  View2 cv("Qwen35::cv", T, Kd * 2 + Vd);
+  View2 cv = Kokkos::subview(sc.cv, rT, Kokkos::ALL);
   View1 no_bias;
   depthwise_conv1d_causal_forward<ExecSpace, Scalar>(qkv, L.lin.conv, no_bias,
                                                     cv, "Qwen35::conv");
@@ -1408,8 +1492,9 @@ void forward_linear_layer(
   // (2*Kd+Vd) wide, so rank-3 views constructed directly over cv would
   // stride every row past the first incorrectly (same as q/gate above).
   // Explicit elementwise copies (subview pair ranges proved unreliable).
-  View2 q16p("Qwen35::q16", T, Kd), k16p("Qwen35::k16", T, Kd),
-      vvp("Qwen35::vv", T, Vd);
+  View2 q16p = Kokkos::subview(sc.q16p, rT, Kokkos::ALL);
+  View2 k16p = Kokkos::subview(sc.k16p, rT, Kokkos::ALL);
+  View2 vvp = Kokkos::subview(sc.vvp, rT, Kokkos::ALL);
   Kokkos::parallel_for(
       "Qwen35::pack_qkv",
       Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, Kd}),
@@ -1426,10 +1511,12 @@ void forward_linear_layer(
   UView3 k16(k16p.data(), T, Kh, Kdh);
   UView3 vv(vvp.data(), T, Vh, Vdh);
   UView3 z3(z.data(), T, Vh, Vdh);
-  FView2 beta("Qwen35::beta", T, Vh), gg("Qwen35::g", T, Vh);
+  FView2 beta = Kokkos::subview(sc.beta, rT, Kokkos::ALL);
+  FView2 gg = Kokkos::subview(sc.gg, rT, Kokkos::ALL);
   Impl::qwen_gdn_gates<ExecSpace, Scalar>(a, b, L.lin.a_log, L.lin.dt_bias,
                                          beta, gg, "Qwen35::gates");
-  View2 qe("Qwen35::qe", T, Vh * Kdh), ke("Qwen35::ke", T, Vh * Kdh);
+  View2 qe = Kokkos::subview(sc.qe, rT, Kokkos::ALL);
+  View2 ke = Kokkos::subview(sc.ke, rT, Kokkos::ALL);
   UView3 q32(qe.data(), T, Vh, Kdh);
   UView3 k32(ke.data(), T, Vh, Kdh);
   Impl::qwen_head_repeat<ExecSpace, Scalar>(q16, q32, rep, "Qwen35::qrep");
@@ -1438,26 +1525,27 @@ void forward_linear_layer(
       q32, 1e-6f, 1.0f / std::sqrt(static_cast<float>(cfg.lin_k_dim)),
       "Qwen35::qnorm");
   Impl::qwen_qk_l2norm<ExecSpace, Scalar>(k32, 1e-6f, 1.0f, "Qwen35::knorm");
-  FView3 state("Qwen35::state", Vh, Kdh, Vdh);
+  FView3 state = sc.state;
   Kokkos::deep_copy(state, 0.0f);
-  View2 coref("Qwen35::core", T, Vd);
+  View2 coref = Kokkos::subview(sc.core, rT, Kokkos::ALL);
   UView3 core(coref.data(), T, Vh, Vdh);
   Impl::qwen_gated_delta_recurrent<ExecSpace, Scalar>(q32, k32, vv, beta, gg,
                                                      state, core,
                                                      "Qwen35::gdn");
   Impl::qwen_rmsnorm_gated<ExecSpace, Scalar>(core, z3, L.lin.norm, cfg.rms_eps,
                                              core, "Qwen35::gnorm");
-  View2 o("Qwen35::o", T, H);
+  View2 o = Kokkos::subview(sc.o, rT, Kokkos::ALL);
   gemm(handle, Scalar(1), coref, L.lin.out_proj, Scalar(0), o, "Qwen35::o");
   Impl::qwen_residual_add<ExecSpace, Scalar>(h, o, "Qwen35::res1");
   // MLP (shared with full layers).
   rmsnorm_one_plus<ExecSpace, Scalar>(h, L.post_norm, cfg.rms_eps, n,
                                      "Qwen35::post_norm");
-  View2 g("Qwen35::g", T, I), u("Qwen35::u", T, I);
+  View2 g = Kokkos::subview(sc.g, rT, Kokkos::ALL);
+  View2 u = Kokkos::subview(sc.u, rT, Kokkos::ALL);
   gemm(handle, Scalar(1), n, L.gate_proj, Scalar(0), g, "Qwen35::mg");
   gemm(handle, Scalar(1), n, L.up_proj, Scalar(0), u, "Qwen35::mu");
   swiglu<ExecSpace, Scalar>(g, u, g, "Qwen35::swiglu");
-  View2 d("Qwen35::d", T, H);
+  View2 d = Kokkos::subview(sc.d, rT, Kokkos::ALL);
   gemm(handle, Scalar(1), g, L.down_proj, Scalar(0), d, "Qwen35::md");
   Impl::qwen_residual_add<ExecSpace, Scalar>(h, d, "Qwen35::res2");
 }
@@ -1477,6 +1565,11 @@ struct EncoderModel {
   Config cfg;
   Weights<ExecSpace, Scalar> w;
   Kokkos::View<float*, ExecSpace> rope_inv;  // [rotary_dim/2]
+  // Persistent per-layer scratch (see Impl::LinScratch/FullScratch): one set
+  // of allocations per model lifetime on the hot path, regrown only when S
+  // grows. Layers carve T-row subviews (metadata-only) from these buffers.
+  Impl::LinScratch<ExecSpace, Scalar> lin_;
+  Impl::FullScratch<ExecSpace, Scalar> full_;
 
   explicit EncoderModel(const Config& c = Config::moss_image_sft())
       : cfg(c), w(c) {
@@ -1494,6 +1587,8 @@ struct EncoderModel {
   void release() {
     w.release();
     rope_inv = Kokkos::View<float*, ExecSpace>();
+    lin_.release();
+    full_.release();
   }
   size_t resident_bytes() const {
     return w.resident_bytes() + rope_inv.extent(0) * sizeof(float);
@@ -1524,6 +1619,10 @@ struct EncoderModel {
             throw std::invalid_argument("EncoderModel::forward: id range");
     }
     Kokkos::View<int*, ExecSpace> toks("Qwen35::toks", S);
+    // Size (or regrow) the shared layer scratch once per forward; every
+    // layer temporary below is a metadata-only subview of it.
+    lin_.ensure(cfg, S);
+    full_.ensure(cfg, S);
     for (size_t b = 0; b < B; ++b) {
       const size_t T = lengths[b];
       if (T == 0 || T > S)
@@ -1541,10 +1640,10 @@ struct EncoderModel {
       for (int l = 0; l < cfg.num_layers; ++l) {
         if (cfg.is_full_layer(l))
           forward_full_layer<ExecSpace, Scalar>(handle, cfg, w.layers[(size_t)l],
-                                                rope_inv, h);
+                                                rope_inv, h, full_);
         else
           forward_linear_layer<ExecSpace, Scalar>(handle, cfg,
-                                                  w.layers[(size_t)l], h);
+                                                  w.layers[(size_t)l], h, lin_);
       }
       View2 hf("Qwen35::hf", T, cfg.hidden);
       // Final norm is Qwen3_5RMSNorm, i.e. the (1+w) variant (zero-init
