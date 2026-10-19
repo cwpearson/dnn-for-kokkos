@@ -1,9 +1,11 @@
 // Promoted spatial convolutions: dense 3x3, depthwise KxK, grouped 1x1.
 // Native correctness vs host references (biased/unbiased, argument
-// validation). All three operators are native-only (see the TPL-status
-// note in src/KokkosDNN_Conv.hpp), so there is no TPL engagement test;
-// dispatched-vs-native agreement is covered by the VAE decoder tests,
-// which run the same operators through the decoder on every backend.
+// validation). The dense 3x3 runs the im2col + gemm_bias lowering (so on
+// TPL builds this also exercises the dispatched GEMM path); depthwise and
+// grouped are native-only (see the TPL-status note in
+// src/KokkosDNN_Conv.hpp). Dispatched-vs-native agreement is covered by
+// the VAE decoder tests, which run the same operators through the decoder
+// on every backend.
 #include <gtest/gtest.h>
 
 #include <Kokkos_Core.hpp>
@@ -157,6 +159,43 @@ TEST(Conv3x3, MatchesHostReferenceUnbiased) {
   Kokkos::View<float*, Exec> no_bias;
   Kokkos::deep_copy(x, hx);
   Kokkos::deep_copy(w, hw);
+  KokkosDNN::conv3x3_forward(h, x, w, no_bias, y, H, W);
+  Kokkos::fence();
+  Kokkos::deep_copy(hgot, y);
+  host_conv3x3_ref(hx, hw, hb, false, href, H, W);
+  expect_near_2d(hgot, href, 1e-4f);
+}
+
+TEST(Conv3x3, LoweredPathMatchesHostReference) {
+  // Wide-output shape (Cout > ConvSkinnyMaxCout) exercising the im2col +
+  // gemm_bias lowering rather than the skinny team kernel.
+  KokkosDNN::DNNHandle<Exec> h;
+  const size_t H = 8, W = 8, T = H * W, Cin = 8, Cout = 40;
+  Kokkos::View<float**, Kokkos::LayoutRight, Host> hx("hx", T, Cin),
+      href("href", T, Cout), hgot("hgot", T, Cout);
+  Kokkos::View<float****, Kokkos::LayoutRight, Host> hw("hw", Cout, Cin, 3, 3);
+  Kokkos::View<float*, Host> hb("hb", Cout);
+  for (size_t t = 0; t < T; ++t)
+    for (size_t i = 0; i < Cin; ++i) hx(t, i) = probe(t, i, 11);
+  for (size_t o = 0; o < Cout; ++o) {
+    for (size_t i = 0; i < Cin; ++i)
+      for (size_t kh = 0; kh < 3; ++kh)
+        for (size_t kw = 0; kw < 3; ++kw)
+          hw(o, i, kh, kw) = 0.5f * probe(o, i, kh * 3 + kw);
+    hb(o) = 0.1f * (float)(o % 5) - 0.2f;
+  }
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> x("x", T, Cin),
+      y("y", T, Cout);
+  Kokkos::View<float****, Kokkos::LayoutRight, Exec> w("w", Cout, Cin, 3, 3);
+  Kokkos::View<float*, Exec> b("b", Cout), no_bias;
+  Kokkos::deep_copy(x, hx);
+  Kokkos::deep_copy(w, hw);
+  Kokkos::deep_copy(b, hb);
+  KokkosDNN::conv3x3_forward(h, x, w, b, y, H, W);
+  Kokkos::fence();
+  Kokkos::deep_copy(hgot, y);
+  host_conv3x3_ref(hx, hw, hb, true, href, H, W);
+  expect_near_2d(hgot, href, 1e-4f);
   KokkosDNN::conv3x3_forward(h, x, w, no_bias, y, H, W);
   Kokkos::fence();
   Kokkos::deep_copy(hgot, y);
