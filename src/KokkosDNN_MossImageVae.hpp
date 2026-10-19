@@ -52,9 +52,11 @@
 //     owns the cuDNN ladder (float path: fused SDPA graph, TPL math
 //     fallback past the graph's head-dim limit, native streaming kernel
 //     otherwise / on failure).
-//   * conv3x3_forward owns the im2col + gemm_bias lowering (cuBLAS
-//     ladder on CUDA, MIOpen path on HIP builds; see KokkosDNN_Conv.hpp
-//     TPL note).
+//   * conv3x3_tok dispatches to cuDNN convolution forward on CUDA
+//     (FMA math, FP32; no im2col scratch, workspace in the persistent
+//     per-shape plan cache), MIOpen on HIP builds, and otherwise the
+//     im2col + gemm_bias lowering (cuBLAS ladder on CUDA) or the
+//     skinny-output team kernel; see KokkosDNN_Conv.hpp TPL note.
 //   * GroupNorm goes through groupnorm_forward, SiLU/upsample/residual/
 //     denormalize/depth-to-space are native elementwise (no TPL expresses
 //     them, so native == dispatched by construction — same rationale as
@@ -1355,10 +1357,14 @@ class DecoderModel {
   }
 
   // 3x3 stride-1 pad-1 conv over token rows with a caller-provided im2col
-  // buffer (no allocation). Same dispatch as conv3x3_forward: MIOpen fast
-  // path on HIP builds when enabled, skinny team kernel for tiny Cout,
-  // otherwise the same row-blocked im2col + gemm_bias lowering with the
-  // same block sizes -- same kernels, same shapes, same numerics.
+  // buffer (no allocation). Same dispatch as conv3x3_forward: cuDNN fast
+  // path on CUDA builds when enabled, MIOpen fast path on HIP builds when
+  // enabled, skinny team kernel for tiny Cout, otherwise the same
+  // row-blocked im2col + gemm_bias lowering with the same block sizes --
+  // same kernels, same shapes, same numerics. The cuDNN path needs no
+  // im2col scratch, so dispatching to it preserves the zero-allocation
+  // discipline (its workspace lives in the persistent per-shape plan
+  // cache, not in per-call Views).
   void conv3x3_tok(const U2& x, const Mat4& wt, const Vec& b, const U2& y,
                    size_t H, size_t W, const U1& col,
                    const std::string& tag) const {
@@ -1374,6 +1380,15 @@ class DecoderModel {
           "MossImage::Vae::DecoderModel::conv3x3_tok: H and W must be "
           "nonzero with H*W == rows");
     if (T == 0 || Cin == 0 || Cout == 0) return;
+#if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)
+    constexpr bool is_cuda = std::is_same_v<ExecSpace, Kokkos::Cuda>;
+    if constexpr (is_cuda) {
+      if (handle_.use_cudnn &&
+          ::KokkosDNN::Impl::try_cudnn_conv3x3_forward<float>(
+              handle_, x, wt, b, y, H, W))
+        return;
+    }
+#endif
 #if defined(KOKKOSDNN_ENABLE_MIOPEN) && defined(KOKKOS_ENABLE_HIP)
     constexpr bool is_hip = std::is_same_v<ExecSpace, Kokkos::HIP>;
     if constexpr (is_hip) {

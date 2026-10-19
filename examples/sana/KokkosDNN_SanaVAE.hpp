@@ -49,9 +49,9 @@
 // Activations are [T,C] token rows (T=H*W row-major, t=h*W+w); 1x1 convs
 // and linears reuse KokkosDNN::gemm_bias (cuBLAS ladder intact); spatial
 // compute (dense 3x3, depthwise, grouped 1x1) uses the promoted core ops
-// in KokkosDNN_Conv.hpp (native; see the TPL-status note there for why
-// there is no cuDNN dispatch). Remaining kernels below are example-local. Backend-portable
-// parallel_for only.
+// in KokkosDNN_Conv.hpp (cuDNN-dispatched on CUDA builds, native
+// otherwise; see the TPL-status note there). Remaining kernels below are
+// example-local. Backend-portable parallel_for only.
 
 #include <Kokkos_Core.hpp>
 

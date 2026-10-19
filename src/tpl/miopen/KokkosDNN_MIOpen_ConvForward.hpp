@@ -3,12 +3,12 @@
 
 // MIOpen convolution dispatch for the three native-only conv ops in
 // src/KokkosDNN_Conv.hpp (dense 3x3 pad 1, depthwise odd-K pad K/2,
-// grouped 1x1). This is new capability, not a mirror of the CUDA path:
-// the NVIDIA build deliberately has NO cuDNN dispatch (cudnn_cnn
-// sublibrary absent + frontend conv node limitations, see Conv.hpp file
-// docs), while on AMD MIOpen convolution (miopenConvolutionForward /
-// miopenConvolutionForwardBias + miopenSetConvolutionGroupCount) is fully
-// available, including depthwise/grouped.
+// grouped 1x1). This mirrors the CUDA path in
+// tpl/cudnn/KokkosDNN_CuDNN_ConvForward.hpp (legacy cudnnConvolution*
+// entry points, full cuDNN sublibraries) while on AMD MIOpen convolution
+// (miopenConvolutionForward / miopenConvolutionForwardBias +
+// miopenSetConvolutionGroupCount) is fully available, including
+// depthwise/grouped.
 //
 // File-ownership coordination: the attention effort owns
 // src/tpl/miopen/* attention files plus the Handle/Types/umbrella

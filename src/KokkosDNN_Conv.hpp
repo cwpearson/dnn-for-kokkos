@@ -16,6 +16,12 @@
 #if defined(KOKKOSDNN_ENABLE_MIOPEN) && defined(KOKKOS_ENABLE_HIP)
 #include "tpl/miopen/KokkosDNN_MIOpen_ConvForward.hpp"
 #endif
+// cuDNN dispatch (CUDA builds with KokkosDNN_ENABLE_CUDNN only). The
+// declarations live in tpl/cudnn, mirroring the cuDNN SDPA arrangement;
+// the im2col lowering / native kernels below are the fallback.
+#if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)
+#include "tpl/cudnn/KokkosDNN_CuDNN_ConvForward.hpp"
+#endif
 
 // Spatial convolutions over token-row activations [T, C] with T = H*W
 // row-major (t = h*W + w). That layout is exactly N=1 NHWC memory order,
@@ -34,23 +40,27 @@
 // src/tpl); the dense 3x3's compute goes through the dispatched gemm_bias
 // core op.
 //
-// TPL status: the dense 3x3 below is lowered to im2col + gemm_bias, so on
-// CUDA it rides the proven cuBLAS ladder in KokkosDNN_Gemm.hpp (FP32
-// sgemm; FP32 accumulation, matching the old native kernel's numerics --
-// unlike the reverted cuDNN-frontend attempt, no TF32 and no sublibrary
-// dependency). Depthwise/grouped keep the documented native/MIOpen
-// behavior (investigated 2026-10, see task/p1-vae-cudnn-conv): a cuDNN
-// dispatch attempt was built and reverted: the legacy cudnnConvolution*
-// entry points live in the cudnn_cnn sublibrary, which is absent wherever
-// only the loader plus cudnn_graph ship (this project's GPU container),
+// TPL status: on CUDA builds with KokkosDNN_ENABLE_CUDNN all three ops
+// dispatch to cuDNN convolution forward (implicit GEMM / Winograd engines
+// via the legacy cudnnConvolution* entry points in the cudnn_cnn
+// sublibrary) when handle.use_cudnn is set, falling back to the lowering
+// / native kernels below on any dispatch failure. FP32 I/O stays FP32
+// (CUDNN_FMA_MATH, same numerics contract as the im2col + sgemm lowering
+// and the old native kernel; no TF32); BF16 uses tensor-op math with FP32
+// accumulation. The dense 3x3 lowering (im2col + gemm_bias, riding the
+// proven cuBLAS ladder) and the skinny-output team kernel remain as the
+// fallback path, and stay the primary path on builds without cuDNN.
+// (History, investigated 2026-10, see task/p1-vae-cudnn-conv: an earlier
+// cuDNN dispatch attempt was built and reverted because the legacy
+// cudnnConvolution* entry points live in the cudnn_cnn sublibrary, which
+// was absent wherever only the loader plus cudnn_graph shipped,
 // failing with CUDNN_STATUS_NOT_SUPPORTED_SUBLIBRARY_UNAVAILABLE; and the
-// cudnn-frontend conv_fprop node at the pinned commit has no group-count
+// cudnn-frontend conv_fprop node at the pinned commit had no group-count
 // knob (ruling out depthwise/grouped) while its only eligible dense
 // engine on sm86 (engine 7, NVRTC-JIT) both silently requires
 // C-innermost (KRSC) filters and computes FP32 I/O at TF32 precision
-// (~6e-4 relative error vs native). Revisit only with (a) full cuDNN
-// sublibraries for a legacy grouped path, or (b) an eligible
-// non-tensor-core dense engine (FORT is arch-gated to Hopper/Blackwell).
+// (~6e-4 relative error vs native). Both blockers are gone with full
+// cuDNN sublibraries plus the legacy grouped path.)
 //
 // HIP diverges from that decision for depthwise/grouped: MIOpen convolution
 // (miopenConvolutionForward/Bias + miopenSetConvolutionGroupCount, all in
@@ -373,8 +383,9 @@ void conv_grouped1x1_2d(
 // with t = h*W + w. x [T,Cin] with T = H*W, w [Cout,Cin,3,3], b [Cout]
 // or empty for no bias, y [T,Cout]. Scalar-agnostic; FP32 accumulation.
 //
-// NOTE: the handle selects the MIOpen path on HIP builds with
-// KokkosDNN_ENABLE_MIOPEN and is threaded into the im2col + gemm_bias
+// NOTE: the handle selects the cuDNN path on CUDA builds with
+// KokkosDNN_ENABLE_CUDNN and the MIOpen path on HIP builds with
+// KokkosDNN_ENABLE_MIOPEN, and is threaded into the im2col + gemm_bias
 // lowering otherwise (cuBLAS ladder on CUDA, hipBLAS on HIP, portable
 // tiled GEMM elsewhere). The handle is still taken on every build for API
 // uniformity with the other operators.
@@ -409,6 +420,14 @@ void conv3x3_forward(
 #else
   (void)handle;
 #endif
+#if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)
+  constexpr bool is_cuda = std::is_same_v<ExecSpace, Kokkos::Cuda>;
+  if constexpr (is_cuda) {
+    if (handle.use_cudnn &&
+        Impl::try_cudnn_conv3x3_forward<Scalar>(handle, x, w, b, y, H, W))
+      return;
+  }
+#endif
   Impl::conv_dense3x3_2d<ExecSpace, Scalar>(handle, x, w, b, y, H, W, label);
 }
 
@@ -419,9 +438,9 @@ void conv3x3_forward(
 // b [C] or empty for no bias. K must be odd (even K has no symmetric
 // padding, so the call is rejected). Scalar-agnostic; FP32 accumulation.
 //
-// NOTE: on CUDA the handle is unused (no cuDNN dispatch, see file docs);
-// on HIP with KokkosDNN_ENABLE_MIOPEN it selects the MIOpen path below,
-// otherwise the native kernel runs.
+// NOTE: the handle selects the cuDNN path on CUDA builds with
+// KokkosDNN_ENABLE_CUDNN and the MIOpen path on HIP builds with
+// KokkosDNN_ENABLE_MIOPEN; otherwise the native kernel runs.
 template <class ExecSpace, class Scalar>
 void depthwise_conv_forward(
     const DNNHandle<ExecSpace>& handle,
@@ -456,6 +475,15 @@ void depthwise_conv_forward(
 #else
   (void)handle;
 #endif
+#if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)
+  constexpr bool is_cuda_dw = std::is_same_v<ExecSpace, Kokkos::Cuda>;
+  if constexpr (is_cuda_dw) {
+    if (handle.use_cudnn &&
+        Impl::try_cudnn_depthwise_forward<Scalar>(handle, x, w, b, y, K, H,
+                                                  W))
+      return;
+  }
+#endif
   Impl::conv_depthwise_2d<ExecSpace, Scalar>(x, w, b, y, K, H, W, label);
 }
 
@@ -465,9 +493,9 @@ void depthwise_conv_forward(
 // bias, y [T,Cout]. Cout and Cin must be divisible by groups.
 // Scalar-agnostic; FP32 accumulation.
 //
-// NOTE: on CUDA the handle is unused (no cuDNN dispatch, see file docs);
-// on HIP with KokkosDNN_ENABLE_MIOPEN it selects the MIOpen path below,
-// otherwise the native kernel runs.
+// NOTE: the handle selects the cuDNN path on CUDA builds with
+// KokkosDNN_ENABLE_CUDNN and the MIOpen path on HIP builds with
+// KokkosDNN_ENABLE_MIOPEN; otherwise the native kernel runs.
 template <class ExecSpace, class Scalar>
 void grouped_conv1x1_forward(
     const DNNHandle<ExecSpace>& handle,
@@ -500,6 +528,15 @@ void grouped_conv1x1_forward(
   }
 #else
   (void)handle;
+#endif
+#if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)
+  constexpr bool is_cuda_g = std::is_same_v<ExecSpace, Kokkos::Cuda>;
+  if constexpr (is_cuda_g) {
+    if (handle.use_cudnn &&
+        Impl::try_cudnn_grouped1x1_forward<Scalar>(handle, x, w, b, y,
+                                                   groups))
+      return;
+  }
 #endif
   Impl::conv_grouped1x1_2d<ExecSpace, Scalar>(x, w, b, y, groups, label);
 }
