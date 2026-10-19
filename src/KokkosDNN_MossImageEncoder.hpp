@@ -1200,7 +1200,8 @@ void forward_full_layer(
         q2(t, d) = qg(t, h * 2 * Hd + dd);
         gate2(t, d) = qg(t, h * 2 * Hd + Hd + dd);
       });
-  Kokkos::fence();
+  // No fence: q2/gate2 are consumed by kernels on this same stream, so
+  // launch order already guarantees visibility (a fence only idles host).
   UView3 q(q2.data(), T, Nq, Hd);
   UView2 gate(gate2.data(), T, Qd);
   Impl::qk_rmsnorm_oneplus_3d<ExecSpace, Scalar>(q, L.full.q_norm, cfg.rms_eps,
@@ -1291,7 +1292,8 @@ void forward_linear_layer(
       "Qwen35::pack_v",
       Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, Vd}),
       KOKKOS_LAMBDA(size_t t, size_t d) { vvp(t, d) = cv(t, 2 * Kd + d); });
-  Kokkos::fence();
+  // No fence: q16p/k16p/vvp feed same-stream kernels below, so launch
+  // order already guarantees visibility (a fence only idles host).
   UView3 q16(q16p.data(), T, Kh, Kdh);
   UView3 k16(k16p.data(), T, Kh, Kdh);
   UView3 vv(vvp.data(), T, Vh, Vdh);
