@@ -58,6 +58,19 @@ bool cudnn_sdpa_math_forward(void* cublas_handle, const float* q,
                              int64_t k_sT, int64_t v_sT, int64_t o_sT,
                              float scale);
 
+// Caller-provided-workspace variant of the math fallback above: uses
+// ws[0, ws_elems) (device memory, same stream) for the transient
+// [Sq,Sk] scores instead of allocating per call. Requires
+// ws != nullptr and ws_elems >= (size_t)Sq * (size_t)Sk; anything else
+// returns false so the caller falls back (to the allocating entry or to
+// native). Same GEMM/softmax sequence and numerics as above.
+bool cudnn_sdpa_math_forward_ws(void* cublas_handle, const float* q,
+                                const float* k, const float* v, float* out,
+                                int64_t Sq, int64_t Sk, int64_t D,
+                                int64_t q_sT, int64_t k_sT, int64_t v_sT,
+                                int64_t o_sT, float scale, float* ws,
+                                size_t ws_elems);
+
 // Sliding-window causal variant: same contract as cudnn_sdpa_forward, plus
 // a bottom-right-aligned diagonal band with left_bound == window, so each
 // query attends to at most `window` keys back (mask columns at or before

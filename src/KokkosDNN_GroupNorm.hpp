@@ -164,6 +164,17 @@ struct GroupNormRowNormFunctor {
   }
 };
 
+// Forward declaration: defined just below; the allocating entry delegates
+// to it so persistent-scratch callers share the exact same phases.
+template <class ExecSpace, class Scalar>
+void groupnorm_nchw_with_scratch(
+    const Kokkos::View<Scalar****, Kokkos::LayoutRight, ExecSpace>& x,
+    const Kokkos::View<Scalar*, ExecSpace>& weight,
+    const Kokkos::View<Scalar*, ExecSpace>& bias, float eps, size_t num_groups,
+    const Kokkos::View<Scalar****, Kokkos::LayoutRight, ExecSpace>& y,
+    const Kokkos::View<float*, ExecSpace>& scratch,
+    const std::string& label);
+
 template <class ExecSpace, class Scalar>
 void groupnorm_nchw_impl(
     const Kokkos::View<Scalar****, Kokkos::LayoutRight, ExecSpace>& x,
@@ -178,8 +189,37 @@ void groupnorm_nchw_impl(
   const size_t CH = Cg * H;  // rows per (n, g) group, > 0
   const size_t NP = N * num_groups * CH;
   const size_t NG = N * num_groups;
-  Kokkos::View<float*, ExecSpace> scratch("groupnorm_scratch",
-                                          2 * (NP + NG));
+  // Write-first scratch (phase A writes all 2*NP row partials, phase B
+  // writes all 2*NG group stats before phase C reads them), so no
+  // zero-fill is needed.
+  Kokkos::View<float*, ExecSpace> scratch(
+      Kokkos::ViewAllocateWithoutInitializing("groupnorm_scratch"),
+      2 * (NP + NG));
+  groupnorm_nchw_with_scratch<ExecSpace, Scalar>(x, weight, bias, eps,
+                                                 num_groups, y, scratch,
+                                                 label);
+}
+
+// Same as groupnorm_nchw_impl but the caller provides the FP32 scratch
+// (a contiguous [2*(NP+NG)] view with NP = N*num_groups*(C/num_groups)*H
+// and NG = N*num_groups; managed or unmanaged). Lets steady-state
+// callers (e.g. the VAE decoder) reuse a persistent buffer instead of
+// allocating per call. Same kernels, same order, same numerics.
+template <class ExecSpace, class Scalar>
+void groupnorm_nchw_with_scratch(
+    const Kokkos::View<Scalar****, Kokkos::LayoutRight, ExecSpace>& x,
+    const Kokkos::View<Scalar*, ExecSpace>& weight,
+    const Kokkos::View<Scalar*, ExecSpace>& bias, float eps, size_t num_groups,
+    const Kokkos::View<Scalar****, Kokkos::LayoutRight, ExecSpace>& y,
+    const Kokkos::View<float*, ExecSpace>& scratch,
+    const std::string& label) {
+  const size_t N = x.extent(0), C = x.extent(1), H = x.extent(2),
+                W = x.extent(3);
+  if (N == 0 || C == 0 || H == 0 || W == 0) return;
+  const size_t Cg = C / num_groups;
+  const size_t CH = Cg * H;  // rows per (n, g) group, > 0
+  const size_t NP = N * num_groups * CH;
+  const size_t NG = N * num_groups;
   using Partial = GroupNormRowPartialFunctor<ExecSpace, Scalar>;
   Kokkos::parallel_for(
       label + "_rows",

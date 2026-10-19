@@ -64,6 +64,7 @@
 
 #include <Kokkos_Core.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -72,6 +73,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -788,20 +790,86 @@ void transpose_tile_launch(
 
 // [C,H,W] -> [T=H*W, C] token rows (t = h*W + w), the layout the core
 // conv/linear ops consume.
+// Token-layout entries writing into caller-provided buffers (no
+// allocation): the same tiled transpose as below, but the output lives in
+// persistent scratch. Templated on view types so both managed views and
+// unmanaged scratch carves bind. Fully overwrite the output (every
+// in-bounds (t, c) is written by exactly one tile), so the destination
+// may be uninitialized.
+template <class ExecSpace, class V3, class V2>
+void to_tokens_into(const V3& x, const V2& tok, const std::string& label) {
+  const size_t C = x.extent(0), H = x.extent(1), W = x.extent(2);
+  if (C == 0 || H == 0 || W == 0) return;
+  using V3u = Kokkos::View<float***, Kokkos::LayoutRight, ExecSpace,
+                           Kokkos::MemoryUnmanaged>;
+  using V2u = Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace,
+                           Kokkos::MemoryUnmanaged>;
+  V3u xu(x.data(), C, H, W);
+  V2u tu(tok.data(), H * W, C);
+  transpose_tile_launch<ExecSpace>(xu, tu, H, W, true, label + "_k");
+}
+
+// [T,C] token rows -> [C,H,W] with T == H*W, into a caller-provided
+// buffer (no allocation). Same overwrite contract as to_tokens_into.
+template <class ExecSpace, class V2, class V3>
+void to_nchw_into(const V2& tok, const V3& x, const std::string& label) {
+  const size_t C = x.extent(0), H = x.extent(1), W = x.extent(2);
+  if (C == 0 || H == 0 || W == 0) return;
+  using V3u = Kokkos::View<float***, Kokkos::LayoutRight, ExecSpace,
+                           Kokkos::MemoryUnmanaged>;
+  using V2u = Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace,
+                           Kokkos::MemoryUnmanaged>;
+  V3u xu(x.data(), C, H, W);
+  V2u tu(const_cast<float*>(tok.data()), H * W, C);
+  transpose_tile_launch<ExecSpace>(xu, tu, H, W, false, label + "_k");
+}
+
+// y = x elementwise copy over [C,H,W] (async stream-ordered kernel).
+// Replaces a two-arg Kokkos::deep_copy on the hot path: deep_copy without
+// an execution-space argument blocks the host (fence) on CUDA, chopping
+// the decode into fully-drained segments, while this kernel stays ordered
+// with the surrounding launches on the same stream. Same flat
+// w-innermost mapping as the other elementwise glue; bitwise exact.
+template <class ExecSpace, class VY, class VX>
+void copy_3d(const VY& y, const VX& x, const std::string& label) {
+  const size_t C = y.extent(0), H = y.extent(1), W = y.extent(2);
+  if (C == 0 || H == 0 || W == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::RangePolicy<ExecSpace>(0, C * H * W),
+      KOKKOS_LAMBDA(size_t e) {
+        const size_t c = e / (H * W), rem = e % (H * W);
+        const size_t h = rem / W, w = rem % W;
+        y(c, h, w) = x(c, h, w);
+      });
+}
+
+// y += x over [T,C] token rows (residual add in token layout; x and y
+// must not alias). Same math as add_3d (one FP32 add per element, no
+// accumulation order), so bitwise identical to the NCHW residual while
+// letting the decoder stay in token layout across the add. Portable flat
+// kernel, exact.
+template <class ExecSpace, class VY, class VX>
+void add_2d(const VY& y, const VX& x, const std::string& label) {
+  const size_t T = y.extent(0), C = y.extent(1);
+  if (T == 0 || C == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::RangePolicy<ExecSpace>(0, T * C),
+      KOKKOS_LAMBDA(size_t e) {
+        const size_t t = e / C, c = e % C;
+        y(t, c) = static_cast<typename VY::value_type>(
+            static_cast<float>(y(t, c)) + static_cast<float>(x(t, c)));
+      });
+}
+
+// [C,H,W] -> [T=H*W, C] token rows (t = h*W + w), the layout the core
+// conv/linear ops consume.
 template <class ExecSpace>
 Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace> to_tokens(
     const Kokkos::View<float***, Kokkos::LayoutRight, ExecSpace>& x,
     const std::string& label) {
   const size_t C = x.extent(0), H = x.extent(1), W = x.extent(2);
   Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace> t(label, H * W, C);
-  if (C == 0 || H == 0 || W == 0) return t;
-  using V3u = Kokkos::View<float***, Kokkos::LayoutRight, ExecSpace,
-                           Kokkos::MemoryUnmanaged>;
-  using V2u = Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace,
-                           Kokkos::MemoryUnmanaged>;
-  V3u xu(x.data(), C, H, W);
-  V2u tu(t.data(), H * W, C);
-  transpose_tile_launch<ExecSpace>(xu, tu, H, W, true, label + "_k");
+  to_tokens_into<ExecSpace>(x, t, label);
   return t;
 }
 
@@ -811,15 +879,27 @@ Kokkos::View<float***, Kokkos::LayoutRight, ExecSpace> to_nchw(
     const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& t, size_t C,
     size_t H, size_t W, const std::string& label) {
   Kokkos::View<float***, Kokkos::LayoutRight, ExecSpace> x(label, C, H, W);
-  if (C == 0 || H == 0 || W == 0) return x;
-  using V3u = Kokkos::View<float***, Kokkos::LayoutRight, ExecSpace,
-                           Kokkos::MemoryUnmanaged>;
-  using V2u = Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace,
-                           Kokkos::MemoryUnmanaged>;
-  V3u xu(x.data(), C, H, W);
-  V2u tu(const_cast<float*>(t.data()), H * W, C);
-  transpose_tile_launch<ExecSpace>(xu, tu, H, W, false, label + "_k");
+  to_nchw_into<ExecSpace>(t, x, label);
   return x;
+}
+
+// GroupNorm over a single-sample [C,H,W] view via an unmanaged [1,C,H,W]
+// wrap (same memory, no copy); delegates to the core op. The scratch
+// variant takes a caller-provided FP32 buffer ([2*(C*H+num_groups)] for a
+// single sample, managed or unmanaged) instead of allocating per call;
+// same kernels, same order, same numerics.
+template <class ExecSpace, class V3>
+void groupnorm_3d_ws(
+    const V3& x, const Kokkos::View<float*, ExecSpace>& weight,
+    const Kokkos::View<float*, ExecSpace>& bias, size_t num_groups,
+    float eps, const V3& y, const Kokkos::View<float*, ExecSpace>& scratch,
+    const std::string& label) {
+  using V4 = Kokkos::View<float****, Kokkos::LayoutRight, ExecSpace,
+                          Kokkos::MemoryUnmanaged>;
+  V4 xu(x.data(), 1, x.extent(0), x.extent(1), x.extent(2));
+  V4 yu(y.data(), 1, y.extent(0), y.extent(1), y.extent(2));
+  ::KokkosDNN::Impl::groupnorm_nchw_with_scratch<ExecSpace, float>(
+      xu, weight, bias, eps, num_groups, yu, scratch, label);
 }
 
 // GroupNorm over a single-sample [C,H,W] view via an unmanaged [1,C,H,W]
@@ -932,9 +1012,179 @@ void load_safetensors(const Config& cfg, const std::string& path,
   put(get("decoder.conv_out.bias", {(size_t)cfg.out_channels}), w.cout_b);
 }
 
+namespace Impl {
+
+// ---------------------------------------------------------------------------
+// Persistent per-model decode scratch (grow-only, weights-adjacent
+// lifetime: owned by DecoderModel). Same pattern as the encoder's
+// LinScratch/FullScratch in KokkosDNN_MossImageEncoder.hpp: buffers are
+// grown only when a larger (B, H, W) geometry arrives; every decode carves
+// metadata-only unmanaged subviews out of them, so steady state performs
+// zero allocations. All buffers use AllocateWithoutInitializing: every
+// region is fully overwritten before any read (same contract as the
+// previous per-call owning views, several of which already relied on it).
+// ---------------------------------------------------------------------------
+struct ScratchSizes {
+  size_t nmax = 0;  // max NCHW/token stage elements (C*H*W)
+  size_t cmax = 0;  // max im2col column elements over non-skinny 3x3 convs
+  size_t gmax = 0;  // max GroupNorm scratch floats over all GN calls
+};
+
+// Maxima over every decode stage for one (H, W) latent geometry. Mirrors
+// the decode() stage walk below (same widths, same spatial growth), plus
+// the exact skinny/blocking rule from Impl::conv_dense3x3_2d so the col
+// budget covers the same row-blocks the lowering takes.
+inline ScratchSizes decoder_scratch_sizes(const Config& cfg, size_t H,
+                                          size_t W) {
+  ScratchSizes s;
+  const size_t LC = (size_t)cfg.latent_channels;
+  const size_t MW = (size_t)cfg.mid_width();
+  const size_t ng = (size_t)cfg.num_groups;
+  const size_t H2 = 2 * H, W2 = 2 * W;
+  auto stage = [&](size_t C, size_t SH, size_t SW) {
+    const size_t T = SH * SW;
+    s.nmax = std::max(s.nmax, C * T);
+    s.gmax = std::max(s.gmax, 2 * (C * SH + ng));
+  };
+  auto conv3 = [&](size_t Cin, size_t Cout, size_t T) {
+    // Token pairs for this conv (input + output rows).
+    s.nmax = std::max(s.nmax, T * Cin);
+    s.nmax = std::max(s.nmax, T * Cout);
+    const size_t K9 = Cin * 9;
+    // Skinny path takes no im2col (same rule as conv_dense3x3_2d).
+    if (Cout <= ::KokkosDNN::Impl::ConvSkinnyMaxCout &&
+        K9 <= ::KokkosDNN::Impl::ConvSkinnyMaxK9)
+      return;
+    const size_t per_row = K9 * sizeof(float);
+    size_t budget_rows = ::KokkosDNN::Impl::ConvIm2colBudgetBytes / per_row;
+    if (budget_rows < 1) budget_rows = 1;
+    const size_t Tm = (T < budget_rows) ? T : budget_rows;
+    s.cmax = std::max(s.cmax, Tm * K9);
+  };
+  const size_t T0 = H2 * W2;
+  stage(LC, H2, W2);  // depth-to-space sample
+  stage(MW, H2, W2);  // conv_in out / mid block
+  conv3(LC, MW, T0);  // conv_in
+  for (int r = 0; r < 4; ++r) conv3(MW, MW, T0);  // mid ResNet pair
+  // Mid attention q/k/v/out/proj + scores plane are sized in ensure().
+  const int NB = cfg.num_up_blocks();
+  size_t SH = H2, SW = W2;
+  for (int i = 0; i < NB; ++i) {
+    const size_t cout = (size_t)cfg.decoder_widths[(size_t)NB - 1 - (size_t)i];
+    const size_t cin_first =
+        (i == 0) ? MW : (size_t)cfg.decoder_widths[(size_t)NB - (size_t)i];
+    const size_t T = SH * SW;
+    stage(cin_first, SH, SW);
+    stage(cout, SH, SW);
+    for (int j = 0; j < cfg.resnets_per_up_block(); ++j) {
+      const size_t cin = (j == 0) ? cin_first : cout;
+      conv3(cin, cout, T);
+      conv3(cout, cout, T);
+      if (cin != cout) {
+        // 1x1 shortcut: token pair only, no im2col.
+        s.nmax = std::max(s.nmax, T * cin);
+        s.nmax = std::max(s.nmax, T * cout);
+      }
+    }
+    if (i < NB - 1) {
+      SH *= 2;
+      SW *= 2;
+      stage(cout, SH, SW);  // upsampler output (= next block input)
+      conv3(cout, cout, SH * SW);
+    }
+  }
+  stage((size_t)cfg.decoder_widths[0], SH, SW);  // head norm / conv_out in
+  conv3((size_t)cfg.decoder_widths[0], (size_t)cfg.out_channels, SH * SW);
+  return s;
+}
+
+template <class ExecSpace>
+struct DecoderScratch {
+  using F1 = Kokkos::View<float*, ExecSpace>;
+  using F2 = Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>;
+  using F4 = Kokkos::View<float****, Kokkos::LayoutRight, ExecSpace>;
+
+  F4 dn;    // [B,DL,H,W] denormalized latents (batched, write-first)
+  F4 d2s;   // [B,LC,2H,2W] depth-to-space latents (batched, write-first)
+  F1 n0, n1;      // NCHW stage ping-pong (flat, [nmax] each)
+  F1 t0, t1, t2;  // token ping-pong + shortcut (flat, [nmax] each)
+  F1 col;   // im2col columns (flat, [cmax])
+  F1 gn;    // GroupNorm scratch (flat, [gmax])
+  F2 aq, ak, av, ao, ap;  // mid-attention q/k/v/out/proj [Tmid,Cmid]
+  F1 attn;  // cuDNN math scores plane [Tmid*Tmid]
+  size_t B = 0, H = 0, W = 0;
+
+  void ensure(const Config& cfg, size_t Bn, size_t Hn, size_t Wn) {
+    if (Bn <= B && Hn <= H && Wn <= W && dn.extent(0) != 0) return;
+    if (Bn > B) B = Bn;
+    if (Hn > H) H = Hn;
+    if (Wn > W) W = Wn;
+    cfg.validate();
+    const size_t DL = (size_t)cfg.dit_latent_channels;
+    const size_t LC = (size_t)cfg.latent_channels;
+    const size_t MW = (size_t)cfg.mid_width();
+    const ScratchSizes sz = decoder_scratch_sizes(cfg, H, W);
+    const size_t Tmid = (2 * H) * (2 * W);
+    dn = F4(Kokkos::ViewAllocateWithoutInitializing("vae_sc_dn"), B, DL, H,
+            W);
+    d2s = F4(Kokkos::ViewAllocateWithoutInitializing("vae_sc_d2s"), B, LC,
+             2 * H, 2 * W);
+    n0 = F1(Kokkos::ViewAllocateWithoutInitializing("vae_sc_n0"), sz.nmax);
+    n1 = F1(Kokkos::ViewAllocateWithoutInitializing("vae_sc_n1"), sz.nmax);
+    t0 = F1(Kokkos::ViewAllocateWithoutInitializing("vae_sc_t0"), sz.nmax);
+    t1 = F1(Kokkos::ViewAllocateWithoutInitializing("vae_sc_t1"), sz.nmax);
+    t2 = F1(Kokkos::ViewAllocateWithoutInitializing("vae_sc_t2"), sz.nmax);
+    col = F1(Kokkos::ViewAllocateWithoutInitializing("vae_sc_col"), sz.cmax);
+    gn = F1(Kokkos::ViewAllocateWithoutInitializing("vae_sc_gn"), sz.gmax);
+    aq = F2(Kokkos::ViewAllocateWithoutInitializing("vae_sc_aq"), Tmid, MW);
+    ak = F2(Kokkos::ViewAllocateWithoutInitializing("vae_sc_ak"), Tmid, MW);
+    av = F2(Kokkos::ViewAllocateWithoutInitializing("vae_sc_av"), Tmid, MW);
+    ao = F2(Kokkos::ViewAllocateWithoutInitializing("vae_sc_ao"), Tmid, MW);
+    ap = F2(Kokkos::ViewAllocateWithoutInitializing("vae_sc_ap"), Tmid, MW);
+    attn =
+        F1(Kokkos::ViewAllocateWithoutInitializing("vae_sc_attn"), Tmid * Tmid);
+  }
+
+  void release() { *this = DecoderScratch{}; }
+
+  size_t resident_bytes() const {
+    size_t n = 0;
+    auto acc = [&](auto& v) { n += v.size() * sizeof(float); };
+    acc(dn);
+    acc(d2s);
+    acc(n0);
+    acc(n1);
+    acc(t0);
+    acc(t1);
+    acc(t2);
+    acc(col);
+    acc(gn);
+    acc(aq);
+    acc(ak);
+    acc(av);
+    acc(ao);
+    acc(ap);
+    acc(attn);
+    return n;
+  }
+};
+
+}  // namespace Impl
+
 // ---------------------------------------------------------------------------
 // DecoderModel: FP32 VAE decoder.
 // decode(latents [B,128,H,W] -> rgb [B,3,16H,16W]).
+//
+// Steady-state allocation discipline: every per-forward temporary lives in
+// Impl::DecoderScratch (owned by the model, grown once per geometry), so a
+// warm decoder performs zero allocations per decode. See DecoderScratch
+// for the rationale (cudaMallocAsync + fence per >= 40 kB temporary plus
+// ~38 GB of default-init memset traffic otherwise). Token layout is kept
+// across consecutive token-legal ops (post-quant -> conv_in tokens feed
+// the 3x3 directly; conv outputs feed residual adds in token space),
+// transposing to NCHW only where a spatial op needs it (GroupNorm,
+// upsample, the final RGB write). Same kernels, shapes, and launch order
+// as the allocating path, so numerics are unchanged.
 // ---------------------------------------------------------------------------
 template <class ExecSpace>
 class DecoderModel {
@@ -944,6 +1194,13 @@ class DecoderModel {
   using View3 = Kokkos::View<float***, Kokkos::LayoutRight, ExecSpace>;
   using View2 = Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>;
   using Vec = Kokkos::View<float*, ExecSpace>;
+  using U3 = Kokkos::View<float***, Kokkos::LayoutRight, ExecSpace,
+                          Kokkos::MemoryUnmanaged>;
+  using U2 = Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace,
+                          Kokkos::MemoryUnmanaged>;
+  using U1 = Kokkos::View<float*, ExecSpace, Kokkos::MemoryUnmanaged>;
+  using Mat2 = Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>;
+  using Mat4 = Kokkos::View<float****, Kokkos::LayoutRight, ExecSpace>;
 
   DecoderModel(const Config& cfg, const Weights<ExecSpace>& w)
       : cfg_(cfg), w_(w) {
@@ -952,8 +1209,14 @@ class DecoderModel {
 
   const Config& config() const { return cfg_; }
 
+  // Bytes held by the persistent decode scratch (grows to the largest
+  // geometry decoded so far).
+  size_t scratch_bytes() const { return sc_.resident_bytes(); }
+
   // Full decode: denorm + depth-to-space (batched core ops), then the
   // post-quant / Decoder chain per sample. rgb must be [B,3,16H,16W].
+  // Zero steady-state allocations after the first decode of a geometry
+  // (scratch is grown in ensure(), never per layer).
   void decode(const View4& latents, View4& rgb) const {
     cfg_.validate();
     const size_t B = latents.extent(0);
@@ -975,49 +1238,95 @@ class DecoderModel {
           "with S = scale_factor");
     if (B == 0) return;
 
-    // Pipeline glue (batched, core ops): BN-stat denormalize then 2x2
-    // depth-to-space, [B,128,H,W] -> [B,32,2H,2W].
-    View4 dn("vae_dn", B, DL, H, W);
-    MossImage::moss_vae_denormalize_forward<ExecSpace, float>(
-        latents, w_.bn_mean, w_.bn_var, cfg_.bn_eps, dn, "vae_denorm");
+    Impl::DecoderScratch<ExecSpace>& sc = sc_;
+    sc.ensure(cfg_, B, H, W);
     const size_t LC = (size_t)cfg_.latent_channels;
-    View4 d2s("vae_d2s", B, LC, 2 * H, 2 * W);
-    MossImage::moss_vae_depth_to_space_2x<ExecSpace, float>(dn, d2s,
+    const size_t MW = (size_t)cfg_.mid_width();
+    const size_t SH0 = 2 * H, SW0 = 2 * W, T0 = SH0 * SW0;
+    float* Nbuf[2] = {sc.n0.data(), sc.n1.data()};
+    float* Tbuf[3] = {sc.t0.data(), sc.t1.data(), sc.t2.data()};
+    const U1 col(sc.col.data(), sc.col.extent(0));
+
+    // Pipeline glue (batched, core ops): BN-stat denormalize then 2x2
+    // depth-to-space, [B,128,H,W] -> [B,32,2H,2W]. Both fully overwrite
+    // the persistent outputs.
+    MossImage::moss_vae_denormalize_forward<ExecSpace, float>(
+        latents, w_.bn_mean, w_.bn_var, cfg_.bn_eps, sc.dn, "vae_denorm");
+    MossImage::moss_vae_depth_to_space_2x<ExecSpace, float>(sc.dn, sc.d2s,
                                                            "vae_d2s");
 
     for (size_t b = 0; b < B; ++b) {
-      auto d2s_b = Kokkos::subview(d2s, b, Kokkos::ALL, Kokkos::ALL,
+      auto d2s_b = Kokkos::subview(sc.d2s, b, Kokkos::ALL, Kokkos::ALL,
                                    Kokkos::ALL);
-      View3 h("vae_h", LC, 2 * H, 2 * W);
-      Kokkos::deep_copy(h, d2s_b);
-      h = linear1x1(h, w_.pq_w, w_.pq_b, "vae_pq");
-      h = conv3x3(h, w_.conv_in_w, w_.conv_in_b, "vae_conv_in");
-      h = resnet(h, w_.mid_a, "vae_mid_a");
-      h = mid_attention(h, "vae_mid_attn");
-      h = resnet(h, w_.mid_b, "vae_mid_b");
-      size_t cH = 2 * H, cW = 2 * W;
+      U3 h0(Nbuf[0], LC, SH0, SW0);
+      Impl::copy_3d<ExecSpace>(h0, d2s_b, "vae_h0");
+      // Post-quant 1x1, token-threaded straight into conv_in: the token
+      // rows skip the NCHW round-trip the allocating path took.
+      U2 pq_in(Tbuf[0], T0, LC), pq_out(Tbuf[1], T0, LC);
+      Impl::to_tokens_into<ExecSpace>(h0, pq_in, "vae_pq");
+      linear1x1_tok(pq_in, w_.pq_w, w_.pq_b, pq_out, "vae_pq");
+      int cur = 1;
+      {
+        U2 ci_out(Tbuf[2], T0, MW);
+        conv3x3_tok(pq_out, w_.conv_in_w, w_.conv_in_b, ci_out, SH0, SW0,
+                    col, "vae_conv_in");
+        U3 h1(Nbuf[cur], MW, SH0, SW0);
+        Impl::to_nchw_into<ExecSpace>(ci_out, h1, "vae_conv_in");
+      }
+      size_t cC = MW, cH = SH0, cW = SW0;
+      resnet_stage(Nbuf[cur], cC, Nbuf[1 - cur], MW, cH, cW, w_.mid_a, col,
+                   "vae_mid_a");
+      cur = 1 - cur;
+      mid_attention_stage(Nbuf[cur], Nbuf[1 - cur], cH, cW, "vae_mid_attn");
+      cur = 1 - cur;
+      resnet_stage(Nbuf[cur], cC, Nbuf[1 - cur], MW, cH, cW, w_.mid_b, col,
+                   "vae_mid_b");
+      cur = 1 - cur;
       const int NB = cfg_.num_up_blocks();
       for (int i = 0; i < NB; ++i) {
         const auto& st = w_.ups[(size_t)i];
         const std::string tag = "vae_up" + std::to_string(i);
-        for (size_t j = 0; j < st.res.size(); ++j)
-          h = resnet(h, st.res[j], tag + "r" + std::to_string(j));
+        const size_t cout =
+            (size_t)cfg_.decoder_widths[(size_t)NB - 1 - (size_t)i];
+        for (size_t j = 0; j < st.res.size(); ++j) {
+          const size_t cin = (j == 0) ? cC : cout;
+          resnet_stage(Nbuf[cur], cin, Nbuf[1 - cur], cout, cH, cW,
+                       st.res[j], col,
+                       tag + "r" + std::to_string(j));
+          cur = 1 - cur;
+          cC = cout;
+        }
         if (st.has_up) {
-          View3 up(tag + "_nn", h.extent(0), 2 * cH, 2 * cW);
-          Impl::nearest_upsample2x_3d<ExecSpace>(h, up, tag + "_nn");
-          h = conv3x3(up, st.up_w, st.up_b, tag + "_conv");
+          U3 xu(Nbuf[cur], cC, cH, cW);
           cH *= 2;
           cW *= 2;
+          U3 xup(Nbuf[1 - cur], cC, cH, cW);
+          Impl::nearest_upsample2x_3d<ExecSpace>(xu, xup, tag + "_nn");
+          cur = 1 - cur;
+          // Upsampler conv runs in place on the upsampled buffer: tokens
+          // out of / back into the same NCHW (stream-ordered, same as the
+          // in-place GroupNorm contract).
+          U3 xc(Nbuf[cur], cC, cH, cW);
+          U2 u0(Tbuf[0], cH * cW, cC), u1(Tbuf[1], cH * cW, cC);
+          Impl::to_tokens_into<ExecSpace>(xc, u0, tag + "_conv");
+          conv3x3_tok(u0, st.up_w, st.up_b, u1, cH, cW, col, tag + "_conv");
+          Impl::to_nchw_into<ExecSpace>(u1, xc, tag + "_conv");
         }
       }
-      Impl::groupnorm_3d<ExecSpace>(h, w_.nout_w, w_.nout_b,
-                                    (size_t)cfg_.num_groups, cfg_.gn_eps, h,
-                                    "vae_norm_out");
-      Impl::silu_inplace_3d<ExecSpace>(h, "vae_head_silu");
-      View3 rgb3 = conv3x3(h, w_.cout_w, w_.cout_b, "vae_conv_out");
-      auto rgb_b =
-          Kokkos::subview(rgb, b, Kokkos::ALL, Kokkos::ALL, Kokkos::ALL);
-      Kokkos::deep_copy(rgb_b, rgb3);
+      {
+        U3 hh(Nbuf[cur], cC, cH, cW);
+        groupnorm_now(hh, w_.nout_w, w_.nout_b, "vae_norm_out");
+        Impl::silu_inplace_3d<ExecSpace>(hh, "vae_head_silu");
+        U2 o0(Tbuf[0], cH * cW, cC),
+            o1(Tbuf[1], cH * cW, (size_t)cfg_.out_channels);
+        Impl::to_tokens_into<ExecSpace>(hh, o0, "vae_conv_out");
+        conv3x3_tok(o0, w_.cout_w, w_.cout_b, o1, cH, cW, col,
+                    "vae_conv_out");
+        // Conv-out lands directly in the caller's RGB (no staging copy).
+        auto rgb_b =
+            Kokkos::subview(rgb, b, Kokkos::ALL, Kokkos::ALL, Kokkos::ALL);
+        Impl::to_nchw_into<ExecSpace>(o1, rgb_b, "vae_conv_out");
+      }
     }
   }
 
@@ -1025,94 +1334,168 @@ class DecoderModel {
   Config cfg_;
   Weights<ExecSpace> w_;
   DNNHandle<ExecSpace> handle_;
+  mutable Impl::DecoderScratch<ExecSpace> sc_;
 
-  // 1x1 conv / linear via the core biased-GEMM op (cuBLAS ladder intact):
-  // y[c] = sum_i W[c,i] x[i] + b[c] over [Cout] <- [Cin].
-  View3 linear1x1(const View3& x,
-                  const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>&
-                      wt,
-                  const Vec& b, const std::string& tag) const {
-    View2 xt = Impl::to_tokens<ExecSpace>(x, tag);
-    View2 yt(tag + "_y", xt.extent(0), wt.extent(0));
-    gemm_bias<ExecSpace, float>(handle_, xt, wt, b, yt, tag);
-    return Impl::to_nchw<ExecSpace>(yt, wt.extent(0), x.extent(1),
-                                    x.extent(2), tag);
+  // GroupNorm + SiLU are in-place on the stage buffer; the persistent GN
+  // scratch is carved per call (exact prefix, no allocation).
+  void groupnorm_now(const U3& v, const Vec& w, const Vec& b,
+                     const std::string& tag) const {
+    const size_t need =
+        2 * (v.extent(0) * v.extent(1) + (size_t)cfg_.num_groups);
+    Vec gs = Kokkos::subview(sc_.gn, std::make_pair(size_t{0}, need));
+    Impl::groupnorm_3d_ws<ExecSpace>(v, w, b, (size_t)cfg_.num_groups,
+                                     cfg_.gn_eps, v, gs, tag);
   }
 
-  // 3x3 stride-1 pad-1 conv via the lowered core conv op (im2col +
-  // gemm_bias, cuBLAS ladder on CUDA, MIOpen on HIP builds; see
-  // KokkosDNN_Conv.hpp). Empty bias (extent 0) selects the unbiased path.
-  View3 conv3x3(const View3& x,
-                const Kokkos::View<float****, Kokkos::LayoutRight, ExecSpace>&
-                    wt,
-                const Vec& b, const std::string& tag) const {
-    const size_t H = x.extent(1), W = x.extent(2);
-    View2 xt = Impl::to_tokens<ExecSpace>(x, tag);
-    View2 yt(tag + "_y", xt.extent(0), wt.extent(0));
-    conv3x3_forward<ExecSpace, float>(handle_, xt, wt, b, yt, H, W, tag);
-    return Impl::to_nchw<ExecSpace>(yt, wt.extent(0), H, W, tag);
+  // 1x1 conv / linear over token rows via the core biased-GEMM op
+  // (cuBLAS ladder intact): y = x*W^T + b. No transposes, no allocation.
+  void linear1x1_tok(const U2& x, const Mat2& wt, const Vec& b, const U2& y,
+                     const std::string& tag) const {
+    gemm_bias<ExecSpace, float>(handle_, x, wt, b, y, tag);
   }
 
-  // ResnetBlock2D (temb=None): GN -> SiLU -> conv3x3+bias -> GN -> SiLU ->
-  // conv3x3+bias -> +1x1 shortcut (iff cin != cout) -> /1.0.
-  View3 resnet(const View3& x, const typename Weights<ExecSpace>::ResW& r,
-               const std::string& tag) const {
-    View3 h("res_h", x.extent(0), x.extent(1), x.extent(2));
-    Kokkos::deep_copy(h, x);
-    Impl::groupnorm_3d<ExecSpace>(h, r.gn1_w, r.gn1_b,
-                                  (size_t)cfg_.num_groups, cfg_.gn_eps, h,
-                                  tag + "_n1");
-    Impl::silu_inplace_3d<ExecSpace>(h, tag + "_s1");
-    h = conv3x3(h, r.c1_w, r.c1_b, tag + "_c1");
-    Impl::groupnorm_3d<ExecSpace>(h, r.gn2_w, r.gn2_b,
-                                  (size_t)cfg_.num_groups, cfg_.gn_eps, h,
-                                  tag + "_n2");
-    Impl::silu_inplace_3d<ExecSpace>(h, tag + "_s2");
-    h = conv3x3(h, r.c2_w, r.c2_b, tag + "_c2");
-    if (r.has_shortcut()) {
-      View3 s = linear1x1(x, r.sc_w, r.sc_b, tag + "_sc");
-      Impl::add_3d<ExecSpace>(h, s, tag + "_add");
+  // 3x3 stride-1 pad-1 conv over token rows with a caller-provided im2col
+  // buffer (no allocation). Same dispatch as conv3x3_forward: MIOpen fast
+  // path on HIP builds when enabled, skinny team kernel for tiny Cout,
+  // otherwise the same row-blocked im2col + gemm_bias lowering with the
+  // same block sizes -- same kernels, same shapes, same numerics.
+  void conv3x3_tok(const U2& x, const Mat4& wt, const Vec& b, const U2& y,
+                   size_t H, size_t W, const U1& col,
+                   const std::string& tag) const {
+    const size_t T = x.extent(0), Cin = x.extent(1), Cout = wt.extent(0);
+    const bool biased = (b.extent(0) != 0);
+    if (wt.extent(1) != Cin || wt.extent(2) != 3 || wt.extent(3) != 3 ||
+        y.extent(0) != T || y.extent(1) != Cout ||
+        (biased && b.extent(0) != Cout))
+      throw std::invalid_argument(
+          "MossImage::Vae::DecoderModel::conv3x3_tok: dimension mismatch");
+    if (H == 0 || W == 0 || T != H * W)
+      throw std::invalid_argument(
+          "MossImage::Vae::DecoderModel::conv3x3_tok: H and W must be "
+          "nonzero with H*W == rows");
+    if (T == 0 || Cin == 0 || Cout == 0) return;
+#if defined(KOKKOSDNN_ENABLE_MIOPEN) && defined(KOKKOS_ENABLE_HIP)
+    constexpr bool is_hip = std::is_same_v<ExecSpace, Kokkos::HIP>;
+    if constexpr (is_hip) {
+      if (handle_.use_miopen &&
+          ::KokkosDNN::Impl::try_miopen_conv3x3_forward<float>(
+              handle_, x, wt, b, y, H, W))
+        return;
     } else {
-      Impl::add_3d<ExecSpace>(h, x, tag + "_add");
+      (void)handle_;
     }
-    return h;
+#else
+    (void)handle_;
+#endif
+    const size_t K9 = Cin * 9;
+    if (Cout <= ::KokkosDNN::Impl::ConvSkinnyMaxCout &&
+        K9 <= ::KokkosDNN::Impl::ConvSkinnyMaxK9) {
+      ::KokkosDNN::Impl::conv_dense3x3_skinny<ExecSpace, float>(x, wt, b, y,
+                                                               H, W, tag);
+      return;
+    }
+    // Row-block the columns exactly like Impl::conv_dense3x3_2d (same Tm
+    // per layer, so the same GEMM shapes run).
+    size_t Tm = T;
+    const size_t per_row = K9 * sizeof(float);
+    if (per_row != 0) {
+      size_t budget_rows =
+          ::KokkosDNN::Impl::ConvIm2colBudgetBytes / per_row;
+      if (budget_rows < 1) budget_rows = 1;
+      if (Tm > budget_rows) Tm = budget_rows;
+    }
+    using Mat2u = Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace,
+                               Kokkos::MemoryUnmanaged>;
+    // Zero-copy [Cout, Cin*9] flatten of the dense LayoutRight weight.
+    Mat2u w2d(wt.data(), Cout, K9);
+    for (size_t r0 = 0; r0 < T; r0 += Tm) {
+      const size_t cur = (r0 + Tm <= T) ? Tm : T - r0;
+      Mat2u col_cur(col.data(), cur, K9);
+      Mat2u y_cur(const_cast<float*>(y.data()) + r0 * Cout, cur, Cout);
+      ::KokkosDNN::Impl::conv3x3_im2col_block<ExecSpace, float>(
+          x, col_cur, r0, H, W, tag + "_im2col");
+      ::KokkosDNN::gemm_bias<ExecSpace, float>(handle_, col_cur, w2d, b,
+                                              y_cur, tag + "_gemm");
+    }
   }
 
-  // Mid-block single-head self-attention (heads=1, dim_head=C): GN(32,
-  // affine) -> q/k/v -> dense softmax(QK^T/sqrt(d))V via the core
-  // bidirectional attention op (cuDNN ladder inherited) -> out proj
-  // (+bias) -> +residual -> /1.0.
-  View3 mid_attention(const View3& x, const std::string& tag) const {
-    const size_t C = x.extent(0), H = x.extent(1), W = x.extent(2);
+  // One decode stage (x [Cin,H,W] -> y [Cout,H,W]) on the ping-pong
+  // buffers: GN -> SiLU -> conv3x3 -> GN -> SiLU -> conv3x3 -> +shortcut
+  // (1x1 iff Cin != Cout) in token space -> NCHW. The residual add stays
+  // in token layout (add_2d, bitwise identical to the NCHW add), so only
+  // the GN inputs/outputs touch NCHW.
+  void resnet_stage(float* xbuf, size_t Cin, float* ybuf, size_t Cout,
+                    size_t H, size_t W,
+                    const typename Weights<ExecSpace>::ResW& r, const U1& col,
+                    const std::string& tag) const {
+    Impl::DecoderScratch<ExecSpace>& sc = sc_;
     const size_t T = H * W;
-    View3 h("attn_h", C, H, W);
-    Kokkos::deep_copy(h, x);
-    Impl::groupnorm_3d<ExecSpace>(h, w_.mid_attn.gn_w, w_.mid_attn.gn_b,
-                                  (size_t)cfg_.num_groups, cfg_.gn_eps, h,
-                                  tag + "_gn");
-    View2 xt = Impl::to_tokens<ExecSpace>(h, tag);
-    View2 q(tag + "_q", T, C), k(tag + "_k", T, C), v(tag + "_v", T, C);
+    U3 x(xbuf, Cin, H, W);
+    U3 y1(ybuf, Cin, H, W);
+    Impl::copy_3d<ExecSpace>(y1, x, tag + "_copy");
+    groupnorm_now(y1, r.gn1_w, r.gn1_b, tag + "_n1");
+    Impl::silu_inplace_3d<ExecSpace>(y1, tag + "_s1");
+    U2 a0(sc.t0.data(), T, Cin), a1(sc.t1.data(), T, Cout);
+    Impl::to_tokens_into<ExecSpace>(y1, a0, tag + "_c1");
+    conv3x3_tok(a0, r.c1_w, r.c1_b, a1, H, W, col, tag + "_c1");
+    // Stage 2 reuses the y buffer at Cout width (stream-ordered after the
+    // stage-1 transpose consumed it, same in-place discipline as GN).
+    U3 y2(ybuf, Cout, H, W);
+    Impl::to_nchw_into<ExecSpace>(a1, y2, tag + "_c1");
+    groupnorm_now(y2, r.gn2_w, r.gn2_b, tag + "_n2");
+    Impl::silu_inplace_3d<ExecSpace>(y2, tag + "_s2");
+    U2 b0(sc.t0.data(), T, Cout), b1(sc.t1.data(), T, Cout);
+    Impl::to_tokens_into<ExecSpace>(y2, b0, tag + "_c2");
+    conv3x3_tok(b0, r.c2_w, r.c2_b, b1, H, W, col, tag + "_c2");
+    if (r.has_shortcut()) {
+      U2 s0(sc.t0.data(), T, Cin), s2(sc.t2.data(), T, Cout);
+      Impl::to_tokens_into<ExecSpace>(x, s0, tag + "_sc");
+      linear1x1_tok(s0, r.sc_w, r.sc_b, s2, tag + "_sc");
+      Impl::add_2d<ExecSpace>(b1, s2, tag + "_add");
+      Impl::to_nchw_into<ExecSpace>(b1, y2, tag + "_add");
+    } else {
+      // No shortcut: add in NCHW (x is alive in its own stage buffer),
+      // skipping the token round-trip of the residual.
+      Impl::to_nchw_into<ExecSpace>(b1, y2, tag + "_add");
+      Impl::add_3d<ExecSpace>(y2, x, tag + "_add");
+    }
+  }
+
+  void mid_attention_stage(float* xbuf, float* ybuf, size_t H, size_t W,
+                           const std::string& tag) const {
+    Impl::DecoderScratch<ExecSpace>& sc = sc_;
+    const size_t C = w_.mid_attn.gn_w.extent(0), T = H * W;
+    U3 x(xbuf, C, H, W), y(ybuf, C, H, W);
     const auto& a = w_.mid_attn;
-    gemm_bias<ExecSpace, float>(handle_, xt, a.q_w, a.q_b, q, tag + "_q");
-    gemm_bias<ExecSpace, float>(handle_, xt, a.k_w, a.k_b, k, tag + "_k");
-    gemm_bias<ExecSpace, float>(handle_, xt, a.v_w, a.v_b, v, tag + "_v");
+    Impl::copy_3d<ExecSpace>(y, x, tag + "_copy");
+    groupnorm_now(y, a.gn_w, a.gn_b, tag + "_gn");
+    U2 xt(sc.t0.data(), T, C);
+    Impl::to_tokens_into<ExecSpace>(y, xt, tag);
+    gemm_bias<ExecSpace, float>(handle_, xt, a.q_w, a.q_b, sc.aq,
+                                tag + "_q");
+    gemm_bias<ExecSpace, float>(handle_, xt, a.k_w, a.k_b, sc.ak,
+                                tag + "_k");
+    gemm_bias<ExecSpace, float>(handle_, xt, a.v_w, a.v_b, sc.av,
+                                tag + "_v");
     // Single head: reinterpret [T,C] token rows as [T,1,C] triples
     // (same memory; LayoutRight keeps D contiguous, as the op requires).
     using V3u = Kokkos::View<float***, Kokkos::LayoutRight, ExecSpace,
                              Kokkos::MemoryUnmanaged>;
-    V3u qu(q.data(), T, 1, C), ku(k.data(), T, 1, C), vu(v.data(), T, 1, C);
-    View2 o(tag + "_o", T, C);
-    V3u ou(o.data(), T, 1, C);
-    attention_mha_bidirectional<ExecSpace, float>(handle_, qu, ku, vu, ou,
-                                                  0.0f, tag + "_attn");
-    View2 proj(tag + "_proj", T, C);
-    gemm_bias<ExecSpace, float>(handle_, o, a.o_w, a.o_b, proj,
+    V3u qu(sc.aq.data(), T, 1, C), ku(sc.ak.data(), T, 1, C),
+        vu(sc.av.data(), T, 1, C);
+    V3u ou(sc.ao.data(), T, 1, C);
+    // Persistent scores plane replaces the math fallback's per-call
+    // [T,T] allocation; same op sequence and numerics.
+    attention_mha_bidirectional<ExecSpace, float>(
+        handle_, qu, ku, vu, ou, 0.0f, tag + "_attn", sc.attn.data(),
+        sc.attn.extent(0));
+    gemm_bias<ExecSpace, float>(handle_, sc.ao, a.o_w, a.o_b, sc.ap,
                                 tag + "_out");
-    View3 back = Impl::to_nchw<ExecSpace>(proj, C, H, W, tag);
-    View3 y("attn_y", C, H, W);
-    Kokkos::deep_copy(y, x);
-    Impl::add_3d<ExecSpace>(y, back, tag + "_res");
-    return y;
+    // Residual in token space (xt buffer is free: q/k/v are materialized
+    // in the dedicated attention buffers).
+    Impl::to_tokens_into<ExecSpace>(x, xt, tag + "_res");
+    Impl::add_2d<ExecSpace>(sc.ap, xt, tag + "_res");
+    Impl::to_nchw_into<ExecSpace>(sc.ap, y, tag + "_res");
   }
 };
 

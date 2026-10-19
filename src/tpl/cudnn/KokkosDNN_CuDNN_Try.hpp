@@ -196,9 +196,18 @@ inline bool try_cudnn_sdpa_gqa_sliding(const DNNHandle<Exec>& handle,
 // to all K keys, so there is no q_off parameter.
 template <class Scalar, class Exec, class QView, class KView, class VView,
           class OView>
+// Optional caller-provided workspace for the single-head FP32 math
+// fallback below: attn_ws[0, attn_ws_elems) (device memory, same stream)
+// replaces that fallback's per-call [T,Ktot] scores allocation. Requires
+// attn_ws_elems >= (size_t)T * (size_t)Ktot; a null buffer keeps the
+// previous allocating behavior, while an undersized one declines the math
+// path (falls through to native below). Defaulted so all existing
+// callers are unaffected.
 inline bool try_cudnn_sdpa_bidir(const DNNHandle<Exec>& handle, const QView& q,
                                  const KView& k, const VView& v,
-                                 const OView& out, float scale) {
+                                 const OView& out, float scale,
+                                 float* attn_ws = nullptr,
+                                 size_t attn_ws_elems = 0) {
   const int64_t T   = static_cast<int64_t>(q.extent(0));
   const int64_t Hq  = static_cast<int64_t>(q.extent(1));
   const int64_t D   = static_cast<int64_t>(q.extent(2));
@@ -320,11 +329,21 @@ inline bool try_cudnn_sdpa_bidir(const DNNHandle<Exec>& handle, const QView& q,
     if (Hq == 1 && Hkv == 1 && q_sT == D && k_sT == D && v_sT == D &&
         o_sT == D) {
       void* ch = handle.cublas_raw();
-      if (ch != nullptr &&
-          cudnn_sdpa_math_forward(
-              ch, static_cast<const float*>(qp), static_cast<const float*>(kp),
-              static_cast<const float*>(vp), static_cast<float*>(op), T, Ktot,
-              D, q_sT, k_sT, v_sT, o_sT, scale)) {
+      const auto* qf = static_cast<const float*>(qp);
+      const auto* kf = static_cast<const float*>(kp);
+      const auto* vf = static_cast<const float*>(vp);
+      auto* of = static_cast<float*>(op);
+      bool math_ok = false;
+      if (ch != nullptr) {
+        if (attn_ws != nullptr)
+          math_ok = cudnn_sdpa_math_forward_ws(
+              ch, qf, kf, vf, of, T, Ktot, D, q_sT, k_sT, v_sT, o_sT, scale,
+              attn_ws, attn_ws_elems);
+        else
+          math_ok = cudnn_sdpa_math_forward(ch, qf, kf, vf, of, T, Ktot, D,
+                                            q_sT, k_sT, v_sT, o_sT, scale);
+      }
+      if (math_ok) {
         if (repack_out) Kokkos::deep_copy(out, o_tmp);
         return true;
       }
