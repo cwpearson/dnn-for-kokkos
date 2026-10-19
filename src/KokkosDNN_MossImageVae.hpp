@@ -49,7 +49,8 @@
 //   * 1x1 convs, conv shortcuts, attention qkv/out projections go through
 //     gemm_bias, which owns the cuBLAS ladder.
 //   * Mid-block attention goes through attention_mha_bidirectional, which
-//     owns the cuDNN ladder (float path; native streaming kernel
+//     owns the cuDNN ladder (float path: fused SDPA graph, TPL math
+//     fallback past the graph's head-dim limit, native streaming kernel
 //     otherwise / on failure).
 //   * conv3x3_forward owns its (documented) native/MIOpen behavior; on
 //     CUDA it runs the native kernel (see KokkosDNN_Conv.hpp TPL note).

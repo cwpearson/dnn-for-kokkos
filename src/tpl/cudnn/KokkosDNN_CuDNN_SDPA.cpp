@@ -26,9 +26,21 @@
 
 #include <Kokkos_Core.hpp>
 
+#include <climits>
+#include <cstddef>
+#include <cstdint>
+
+#include "KokkosDNN_Softmax.hpp"
 #include "tpl/cudnn/KokkosDNN_CuDNN_Forward.hpp"
 
 #if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)
+
+#if defined(KOKKOSDNN_ENABLE_CUBLAS)
+#include <cublas_v2.h>
+
+#include "tpl/cublas/KokkosDNN_CuBLAS_GemmFloat.hpp"
+#include "tpl/cublas/KokkosDNN_CuBLAS_Stream.hpp"
+#endif
 
 #include <cudnn.h>
 #include <cudnn_frontend.h>
@@ -446,6 +458,72 @@ bool cudnn_sdpa_forward_noncausal(
                            /*causal=*/false, -1, "kokkosdnn_sdpa_noncausal");
 }
 
+// Single-head FP32 math fallback for shapes the fused node cannot serve
+// (head_dim > 128): S = scale * Q * K^T via cuBLAS NT sgemm, stable
+// in-place row softmax (core op, same stream), O = P * V via row-major
+// cuBLAS sgemm. cuBLAS runs on the Kokkos CUDA stream (selected per call
+// on the cached handle, same discipline as the core GEMM ladder), so no
+// fence is needed between these steps. cuBLAS sgemm takes int dims; shapes
+// past INT_MAX decline to native.
+bool cudnn_sdpa_math_forward(void* cublas_handle, const float* q,
+                             const float* k, const float* v, float* out,
+                             int64_t Sq, int64_t Sk, int64_t D, int64_t q_sT,
+                             int64_t k_sT, int64_t v_sT, int64_t o_sT,
+                             float scale) {
+#if !defined(KOKKOSDNN_ENABLE_CUBLAS)
+  (void)cublas_handle;
+  (void)q;
+  (void)k;
+  (void)v;
+  (void)out;
+  (void)Sq;
+  (void)Sk;
+  (void)D;
+  (void)q_sT;
+  (void)k_sT;
+  (void)v_sT;
+  (void)o_sT;
+  (void)scale;
+  return false;
+#else
+  try {
+    if (cublas_handle == nullptr || q == nullptr || k == nullptr ||
+        v == nullptr || out == nullptr)
+      return false;
+    if (Sq <= 0 || Sk <= 0 || D <= 0) return false;
+    // Packed single-head rows: each [S,D] head matrix is contiguous, so
+    // both GEMMs map onto plain row-major sgemm calls with no copies.
+    if (q_sT != D || k_sT != D || v_sT != D || o_sT != D) return false;
+    if (Sq > INT_MAX || Sk > INT_MAX || D > INT_MAX) return false;
+    auto h = static_cast<cublasHandle_t>(cublas_handle);
+    // S = scale * Q * K^T ([Sq,D] NT [Sk,D] -> [Sq,Sk]).
+    Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::Cuda> sbuf(
+        Kokkos::ViewAllocateWithoutInitializing("KokkosDNN::cudnn_math_s"),
+        static_cast<size_t>(Sq), static_cast<size_t>(Sk));
+    if (!cublas_gemm_nt_with_handle(h, static_cast<int>(Sq),
+                                    static_cast<int>(Sk), static_cast<int>(D),
+                                    scale, q, k, 0.0f, sbuf.data()))
+      return false;
+    // Stable softmax over keys, in place (same stream, no fence).
+    KokkosDNN::softmax_rows<Kokkos::Cuda, float>(sbuf, sbuf,
+                                                "KokkosDNN::cudnn_math_sm");
+    // O = P * V ([Sq,Sk] @ [Sk,D] -> [Sq,D]) via the row-major identity
+    // C_col[D,Sq] = V_col[D,Sk] * P_col[Sk,Sq] (memory-identical to the
+    // row-major product, so no transpose copy is needed).
+    if (!cublas_select_kokkos_stream(h)) return false;
+    const float one = 1.0f, zero = 0.0f;
+    const cublasStatus_t st = cublasSgemm(
+        h, CUBLAS_OP_N, CUBLAS_OP_N, static_cast<int>(D),
+        static_cast<int>(Sq), static_cast<int>(Sk), &one, v,
+        static_cast<int>(D), sbuf.data(), static_cast<int>(Sk), &zero, out,
+        static_cast<int>(D));
+    return st == CUBLAS_STATUS_SUCCESS;
+  } catch (...) {
+    return false;
+  }
+#endif
+}
+
 bool cudnn_sdpa_forward_sliding(
     void* cached_handle, CudnnSdpaScalar dtype, const void* q, const void* k,
     const void* v, void* out, int64_t T, int64_t Ktot, int64_t Hq, int64_t Hkv,
@@ -490,6 +568,12 @@ bool cudnn_sdpa_forward_sliding(void*, CudnnSdpaScalar, const void*,
                                 int64_t, int64_t, int64_t, int64_t, int64_t,
                                 int64_t, int64_t, int64_t, int64_t, int64_t,
                                 int64_t, float, int64_t) {
+  return false;
+}
+
+bool cudnn_sdpa_math_forward(void*, const float*, const float*, const float*,
+                             float*, int64_t, int64_t, int64_t, int64_t,
+                             int64_t, int64_t, int64_t, float) {
   return false;
 }
 
