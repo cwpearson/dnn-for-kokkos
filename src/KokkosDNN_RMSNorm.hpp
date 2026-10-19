@@ -113,6 +113,50 @@ void rmsnorm_noscale(
       });
 }
 
+namespace Impl {
+// Team-parallel row-norm worker: one team per row; the sum-of-squares is
+// accumulated sequentially in the same order as the serial form (identical
+// summation) and broadcast via Kokkos::single, while the scale pass fans out
+// over the team (elementwise, order-free). A RangePolicy over rows alone
+// leaves only T threads (256 at encoder geometry); teams expose T*D-way
+// parallelism. (The rsqrt uses sqrtf where the serial form used sqrt: at
+// most 1 ulp, far inside the 1e-5 test tolerance.) Team size clamps to
+// team_size_max (Serial -> 1) via the caller's probe.
+template <class ExecSpace, class Scalar>
+struct RmsNormOnePlusTeam {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  using View2 = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
+  using View1 = Kokkos::View<Scalar*, ExecSpace>;
+  View2 x;
+  View1 w;
+  View2 y;
+  float eps;
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& team) const {
+    const size_t t = static_cast<size_t>(team.league_rank());
+    const size_t D = x.extent(1);
+    float ss = 0;
+    Kokkos::single(
+        Kokkos::PerTeam(team),
+        [&](float& v) {
+          float s = 0;
+          for (size_t d = 0; d < D; ++d) {
+            const float xvd = static_cast<float>(x(t, d));
+            s += xvd * xvd;
+          }
+          v = s;
+        },
+        ss);
+    const float inv = 1.0f / sqrtf(ss / static_cast<float>(D) + eps);
+    Kokkos::parallel_for(
+        Kokkos::TeamThreadRange(team, D), KOKKOS_LAMBDA(size_t d) {
+          y(t, d) = static_cast<Scalar>(static_cast<float>(x(t, d)) * inv *
+                                        (1.0f + static_cast<float>(w(d))));
+        });
+  }
+};
+}  // namespace Impl
+
 // Gemma2 RMSNorm variant (zero-initialized weights multiply as (1 + w)):
 //   y[i,:] = x[i,:] / sqrt(mean(x[i,:]^2) + eps) * (1 + w[:])
 // Matches HF Gemma2RMSNorm (norm in FP32, then scale, then cast).
@@ -130,18 +174,19 @@ void rmsnorm_one_plus(
   if (y.extent(0) != T || y.extent(1) != D || w.extent(0) != D)
     throw std::invalid_argument("rmsnorm_one_plus: dimension mismatch");
   if (T == 0 || D == 0) return;
-  Kokkos::parallel_for(
-      label, Kokkos::RangePolicy<ExecSpace>(0, T), KOKKOS_LAMBDA(size_t t) {
-        float ss = 0;
-        for (size_t d = 0; d < D; ++d) {
-          float v = static_cast<float>(x(t, d));
-          ss += v * v;
-        }
-        float inv = 1.0f / sqrt(ss / (float)D + eps);
-        for (size_t d = 0; d < D; ++d)
-          y(t, d) = static_cast<Scalar>(static_cast<float>(x(t, d)) * inv *
-                                        (1.0f + static_cast<float>(w(d))));
-      });
+  // Team per row (same summation order; the serial form exposed only T
+  // threads). Probe clamps the team size for backends that cannot field
+  // 256 threads (Serial -> 1; strided TeamThreadRange stays correct).
+  Impl::RmsNormOnePlusTeam<ExecSpace, Scalar> f{
+      x, w, y, eps,
+  };
+  Kokkos::TeamPolicy<ExecSpace> probe(1, 1);
+  int ts = static_cast<int>(D < 256 ? D : 256);
+  const int mx = probe.team_size_max(f, Kokkos::ParallelForTag{});
+  if (mx < ts) ts = mx;
+  if (ts < 1) ts = 1;
+  Kokkos::TeamPolicy<ExecSpace> policy(static_cast<int>(T), ts);
+  Kokkos::parallel_for(label, policy, f);
 }
 
 // Single-row scaleless variant for decode.
