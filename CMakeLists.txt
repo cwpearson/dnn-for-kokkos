@@ -156,6 +156,7 @@ configure_file(cmake/KokkosDNN_config.h.in
 add_library(kokkosdnn
   src/KokkosDNN_PrintConfiguration.cpp
   src/tpl/cudnn/KokkosDNN_CuDNN_SDPA.cpp
+  src/tpl/cudnn/KokkosDNN_CuDNN_ConvForward.cpp
   src/tpl/miopen/KokkosDNN_MIOpen_SDPA.cpp
   src/tpl/miopen/KokkosDNN_MIOpen_ConvForward.cpp
 )
