@@ -113,6 +113,15 @@ TEST(AttentionBidirectional, BHalfMHAReference) {
       /*T=*/5, /*K=*/5, /*Hq=*/2, /*Hkv=*/2, /*D=*/8, 5e-2f);
 }
 
+// VAE mid-block geometry: a single head with head_dim 384, past the fused
+// cuDNN SDPA node's engine limit (D <= 128), so CUDA+CUDNN builds serve it
+// from the TPL math path while other builds run the native kernel. Small
+// T/K keeps the host reference cheap; asymmetric K exercises cross shapes.
+TEST(AttentionBidirectional, SingleHeadWideDimReference) {
+  check_bidir_reference<float>(/*T=*/16, /*K=*/12, /*Hq=*/1, /*Hkv=*/1,
+                               /*D=*/384, 1e-4f);
+}
+
 // Non-causal property: perturbing a FUTURE key/value (last token) must
 // change the FIRST query's output under the bidirectional kernel, while
 // the causal kernel's first output (q_off=0, attending only to key 0)

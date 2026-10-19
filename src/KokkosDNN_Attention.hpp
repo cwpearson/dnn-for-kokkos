@@ -1573,8 +1573,10 @@ void attention_bidirectional_streaming(const DNNHandle<ExecSpace>& handle,
 // scale : softmax scale; pass <= 0 (the default) for 1/sqrt(Dh).
 //
 // TPL: float and bhalf_t dispatch to the non-causal cuDNN SDPA graph
-// first (see tpl/cudnn/); any failure falls back to the native kernel.
-// Other scalars run the native kernel. Otherwise native.
+// first (see tpl/cudnn/); single-head float shapes past the graph's
+// head-dim engine limit (D > 128, e.g. the VAE mid-block) take the TPL
+// math composition there instead. Any failure falls back to the native
+// kernel. Otherwise native.
 //
 // Two overloads: explicit <ExecSpace, Scalar> and a deduction overload
 // taking Scalar from the query view. Both share the Impl core above so

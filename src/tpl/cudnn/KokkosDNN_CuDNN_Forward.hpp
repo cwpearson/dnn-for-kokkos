@@ -38,6 +38,26 @@ bool cudnn_sdpa_forward_noncausal(
     int64_t k_sH, int64_t k_sD, int64_t v_sT, int64_t v_sH, int64_t v_sD,
     int64_t o_sT, int64_t o_sH, int64_t o_sD, float scale);
 
+// Single-head FP32 math fallback for bidirectional attention, used when the
+// fused cuDNN SDPA node above has no engine for the shape (cuDNN 9.x
+// provides no SDPA engine for head_dim > 128 on pre-Hopper architectures;
+// validate/build fail while D <= 128 succeeds). Computes the same FP32 op
+// sequence as torch's SDPA math backend: S = scale * Q * K^T (cuBLAS),
+// numerically-stable row softmax, O = P * V (cuBLAS).
+//
+// Requirements (checked inside; anything else returns false so the caller
+// falls back to the native kernel): exactly one query head and one KV
+// head, FP32, and packed rows (row stride == D, so each head's [S,D]
+// matrix is a contiguous row-major GEMM operand). Q/K/V/O strides are in
+// elements for (token, head, dim) indexing, i.e. the Kokkos View strides;
+// S is a transient [Sq,Sk] scratch allocated per call. Returns true on
+// success, false to fall back to native. Never throws.
+bool cudnn_sdpa_math_forward(void* cublas_handle, const float* q,
+                             const float* k, const float* v, float* out,
+                             int64_t Sq, int64_t Sk, int64_t D, int64_t q_sT,
+                             int64_t k_sT, int64_t v_sT, int64_t o_sT,
+                             float scale);
+
 // Sliding-window causal variant: same contract as cudnn_sdpa_forward, plus
 // a bottom-right-aligned diagonal band with left_bound == window, so each
 // query attends to at most `window` keys back (mask columns at or before
