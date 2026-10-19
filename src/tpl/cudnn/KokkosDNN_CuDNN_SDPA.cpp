@@ -57,8 +57,14 @@ namespace {
 // overhead. The graph bakes dims/strides but NOT data pointers, so a built
 // graph can be re-executed with the current call's pointers via the variant
 // pack. Keyed on every parameter that affects the built plan; bounded with
-// FIFO eviction (~16 entries) so memory stays flat.
-constexpr std::size_t kSdpaPlanCacheCapacity = 16;
+// FIFO eviction (64 entries) so memory stays flat. 64 (not 16): MOSS-Image
+// DiT keys one plan per joint length Sj = HW + Sv (plus one per text length
+// Sv), and Sv varies per prompt while HW varies per resolution, so a long
+// session easily exceeds 16 distinct shapes; each entry is just a host-side
+// graph plus a small persistent workspace, so 64 stays cheap while covering
+// realistic (resolution x prompt-length) diversity. A new-shape miss costs
+// ~45 ms once, then all 42 layers hit.
+constexpr std::size_t kSdpaPlanCacheCapacity = 64;
 
 struct SdpaPlanKey {
   CudnnSdpaScalar dtype = CudnnSdpaScalar::Float;
