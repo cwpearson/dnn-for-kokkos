@@ -364,14 +364,142 @@ void qwen_qk_l2norm(const XView& x, float eps, float scale,
               static_cast<Scalar>(static_cast<float>(x(t, h, d)) * inv);
       });
 }
+// -- Recurrent gated delta rule: team-scratch worker ----------------------------
+// One team per (head, column group); the head state slice [K, Vg] plus the
+// current k/q rows are staged into team scratch, so the whole T recurrence
+// runs from scratch instead of DRAM (the flat version streamed ~3.8 GB per
+// launch at real geometry). Columns are independent -- step t at (h, vv)
+// touches only column vv -- and the two kk-dots per step use 4 accumulators
+// (K4-blocked + tail) so the FMA chains pipeline instead of stalling on one
+// accumulator; the combine order differs from the sequential reference by
+// fp32 rounding only (~1e-6, goldens at 1e-4). One barrier per step stages
+// the rows; the two outer barriers stage state in/out. Team size clamps to
+// team_size_max (Serial -> 1, strided loops stay correct); scratch <= 24 KB.
+template <class ExecSpace, class Scalar, class QView, class KView, class VView,
+          class GView, class SView, class OView>
+struct GatedDeltaTeam {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  QView q;
+  KView k;
+  VView vv;
+  GView beta;
+  GView gg;
+  SView state;
+  OView out;
+  size_t T, H, K, V, G, Vg, shBytes;
+
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& team) const {
+    const size_t hg = static_cast<size_t>(team.league_rank());
+    const size_t h = hg / G;
+    const size_t v0 = (hg % G) * Vg;
+    const int Tk = team.team_size();
+    const int tr = team.team_rank();
+    // 32-bit index math throughout: K*Vg <= 16K, T <= 512, so unsigned is
+    // ample and avoids 64-bit IMAD/IADD chains in the inner loops (SASS
+    // showed ~3 integer ops per MAC with size_t).
+    const unsigned Ku = static_cast<unsigned>(K);
+    const unsigned Vgu = static_cast<unsigned>(Vg);
+    const unsigned Tu = static_cast<unsigned>(T);
+    const unsigned Vg4 = 4 * Vgu;
+    const unsigned K4 = Ku & ~3u;
+    float* sh = static_cast<float*>(team.team_scratch(0).get_shmem(shBytes));
+    float* shk = sh + K * Vg;
+    float* shq = shk + K;
+    const unsigned n = Ku * Vgu;
+    for (unsigned e = static_cast<unsigned>(tr); e < n;
+         e += static_cast<unsigned>(Tk))
+      sh[e] = state(h, e / Vgu, v0 + e % Vgu);
+    team.team_barrier();
+    for (unsigned t = 0; t < Tu; ++t) {
+      // Stage k/q rows once per step (bf16->fp32 is exact per element).
+      for (unsigned e = static_cast<unsigned>(tr); e < 2 * Ku;
+           e += static_cast<unsigned>(Tk)) {
+        if (e < Ku)
+          shk[e] = static_cast<float>(k(t, h, e));
+        else
+          shq[e - Ku] = static_cast<float>(q(t, h, e - Ku));
+      }
+      team.team_barrier();
+      const float decay = expf(gg(t, h));
+      const float bt = beta(t, h);
+      // Pointer-walked kk loops with 4 accumulators per dot so the FMA
+      // chains pipeline (combine order differs from sequential by fp32
+      // rounding only, ~1e-6 vs 1e-4 goldens).
+      for (unsigned j = static_cast<unsigned>(tr); j < Vgu;
+           j += static_cast<unsigned>(Tk)) {
+        const size_t c = v0 + j;
+        float* pc = sh + j;
+        for (unsigned kk = 0; kk < Ku; ++kk, pc += Vgu) *pc *= decay;
+        float *p0 = sh + j, *p1 = p0 + Vgu, *p2 = p1 + Vgu, *p3 = p2 + Vgu;
+        float* pk = shk;
+        float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+        unsigned kk = 0;
+        for (; kk < K4; kk += 4) {
+          a0 += *p0 * pk[0];
+          a1 += *p1 * pk[1];
+          a2 += *p2 * pk[2];
+          a3 += *p3 * pk[3];
+          p0 += Vg4;
+          p1 += Vg4;
+          p2 += Vg4;
+          p3 += Vg4;
+          pk += 4;
+        }
+        for (; kk < Ku; ++kk) {
+          a0 += *p0 * *pk;
+          p0 += Vgu;
+          ++pk;
+        }
+        const float kv = (a0 + a1) + (a2 + a3);
+        const float delta = (static_cast<float>(vv(t, h, c)) - kv) * bt;
+        float* pu = sh + j;
+        pk = shk;
+        for (unsigned ku = 0; ku < Ku; ++ku, pu += Vgu) *pu += *pk++ * delta;
+        float *q0 = sh + j, *q1 = q0 + Vgu, *q2 = q1 + Vgu, *q3 = q2 + Vgu;
+        float* pq = shq;
+        float b0 = 0, b1 = 0, b2 = 0, b3 = 0;
+        kk = 0;
+        for (; kk < K4; kk += 4) {
+          b0 += *q0 * pq[0];
+          b1 += *q1 * pq[1];
+          b2 += *q2 * pq[2];
+          b3 += *q3 * pq[3];
+          q0 += Vg4;
+          q1 += Vg4;
+          q2 += Vg4;
+          q3 += Vg4;
+          pq += 4;
+        }
+        for (; kk < Ku; ++kk) {
+          b0 += *q0 * *pq;
+          q0 += Vgu;
+          ++pq;
+        }
+        out(t, h, c) = static_cast<Scalar>((b0 + b1) + (b2 + b3));
+      }
+      // Publish this step's compute before any thread overwrites the
+      // staged k/q rows at the top of the next iteration (the stage
+      // barrier alone does not protect readers from a fast stager).
+      team.team_barrier();
+    }
+    team.team_barrier();
+    for (size_t e = static_cast<size_t>(tr); e < n;
+         e += static_cast<size_t>(Tk))
+      state(h, e / Vg, v0 + e % Vg) = sh[e];
+  }
+};
 // -- Recurrent gated delta rule (linear-layer core) -----------------------------
 // Exact port of torch_recurrent_gated_delta_rule: per head h with state
 // S [K, V] (fp32 workspace, zeroed by caller):
 //   S *= exp(g); kv = sum_k S[k,v] k[k]; delta = (v - kv) beta;
 //   S += k (x) delta; out = sum_k S[k,v] q[k].
 // q/k are L2-normed with q pre-scaled by 1/sqrt(K); beta/g fp32 [T, H].
-// Parallel over heads; T is sequential per head (recurrence dependence).
-// Dispatch: native (no TPL; a chunked parallel form is future work).
+// Parallel over heads x column-groups via GatedDeltaTeam (TeamPolicy +
+// team scratch): the T recurrence at fixed (h, vv) touches only column vv
+// of S, so columns are fully independent and the T loop stays sequential
+// per index -- the only true dependence in the op.
+// Dispatch: native (no TPL; the recurrence has no TPL equivalent).
 template <class ExecSpace, class Scalar, class QView, class KView, class VView,
           class GView, class SView, class OView>
 void qwen_gated_delta_recurrent(const QView& q, const KView& k, const VView& v,
@@ -387,31 +515,33 @@ void qwen_gated_delta_recurrent(const QView& q, const KView& k, const VView& v,
       out.extent(0) != T || out.extent(1) != H || out.extent(2) != V)
     throw std::invalid_argument("qwen_gated_delta_recurrent: dim mismatch");
   if (T == 0 || H == 0 || K == 0 || V == 0) return;
-  Kokkos::parallel_for(
-      label, Kokkos::RangePolicy<ExecSpace>(0, H),
-      KOKKOS_LAMBDA(size_t h) {
-        for (size_t t = 0; t < T; ++t) {
-          const float decay = expf(g(t, h));
-          const float bt = beta(t, h);
-          for (size_t kk = 0; kk < K; ++kk)
-            for (size_t vv = 0; vv < V; ++vv) state(h, kk, vv) *= decay;
-          for (size_t vv = 0; vv < V; ++vv) {
-            float kv = 0;
-            for (size_t kk = 0; kk < K; ++kk)
-              kv += state(h, kk, vv) * static_cast<float>(k(t, h, kk));
-            const float delta =
-                (static_cast<float>(v(t, h, vv)) - kv) * bt;
-            for (size_t kk = 0; kk < K; ++kk)
-              state(h, kk, vv) += static_cast<float>(k(t, h, kk)) * delta;
-          }
-          for (size_t vv = 0; vv < V; ++vv) {
-            float o = 0;
-            for (size_t kk = 0; kk < K; ++kk)
-              o += state(h, kk, vv) * static_cast<float>(q(t, h, kk));
-            out(t, h, vv) = static_cast<Scalar>(o);
-          }
-        }
-      });
+  // Column groups: largest G in {4,2,1} dividing V with state ([K, V/G])
+  // plus k/q row staging (2*K) fitting in <= 24 KB of team scratch.
+  size_t G = 1;
+  const int cands[3] = {4, 2, 1};
+  for (int ci = 0; ci < 3; ++ci) {
+    const size_t c = static_cast<size_t>(cands[ci]);
+    if (V % c == 0 && (K * (V / c) + 2 * K) * sizeof(float) <= 24576) {
+      G = c;
+      break;
+    }
+  }
+  const size_t Vg = V / G;
+  const size_t shBytes = (K * Vg + 2 * K) * sizeof(float);
+  GatedDeltaTeam<ExecSpace, Scalar, QView, KView, VView, GView, SView, OView>
+      f{q, k, v, beta, g, state, out, T, H, K, V, G, Vg, shBytes};
+  // Team-size probe (same pattern as gemm_tiled_impl): the query accounts
+  // for functor registers and per-team scratch; strided loops stay correct
+  // at any team size (Serial -> 1).
+  Kokkos::TeamPolicy<ExecSpace> probe(1, 1);
+  probe.set_scratch_size(0, Kokkos::PerTeam(shBytes));
+  int ts = static_cast<int>(Vg);
+  const int mx = probe.team_size_max(f, Kokkos::ParallelForTag{});
+  if (mx < ts) ts = mx;
+  if (ts < 1) ts = 1;
+  Kokkos::TeamPolicy<ExecSpace> policy(static_cast<int>(H * G), ts);
+  policy.set_scratch_size(0, Kokkos::PerTeam(shBytes));
+  Kokkos::parallel_for(label, policy, f);
 }
 
 // -- Gated RMSNorm (linear-layer norm) -------------------------------------------
