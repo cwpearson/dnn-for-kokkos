@@ -109,7 +109,6 @@ void conv3x3_im2col_block(
     size_t r0, size_t H, size_t W, const std::string& label) {
   const size_t cur = col.extent(0), K9 = col.extent(1);
   if (cur == 0 || K9 == 0) return;
-  const size_t Cin = K9 / 9;
   Kokkos::parallel_for(
       label, Kokkos::RangePolicy<ExecSpace>(0, cur * K9),
       KOKKOS_LAMBDA(size_t e) {
@@ -165,7 +164,6 @@ struct SkinnyConvFunctor {
     float* patch = sh;      // [K9] staged input patch (FP32)
     float* psum = sh + K9;  // [team_size] per-thread partials
     const size_t h = t / W, ww = t % W;
-    const size_t Cin = K9 / 9;
     // Cooperative gather: consecutive threads take consecutive k, i.e.
     // consecutive channels of (mostly) the same input row -- coalesced.
     for (size_t e = static_cast<size_t>(rank); e < K9;
