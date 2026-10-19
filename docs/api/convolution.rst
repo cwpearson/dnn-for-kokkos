@@ -5,8 +5,11 @@ Headers: ``src/KokkosDNN_Conv.hpp``,
 ``src/KokkosDNN_DepthwiseConv.hpp``. Token-row ``[T, C]`` views with
 ``T = H*W`` row-major, stride 1, symmetric zero padding, FP32
 accumulation. Bias is ``[Cout]``/``[C]`` or empty (extent 0) for no bias.
-Native kernels only (no cuDNN dispatch; see the header's TPL-status note
-for why). The ``handle`` is still taken for API uniformity.
+Dense 3x3, depthwise, and grouped 1x1 dispatch to cuDNN convolution
+forward on CUDA builds with ``KokkosDNN_ENABLE_CUDNN`` (FP32 stays FP32;
+see the header's TPL-status note), MIOpen on HIP builds with
+``KokkosDNN_ENABLE_MIOPEN``, and otherwise run the native lowering /
+kernels. The ``handle`` is still taken for API uniformity.
 
 .. cpp:function:: template <typename ExecSpace, typename Scalar> void conv3x3_forward(const DNNHandle<ExecSpace>& handle, const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x, const Kokkos::View<Scalar****, Kokkos::LayoutRight, ExecSpace>& w, const Kokkos::View<Scalar*, ExecSpace>& b, const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& y, size_t H, size_t W, const std::string& label)
 
