@@ -29,6 +29,7 @@
 #include <climits>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 #include "KokkosDNN_Softmax.hpp"
 #include "tpl/cudnn/KokkosDNN_CuDNN_Forward.hpp"
@@ -53,6 +54,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -162,6 +164,15 @@ struct SdpaPlanCache {
                      SdpaPlanKeyHash>
       plans;
   std::deque<SdpaPlanKey> order;  // insertion order for FIFO eviction
+  // Keys whose graph validate()/build() deterministically failed (e.g. no
+  // engine for head_dim > 128). Validate/build outcomes depend only on the
+  // key (dims/strides/dtype), never on the data pointers, so repeat calls
+  // with a known-bad key skip the frontend rebuild entirely and fall
+  // through immediately. Workspace-malloc and execute failures are
+  // transient and are deliberately NOT cached. Same FIFO capacity as the
+  // plan cache.
+  std::unordered_set<SdpaPlanKey, SdpaPlanKeyHash> bad;
+  std::deque<SdpaPlanKey> bad_order;  // insertion order for FIFO eviction
 };
 
 SdpaPlanCache& sdpa_plan_cache() {
@@ -265,11 +276,15 @@ bool sdpa_forward_impl(void* cached_handle, CudnnSdpaScalar dtype,
   // re-execute the built graph with the CURRENT call's pointers (the graph
   // bakes dims/strides, not data pointers). The shared_ptr copy keeps the
   // entry (and its workspace) alive past a concurrent eviction.
+  // Known-bad key: a previous validate()/build() for this exact key
+  // deterministically failed, so decline immediately (same fall-through
+  // the caller would take after the rebuild fails).
   {
     std::shared_ptr<SdpaPlanEntry> hit;
     {
       SdpaPlanCache& cache = sdpa_plan_cache();
       std::lock_guard<std::mutex> lock(cache.mutex);
+      if (cache.bad.find(key) != cache.bad.end()) return false;
       auto it = cache.plans.find(key);
       if (it != cache.plans.end()) hit = it->second;
     }
@@ -367,12 +382,31 @@ bool sdpa_forward_impl(void* cached_handle, CudnnSdpaScalar dtype,
     O = Out;
     O->set_output(true).set_dim(o_dim).set_stride(o_stride);
 
+    auto note_bad = [&]() {
+      // Record the deterministic validate/build failure so repeat calls
+      // skip the frontend rebuild (FIFO-evicted past capacity, mirroring
+      // the plan cache). Lock-protected; allocation-free on the hot path
+      // after the first miss.
+      SdpaPlanCache& cache = sdpa_plan_cache();
+      std::lock_guard<std::mutex> lock(cache.mutex);
+      if (cache.bad.find(key) == cache.bad.end()) {
+        while (cache.bad.size() >= kSdpaPlanCacheCapacity &&
+               !cache.bad_order.empty()) {
+          cache.bad.erase(cache.bad_order.front());
+          cache.bad_order.pop_front();
+        }
+        cache.bad.insert(key);
+        cache.bad_order.push_back(key);
+      }
+    };
     if (!graph->validate().is_good()) {
+      note_bad();
       return false;
     }
     if (!graph->build(cudnn_handle,
                       {fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK})
              .is_good()) {
+      note_bad();
       return false;
     }
 
@@ -471,11 +505,12 @@ bool cudnn_sdpa_forward_noncausal(
 // on the cached handle, same discipline as the core GEMM ladder), so no
 // fence is needed between these steps. cuBLAS sgemm takes int dims; shapes
 // past INT_MAX decline to native.
-bool cudnn_sdpa_math_forward(void* cublas_handle, const float* q,
-                             const float* k, const float* v, float* out,
-                             int64_t Sq, int64_t Sk, int64_t D, int64_t q_sT,
-                             int64_t k_sT, int64_t v_sT, int64_t o_sT,
-                             float scale) {
+bool cudnn_sdpa_math_forward_ws(void* cublas_handle, const float* q,
+                                const float* k, const float* v, float* out,
+                                int64_t Sq, int64_t Sk, int64_t D,
+                                int64_t q_sT, int64_t k_sT, int64_t v_sT,
+                                int64_t o_sT, float scale, float* ws,
+                                size_t ws_elems) {
 #if !defined(KOKKOSDNN_ENABLE_CUBLAS)
   (void)cublas_handle;
   (void)q;
@@ -501,11 +536,19 @@ bool cudnn_sdpa_math_forward(void* cublas_handle, const float* q,
     // both GEMMs map onto plain row-major sgemm calls with no copies.
     if (q_sT != D || k_sT != D || v_sT != D || o_sT != D) return false;
     if (Sq > INT_MAX || Sk > INT_MAX || D > INT_MAX) return false;
+    if (ws == nullptr) return false;
+    // Overflow-safe capacity check for the caller-provided scores plane.
+    if (Sq > 0 &&
+        static_cast<size_t>(Sk) >
+            std::numeric_limits<size_t>::max() / static_cast<size_t>(Sq))
+      return false;
+    if (ws_elems < static_cast<size_t>(Sq) * static_cast<size_t>(Sk))
+      return false;
     auto h = static_cast<cublasHandle_t>(cublas_handle);
     // S = scale * Q * K^T ([Sq,D] NT [Sk,D] -> [Sq,Sk]).
-    Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::Cuda> sbuf(
-        Kokkos::ViewAllocateWithoutInitializing("KokkosDNN::cudnn_math_s"),
-        static_cast<size_t>(Sq), static_cast<size_t>(Sk));
+    Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::Cuda,
+                 Kokkos::MemoryUnmanaged>
+        sbuf(ws, static_cast<size_t>(Sq), static_cast<size_t>(Sk));
     if (!cublas_gemm_nt_with_handle(h, static_cast<int>(Sq),
                                     static_cast<int>(Sk), static_cast<int>(D),
                                     scale, q, k, 0.0f, sbuf.data()))
@@ -527,6 +570,45 @@ bool cudnn_sdpa_math_forward(void* cublas_handle, const float* q,
   } catch (...) {
     return false;
   }
+#endif
+}
+
+bool cudnn_sdpa_math_forward(void* cublas_handle, const float* q,
+                             const float* k, const float* v, float* out,
+                             int64_t Sq, int64_t Sk, int64_t D, int64_t q_sT,
+                             int64_t k_sT, int64_t v_sT, int64_t o_sT,
+                             float scale) {
+#if !defined(KOKKOSDNN_ENABLE_CUBLAS)
+  (void)cublas_handle;
+  (void)q;
+  (void)k;
+  (void)v;
+  (void)out;
+  (void)Sq;
+  (void)Sk;
+  (void)D;
+  (void)q_sT;
+  (void)k_sT;
+  (void)v_sT;
+  (void)o_sT;
+  (void)scale;
+  return false;
+#else
+  if (Sq <= 0 || Sk <= 0) return false;
+  if (Sq > 0 &&
+      static_cast<size_t>(Sk) >
+          std::numeric_limits<size_t>::max() / static_cast<size_t>(Sq))
+    return false;
+  // Write-first scores plane (both GEMMs fully overwrite it: beta=0 on
+  // the first, softmax rewrites every row in place), so no zero-fill.
+  Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::Cuda> owned(
+      Kokkos::ViewAllocateWithoutInitializing("KokkosDNN::cudnn_math_s"),
+      static_cast<size_t>(Sq), static_cast<size_t>(Sk));
+  return cudnn_sdpa_math_forward_ws(cublas_handle, q, k, v, out, Sq, Sk, D,
+                                    q_sT, k_sT, v_sT, o_sT, scale,
+                                    owned.data(),
+                                    static_cast<size_t>(Sq) *
+                                        static_cast<size_t>(Sk));
 #endif
 }
 
@@ -580,6 +662,13 @@ bool cudnn_sdpa_forward_sliding(void*, CudnnSdpaScalar, const void*,
 bool cudnn_sdpa_math_forward(void*, const float*, const float*, const float*,
                              float*, int64_t, int64_t, int64_t, int64_t,
                              int64_t, int64_t, int64_t, float) {
+  return false;
+}
+
+bool cudnn_sdpa_math_forward_ws(void*, const float*, const float*,
+                                const float*, float*, int64_t, int64_t,
+                                int64_t, int64_t, int64_t, int64_t, int64_t,
+                                float, float*, size_t) {
   return false;
 }
 

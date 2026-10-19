@@ -1493,10 +1493,17 @@ void launch_bidir_streaming_auto(const QView& q, const KView& k, const VView& v,
 // every query attends to ALL keys (no causal truncation).
 template <class ExecSpace, class Scalar, class QView, class KView, class VView,
           class OView>
+// Optional caller-provided workspace for the single-head FP32 TPL math
+// fallback (see try_cudnn_sdpa_bidir): attn_ws[0, attn_ws_elems) replaces
+// that fallback's per-call [T,K] scores allocation when sized
+// >= (size_t)T * (size_t)K. Defaulted so all existing callers and both
+// attention_mha_bidirectional overloads below are unaffected.
 void attention_bidirectional_streaming(const DNNHandle<ExecSpace>& handle,
                                        const QView& q, const KView& k,
                                        const VView& v, const OView& out,
-                                       float scale, const std::string& label) {
+                                       float scale, const std::string& label,
+                                       float* attn_ws = nullptr,
+                                       size_t attn_ws_elems = 0) {
   const size_t T = q.extent(0), Hq = q.extent(1), D = q.extent(2);
   const size_t Hkv = k.extent(1);
   const size_t Ktot = k.extent(0);
@@ -1509,7 +1516,8 @@ void attention_bidirectional_streaming(const DNNHandle<ExecSpace>& handle,
   if constexpr (std::is_same_v<Scalar, float> ||
                 std::is_same_v<Scalar, Kokkos::Experimental::bhalf_t>) {
     if (handle.use_cudnn &&
-        try_cudnn_sdpa_bidir<Scalar>(handle, q, k, v, out, eff))
+        try_cudnn_sdpa_bidir<Scalar>(handle, q, k, v, out, eff, attn_ws,
+                                    attn_ws_elems))
       return;
   } else {
     (void)handle;
@@ -1586,19 +1594,21 @@ template <class ExecSpace, class Scalar, class QView, class KView, class VView,
 void attention_mha_bidirectional(
     const DNNHandle<ExecSpace>& handle, const QView& q, const KView& k,
     const VView& v, const OView& out, float scale = 0.0f,
-    const std::string& label = "KokkosDNN::attn_bidir") {
-  Impl::attention_bidirectional_streaming<ExecSpace, Scalar>(handle, q, k, v,
-                                                            out, scale, label);
+    const std::string& label = "KokkosDNN::attn_bidir",
+    float* attn_ws = nullptr, size_t attn_ws_elems = 0) {
+  Impl::attention_bidirectional_streaming<ExecSpace, Scalar>(
+      handle, q, k, v, out, scale, label, attn_ws, attn_ws_elems);
 }
 
 template <class ExecSpace, class QView, class KView, class VView, class OView>
 void attention_mha_bidirectional(
     const DNNHandle<ExecSpace>& handle, const QView& q, const KView& k,
     const VView& v, const OView& out, float scale = 0.0f,
-    const std::string& label = "KokkosDNN::attn_bidir") {
+    const std::string& label = "KokkosDNN::attn_bidir",
+    float* attn_ws = nullptr, size_t attn_ws_elems = 0) {
   using Scalar = std::remove_const_t<typename QView::value_type>;
-  Impl::attention_bidirectional_streaming<ExecSpace, Scalar>(handle, q, k, v,
-                                                            out, scale, label);
+  Impl::attention_bidirectional_streaming<ExecSpace, Scalar>(
+      handle, q, k, v, out, scale, label, attn_ws, attn_ws_elems);
 }
 
 }  // namespace KokkosDNN
