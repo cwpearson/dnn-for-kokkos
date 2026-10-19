@@ -592,7 +592,17 @@ TEST(MossDitForward, BatchSamplesAreIndependent) {
   Kokkos::View<float****, Kokkos::LayoutRight, Exec> out2("o2", 2, C, H, W);
   model.forward(lat2, t2, enc2, mask2, out2);
   Kokkos::fence();
-  // Same samples run as B=1 must match exactly (no cross-sample leakage).
+  // Same samples run as B=1 must match to FP tolerance (no cross-sample
+  // leakage). This is EXPECT_NEAR, not EXPECT_FLOAT_EQ, by construction:
+  // the time-path and video-embedder GEMMs run batched ([B,...]/[B*HW,...])
+  // in the B=2 call but single-sample ([1,...]/[HW,...]) in the B=1 calls.
+  // cuBLAS selects kernels / accumulation order per shape, so the two shapes
+  // round differently by a few ulps even for the same sample row (cuBLAS
+  // documents shape-dependent rounding; the ~8-ulp diff seen on CUDA+TPL is
+  // appropriate TPL numerics, not leakage, which would be O(1e-2+) given
+  // the samples' different timesteps/masks/encodings). The native Kokkos
+  // GEMM is per-row deterministic, so Serial stays bit-exact well inside
+  // this bound.
   for (int b = 0; b < 2; ++b) {
     Kokkos::View<float****, Kokkos::LayoutRight, Exec> lat1("l1", 1, C, H, W);
     auto sl = Kokkos::subview(lat2, b, Kokkos::ALL(), Kokkos::ALL(),
@@ -625,7 +635,7 @@ TEST(MossDitForward, BatchSamplesAreIndependent) {
     for (int c = 0; c < C; ++c)
       for (int i = 0; i < H; ++i)
         for (int j = 0; j < W; ++j)
-          EXPECT_FLOAT_EQ(h1(0, c, i, j), h2(b, c, i, j))
+          EXPECT_NEAR(h1(0, c, i, j), h2(b, c, i, j), 1e-5f)
               << "sample " << b << " differs batched vs single";
   }
 }
