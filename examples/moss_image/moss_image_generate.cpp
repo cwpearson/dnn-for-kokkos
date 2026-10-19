@@ -1413,19 +1413,17 @@ int main(int argc, char** argv) {
         Kokkos::fence();
         auto rh = Kokkos::create_mirror_view(rgb);
         Kokkos::deep_copy(rh, rgb);
-        float mn = rh(0, 0, 0, 0), mx = mn;
-        for (size_t c = 0; c < 3; ++c)
-          for (size_t h = 0; h < oH; ++h)
-            for (size_t ww = 0; ww < oW; ++ww) {
-              mn = std::min(mn, rh(0, c, h, ww));
-              mx = std::max(mx, rh(0, c, h, ww));
-            }
-        const float span = (mx > mn) ? (mx - mn) : 1.0f;
+        // Reference postprocess: VAE output clamped to [-1,1], then
+        // (x*0.5+0.5) to [0,1] (VaeImageProcessor denormalize). NOT a
+        // per-image min-max stretch (that hides exposure errors and shifts
+        // colors with outliers).
         pix.resize(oH * oW * 3);
         for (size_t h = 0; h < oH; ++h)
           for (size_t ww = 0; ww < oW; ++ww)
             for (size_t c = 0; c < 3; ++c) {
-              const float v = (rh(0, c, h, ww) - mn) / span;
+              float v = rh(0, c, h, ww);
+              v = std::min(1.0f, std::max(-1.0f, v)) * 0.5f + 0.5f;
+              v = std::min(1.0f, std::max(0.0f, v));
               pix[(h * oW + ww) * 3 + c] =
                   (unsigned char)(std::lround(255.0f * v));
             }

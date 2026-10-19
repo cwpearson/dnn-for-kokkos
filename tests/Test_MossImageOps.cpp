@@ -216,9 +216,10 @@ TEST(MossRope, BuildApply) {
       double band = 1.0 / std::pow(10000.0, (double)k / nb);
       for (int m = 0; m < 4; ++m) {
         double ph = coord[m] * band;
-        EXPECT_NEAR(got(0, s, m * 2 * nb + k), std::sin(ph), tol)
+        EXPECT_NEAR(got(0, s, (size_t)m * nb + k), std::sin(ph), tol)
             << "sin mismatch at (" << s << "," << m << "," << k << ")";
-        EXPECT_NEAR(got(0, s, m * 2 * nb + nb + k), std::cos(ph), tol)
+        EXPECT_NEAR(got(0, s, 4 * nb + (size_t)m * nb + k), std::cos(ph),
+                    tol)
             << "cos mismatch at (" << s << "," << m << "," << k << ")";
       }
     }

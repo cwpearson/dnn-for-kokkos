@@ -276,9 +276,10 @@ void moss_qk_rmsnorm_forward(
 // S = height*width + text_length, Dh % 8 == 0 (num_bands = Dh/8).
 // Image token (r, c): coords (0, text_length, r - (H-1)/2, c - (W-1)/2);
 // text token i: (0, i, 0, 0). bands[k] = 1 / base^(k/num_bands).
-// Layout matches the reference (sin block then cos block per coordinate):
-//   out[0, s, m*2*nb + k]      = sin(coord[m] * bands[k])
-//   out[0, s, m*2*nb + nb + k] = cos(coord[m] * bands[k]).
+// Layout matches the reference (torch.cat((phase.sin(), phase.cos()), -2)
+// .flatten(-2): all four sin coordinate blocks, then all four cos blocks):
+//   out[0, s, m*nb + k]        = sin(coord[m] * bands[k])
+//   out[0, s, 4*nb + m*nb + k] = cos(coord[m] * bands[k]).
 // FP32 throughout (reference builds fp32 bands on CPU and fp32 phase).
 // Dispatch: native elementwise (no TPL).
 template <class ExecSpace>
@@ -324,8 +325,8 @@ void moss_rope_build_forward(
         }
         for (int m = 0; m < 4; ++m) {
           const float ph = coord[m] * band;
-          out(0, s, m * 2 * nb + k) = sinf(ph);
-          out(0, s, m * 2 * nb + nb + k) = cosf(ph);
+          out(0, s, (size_t)m * nb + k) = sinf(ph);
+          out(0, s, 4 * nb + (size_t)m * nb + k) = cosf(ph);
         }
       });
 }
