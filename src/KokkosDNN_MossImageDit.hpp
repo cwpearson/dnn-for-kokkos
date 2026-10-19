@@ -1593,7 +1593,9 @@ class MossImageDitModel {
                                  label + "_tgate");
     gemm_bias<ExecSpace, Scalar>(handle_, txn, T.up_W, T.up_b, fg,
                                  label + "_tup");
-    MossImage::moss_situ_forward<ExecSpace, Scalar>(fh, fg, fh,
+    // Reference _TextBlock: _situ(ffn_up(y), ffn_gate(y)) — hidden first
+    // (up), gate second. fh holds gate, fg holds up.
+    MossImage::moss_situ_forward<ExecSpace, Scalar>(fg, fh, fh,
                                                     label + "_tsitu");
     V2 fd = Sc.c2.get("tfd", Sv, D);
     gemm_bias<ExecSpace, Scalar>(handle_, fh, T.down_W, T.down_b, fd,
