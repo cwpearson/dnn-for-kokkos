@@ -4,10 +4,9 @@ C++20 Kokkos port of a MOSS-Image-SFT-style flow-matching DiT stack (joint
 self+cross attention transformer + FlowEuler sampler with CFG and
 skip-layer guidance) + `moss_image_generate` driver.
 
-> Scope: the public MOSS-Image-SFT checkpoint layout is not pinned here, so
-> this example defines and documents its own canonical key layout (below).
-> Full-weight runs need a checkpoint converted to that layout; `--tiny`
-> (random weights) always works and is what CI/smoke uses.
+Loads the published `OpenMOSS-Team/MOSS-Image-SFT` checkpoint layout
+directly (BF16, sharded `.safetensors`); `--tiny` (random weights) always
+works and is what CI/smoke uses.
 
 ## Quickstart (0 to working)
 
@@ -46,11 +45,11 @@ released, so there is no disk round-trip and no second command):
 
 ```bash
 ./build/examples/moss_image/moss_image_generate \
-  --weights moss_image_sft.safetensors --prompt "a red panda" \
+  --weights moss-sft/transformer --prompt "a red panda" \
   --staged --steps 50 --out moss_out.png
 # sample from precomputed file embeds instead (alias of --text-weights):
 ./build/examples/moss_image/moss_image_generate \
-  --weights moss_image_sft.safetensors --prompt-embeds-in embeds.f32 \
+  --weights moss-sft/transformer --prompt-embeds-in embeds.f32 \
   --steps 50 --out moss_out.png
 # tiny staged smoke (no downloads; exercises the same plumbing):
 ./build/examples/moss_image/moss_image_generate \
@@ -63,10 +62,12 @@ End-to-end with the public `OpenMOSS-Team/MOSS-Image-SFT` checkpoint
 (Apache-2.0). The driver builds against both the checked-in placeholder
 geometry and the true-pipeline headers
 (`src/KokkosDNN_MossImageDit.hpp`, `src/KokkosDNN_MossImageEncoder.hpp`,
-`src/KokkosDNN_MossImageVae.hpp`, landing from parallel worktrees): each
+`src/KokkosDNN_MossImageVae.hpp`): each
 phase is probed with `__has_include` and falls back with a logged reason,
 so the `[backend dit=... encoder=... vae=...]` banner tells you exactly
-which path a run took.
+which path a run took. With a normal build all three true-pipeline headers
+are present, so the published `transformer/` / `text_encoder/` / `vae/`
+shards load with no conversion.
 
 ### (a) Retrieve the pieces
 
@@ -225,9 +226,7 @@ The driver prints a per-phase resident estimate
 (`[memory phase=...] weights + activations`) and issues a
 `Kokkos::fence()` between phases; `Weights::release()` /
 `BlockWeights::release()` drop every device View (assign `{}`) before the
-next phase loads. The current example-geometry estimates print smaller
-numbers than the table above (the example DiT is ~0.8B params, not the full
-5B checkpoint); the table governs real-checkpoint runs.
+next phase loads.
 
 Checkpoint → flag mapping: `--weights` = DiT transformer checkpoint
 (`transformer/` shard dir or single `.safetensors`); `--tokenizer` = dir
@@ -315,9 +314,11 @@ last block wins); `--vae-weights` = FLUX.2 VAE `.safetensors` (single
 
 ## Checkpoint key layout (MOSS-Image-SFT `transformer/`)
 
-`.safetensors` keys are suffix-matched (a `model.`-style prefix is fine);
+The loader accepts the published `transformer/` shards as-is (BF16 or F32;
+pass the shard dir or a single `.safetensors`). Keys are matched by exact
+name with an optional `model.`-style dotted prefix tolerated;
 `rope.bands` is skipped (rebuilt as an fp32 constant). 463 tensors total
-(`diffusion_pytorch_model.safetensors.index.json`):
+(`diffusion_pytorch_model.safetensors.index.json`), 462 loaded:
 
 ```text
 video_embedder.{weight,bias}              # latent patch embed
@@ -337,9 +338,11 @@ final_norm_video.weight
 final_linear_video.weight
 ```
 
-The placeholder-geometry path (no true-pipeline headers) instead uses the
+The placeholder-geometry path (built only when the true-pipeline headers
+are absent) instead uses the
 legacy `blocks.{i}.attn.qkv.weight`-style layout with `.pth` positional
-mapping; see "Design notes" in the git history.
+mapping; see "Design notes" in the git history. It requires converting the
+published checkpoint to that layout and only accepts F32.
 
 ## Verification
 
@@ -363,5 +366,5 @@ Real-weights verification: tokenize parity is covered by the golden tests;
 the encoder loader is checked tensor-by-tensor against the published
 `text_encoder` index (names/shapes/dtypes); end-to-end, run §(c) on a
 CUDA/HIP build and compare latents against the reference
-`pipeline_moss_image.py` (tolerances TBD once dtypes/layouts are pinned),
+`pipeline_moss_image.py` (tolerances TBD),
 mirroring `examples/sana/Test_SanaGolden.cpp`.
