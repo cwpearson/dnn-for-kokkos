@@ -51,8 +51,9 @@
 //   * Mid-block attention goes through attention_mha_bidirectional, which
 //     owns the cuDNN ladder (float path; native streaming kernel
 //     otherwise / on failure).
-//   * conv3x3_forward owns its (documented) native/MIOpen behavior; on
-//     CUDA it runs the native kernel (see KokkosDNN_Conv.hpp TPL note).
+//   * conv3x3_forward owns the im2col + gemm_bias lowering (cuBLAS
+//     ladder on CUDA, MIOpen path on HIP builds; see KokkosDNN_Conv.hpp
+//     TPL note).
 //   * GroupNorm goes through groupnorm_forward, SiLU/upsample/residual/
 //     denormalize/depth-to-space are native elementwise (no TPL expresses
 //     them, so native == dispatched by construction — same rationale as
@@ -629,46 +630,159 @@ struct SafeFile {
 // In-place SiLU over a contiguous [C,H,W] view (SiLU(x) = x*sigmoid(x),
 // FP32, cast back). Same math as silu_forward; kept header-local so the
 // decoder can stay in NCHW layout without flattening through view casts.
+//
+// Flat 1D RangePolicy with w innermost: consecutive threads step along w,
+// the LayoutRight-contiguous dimension, so both the read and the write
+// are coalesced. (A Rank<3> MDRangePolicy steps the leftmost index with
+// consecutive threads on CUDA, i.e. channel-strided ~8x sector waste on
+// both streams here -- measured ~4x on the 512x512 layers.)
 template <class ExecSpace, class V3>
 void silu_inplace_3d(const V3& v, const std::string& label) {
   const size_t C = v.extent(0), H = v.extent(1), W = v.extent(2);
   if (C == 0 || H == 0 || W == 0) return;
   Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<3>>({0, 0, 0},
-                                                              {C, H, W}),
-      KOKKOS_LAMBDA(size_t c, size_t h, size_t w) {
+      label, Kokkos::RangePolicy<ExecSpace>(0, C * H * W),
+      KOKKOS_LAMBDA(size_t e) {
+        const size_t c = e / (H * W), rem = e % (H * W);
+        const size_t h = rem / W, w = rem % W;
         const float x = static_cast<float>(v(c, h, w));
         v(c, h, w) = static_cast<typename V3::value_type>(
             x / (1.0f + expf(-x)));
       });
 }
 
-// y += x over [C,H,W] (residual add; x and y must not alias).
+// y += x over [C,H,W] (residual add; x and y must not alias). Same flat,
+// w-innermost mapping as silu_inplace_3d: all three streams coalesced.
 template <class ExecSpace, class V3>
 void add_3d(const V3& y, const V3& x, const std::string& label) {
   const size_t C = y.extent(0), H = y.extent(1), W = y.extent(2);
   if (C == 0 || H == 0 || W == 0) return;
   Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<3>>({0, 0, 0},
-                                                              {C, H, W}),
-      KOKKOS_LAMBDA(size_t c, size_t h, size_t w) {
+      label, Kokkos::RangePolicy<ExecSpace>(0, C * H * W),
+      KOKKOS_LAMBDA(size_t e) {
+        const size_t c = e / (H * W), rem = e % (H * W);
+        const size_t h = rem / W, w = rem % W;
         y(c, h, w) = static_cast<typename V3::value_type>(
             static_cast<float>(y(c, h, w)) + static_cast<float>(x(c, h, w)));
       });
 }
 
-// Nearest-neighbor 2x upsample: y [C,2H,2W] from x [C,H,W].
+// Nearest-neighbor 2x upsample: y [C,2H,2W] from x [C,H,W]. Same flat,
+// w-innermost mapping: consecutive threads read (mostly) the same input
+// element pair and write consecutive outputs -- coalesced.
 template <class ExecSpace, class V3>
 void nearest_upsample2x_3d(const V3& x, const V3& y, const std::string& label) {
   const size_t C = x.extent(0), H = x.extent(1), W = x.extent(2);
   if (C == 0 || H == 0 || W == 0) return;
   Kokkos::parallel_for(
-      label,
-      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<3>>({0, 0, 0},
-                                                       {C, 2 * H, 2 * W}),
-      KOKKOS_LAMBDA(size_t c, size_t h2, size_t w2) {
+      label, Kokkos::RangePolicy<ExecSpace>(0, C * 2 * H * 2 * W),
+      KOKKOS_LAMBDA(size_t e) {
+        const size_t c = e / (2 * H * 2 * W), rem = e % (2 * H * 2 * W);
+        const size_t h2 = rem / (2 * W), w2 = rem % (2 * W);
         y(c, h2, w2) = x(c, h2 / 2, w2 / 2);
       });
+}
+
+// 32x32 scratch-tiled transpose between [C,H,W] and [T=H*W,C] token rows.
+// A direct kernel always strides on one side (channel stride H*W vs token
+// row stride C); staging a 32-channel x 32-position tile in scratch makes
+// both the NCHW and the token stream coalesced. Portable: TeamPolicy +
+// team scratch only; the team size is probed at runtime (same pattern as
+// Impl::gemv_native) so team-incapable backends still run correctly.
+// The [32][33] pad avoids shared-memory bank conflicts on the transposed
+// side; it is just a size, not backend-gated code.
+template <class ExecSpace>
+struct TransposeTileFunctor {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  using V3 = Kokkos::View<float***, Kokkos::LayoutRight, ExecSpace,
+                          Kokkos::MemoryUnmanaged>;
+  using V2 = Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace,
+                         Kokkos::MemoryUnmanaged>;
+  V3 nchw;  // [C,H,W]
+  V2 tok;   // [T,C] with T = H*W
+  size_t H, W, shBytes;
+  bool to_tokens;  // true: nchw -> tok; false: tok -> nchw
+
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& team) const {
+    constexpr int TT = 32;
+    const int Tk = team.team_size();
+    const int rank = team.team_rank();
+    float* sh = static_cast<float*>(team.team_scratch(0).get_shmem(shBytes));
+    // tile[dc][dt]: dc = channel within tile, dt = position within tile.
+    auto at = [&](int dc, int dt) -> float& { return sh[dc * (TT + 1) + dt]; };
+    const size_t C = nchw.extent(0), T = H * W;
+    const size_t nCT = (C + TT - 1) / TT, nTT = (T + TT - 1) / TT;
+    const size_t tile = static_cast<size_t>(team.league_rank());
+    const size_t tc = tile / nTT, tt = tile % nTT;
+    const size_t c0 = tc * TT, t0 = tt * TT;
+    if (to_tokens) {
+      // Load NCHW tile coalesced (consecutive threads: consecutive dt =
+      // consecutive w within a row), then store tokens coalesced
+      // (consecutive threads: consecutive dc = consecutive c in a row).
+      for (int q = rank; q < TT * TT; q += Tk) {
+        const int dc = q / TT, dt = q % TT;
+        const size_t t = t0 + static_cast<size_t>(dt);
+        float v = 0.0f;
+        if (c0 + static_cast<size_t>(dc) < C && t < T)
+          v = nchw(c0 + static_cast<size_t>(dc), t / W, t % W);
+        at(dc, dt) = v;
+      }
+      team.team_barrier();
+      for (int q = rank; q < TT * TT; q += Tk) {
+        const int dc = q % TT, dt = q / TT;
+        const size_t t = t0 + static_cast<size_t>(dt);
+        if (c0 + static_cast<size_t>(dc) < C && t < T)
+          tok(t, c0 + static_cast<size_t>(dc)) = at(dc, dt);
+      }
+    } else {
+      // Mirror image: load tokens coalesced, store NCHW coalesced.
+      for (int q = rank; q < TT * TT; q += Tk) {
+        const int dc = q % TT, dt = q / TT;
+        const size_t t = t0 + static_cast<size_t>(dt);
+        float v = 0.0f;
+        if (c0 + static_cast<size_t>(dc) < C && t < T)
+          v = tok(t, c0 + static_cast<size_t>(dc));
+        at(dc, dt) = v;
+      }
+      team.team_barrier();
+      for (int q = rank; q < TT * TT; q += Tk) {
+        const int dc = q / TT, dt = q % TT;
+        const size_t t = t0 + static_cast<size_t>(dt);
+        if (c0 + static_cast<size_t>(dc) < C && t < T)
+          nchw(c0 + static_cast<size_t>(dc), t / W, t % W) = at(dc, dt);
+      }
+    }
+  }
+};
+
+// Shared launcher for the tiled transposes below.
+template <class ExecSpace>
+void transpose_tile_launch(
+    const Kokkos::View<float***, Kokkos::LayoutRight, ExecSpace,
+                       Kokkos::MemoryUnmanaged>& nchw,
+    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace,
+                       Kokkos::MemoryUnmanaged>& tok,
+    size_t H, size_t W, bool to_tokens, const std::string& label) {
+  constexpr int TT = 32;
+  const size_t C = nchw.extent(0), T = H * W;
+  if (C == 0 || T == 0) return;
+  using Functor = TransposeTileFunctor<ExecSpace>;
+  const size_t shBytes = static_cast<size_t>(TT) * (TT + 1) * sizeof(float);
+  int team_size = 128;
+  {
+    Kokkos::TeamPolicy<ExecSpace> probe(1, 1);
+    probe.set_scratch_size(0, Kokkos::PerTeam(shBytes));
+    Functor f{nchw, tok, H, W, shBytes, to_tokens};
+    int mx = probe.team_size_max(f, Kokkos::ParallelForTag{});
+    if (mx < team_size) team_size = mx;
+    if (team_size < 1) team_size = 1;
+  }
+  const size_t nCT = (C + TT - 1) / TT, nTT = (T + TT - 1) / TT;
+  Kokkos::TeamPolicy<ExecSpace> policy(static_cast<int>(nCT * nTT), team_size);
+  policy.set_scratch_size(0, Kokkos::PerTeam(shBytes));
+  Functor f{nchw, tok, H, W, shBytes, to_tokens};
+  Kokkos::parallel_for(label, policy, f);
 }
 
 // [C,H,W] -> [T=H*W, C] token rows (t = h*W + w), the layout the core
@@ -680,10 +794,13 @@ Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace> to_tokens(
   const size_t C = x.extent(0), H = x.extent(1), W = x.extent(2);
   Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace> t(label, H * W, C);
   if (C == 0 || H == 0 || W == 0) return t;
-  Kokkos::parallel_for(
-      label + "_k",
-      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<3>>({0, 0, 0}, {C, H, W}),
-      KOKKOS_LAMBDA(size_t c, size_t h, size_t w) { t(h * W + w, c) = x(c, h, w); });
+  using V3u = Kokkos::View<float***, Kokkos::LayoutRight, ExecSpace,
+                           Kokkos::MemoryUnmanaged>;
+  using V2u = Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace,
+                           Kokkos::MemoryUnmanaged>;
+  V3u xu(x.data(), C, H, W);
+  V2u tu(t.data(), H * W, C);
+  transpose_tile_launch<ExecSpace>(xu, tu, H, W, true, label + "_k");
   return t;
 }
 
@@ -694,10 +811,13 @@ Kokkos::View<float***, Kokkos::LayoutRight, ExecSpace> to_nchw(
     size_t H, size_t W, const std::string& label) {
   Kokkos::View<float***, Kokkos::LayoutRight, ExecSpace> x(label, C, H, W);
   if (C == 0 || H == 0 || W == 0) return x;
-  Kokkos::parallel_for(
-      label + "_k",
-      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<3>>({0, 0, 0}, {C, H, W}),
-      KOKKOS_LAMBDA(size_t c, size_t h, size_t w) { x(c, h, w) = t(h * W + w, c); });
+  using V3u = Kokkos::View<float***, Kokkos::LayoutRight, ExecSpace,
+                           Kokkos::MemoryUnmanaged>;
+  using V2u = Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace,
+                           Kokkos::MemoryUnmanaged>;
+  V3u xu(x.data(), C, H, W);
+  V2u tu(const_cast<float*>(t.data()), H * W, C);
+  transpose_tile_launch<ExecSpace>(xu, tu, H, W, false, label + "_k");
   return x;
 }
 
@@ -918,9 +1038,9 @@ class DecoderModel {
                                     x.extent(2), tag);
   }
 
-  // 3x3 stride-1 pad-1 conv via the core conv op (native on CUDA, MIOpen
-  // on HIP builds; see KokkosDNN_Conv.hpp). Empty bias (extent 0)
-  // selects the unbiased path.
+  // 3x3 stride-1 pad-1 conv via the lowered core conv op (im2col +
+  // gemm_bias, cuBLAS ladder on CUDA, MIOpen on HIP builds; see
+  // KokkosDNN_Conv.hpp). Empty bias (extent 0) selects the unbiased path.
   View3 conv3x3(const View3& x,
                 const Kokkos::View<float****, Kokkos::LayoutRight, ExecSpace>&
                     wt,
