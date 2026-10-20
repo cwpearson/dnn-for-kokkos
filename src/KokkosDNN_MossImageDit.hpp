@@ -1369,6 +1369,8 @@ class MossImageDitModel {
   // (the default negative-branch skip is {22} at the pipeline level).
   // No cross-sample interaction: each sample is truncated to its valid
   // text length before concat, exactly like the reference batch loop.
+  // Callers with all-valid captions should prefer forward_all_valid below
+  // (identical result, no mask traffic).
   template <class MaskView>
   void forward(const L4& latents, const F1& timestep, const V3& encoder,
                const MaskView& mask, const L4& out,
@@ -1401,27 +1403,87 @@ class MossImageDitModel {
           "MossImageDitModel::forward: out must be [B, C, H, W]");
     if (B == 0) return;
 
-    const size_t D = (size_t)cfg_.dim, F = (size_t)cfg_.ffn_dim,
-                 Fr = (size_t)cfg_.freq_dim;
-    const size_t Nh = (size_t)cfg_.num_heads, Hd = D / Nh;
-    const size_t HW = H * Wd;
-    const float attn_scale = 1.0f / std::sqrt((float)Hd);
-
-    // Host copies of the tiny per-sample metadata (mask + timestep).
+    // Host copies of the tiny per-sample metadata (mask + timestep). The
+    // gather lists hoist the per-sample scan out of the shared body below.
     auto hmask = Kokkos::create_mirror_view(mask);
     Kokkos::deep_copy(hmask, mask);
     auto htime = Kokkos::create_mirror_view(timestep);
     Kokkos::deep_copy(htime, timestep);
     std::vector<size_t> nvalid(B, 0);
+    std::vector<std::vector<int>> gather(B);
     for (size_t b = 0; b < B; ++b) {
-      size_t n = 0;
       for (size_t s = 0; s < S; ++s)
-        if (hmask(b, s)) ++n;
-      if (n == 0)
+        if (hmask(b, s)) gather[b].push_back((int)s);
+      if (gather[b].empty())
         throw std::invalid_argument(
             "MossImageDitModel::forward: each sample needs >= 1 valid token");
-      nvalid[b] = n;
+      nvalid[b] = gather[b].size();
     }
+
+    forward_core(latents, htime, nvalid, &gather, encoder, out, skips, label);
+  }
+
+  // All-valid fast path: bitwise identical to forward() with every mask
+  // entry nonzero, but without any mask allocation on the caller side and
+  // without the mask device->host copy + host scan here (the sample loop
+  // always passes all-valid captions, so it calls this instead). Only the
+  // timestep crosses device->host, for the host float64 time sinusoid.
+  void forward_all_valid(const L4& latents, const F1& timestep,
+                         const V3& encoder, const L4& out,
+                         const std::vector<int>& skip_layers = {},
+                         const std::string& label = "KokkosDNN::moss_dit") {
+    const std::vector<int> skips =
+        MossImage::moss_checked_skip_layers(skip_layers, cfg_.num_layers);
+    const size_t B = latents.extent(0), C = latents.extent(1),
+                 H = latents.extent(2), Wd = latents.extent(3);
+    const size_t S = encoder.extent(1), Td = encoder.extent(2);
+    if (C != (size_t)cfg_.latent_channels)
+      throw std::invalid_argument("MossImageDitModel::forward: latents must be"
+                                  " [B, latent_channels, H, W]");
+    if (H == 0 || Wd == 0)
+      throw std::invalid_argument(
+          "MossImageDitModel::forward: H and W must be > 0");
+    if (encoder.extent(0) != B || Td != (size_t)cfg_.text_dim)
+      throw std::invalid_argument(
+          "MossImageDitModel::forward: encoder must be [B, S, text_dim]");
+    if (timestep.extent(0) != B)
+      throw std::invalid_argument(
+          "MossImageDitModel::forward: timestep must be [B]");
+    if (out.extent(0) != B || out.extent(1) != C || out.extent(2) != H ||
+        out.extent(3) != Wd)
+      throw std::invalid_argument(
+          "MossImageDitModel::forward: out must be [B, C, H, W]");
+    if (S == 0)
+      throw std::invalid_argument(
+          "MossImageDitModel::forward: each sample needs >= 1 valid token");
+    if (B == 0) return;
+    auto htime = Kokkos::create_mirror_view(timestep);
+    Kokkos::deep_copy(htime, timestep);
+    const std::vector<size_t> nvalid(B, S);
+    forward_core(latents, htime, nvalid, nullptr, encoder, out, skips, label);
+  }
+
+  // Shared forward body for both entries above. `gather` holds the
+  // per-sample valid token indices; nullptr selects the identity gather
+  // (every token valid). Same-stream ordering already sequences each
+  // deep_copy and kernel launch below (the cached cuBLAS/cuDNN handles
+  // re-select the Kokkos stream per call), so the body issues no fences;
+  // callers fence only where the host consumes device data.
+  void forward_core(const L4& latents,
+                    const typename F1::host_mirror_type& htime,
+                    const std::vector<size_t>& nvalid,
+                    const std::vector<std::vector<int>>* gather,
+                    const V3& encoder, const L4& out,
+                    const std::vector<int>& skips, const std::string& label) {
+    const size_t B = latents.extent(0);
+    const size_t S = encoder.extent(1);
+    const size_t H = latents.extent(2), Wd = latents.extent(3);
+    const size_t C = latents.extent(1), Td = encoder.extent(2);
+    const size_t D = (size_t)cfg_.dim, F = (size_t)cfg_.ffn_dim,
+                 Fr = (size_t)cfg_.freq_dim;
+    const size_t Nh = (size_t)cfg_.num_heads, Hd = D / Nh;
+    const size_t HW = H * Wd;
+    const float attn_scale = 1.0f / std::sqrt((float)Hd);
 
     auto& W = weights_;
     auto& Sc = scratch_;
@@ -1532,9 +1594,12 @@ class MossImageDitModel {
       {
         I1 gidx = Sc.i1.get("gidx", Sv);
         auto hgidx = Kokkos::create_mirror_view(gidx);
-        size_t n = 0;
-        for (size_t s = 0; s < S; ++s)
-          if (hmask(b, s)) hgidx(n++) = (int)s;
+        if (gather) {
+          const std::vector<int>& lst = (*gather)[b];
+          for (size_t i = 0; i < Sv; ++i) hgidx(i) = lst[i];
+        } else {
+          for (size_t i = 0; i < Sv; ++i) hgidx(i) = (int)i;
+        }
         Kokkos::deep_copy(gidx, hgidx);
         auto enc_b =
             Kokkos::subview(encoder, b, Kokkos::ALL(), Kokkos::ALL());
