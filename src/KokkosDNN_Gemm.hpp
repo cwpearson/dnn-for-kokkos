@@ -164,6 +164,11 @@ struct TiledGemmFunctor {
   Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> X, W, Y;
   float alpha_f, beta_f;
   size_t M, N, K, tilesN, nSlabs, shBytes;
+  // Optional row-broadcast bias for fused gemm_bias: bias[j] is added in
+  // FP32 at write-back (nullptr = plain GEMM). A raw device pointer keeps
+  // the functor trivially copyable and lets every existing aggregate
+  // initializer keep working (defaulted to nullptr).
+  const Scalar* bias = nullptr;
 
   KOKKOS_INLINE_FUNCTION
   void operator()(const Member& team) const {
@@ -299,7 +304,11 @@ struct TiledGemmFunctor {
       team.team_barrier();
     }
 
-    // -- write-back with alpha/beta, guarded at M/N edges --
+    // -- write-back with alpha/beta and optional fused bias, guarded at
+    // M/N edges. Bias is added in FP32 before the single output cast
+    // (matches torch addmm / cublasLt BIAS-epilogue order; the old split
+    // gemm+bias path rounded to Scalar between the two ops, so bf16
+    // results may differ from the split path by <= 1 ulp).
     for (int r = 0; r < RT; ++r) {
       for (int c = 0; c < CT; ++c) {
         const size_t i = i0 + size_t(tr * RT + r);
@@ -308,7 +317,10 @@ struct TiledGemmFunctor {
           float yold =
               (beta_f != 0) ? beta_f * static_cast<float>(Yd[i * sy0 + j])
                             : 0.0f;
-          Yd[i * sy0 + j] = static_cast<Scalar>(alpha_f * acc[r][c] + yold);
+          const float bb =
+              (bias != nullptr) ? static_cast<float>(bias[j]) : 0.0f;
+          Yd[i * sy0 + j] =
+              static_cast<Scalar>(alpha_f * acc[r][c] + yold + bb);
         }
       }
     }
@@ -319,16 +331,19 @@ struct TiledGemmFunctor {
 // (team_size_max < kernel TeamSize, e.g. Serial): one output element per
 // thread, K-loop over global memory. Obviously correct, memory-bound --
 // the tiled kernel below is what every team-capable backend runs.
+// Optional fused bias (see TiledGemmFunctor::bias).
 template <class ExecSpace, class Scalar>
 void gemm_naive(
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& X,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& W,
     float alpha_f, float beta_f,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& Y,
-    const std::string& label);
+    const std::string& label, const Scalar* bias = nullptr);
 
 // Geometry-parameterized launch: shared-memory tiled kernel (design notes at
-// Impl top). Portable -- TeamPolicy + team scratch only.
+// Impl top). Portable -- TeamPolicy + team scratch only. Optional fused
+// bias (raw device pointer, nullptr = plain GEMM) for gemm_bias so the
+// native path is exactly one kernel launch.
 template <class ExecSpace, class Scalar, int TM, int TN, int TK, int RT,
           int CT, int UNROLL>
 void gemm_tiled_impl(
@@ -336,7 +351,7 @@ void gemm_tiled_impl(
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& W,
     float alpha_f, float beta_f,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& Y,
-    const std::string& label) {
+    const std::string& label, const Scalar* bias = nullptr) {
   using Functor = TiledGemmFunctor<ExecSpace, Scalar, TM, TN, TK, RT, CT,
                                    false, UNROLL>;
   using FunctorV =
@@ -374,17 +389,19 @@ void gemm_tiled_impl(
     Kokkos::TeamPolicy<ExecSpace> probe(1, 1);
     probe.set_scratch_size(0, Kokkos::PerTeam(shBytes));
     if (use_vec) {
-      FunctorV fv{X, W, Y, alpha_f, beta_f, M, N, K, tilesN, nSlabs, shBytes};
+      FunctorV fv{X, W, Y, alpha_f, beta_f, M, N, K,
+                  tilesN, nSlabs, shBytes, bias};
       if (probe.team_size_max(fv, Kokkos::ParallelForTag{}) <
           FunctorV::TeamSize) {
-        gemm_naive<ExecSpace, Scalar>(X, W, alpha_f, beta_f, Y, label);
+        gemm_naive<ExecSpace, Scalar>(X, W, alpha_f, beta_f, Y, label, bias);
         return;
       }
     } else {
-      Functor f{X, W, Y, alpha_f, beta_f, M, N, K, tilesN, nSlabs, shBytes};
+      Functor f{X, W, Y, alpha_f, beta_f, M, N, K,
+                tilesN, nSlabs, shBytes, bias};
       if (probe.team_size_max(f, Kokkos::ParallelForTag{}) <
           Functor::TeamSize) {
-        gemm_naive<ExecSpace, Scalar>(X, W, alpha_f, beta_f, Y, label);
+        gemm_naive<ExecSpace, Scalar>(X, W, alpha_f, beta_f, Y, label, bias);
         return;
       }
     }
@@ -395,10 +412,12 @@ void gemm_tiled_impl(
   policy.set_scratch_size(0, Kokkos::PerTeam(shBytes));
 
   if (use_vec) {
-    FunctorV f{X, W, Y, alpha_f, beta_f, M, N, K, tilesN, nSlabs, shBytes};
+    FunctorV f{X, W, Y, alpha_f, beta_f, M, N, K,
+               tilesN, nSlabs, shBytes, bias};
     Kokkos::parallel_for(label, policy, f);
   } else {
-    Functor f{X, W, Y, alpha_f, beta_f, M, N, K, tilesN, nSlabs, shBytes};
+    Functor f{X, W, Y, alpha_f, beta_f, M, N, K,
+              tilesN, nSlabs, shBytes, bias};
     Kokkos::parallel_for(label, policy, f);
   }
 }
@@ -413,7 +432,7 @@ void gemm_naive(
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& W,
     float alpha_f, float beta_f,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& Y,
-    const std::string& label) {
+    const std::string& label, const Scalar* bias) {
   const size_t M = X.extent(0), K = X.extent(1), N = W.extent(0);
   if (M == 0 || N == 0 || K == 0) return;
   Kokkos::parallel_for(
@@ -422,8 +441,11 @@ void gemm_naive(
         float acc = 0;
         for (size_t k = 0; k < K; ++k)
           acc += static_cast<float>(X(i, k)) * static_cast<float>(W(j, k));
+        const float bb =
+            (bias != nullptr) ? static_cast<float>(bias[j]) : 0.0f;
         Y(i, j) = static_cast<Scalar>(alpha_f * acc +
-                                      beta_f * static_cast<float>(Y(i, j)));
+                                      beta_f * static_cast<float>(Y(i, j)) +
+                                      bb);
       });
 }
 
@@ -433,7 +455,7 @@ void gemm_tiled(
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& W,
     float alpha_f, float beta_f,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& Y,
-    const std::string& label) {
+    const std::string& label, const Scalar* bias = nullptr) {
   const size_t M = X.extent(0);
   // Small-M specialization ladder (parallelism comes from N; finer N-tiling
   // multiplies teams with the same K range in flight; no padded-row waste
@@ -446,13 +468,14 @@ void gemm_tiled(
   if (M <= size_t(GemmThinFineTM)) {
     gemm_tiled_impl<ExecSpace, Scalar, GemmThinFineTM, GemmThinFineTN,
                     GemmThinFineTK, GemmThinFineRT, GemmThinFineCT, 4>(
-        X, W, alpha_f, beta_f, Y, label);
+        X, W, alpha_f, beta_f, Y, label, bias);
   } else if (M <= size_t(GemmMidTM) * 2) {
     gemm_tiled_impl<ExecSpace, Scalar, GemmMidTM, GemmMidTN, GemmMidTK,
-                    GemmMidRT, GemmMidCT, 2>(X, W, alpha_f, beta_f, Y, label);
+                    GemmMidRT, GemmMidCT, 2>(X, W, alpha_f, beta_f, Y, label,
+                                             bias);
   } else {
     gemm_tiled_impl<ExecSpace, Scalar, GemmTM, GemmTN, GemmTK, GemmRT, GemmCT,
-                    2>(X, W, alpha_f, beta_f, Y, label);
+                    2>(X, W, alpha_f, beta_f, Y, label, bias);
   }
 }
 
@@ -497,6 +520,9 @@ struct GemvFunctor {
   WView W;
   float alpha_f, beta_f;
   size_t N, K, nSlabs, shBytes, sw0;
+  // Optional fused bias for gemv_bias (nullptr = plain GEMV); added in
+  // FP32 before the single output cast, same order as the GEMM fusion.
+  const Scalar* bias = nullptr;
 
   KOKKOS_INLINE_FUNCTION
   void operator()(const Member& team) const {
@@ -571,7 +597,9 @@ struct GemvFunctor {
     if (t == 0) {
       float yold =
           (beta_f != 0) ? beta_f * static_cast<float>(Yd[j]) : 0.0f;
-      Yd[j] = static_cast<Scalar>(alpha_f * team_sum + yold);
+      const float bb =
+          (bias != nullptr) ? static_cast<float>(bias[j]) : 0.0f;
+      Yd[j] = static_cast<Scalar>(alpha_f * team_sum + yold + bb);
     }
   }
 };
@@ -579,13 +607,15 @@ struct GemvFunctor {
 // Native GEMV launcher: runtime UseVec selection + team-size probe (same
 // pattern as gemm_tiled_impl). FP32 accumulation, result cast to Scalar.
 // XView/YView are rank-1 views (managed, or unmanaged row aliases for the
-// rank-2 M == 1 reuse below); WView stays rank-2 LayoutRight.
+// rank-2 M == 1 reuse below); WView stays rank-2 LayoutRight. Optional
+// fused bias (raw device pointer, nullptr = plain GEMV) for gemv_bias and
+// the rank-2 M == 1 gemm_bias path.
 template <class ExecSpace, class Scalar, class XView, class YView>
 void gemv_native(
     const XView& x,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& W,
     float alpha_f, float beta_f, const YView& y,
-    const std::string& label) {
+    const std::string& label, const Scalar* bias = nullptr) {
   using Vec4 = GemmVec4<Scalar>;
   const size_t K = x.extent(0), N = W.extent(0);
   if (N == 0 || K == 0) return;
@@ -613,11 +643,11 @@ void gemv_native(
     int mx;
     if (use_vec) {
       GemvFunctor<ExecSpace, Scalar, XView, YView, true> f{
-          x, y, W, alpha_f, beta_f, N, K, nSlabs, shBytes, sw0};
+          x, y, W, alpha_f, beta_f, N, K, nSlabs, shBytes, sw0, bias};
       mx = probe.team_size_max(f, Kokkos::ParallelForTag{});
     } else {
       GemvFunctor<ExecSpace, Scalar, XView, YView, false> f{
-          x, y, W, alpha_f, beta_f, N, K, nSlabs, shBytes, sw0};
+          x, y, W, alpha_f, beta_f, N, K, nSlabs, shBytes, sw0, bias};
       mx = probe.team_size_max(f, Kokkos::ParallelForTag{});
     }
     if (mx < team_size) team_size = mx;
@@ -628,11 +658,11 @@ void gemv_native(
   policy.set_scratch_size(0, Kokkos::PerTeam(shBytes));
   if (use_vec) {
     GemvFunctor<ExecSpace, Scalar, XView, YView, true> f{
-        x, y, W, alpha_f, beta_f, N, K, nSlabs, shBytes, sw0};
+        x, y, W, alpha_f, beta_f, N, K, nSlabs, shBytes, sw0, bias};
     Kokkos::parallel_for(label, policy, f);
   } else {
     GemvFunctor<ExecSpace, Scalar, XView, YView, false> f{
-        x, y, W, alpha_f, beta_f, N, K, nSlabs, shBytes, sw0};
+        x, y, W, alpha_f, beta_f, N, K, nSlabs, shBytes, sw0, bias};
     Kokkos::parallel_for(label, policy, f);
   }
 }

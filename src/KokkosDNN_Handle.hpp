@@ -11,6 +11,7 @@
 // free of TPL types (cached handles are opaque void*).
 #ifdef KOKKOSDNN_ENABLE_CUBLAS
 #include "tpl/cublas/KokkosDNN_CuBLAS_Handle.hpp"
+#include "tpl/cublas/KokkosDNN_CuBLAS_GemmBiasLt.hpp"
 #endif
 #ifdef KOKKOSDNN_ENABLE_CUDNN
 #include "tpl/cudnn/KokkosDNN_CuDNN_Handle.hpp"
@@ -64,6 +65,10 @@ struct DNNHandle {
   mutable void* cudnn_ptr_   = nullptr;
   mutable void* hipblas_ptr_ = nullptr;
   mutable void* miopen_ptr_  = nullptr;
+  // Opaque cached cublasLt fused-bias state (Impl::CublasLtBiasState: one
+  // cublasLt handle plus per-shape GEMM+bias plans). Same lazy/nullable
+  // contract as the handles above; only used by gemm_bias/gemv_bias.
+  mutable void* cublaslt_bias_ptr_ = nullptr;
 
   DNNHandle() {
 #if (defined(KOKKOSDNN_ENABLE_CUBLAS) || defined(KOKKOSDNN_ENABLE_CUDNN)) && \
@@ -109,7 +114,8 @@ struct DNNHandle {
         cublas_ptr_(other.cublas_ptr_),
         cudnn_ptr_(other.cudnn_ptr_),
         hipblas_ptr_(other.hipblas_ptr_),
-        miopen_ptr_(other.miopen_ptr_) {
+        miopen_ptr_(other.miopen_ptr_),
+        cublaslt_bias_ptr_(other.cublaslt_bias_ptr_) {
     other.use_cublas   = false;
     other.use_cudnn    = false;
     other.use_hipblas  = false;
@@ -118,6 +124,7 @@ struct DNNHandle {
     other.cudnn_ptr_   = nullptr;
     other.hipblas_ptr_ = nullptr;
     other.miopen_ptr_  = nullptr;
+    other.cublaslt_bias_ptr_ = nullptr;
   }
 
   DNNHandle& operator=(DNNHandle&& other) noexcept {
@@ -131,6 +138,7 @@ struct DNNHandle {
       cudnn_ptr_   = other.cudnn_ptr_;
       hipblas_ptr_ = other.hipblas_ptr_;
       miopen_ptr_  = other.miopen_ptr_;
+      cublaslt_bias_ptr_ = other.cublaslt_bias_ptr_;
       other.use_cublas   = false;
       other.use_cudnn    = false;
       other.use_hipblas  = false;
@@ -139,6 +147,7 @@ struct DNNHandle {
       other.cudnn_ptr_   = nullptr;
       other.hipblas_ptr_ = nullptr;
       other.miopen_ptr_  = nullptr;
+      other.cublaslt_bias_ptr_ = nullptr;
     }
     return *this;
   }
@@ -156,6 +165,25 @@ struct DNNHandle {
         cublas_ptr_ = Impl::cublas_handle_create();
       }
       return cublas_ptr_;
+    }
+#endif
+    return nullptr;
+  }
+
+  // Lazily created cached cublasLt fused-bias state (nullptr when
+  // unusable: non-CUDA space, TPL disabled, or creation failure -- callers
+  // fall back then). Const so gemm_bias/gemv_bias can take
+  // `const DNNHandle&`. Lifecycle in
+  // tpl/cublas/KokkosDNN_CuBLAS_GemmBiasLt.hpp.
+  void* cublaslt_bias_state() const {
+#if defined(KOKKOSDNN_ENABLE_CUBLAS) && defined(KOKKOS_ENABLE_CUDA)
+    // See ctor: backend named deliberately, this state is CUDA-only.
+    constexpr bool is_cuda = std::is_same_v<ExecSpace, Kokkos::Cuda>;
+    if constexpr (is_cuda) {
+      if (use_cublas && cublaslt_bias_ptr_ == nullptr) {
+        cublaslt_bias_ptr_ = Impl::cublaslt_bias_state_create();
+      }
+      return cublaslt_bias_ptr_;
     }
 #endif
     return nullptr;
@@ -213,8 +241,10 @@ struct DNNHandle {
    void destroy() {
 #if defined(KOKKOSDNN_ENABLE_CUBLAS) && defined(KOKKOS_ENABLE_CUDA)
     Impl::cublas_handle_destroy(cublas_ptr_);
+    Impl::cublaslt_bias_state_destroy(cublaslt_bias_ptr_);
 #else
     cublas_ptr_ = nullptr;
+    cublaslt_bias_ptr_ = nullptr;
 #endif
 #if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)
     Impl::cudnn_handle_destroy(cudnn_ptr_);
