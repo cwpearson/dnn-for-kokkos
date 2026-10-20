@@ -128,6 +128,60 @@ KOKKOS_INLINE_FUNCTION float moss_situ_scalar(float h, float g) {
   return (4.0f * tanhf(g / 4.0f) * sig) * (25.0f * tanhf(h / 25.0f));
 }
 
+// Team functor for moss_rmsnorm_modulate_forward: one team per (b, t) row.
+// Both the sum-of-squares reduction and the normalize/modulate write-back
+// run as TeamThreadRange parallel constructs over D, so consecutive threads
+// touch consecutive D elements (fully coalesced under LayoutRight,
+// auto-vectorized) with full GPU occupancy. Same two-pass FP32 algorithm
+// and eps placement as the original serial-row code:
+//   inv = 1/sqrt(sum(x^2)/D + eps);
+//   y = (x * inv * w) * (1 + scale) + shift.
+// In-place safe: the reduction only reads x; writes start after the team's
+// reduction completes, and each (row, col) write reads only its own input
+// element. Named functor (not a nested extended lambda): nvcc rejects an
+// extended lambda defined inside another extended lambda, so the team body
+// lives in operator() where inner KOKKOS_LAMBDA levels are legal.
+template <class ExecSpace, class Scalar>
+struct MossRmsNormModulateFunctor {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace> x, y;
+  Kokkos::View<Scalar*, ExecSpace> w;
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> shift, scale;
+  float eps;
+  size_t T, D;
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& member) const {
+    // Local handles: inner lambdas capture by value without an implicit
+    // `this` capture (quiets -Wdeprecated under C++20).
+    const auto X = x;
+    const auto Y = y;
+    const auto W = w;
+    const auto Sh = shift;
+    const auto Sc = scale;
+    const size_t row = static_cast<size_t>(member.league_rank());
+    const size_t b = row / T;
+    const size_t t = row % T;
+    const float Dn = static_cast<float>(D);
+    float ss = 0;
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(member, D),
+        KOKKOS_LAMBDA(size_t d, float& acc) {
+          const float v = static_cast<float>(X(b, t, d));
+          acc += v * v;
+        },
+        ss);
+    const float inv = 1.0f / sqrt(ss / Dn + eps);
+    Kokkos::parallel_for(
+        Kokkos::TeamThreadRange(member, D), KOKKOS_LAMBDA(size_t d) {
+          const float n = static_cast<float>(X(b, t, d)) * inv *
+                          static_cast<float>(W(d));
+          Y(b, t, d) = static_cast<Scalar>(
+              n * (1.0f + static_cast<float>(Sc(b, d))) +
+              static_cast<float>(Sh(b, d)));
+        });
+  }
+};
+
 }  // namespace Impl
 
 // Shift-aware timestep embedding: raw t in [0,1] is first mapped through
@@ -166,7 +220,11 @@ void moss_timestep_shifted(
 // shared_block_modulation slice: att-{shift,scale} or ffn-{shift,scale}).
 // Same FP32 RMSNorm math as rmsnorm(); the residual gate multiplies
 // outside (see moss_gate_residual_forward). In-place safe (x may alias y).
-// Dispatch: native elementwise (no TPL).
+// Dispatch: native elementwise (no TPL). Single TeamPolicy launch (one team
+// per (b, t) row, TeamThreadRange over D): fully coalesced on LayoutRight
+// data, replacing the old one-thread-per-row MDRange kernel whose serial
+// loop over D strided adjacent threads by D elements (~3% of peak
+// bandwidth on a pure streaming op).
 template <class ExecSpace, class Scalar>
 void moss_rmsnorm_modulate_forward(
     const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& x,
@@ -183,23 +241,11 @@ void moss_rmsnorm_modulate_forward(
   if (!(eps >= 0.0f) || !std::isfinite(eps))
     throw std::invalid_argument("moss_rmsnorm_modulate_forward: bad eps");
   if (B == 0 || T == 0 || D == 0) return;
+  Impl::MossRmsNormModulateFunctor<ExecSpace, Scalar> f{x, y, w,
+                                                        shift, scale, eps,
+                                                        T,     D};
   Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {B, T}),
-      KOKKOS_LAMBDA(size_t b, size_t t) {
-        float ss = 0;
-        for (size_t d = 0; d < D; ++d) {
-          float v = static_cast<float>(x(b, t, d));
-          ss += v * v;
-        }
-        float inv = 1.0f / sqrt(ss / static_cast<float>(D) + eps);
-        for (size_t d = 0; d < D; ++d) {
-          float n = static_cast<float>(x(b, t, d)) * inv *
-                    static_cast<float>(w(d));
-          y(b, t, d) = static_cast<Scalar>(
-              n * (1.0f + static_cast<float>(scale(b, d))) +
-              static_cast<float>(shift(b, d)));
-        }
-      });
+      label, Kokkos::TeamPolicy<ExecSpace>(B * T, Kokkos::AUTO), f);
 }
 
 // AdaLN-zero gated residual: out = x + gate[b,d] * branch, all [B,T,D] /
