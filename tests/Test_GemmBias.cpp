@@ -53,6 +53,124 @@ TEST(GemmBias, BHalf) { check_gemm_bias<Kokkos::Experimental::bhalf_t>(5e-2f); }
 
 TEST(GemmBias, Half) { check_gemm_bias<Kokkos::Experimental::half_t>(5e-2f); }
 
+// Skinny M=1 path (time-modulation GEMMs are B=1 rows): fused result vs
+// host reference, on both the dispatched handle (cublasLt BIAS epilogue
+// on CUDA) and a forced-native handle (bias folded into the GEMV
+// write-back). Non-square K != N so a transpose mixup cannot hide.
+template <class Scalar>
+void check_gemm_bias_m1(float tol) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  for (int force_native = 0; force_native < 2; ++force_native) {
+    KokkosDNN::DNNHandle<Exec> h;
+    if (force_native) {
+      h.use_cublas  = false;
+      h.use_cudnn   = false;
+      h.use_hipblas = false;
+      h.use_miopen  = false;
+    }
+    const int M = 1, K = 32, N = 48;
+    Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> X("X", M, K),
+        W("W", N, K), Y("Y", M, N);
+    Kokkos::View<Scalar*, Exec> b("b", N);
+    auto hx = Kokkos::create_mirror_view(X);
+    auto hw = Kokkos::create_mirror_view(W);
+    auto hb = Kokkos::create_mirror_view(b);
+    // Bounded modular fills: outputs stay O(1) so absolute tolerances are
+    // meaningful (unbounded fills reach O(1000), where summation-order
+    // noise alone exceeds a tight abs tol).
+    for (int k = 0; k < K; ++k)
+      hx(0, k) = static_cast<Scalar>(0.02f * ((k * 7) % 17) - 0.1f);
+    for (int j = 0; j < N; ++j)
+      for (int k = 0; k < K; ++k)
+        hw(j, k) = static_cast<Scalar>(0.02f * ((j + k * 3) % 19) - 0.1f);
+    for (int j = 0; j < N; ++j)
+      hb(j) = static_cast<Scalar>(0.05f * (j % 11) - 0.2f);
+    Kokkos::deep_copy(X, hx);
+    Kokkos::deep_copy(W, hw);
+    Kokkos::deep_copy(b, hb);
+    KokkosDNN::gemm_bias(h, X, W, b, Y);
+    Kokkos::fence();
+    auto got = Kokkos::create_mirror_view(Y);
+    Kokkos::deep_copy(got, Y);
+    for (int j = 0; j < N; ++j) {
+      float acc = 0;
+      for (int k = 0; k < K; ++k)
+        acc += static_cast<float>(hx(0, k)) * static_cast<float>(hw(j, k));
+      float want = acc + static_cast<float>(hb(j));
+      EXPECT_NEAR(static_cast<float>(got(0, j)), want, tol)
+          << "gemm_bias M=1 mismatch at (0," << j << ") native=" << force_native;
+    }
+  }
+}
+
+TEST(GemmBias, FloatM1Skinny) { check_gemm_bias_m1<float>(1e-4f); }
+
+TEST(GemmBias, BHalfM1Skinny) {
+  check_gemm_bias_m1<Kokkos::Experimental::bhalf_t>(5e-2f);
+}
+
+// Fused (single-pass) vs split (gemm + broadcast add) agreement: catches
+// orientation, broadcast-axis, or epilogue-shape bugs in the fusion while
+// tolerating legitimate kernel differences (cublasLt vs sgemm/GemmEx
+// summation order, single vs double output rounding for bf16). Covers the
+// M=1 row path and a multi-row tile path on both handles.
+template <class Scalar>
+void check_gemm_bias_matches_split(float tol) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  const int Ms[2] = {1, 5};
+  const int K = 8, N = 7;
+  for (int force_native = 0; force_native < 2; ++force_native) {
+    for (int mi = 0; mi < 2; ++mi) {
+      const int M = Ms[mi];
+      KokkosDNN::DNNHandle<Exec> h;
+      if (force_native) {
+        h.use_cublas  = false;
+        h.use_cudnn   = false;
+        h.use_hipblas = false;
+        h.use_miopen  = false;
+      }
+      Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> X("X", M, K),
+          W("W", N, K), Yf("Yf", M, N), Ys("Ys", M, N);
+      Kokkos::View<Scalar*, Exec> b("b", N);
+      auto hx = Kokkos::create_mirror_view(X);
+      auto hw = Kokkos::create_mirror_view(W);
+      auto hb = Kokkos::create_mirror_view(b);
+      for (int i = 0; i < M; ++i)
+        for (int k = 0; k < K; ++k)
+          hx(i, k) = static_cast<Scalar>(0.1f * (i * K + k + 1) - 0.3f);
+      for (int j = 0; j < N; ++j)
+        for (int k = 0; k < K; ++k)
+          hw(j, k) = static_cast<Scalar>(0.05f * (j * K - k + 2));
+      for (int j = 0; j < N; ++j)
+        hb(j) = static_cast<Scalar>(-0.5f + 0.25f * j);
+      Kokkos::deep_copy(X, hx);
+      Kokkos::deep_copy(W, hw);
+      Kokkos::deep_copy(b, hb);
+      KokkosDNN::gemm_bias(h, X, W, b, Yf);
+      KokkosDNN::gemm(h, static_cast<Scalar>(1), X, W, static_cast<Scalar>(0),
+                      Ys);
+      KokkosDNN::Impl::add_bias_2d<Exec, Scalar>(Ys, b, "split_bias");
+      Kokkos::fence();
+      auto gotf = Kokkos::create_mirror_view(Yf);
+      Kokkos::deep_copy(gotf, Yf);
+      auto gots = Kokkos::create_mirror_view(Ys);
+      Kokkos::deep_copy(gots, Ys);
+      for (int i = 0; i < M; ++i)
+        for (int j = 0; j < N; ++j)
+          EXPECT_NEAR(static_cast<float>(gotf(i, j)),
+                      static_cast<float>(gots(i, j)), tol)
+              << "fused-vs-split mismatch at (" << i << "," << j << ") M=" << M
+              << " native=" << force_native;
+    }
+  }
+}
+
+TEST(GemmBias, FloatMatchesSplit) { check_gemm_bias_matches_split<float>(1e-3f); }
+
+TEST(GemmBias, BHalfMatchesSplit) {
+  check_gemm_bias_matches_split<Kokkos::Experimental::bhalf_t>(1e-1f);
+}
+
 // Hand-computed transpose pin: identity rows of W select columns of X,
 // so Y = X * W^T + b is unambiguous (no-transpose X*W is not even
 // shape-valid here: [2,3] * [4,3]).

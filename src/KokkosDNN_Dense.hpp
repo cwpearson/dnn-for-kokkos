@@ -6,6 +6,7 @@
 #include <string>
 
 #include "KokkosDNN_Gemm.hpp"
+#include "KokkosDNN_GemmBias.hpp"
 #include "KokkosDNN_Handle.hpp"
 
 namespace KokkosDNN {
@@ -13,9 +14,11 @@ namespace KokkosDNN {
 // Fully-connected layer Y = X * W^T + b with
 //   X : [B, In] activations, W : [Out, In] weights, b : [Out] bias,
 //   Y : [B, Out].
-// Forward reuses gemm() (so the cuBLAS path still applies on CUDA) and adds
-// a small broadcast-bias kernel afterwards. Backward is three explicit
-// FP32-accumulation kernels (batch sizes here are tiny; no TPL needed):
+// Forward delegates to gemm_bias (which requires a non-empty bias, as
+// here), so it inherits the single-pass fusion: cublasLt BIAS epilogue on
+// CUDA, bias folded into the native kernel write-back elsewhere. Backward
+// is three explicit FP32-accumulation kernels (batch sizes here are tiny;
+// no TPL needed):
 //   db[o]    = sum_b dY[b,o]
 //   dW[o,i]  = sum_b dY[b,o] * X[b,i]
 //   dX[b,i]  = sum_o dY[b,o] * W[o,i]
@@ -34,14 +37,7 @@ void dense_forward(
     throw std::invalid_argument("dense_forward: dimension mismatch");
   const size_t Out = W.extent(0);
   if (B == 0 || In == 0 || Out == 0) return;
-  gemm(handle, static_cast<Scalar>(1), X, W, static_cast<Scalar>(0), Y, label);
-  Kokkos::parallel_for(
-      label + "_bias", Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0},
-                                                                        {B, Out}),
-      KOKKOS_LAMBDA(size_t i, size_t j) {
-        Y(i, j) = static_cast<Scalar>(static_cast<float>(Y(i, j)) +
-                                      static_cast<float>(b(j)));
-      });
+  gemm_bias(handle, X, W, b, Y, label);
 }
 
 template <class ExecSpace, class Scalar>

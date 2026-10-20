@@ -170,7 +170,9 @@ target_include_directories(kokkosdnn PUBLIC
 target_link_libraries(kokkosdnn PUBLIC Kokkos::kokkos)
 
 if(KokkosDNN_ENABLE_CUBLAS)
-  target_link_libraries(kokkosdnn PUBLIC CUDA::cublas)
+  # cublasLt backs the fused GEMM+bias epilogue in gemm_bias/gemv_bias
+  # (src/tpl/cublas/KokkosDNN_CuBLAS_GemmBiasLt.hpp).
+  target_link_libraries(kokkosdnn PUBLIC CUDA::cublas CUDA::cublasLt)
 endif()
 if(KokkosDNN_ENABLE_CUDNN)
   if(TARGET CUDNN::cudnn)
