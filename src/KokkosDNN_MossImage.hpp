@@ -206,14 +206,16 @@ void moss_rmsnorm_modulate_forward(
 // [B,D]. Covers the attention residual (* gate_a), the FFN residual
 // (* gate_f), and skipped-block semantics (a skipped block is the identity,
 // i.e. gate 0 with any branch). In-place safe (out may alias x/branch).
+// Views are layout-agnostic (managed or unmanaged aliases alike; only
+// extents and operator()(b/t/d) are used), so callers may pass zero-copy
+// reshapes over GEMM outputs instead of repacking.
 // Dispatch: native elementwise (no TPL).
-template <class ExecSpace, class Scalar>
-void moss_gate_residual_forward(
-    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& x,
-    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& branch,
-    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& gate,
-    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& out,
-    const std::string& label = "KokkosDNN::moss_gate_residual") {
+template <class ExecSpace, class Scalar, class XView, class BView, class GView,
+          class OView>
+void moss_gate_residual_forward(const XView& x, const BView& branch,
+                                const GView& gate, const OView& out,
+                                const std::string& label =
+                                    "KokkosDNN::moss_gate_residual") {
   const size_t B = x.extent(0), T = x.extent(1), D = x.extent(2);
   if (branch.extent(0) != B || branch.extent(1) != T || branch.extent(2) != D ||
       out.extent(0) != B || out.extent(1) != T || out.extent(2) != D ||
@@ -240,13 +242,14 @@ void moss_gate_residual_forward(
 // q, out: [B, S, H, Dh]; w: [Dh] (shared across heads, as in the
 // checkpoint). Same FP32 math as qk_rmsnorm3d(), extended to a batch of
 // joint sequences. eps = 1e-6 in the checkpoint. In-place safe.
+// Views are layout-agnostic (managed or unmanaged aliases alike; only
+// extents and operator()(b/s/h/d) are used).
 // Dispatch: native elementwise (no TPL).
-template <class ExecSpace, class Scalar>
-void moss_qk_rmsnorm_forward(
-    const Kokkos::View<Scalar****, Kokkos::LayoutRight, ExecSpace>& q,
-    const Kokkos::View<Scalar*, ExecSpace>& w, float eps,
-    const Kokkos::View<Scalar****, Kokkos::LayoutRight, ExecSpace>& out,
-    const std::string& label = "KokkosDNN::moss_qk_rmsnorm") {
+template <class ExecSpace, class Scalar, class QView, class WView, class OView>
+void moss_qk_rmsnorm_forward(const QView& q, const WView& w, float eps,
+                             const OView& out,
+                             const std::string& label =
+                                 "KokkosDNN::moss_qk_rmsnorm") {
   const size_t B = q.extent(0), S = q.extent(1), H = q.extent(2),
                Dh = q.extent(3);
   if (out.extent(0) != B || out.extent(1) != S || out.extent(2) != H ||
@@ -337,13 +340,13 @@ void moss_rope_build_forward(
 // x = [a, b] halves: out = x * C_full + cat(-b, a) * S_full.
 // x, out: [B, S, H, Dh]; rope: [1, S, Dh] from moss_rope_build_forward.
 // Apply separately to q and k (same rope). In-place safe.
+// Views are layout-agnostic (managed or unmanaged aliases alike; only
+// extents and operator() are used).
 // Dispatch: native elementwise (no TPL).
-template <class ExecSpace, class Scalar>
-void moss_rope_apply_forward(
-    const Kokkos::View<Scalar****, Kokkos::LayoutRight, ExecSpace>& x,
-    const Kokkos::View<float***, Kokkos::LayoutRight, ExecSpace>& rope,
-    const Kokkos::View<Scalar****, Kokkos::LayoutRight, ExecSpace>& out,
-    const std::string& label = "KokkosDNN::moss_rope_apply") {
+template <class ExecSpace, class Scalar, class XView, class RView, class OView>
+void moss_rope_apply_forward(const XView& x, const RView& rope, const OView& out,
+                             const std::string& label =
+                                 "KokkosDNN::moss_rope_apply") {
   const size_t B = x.extent(0), S = x.extent(1), H = x.extent(2),
                Dh = x.extent(3);
   if (out.extent(0) != B || out.extent(1) != S || out.extent(2) != H ||
