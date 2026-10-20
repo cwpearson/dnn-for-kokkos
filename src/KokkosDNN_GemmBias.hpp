@@ -13,8 +13,11 @@ namespace Impl {
 
 // Broadcast-bias add for the rank-2 path: Y(i,j) += b(j) in FP32.
 // Separate efficient device kernel (one element per thread), not a host
-// loop. Called after gemm() so the cuBLAS/TPL dispatch inside gemm() is
-// reused as-is (cuBLAS has no bias operand; same split as dense_forward).
+// loop. Used only by the TPL-split fallback in gemm_bias() below (cuBLAS
+// sgemm / cublasGemmEx + bias kernel when the fused cublasLt epilogue is
+// unavailable) and by the correctness tests as the split reference. The
+// primary paths are single-pass fused (cublasLt BIAS epilogue on CUDA,
+// bias folded into the native kernel write-back elsewhere).
 //
 // Flat 1D RangePolicy with j innermost (e = i*N + j): consecutive GPU
 // threads step along j, the LayoutRight-contiguous dimension, so the
@@ -67,12 +70,19 @@ void add_bias_1d(const Kokkos::View<Scalar*, ExecSpace>& y,
 //   Y : [M, N].
 // Scalar-agnostic (float, half_t, bhalf_t); accumulation is FP32 and the
 // result is cast back to Scalar.
-// cuBLAS reuse: the GEMM part is a plain gemm() call (alpha=1, beta=0),
-// so the full dispatch ladder in KokkosDNN_Gemm.hpp applies unchanged:
-// cuBLAS sgemm / cublasGemmEx on CUDA for float/bhalf_t via the handle's
-// cached handle, tiled fallback on CUDA, naive MDRange elsewhere. The
-// bias broadcast is a separate device kernel afterwards (same split as
-// dense_forward); existing gemm/gemv APIs are untouched.
+//
+// Single-pass fusion (no separate bias kernel on the primary paths):
+//   * CUDA + cuBLAS, float/bhalf_t: cublasLt GEMM with the BIAS epilogue
+//     (CUBLAS_COMPUTE_32F, so bf16 keeps FP32 accumulation; bias added in
+//     FP32 before the single output cast). Falls back to cuBLAS
+//     sgemm/cublasGemmEx + add_bias_2d when Lt cannot serve the shape.
+//   * HIP + hipBLAS, float/bhalf_t: hipBLAS GEMM + add_bias_2d (unchanged
+//     split; no hipBLASLt epilogue wired up -- no GEMM-speed regression).
+//   * Native (TPL off/unavailable, other scalars): bias is folded into the
+//     tiled GEMM (or M == 1 GEMV) write-back, so the native path is exactly
+//     one kernel launch.
+// The unbiased (empty-bias) path is a plain gemm() call, unchanged.
+// Existing gemm/gemv APIs are untouched.
 template <class ExecSpace, class Scalar>
 void gemm_bias(
     const DNNHandle<ExecSpace>& handle,
@@ -87,13 +97,86 @@ void gemm_bias(
       (biased && b.extent(0) != N))
     throw std::invalid_argument("gemm_bias: dimension mismatch");
   if (M == 0 || N == 0 || K == 0) return;
-  gemm(handle, static_cast<Scalar>(1), X, W, static_cast<Scalar>(0), Y, label);
-  if (biased) Impl::add_bias_2d<ExecSpace, Scalar>(Y, b, label + "_bias");
+  if (!biased) {
+    gemm(handle, static_cast<Scalar>(1), X, W, static_cast<Scalar>(0), Y,
+         label);
+    return;
+  }
+#if defined(KOKKOSDNN_ENABLE_CUBLAS) && defined(KOKKOS_ENABLE_CUDA)
+  // Backend named deliberately: cublasLt dispatch genuinely requires CUDA.
+  constexpr bool is_cuda = std::is_same_v<ExecSpace, Kokkos::Cuda>;
+  if constexpr (is_cuda) {
+    if (handle.use_cublas) {
+      void* lt = handle.cublaslt_bias_state();
+      if (lt != nullptr) {
+        // No fence here: the Lt call re-selects the Kokkos CUDA stream on
+        // every invocation, so it stays ordered with Kokkos kernels.
+        bool ok = false;
+        if constexpr (std::is_same_v<Scalar, float>) {
+          ok = Impl::cublaslt_gemm_bias_nt_f32_with_state(
+              lt, static_cast<int>(M), static_cast<int>(N),
+              static_cast<int>(K), 1.0f, X.data(), W.data(), b.data(),
+              Y.data());
+        } else if constexpr (std::is_same_v<
+                                 Scalar, Kokkos::Experimental::bhalf_t>) {
+          ok = Impl::cublaslt_gemm_bias_nt_bf16_with_state(
+              lt, static_cast<int>(M), static_cast<int>(N),
+              static_cast<int>(K), 1.0f, X.data(), W.data(), b.data(),
+              Y.data());
+        }
+        if (ok) return;
+        // else fall through to the split TPL path below (keeps cuBLAS
+        // GEMM speed; the bias kernel is today's behavior there).
+      }
+      // Split TPL fallback: the plain-gemm ladder (sgemm / cublasGemmEx)
+      // plus the bias kernel. Only for scalars the ladder serves; other
+      // scalars (e.g. half_t) go straight to the fused native path.
+      if constexpr (std::is_same_v<Scalar, float> ||
+                    std::is_same_v<Scalar, Kokkos::Experimental::bhalf_t>) {
+        if (handle.cublas_raw() != nullptr) {
+          gemm(handle, static_cast<Scalar>(1), X, W, static_cast<Scalar>(0),
+               Y, label);
+          Impl::add_bias_2d<ExecSpace, Scalar>(Y, b, label + "_bias");
+          return;
+        }
+      }
+    }
+  }
+#endif
+#if defined(KOKKOSDNN_ENABLE_HIPBLAS) && defined(KOKKOS_ENABLE_HIP)
+  // Backend named deliberately: hipBLAS dispatch genuinely requires HIP.
+  // Split only (no fused epilogue): today's behavior, no regression.
+  constexpr bool is_hip = std::is_same_v<ExecSpace, Kokkos::HIP>;
+  if constexpr (is_hip) {
+    if (handle.use_hipblas &&
+        (std::is_same_v<Scalar, float> ||
+         std::is_same_v<Scalar, Kokkos::Experimental::bhalf_t>) &&
+        handle.hipblas_raw() != nullptr) {
+      gemm(handle, static_cast<Scalar>(1), X, W, static_cast<Scalar>(0), Y,
+           label);
+      Impl::add_bias_2d<ExecSpace, Scalar>(Y, b, label + "_bias");
+      return;
+    }
+  }
+#endif
+  // Native fused single pass: rank-2 M == 1 reuses the team-per-row GEMV
+  // kernel with fused bias (same working set), M > 1 uses the tiled GEMM
+  // with bias folded into write-back.
+  if (M == 1) {
+    Kokkos::View<Scalar*, ExecSpace,
+                 Kokkos::MemoryTraits<Kokkos::Unmanaged>>
+        x1(X.data(), K), y1(Y.data(), N);
+    Impl::gemv_native<ExecSpace, Scalar>(x1, W, 1.0f, 0.0f, y1, label,
+                                         b.data());
+    return;
+  }
+  Impl::gemm_tiled<ExecSpace, Scalar>(X, W, 1.0f, 0.0f, Y, label, b.data());
 }
 
 // Rank-1 (single token) variant: y = W * x + b with x : [K], W : [N, K],
-// b : [N] (or empty for unbiased), y : [N]. Reuses gemv()'s dispatch
-// ladder the same way the rank-2 path reuses gemm().
+// b : [N] (or empty for unbiased), y : [N]. Same single-pass fusion as
+// the rank-2 path (cublasLt M == 1 bias epilogue on CUDA, bias folded
+// into the native GEMV write-back elsewhere); unbiased reuses gemv().
 template <class ExecSpace, class Scalar>
 void gemv_bias(
     const DNNHandle<ExecSpace>& handle,
@@ -107,8 +190,58 @@ void gemv_bias(
   if (W.extent(1) != K || y.extent(0) != N || (biased && b.extent(0) != N))
     throw std::invalid_argument("gemv_bias: dimension mismatch");
   if (N == 0 || K == 0) return;
-  gemv(handle, x, W, y, label);
-  if (biased) Impl::add_bias_1d<ExecSpace, Scalar>(y, b, label + "_bias");
+  if (!biased) {
+    gemv(handle, x, W, y, label);
+    return;
+  }
+#if defined(KOKKOSDNN_ENABLE_CUBLAS) && defined(KOKKOS_ENABLE_CUDA)
+  // Backend named deliberately: cublasLt dispatch genuinely requires CUDA.
+  constexpr bool is_cuda_gv = std::is_same_v<ExecSpace, Kokkos::Cuda>;
+  if constexpr (is_cuda_gv) {
+    if (handle.use_cublas) {
+      void* lt = handle.cublaslt_bias_state();
+      if (lt != nullptr) {
+        bool ok = false;
+        if constexpr (std::is_same_v<Scalar, float>) {
+          ok = Impl::cublaslt_gemm_bias_nt_f32_with_state(
+              lt, 1, static_cast<int>(N), static_cast<int>(K), 1.0f, x.data(),
+              W.data(), b.data(), y.data());
+        } else if constexpr (std::is_same_v<
+                                 Scalar, Kokkos::Experimental::bhalf_t>) {
+          ok = Impl::cublaslt_gemm_bias_nt_bf16_with_state(
+              lt, 1, static_cast<int>(N), static_cast<int>(K), 1.0f, x.data(),
+              W.data(), b.data(), y.data());
+        }
+        if (ok) return;
+      }
+      if constexpr (std::is_same_v<Scalar, float> ||
+                    std::is_same_v<Scalar, Kokkos::Experimental::bhalf_t>) {
+        if (handle.cublas_raw() != nullptr) {
+          gemv(handle, x, W, y, label);
+          Impl::add_bias_1d<ExecSpace, Scalar>(y, b, label + "_bias");
+          return;
+        }
+      }
+    }
+  }
+#endif
+#if defined(KOKKOSDNN_ENABLE_HIPBLAS) && defined(KOKKOS_ENABLE_HIP)
+  // Backend named deliberately: hipBLAS dispatch genuinely requires HIP.
+  // Split only (no fused epilogue): today's behavior, no regression.
+  constexpr bool is_hip_gv = std::is_same_v<ExecSpace, Kokkos::HIP>;
+  if constexpr (is_hip_gv) {
+    if (handle.use_hipblas &&
+        (std::is_same_v<Scalar, float> ||
+         std::is_same_v<Scalar, Kokkos::Experimental::bhalf_t>) &&
+        handle.hipblas_raw() != nullptr) {
+      gemv(handle, x, W, y, label);
+      Impl::add_bias_1d<ExecSpace, Scalar>(y, b, label + "_bias");
+      return;
+    }
+  }
+#endif
+  // Native fused single pass (bias folded into the GEMV write-back).
+  Impl::gemv_native<ExecSpace, Scalar>(x, W, 1.0f, 0.0f, y, label, b.data());
 }
 
 }  // namespace KokkosDNN
