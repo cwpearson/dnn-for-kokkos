@@ -122,6 +122,173 @@ TEST(AttentionBidirectional, SingleHeadWideDimReference) {
                                /*D=*/384, 1e-4f);
 }
 
+// DiT joint-attention geometry (MOSS-Image: 24 heads, head_dim 128, dense
+// T == K == HW + Sv): cond-vs-neg text-length variants must both match the
+// host reference. Small HW/Sv keep the host reference cheap; LayoutRight
+// mirrors the DiT scratch buffers (D-contiguous, so cuDNN takes them with
+// no repack, exactly like the per-block calls in MossImageDitModel).
+template <class Scalar>
+void check_dit_shape_reference(int HW, int Sv, float tol) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  KokkosDNN::DNNHandle<Exec> h;
+  const int T = HW + Sv, K = HW + Sv, Hq = 24, Hkv = 24, D = 128;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+
+  Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec> q("q", T, Hq, D),
+      k("k", K, Hkv, D), v("v", K, Hkv, D), out("out", T, Hq, D);
+  auto hq = Kokkos::create_mirror_view(q);
+  auto hk = Kokkos::create_mirror_view(k);
+  auto hv = Kokkos::create_mirror_view(v);
+  for (int t = 0; t < T; ++t)
+    for (int hh = 0; hh < Hq; ++hh)
+      for (int d = 0; d < D; ++d)
+        hq(t, hh, d) =
+            static_cast<Scalar>(0.05f * ((t * 7 + hh * 13 + d * 3) % 17) - 0.2f);
+  for (int n = 0; n < K; ++n)
+    for (int hh = 0; hh < Hkv; ++hh)
+      for (int d = 0; d < D; ++d) {
+        hk(n, hh, d) =
+            static_cast<Scalar>(0.05f * ((n * 5 + hh * 11 + d) % 19) - 0.2f);
+        hv(n, hh, d) =
+            static_cast<Scalar>(0.05f * ((n * 3 + hh * 17 + d * 2) % 23) - 0.3f);
+      }
+  Kokkos::deep_copy(q, hq);
+  Kokkos::deep_copy(k, hk);
+  Kokkos::deep_copy(v, hv);
+
+  KokkosDNN::attention_mha_bidirectional<Exec>(h, q, k, v, out, scale);
+  Kokkos::fence();
+  auto got = Kokkos::create_mirror_view(out);
+  Kokkos::deep_copy(got, out);
+
+  std::vector<float> ref((size_t)T * Hq * D);
+  host_bidir_ref<Scalar>(hq, hk, hv, scale, T, K, Hq, Hkv, D, ref.data());
+  for (int t = 0; t < T; ++t)
+    for (int hh = 0; hh < Hq; ++hh)
+      for (int d = 0; d < D; ++d)
+        EXPECT_NEAR(static_cast<float>(got(t, hh, d)),
+                    ref[(size_t)(t * Hq + hh) * D + d], tol)
+            << "DiT-shape bidir mismatch at (" << t << "," << hh << "," << d
+            << ") HW=" << HW << " Sv=" << Sv;
+}
+
+TEST(AttentionBidirectional, DitJointCondShapeReference) {
+  check_dit_shape_reference<float>(/*HW=*/48, /*Sv=*/16, 1e-4f);
+}
+
+TEST(AttentionBidirectional, DitJointNegShapeReference) {
+  check_dit_shape_reference<float>(/*HW=*/48, /*Sv=*/23, 1e-4f);
+}
+
+TEST(AttentionBidirectional, DitJointBHalfReference) {
+  check_dit_shape_reference<Kokkos::Experimental::bhalf_t>(
+      /*HW=*/48, /*Sv=*/16, 5e-2f);
+}
+
+// Zero-copy reshape path: the DiT consumes GEMM outputs through unmanaged
+// [T,H,Dh] aliases over contiguous [T,H*Dh] buffers (see dit_alias_*).
+// Aliased views must agree with managed views bit-exactly (same kernels,
+// same bytes, no repack on either side).
+TEST(AttentionBidirectional, UnmanagedAliasViewsMatchManaged) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  KokkosDNN::DNNHandle<Exec> h;
+  const int T = 32, K = 32, Hq = 8, Hkv = 8, D = 64;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> qf("qf", T, Hq * D),
+      kf("kf", K, Hkv * D), vf("vf", K, Hkv * D), of("of", T, Hq * D);
+  auto hqf = Kokkos::create_mirror_view(qf);
+  auto hkf = Kokkos::create_mirror_view(kf);
+  auto hvf = Kokkos::create_mirror_view(vf);
+  for (int t = 0; t < T; ++t)
+    for (int d = 0; d < Hq * D; ++d)
+      hqf(t, d) = 0.05f * ((t * 7 + d * 3) % 17) - 0.2f;
+  for (int n = 0; n < K; ++n)
+    for (int d = 0; d < Hkv * D; ++d) {
+      hkf(n, d) = 0.05f * ((n * 5 + d) % 19) - 0.2f;
+      hvf(n, d) = 0.05f * ((n * 3 + d * 2) % 23) - 0.3f;
+    }
+  Kokkos::deep_copy(qf, hqf);
+  Kokkos::deep_copy(kf, hkf);
+  Kokkos::deep_copy(vf, hvf);
+
+  using U3 = Kokkos::View<float***, Kokkos::LayoutRight, Exec,
+                          Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+  U3 q(qf.data(), T, Hq, D), k(kf.data(), K, Hkv, D), v(vf.data(), K, Hkv, D),
+      out(of.data(), T, Hq, D);
+  KokkosDNN::attention_mha_bidirectional<Exec>(h, q, k, v, out, scale);
+  Kokkos::fence();
+
+  Kokkos::View<float***, Kokkos::LayoutRight, Exec> qm("qm", T, Hq, D),
+      km("km", K, Hkv, D), vm("vm", K, Hkv, D), om("om", T, Hq, D);
+  Kokkos::deep_copy(qm, q);
+  Kokkos::deep_copy(km, k);
+  Kokkos::deep_copy(vm, v);
+  KokkosDNN::attention_mha_bidirectional<Exec>(h, qm, km, vm, om, scale);
+  Kokkos::fence();
+  auto got_alias = Kokkos::create_mirror_view(of);
+  auto got_managed = Kokkos::create_mirror_view(om);
+  Kokkos::deep_copy(got_alias, of);
+  Kokkos::deep_copy(got_managed, om);
+  for (int t = 0; t < T; ++t)
+    for (int hh = 0; hh < Hq; ++hh)
+      for (int d = 0; d < D; ++d)
+        EXPECT_EQ(got_alias(t, hh * D + d), got_managed(t, hh, d))
+            << "alias/managed divergence at (" << t << "," << hh << "," << d
+            << ")";
+}
+
+#if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)
+#include "tpl/cudnn/KokkosDNN_CuDNN_Forward.hpp"
+
+// Plan-cache reuse across DiT blocks: after warming the cond and neg joint
+// shapes, every repeat call must be a plan-cache hit (no rebuild miss, no
+// known-bad skip). Shapes repeat across the 42 blocks and across steps —
+// only the text length varies cond vs neg — so a miss per block would be
+// pure host-side overhead (~45 ms per new-shape build).
+TEST(AttentionBidirectional, DitPlanCacheHitsAcrossBlocks) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  KokkosDNN::DNNHandle<Exec> h;
+  const int Hq = 8, Hkv = 8, D = 64;
+  const int Tcond = 48, Tneg = 55;  // cond-vs-neg text-length diversity
+  const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+  Kokkos::View<float***, Kokkos::LayoutRight, Exec> q("q", Tneg, Hq, D),
+      k("k", Tneg, Hkv, D), v("v", Tneg, Hkv, D), out("out", Tneg, Hq, D);
+  Kokkos::deep_copy(q, 0.1f);
+  Kokkos::deep_copy(k, 0.1f);
+  Kokkos::deep_copy(v, 0.1f);
+  auto sub = [](auto& w, int T) {
+    return Kokkos::subview(w, std::pair<int, int>(0, T), Kokkos::ALL(),
+                           Kokkos::ALL());
+  };
+  // Warm both shapes (absorbs the one-time builds).
+  KokkosDNN::attention_mha_bidirectional<Exec>(h, sub(q, Tcond), sub(k, Tcond),
+                                               sub(v, Tcond), sub(out, Tcond),
+                                               scale);
+  KokkosDNN::attention_mha_bidirectional<Exec>(h, q, k, v, out, scale);
+  Kokkos::fence();
+  uint64_t h0, m0, b0;
+  KokkosDNN::Impl::sdpa_plan_cache_stats(h0, m0, b0);
+  // 12 alternating cond/neg calls, as the per-sample loop issues them.
+  for (int i = 0; i < 12; ++i) {
+    if (i % 2 == 0)
+      KokkosDNN::attention_mha_bidirectional<Exec>(
+          h, sub(q, Tcond), sub(k, Tcond), sub(v, Tcond), sub(out, Tcond),
+          scale);
+    else
+      KokkosDNN::attention_mha_bidirectional<Exec>(h, q, k, v, out, scale);
+  }
+  Kokkos::fence();
+  uint64_t h1, m1, b1;
+  KokkosDNN::Impl::sdpa_plan_cache_stats(h1, m1, b1);
+  // One clipped subview row-range keeps D-contiguity, so every repeat must
+  // hit the cached plan for its shape.
+  EXPECT_EQ(h1 - h0, 12u) << "expected 12 plan-cache hits (6 cond + 6 neg)";
+  EXPECT_EQ(m1 - m0, 0u) << "repeat shapes must not rebuild plans";
+  EXPECT_EQ(b1 - b0, 0u) << "DiT shapes must not be known-bad";
+}
+#endif
+
 // Non-causal property: perturbing a FUTURE key/value (last token) must
 // change the FIRST query's output under the bidirectional kernel, while
 // the causal kernel's first output (q_off=0, attending only to key 0)
