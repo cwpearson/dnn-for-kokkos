@@ -187,6 +187,83 @@ void check_qk_rmsnorm(float tol) {
 TEST(MossQkRmsnorm, Float) { check_qk_rmsnorm<float>(1e-5f); }
 TEST(MossQkRmsnorm, BHalf) { check_qk_rmsnorm<bhalf>(5e-2f); }
 
+// Fused QK-norm+RoPE must match the unfused norm->rope sequence bit-for-bit
+// (the DiT relies on this: same Scalar rounding of the normalized values,
+// same FP32 op order). In-place fused (as the blocks call it) vs out-of-place
+// unfused.
+template <class Scalar>
+void check_qk_rmsnorm_rope_fused() {
+  const int B = 2, S = 5, H = 2, Dh = 8;
+  Kokkos::View<Scalar****, Kokkos::LayoutRight, Exec> q("q", B, S, H, Dh),
+      k("k", B, S, H, Dh), qf("qf", B, S, H, Dh), kf("kf", B, S, H, Dh),
+      qn("qn", B, S, H, Dh), kn("kn", B, S, H, Dh), rq("rq", B, S, H, Dh),
+      rk("rk", B, S, H, Dh);
+  Kokkos::View<Scalar*, Exec> qw("qw", Dh), kw("kw", Dh);
+  Kokkos::View<float***, Kokkos::LayoutRight, Exec> rope("rope", 1, S, Dh);
+  auto hq = Kokkos::create_mirror_view(q);
+  auto hqw = Kokkos::create_mirror_view(qw);
+  auto hkw = Kokkos::create_mirror_view(kw);
+  auto hk = Kokkos::create_mirror_view(k);
+  for (int b = 0; b < B; ++b)
+    for (int s = 0; s < S; ++s)
+      for (int h = 0; h < H; ++h)
+        for (int d = 0; d < Dh; ++d) {
+          hq(b, s, h, d) = static_cast<Scalar>(0.31f * (b + 1) -
+                                               0.17f * (s + 1) +
+                                               0.11f * (h + 1) + 0.05f * d);
+          hk(b, s, h, d) = static_cast<Scalar>(-0.23f * (b + 1) +
+                                               0.19f * (s + 1) -
+                                               0.07f * (h + 1) - 0.03f * d);
+        }
+  for (int d = 0; d < Dh; ++d) {
+    hqw(d) = static_cast<Scalar>(0.9f + 0.03f * d);
+    hkw(d) = static_cast<Scalar>(1.1f - 0.02f * d);
+  }
+  Kokkos::deep_copy(q, hq);
+  Kokkos::deep_copy(k, hk);
+  Kokkos::deep_copy(qf, hq);
+  Kokkos::deep_copy(kf, hk);
+  Kokkos::deep_copy(qw, hqw);
+  Kokkos::deep_copy(kw, hkw);
+  KokkosDNN::MossImage::moss_rope_build_forward<Exec>(1, S, 0, 10000.0f, rope);
+  const float eps = 1e-6f;
+  // Unfused reference sequence, out of place.
+  KokkosDNN::MossImage::moss_qk_rmsnorm_forward<Exec, Scalar>(q, qw, eps, qn);
+  KokkosDNN::MossImage::moss_qk_rmsnorm_forward<Exec, Scalar>(k, kw, eps, kn);
+  KokkosDNN::MossImage::moss_rope_apply_forward<Exec, Scalar>(qn, rope, rq);
+  KokkosDNN::MossImage::moss_rope_apply_forward<Exec, Scalar>(kn, rope, rk);
+  // Fused, in place (the DiT call pattern).
+  KokkosDNN::MossImage::moss_qk_rmsnorm_rope_forward<Exec, Scalar>(
+      qf, qw, kf, kw, eps, rope, qf, kf);
+  Kokkos::fence();
+  auto grq = Kokkos::create_mirror_view(rq);
+  auto grk = Kokkos::create_mirror_view(rk);
+  auto gqf = Kokkos::create_mirror_view(qf);
+  auto gkf = Kokkos::create_mirror_view(kf);
+  Kokkos::deep_copy(grq, rq);
+  Kokkos::deep_copy(grk, rk);
+  Kokkos::deep_copy(gqf, qf);
+  Kokkos::deep_copy(gkf, kf);
+  for (int b = 0; b < B; ++b)
+    for (int s = 0; s < S; ++s)
+      for (int h = 0; h < H; ++h)
+        for (int d = 0; d < Dh; ++d) {
+          EXPECT_EQ(gqf(b, s, h, d), grq(b, s, h, d))
+              << "q mismatch at (" << b << "," << s << "," << h << "," << d
+              << ")";
+          EXPECT_EQ(gkf(b, s, h, d), grk(b, s, h, d))
+              << "k mismatch at (" << b << "," << s << "," << h << "," << d
+              << ")";
+        }
+}
+
+TEST(MossQkRmsnormRope, FusedMatchesUnfusedFloat) {
+  check_qk_rmsnorm_rope_fused<float>();
+}
+TEST(MossQkRmsnormRope, FusedMatchesUnfusedBHalf) {
+  check_qk_rmsnorm_rope_fused<bhalf>();
+}
+
 TEST(MossRope, BuildApply) {
   const int Hh = 2, Ww = 3, TL = 4, Dh = 16;  // nb = 2
   const size_t S = Hh * Ww + TL;
