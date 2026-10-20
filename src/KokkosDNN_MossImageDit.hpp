@@ -405,6 +405,46 @@ void dit_copy_flat(Scalar* dst, const Scalar* src, size_t n) {
   Kokkos::deep_copy(d, s);
 }
 
+// Zero-copy reshape aliases over contiguous row-major GEMM outputs: [S,D]
+// with D == H*Dh holds elements in exactly the same order as [1,S,H,Dh]
+// (or [S,H,Dh]) and [1,S,D] LayoutRight views, so QK-norm / RoPE /
+// attention / gated residuals can consume GEMM outputs in place instead of
+// dit_copy_flat repacks above (each repack is a full read+write pass plus a
+// launch per block: 6 per main block x 42 blocks per sample per forward).
+// The alias borrows the source allocation; the caller keeps the source view
+// alive across the use. Unmanaged views bind to the view-generic op
+// overloads (moss_qk_rmsnorm/rope/gate_residual, attention_*), which use
+// only extents and operator(). Sharing is exact (not just numerically
+// close): every aliased buffer is fully overwritten by its producer GEMM
+// (beta == 0) or by attention (every output row written once) before the
+// alias is consumed, and skipped blocks `continue` before touching them.
+template <class ExecSpace, class Scalar>
+auto dit_alias_qk(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& src,
+    size_t S, size_t H, size_t Dh) {
+  using U = Kokkos::View<Scalar****, Kokkos::LayoutRight, ExecSpace,
+                         Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+  return U(src.data(), 1, S, H, Dh);
+}
+
+template <class ExecSpace, class Scalar>
+auto dit_alias_attn(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& src,
+    size_t S, size_t H, size_t Dh) {
+  using U = Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace,
+                         Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+  return U(src.data(), S, H, Dh);
+}
+
+template <class ExecSpace, class Scalar>
+auto dit_alias_seq(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& src, size_t S,
+    size_t D) {
+  using U = Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace,
+                         Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+  return U(src.data(), 1, S, D);
+}
+
 // ---- host-side safetensors parsing (F32/BF16, header-only) ----
 
 inline uint64_t dit_ld64(const char* p) {
@@ -1556,13 +1596,15 @@ class MossImageDitModel {
     V2 q2 = Sc.c2.get("tq", Sv, D), k2 = Sc.c2.get("tk", Sv, D),
        v2 = Sc.c2.get("tv", Sv, D);
     Impl::dit_split3<ExecSpace, Scalar>(tqkv, q2, k2, v2, label + "_tsplit");
-    V4 q4 = Sc.c4.get("tq4", 1, Sv, Nh, Hd),
-       k4 = Sc.c4.get("tk4", 1, Sv, Nh, Hd);
-    V3 vv3 = Sc.c3.get("tv3", Sv, Nh, Hd),
-       ao3 = Sc.c3.get("tao3", Sv, Nh, Hd);
-    Impl::dit_copy_flat<ExecSpace, Scalar>(q4.data(), q2.data(), Sv * D);
-    Impl::dit_copy_flat<ExecSpace, Scalar>(k4.data(), k2.data(), Sv * D);
-    Impl::dit_copy_flat<ExecSpace, Scalar>(vv3.data(), v2.data(), Sv * D);
+    // Zero-copy reshapes over the GEMM outputs (identical row-major order,
+    // no dit_copy_flat repacks): q2/k2 double as [1,Sv,Nh,Hd] for QK-norm +
+    // RoPE, v2/ao2 as [Sv,Nh,Hd] for attention. ao2 is fetched before
+    // attention so ao3 can alias it directly.
+    auto q4 = Impl::dit_alias_qk<ExecSpace, Scalar>(q2, Sv, Nh, Hd);
+    auto k4 = Impl::dit_alias_qk<ExecSpace, Scalar>(k2, Sv, Nh, Hd);
+    auto vv3 = Impl::dit_alias_attn<ExecSpace, Scalar>(v2, Sv, Nh, Hd);
+    V2 ao2 = Sc.c2.get("tao", Sv, D);
+    auto ao3 = Impl::dit_alias_attn<ExecSpace, Scalar>(ao2, Sv, Nh, Hd);
     MossImage::moss_qk_rmsnorm_forward<ExecSpace, Scalar>(q4, T.qn, kNormEps,
                                                           q4, label + "_tqn");
     MossImage::moss_qk_rmsnorm_forward<ExecSpace, Scalar>(k4, T.kn, kNormEps,
@@ -1576,13 +1618,10 @@ class MossImageDitModel {
         Kokkos::subview(q4, 0, Kokkos::ALL(), Kokkos::ALL(), Kokkos::ALL()),
         Kokkos::subview(k4, 0, Kokkos::ALL(), Kokkos::ALL(), Kokkos::ALL()),
         vv3, ao3, attn_scale, label + "_tattn");
-    V2 ao2 = Sc.c2.get("tao", Sv, D);
-    Impl::dit_copy_flat<ExecSpace, Scalar>(ao2.data(), ao3.data(), Sv * D);
     V2 prao = Sc.c2.get("tprao", Sv, D);
     gemm_bias<ExecSpace, Scalar>(handle_, ao2, T.proj_W, T.proj_b, prao,
                                  label + "_tproj");
-    V3 prao3 = Sc.c3.get("tprao3", 1, Sv, D);
-    Impl::dit_copy_flat<ExecSpace, Scalar>(prao3.data(), prao.data(), Sv * D);
+    auto prao3 = Impl::dit_alias_seq<ExecSpace, Scalar>(prao, Sv, D);
     V2 ones = Sc.c2.get("ones", 1, D);
     MossImage::moss_gate_residual_forward<ExecSpace, Scalar>(
         txt, prao3, ones, txt, label + "_tres");
@@ -1600,8 +1639,7 @@ class MossImageDitModel {
     V2 fd = Sc.c2.get("tfd", Sv, D);
     gemm_bias<ExecSpace, Scalar>(handle_, fh, T.down_W, T.down_b, fd,
                                  label + "_tdown");
-    V3 fd3 = Sc.c3.get("tfd3", 1, Sv, D);
-    Impl::dit_copy_flat<ExecSpace, Scalar>(fd3.data(), fd.data(), Sv * D);
+    auto fd3 = Impl::dit_alias_seq<ExecSpace, Scalar>(fd, Sv, D);
     MossImage::moss_gate_residual_forward<ExecSpace, Scalar>(
         txt, fd3, ones, txt, label + "_tres2");
   }
@@ -1621,12 +1659,20 @@ class MossImageDitModel {
     V2 q2 = Sc.c2.get("qq", Sj, D), k2 = Sc.c2.get("kk", Sj, D),
        v2 = Sc.c2.get("vv", Sj, D), ao2 = Sc.c2.get("ao", Sj, D),
        prao = Sc.c2.get("prao", Sj, D), fd = Sc.c2.get("fd", Sj, D);
-    V4 q4 = Sc.c4.get("q4", 1, Sj, Nh, Hd),
-       k4 = Sc.c4.get("k4", 1, Sj, Nh, Hd);
-    V3 vv3 = Sc.c3.get("vv3", Sj, Nh, Hd),
-       ao3 = Sc.c3.get("ao3", Sj, Nh, Hd);
-    V3 prao3 = Sc.c3.get("prao3", 1, Sj, D);
-    V3 fd3 = Sc.c3.get("fd3", 1, Sj, D);
+    // Zero-copy reshapes over the GEMM outputs (identical row-major order,
+    // no dit_copy_flat repacks): q2/k2 double as [1,Sj,Nh,Hd] for QK-norm +
+    // RoPE, v2/ao2 as [Sj,Nh,Hd] for attention, prao/fd as [1,Sj,D] for
+    // the gated residuals. Hoisted out of the per-block loop: the aliases
+    // borrow the (already hoisted) GEMM buffers, so the loop body issues no
+    // view-cache lookups, allocations, or repack copies around attention.
+    // Every aliased buffer is fully overwritten by its producer GEMM
+    // (beta == 0) or by attention before its alias is consumed.
+    auto q4 = Impl::dit_alias_qk<ExecSpace, Scalar>(q2, Sj, Nh, Hd);
+    auto k4 = Impl::dit_alias_qk<ExecSpace, Scalar>(k2, Sj, Nh, Hd);
+    auto vv3 = Impl::dit_alias_attn<ExecSpace, Scalar>(v2, Sj, Nh, Hd);
+    auto ao3 = Impl::dit_alias_attn<ExecSpace, Scalar>(ao2, Sj, Nh, Hd);
+    auto prao3 = Impl::dit_alias_seq<ExecSpace, Scalar>(prao, Sj, D);
+    auto fd3 = Impl::dit_alias_seq<ExecSpace, Scalar>(fd, Sj, D);
     V2 ug = Sc.c2.get("ug", Sj, 2 * F);
     V2 fh = Sc.c2.get("fh", Sj, F);
     for (int li = 0; li < cfg_.num_layers; ++li) {
@@ -1640,9 +1686,6 @@ class MossImageDitModel {
                               static_cast<Scalar>(0), k2, label + "_k");
       gemm<ExecSpace, Scalar>(handle_, static_cast<Scalar>(1), nrm2, L.v_W,
                               static_cast<Scalar>(0), v2, label + "_v");
-      Impl::dit_copy_flat<ExecSpace, Scalar>(q4.data(), q2.data(), Sj * D);
-      Impl::dit_copy_flat<ExecSpace, Scalar>(k4.data(), k2.data(), Sj * D);
-      Impl::dit_copy_flat<ExecSpace, Scalar>(vv3.data(), v2.data(), Sj * D);
       MossImage::moss_qk_rmsnorm_forward<ExecSpace, Scalar>(q4, L.qn, kNormEps,
                                                             q4, label + "_qn");
       MossImage::moss_qk_rmsnorm_forward<ExecSpace, Scalar>(k4, L.kn, kNormEps,
@@ -1656,10 +1699,8 @@ class MossImageDitModel {
           Kokkos::subview(q4, 0, Kokkos::ALL(), Kokkos::ALL(), Kokkos::ALL()),
           Kokkos::subview(k4, 0, Kokkos::ALL(), Kokkos::ALL(), Kokkos::ALL()),
           vv3, ao3, attn_scale, label + "_attn");
-      Impl::dit_copy_flat<ExecSpace, Scalar>(ao2.data(), ao3.data(), Sj * D);
       gemm<ExecSpace, Scalar>(handle_, static_cast<Scalar>(1), ao2, L.o_W,
                               static_cast<Scalar>(0), prao, label + "_o");
-      Impl::dit_copy_flat<ExecSpace, Scalar>(prao3.data(), prao.data(), Sj * D);
       MossImage::moss_gate_residual_forward<ExecSpace, Scalar>(
           joint, prao3, gt_a1, joint, label + "_res");
       MossImage::moss_rmsnorm_modulate_forward<ExecSpace, Scalar>(
@@ -1670,7 +1711,6 @@ class MossImageDitModel {
       Impl::dit_ug_split_situ<ExecSpace, Scalar>(ug, fh, label + "_situ");
       gemm<ExecSpace, Scalar>(handle_, static_cast<Scalar>(1), fh, L.down_W,
                               static_cast<Scalar>(0), fd, label + "_down");
-      Impl::dit_copy_flat<ExecSpace, Scalar>(fd3.data(), fd.data(), Sj * D);
       MossImage::moss_gate_residual_forward<ExecSpace, Scalar>(
           joint, fd3, gt_f1, joint, label + "_res2");
     }

@@ -50,9 +50,10 @@
 
 #include <cstring>
 #include <deque>
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
-#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -92,7 +93,10 @@ struct SdpaPlanKey {
   uint32_t scale_bits = 0;  // bit-exact float key, no epsilon issues
   bool causal = false;
   int64_t left_bound = -1;
-  std::string node_name;
+  // NOTE: the frontend node name is intentionally NOT part of the key: the
+  // (causal, left_bound) pair already distinguishes the three mask modes,
+  // and hashing a std::string per call costs a heap round-trip (SSO holds
+  // only 15 chars). The name is still passed to the graph builder.
 
   bool operator==(const SdpaPlanKey& o) const {
     return dtype == o.dtype && T == o.T && Ktot == o.Ktot && Hq == o.Hq &&
@@ -103,7 +107,7 @@ struct SdpaPlanKey {
            v_sB == o.v_sB && o_sT == o.o_sT && o_sH == o.o_sH &&
            o_sD == o.o_sD && o_sB == o.o_sB &&
            scale_bits == o.scale_bits && causal == o.causal &&
-           left_bound == o.left_bound && node_name == o.node_name;
+           left_bound == o.left_bound;
   }
 };
 
@@ -137,7 +141,6 @@ struct SdpaPlanKeyHash {
     mix(h, std::hash<uint32_t>{}(k.scale_bits));
     mix(h, std::hash<bool>{}(k.causal));
     mix(h, std::hash<int64_t>{}(k.left_bound));
-    mix(h, std::hash<std::string>{}(k.node_name));
     return h;
   }
 };
@@ -179,6 +182,37 @@ SdpaPlanCache& sdpa_plan_cache() {
   static SdpaPlanCache cache;
   return cache;
 }
+
+}  // namespace
+
+// Cumulative per-process SDPA dispatch counters for the DiT attention-call
+// overhead probe: every sdpa_forward_impl call lands in exactly one bucket
+// (plan-cache hit, full rebuild miss, or known-bad early-out). Lock-free
+// atomics; read via sdpa_plan_cache_stats(). Numerics-neutral. Defined
+// outside the anonymous namespace above so the Forward.hpp declaration
+// links (internal linkage there would give each TU its own counters).
+struct SdpaPlanStats {
+  std::atomic<uint64_t> hits{0};
+  std::atomic<uint64_t> misses{0};
+  std::atomic<uint64_t> bad_skips{0};
+};
+
+namespace {
+SdpaPlanStats& sdpa_plan_stats() {
+  static SdpaPlanStats s;
+  return s;
+}
+}  // namespace
+
+void sdpa_plan_cache_stats(uint64_t& hits, uint64_t& misses,
+                           uint64_t& bad_skips) {
+  SdpaPlanStats& s = sdpa_plan_stats();
+  hits = s.hits.load(std::memory_order_relaxed);
+  misses = s.misses.load(std::memory_order_relaxed);
+  bad_skips = s.bad_skips.load(std::memory_order_relaxed);
+}
+
+namespace {
 
 // Shared SDPA graph builder/executor. causal=false omits the diagonal-mask
 // attributes entirely, which per the cuDNN frontend docs yields dense
@@ -270,7 +304,6 @@ bool sdpa_forward_impl(void* cached_handle, CudnnSdpaScalar dtype,
   std::memcpy(&key.scale_bits, &scale, sizeof(scale));
   key.causal = causal;
   key.left_bound = left_bound;
-  key.node_name = (node_name != nullptr) ? node_name : "";
 
   // Cache hit: skip validate/build/workspace-query/malloc entirely; just
   // re-execute the built graph with the CURRENT call's pointers (the graph
@@ -281,14 +314,23 @@ bool sdpa_forward_impl(void* cached_handle, CudnnSdpaScalar dtype,
   // the caller would take after the rebuild fails).
   {
     std::shared_ptr<SdpaPlanEntry> hit;
+    bool known_bad = false;
     {
       SdpaPlanCache& cache = sdpa_plan_cache();
       std::lock_guard<std::mutex> lock(cache.mutex);
-      if (cache.bad.find(key) != cache.bad.end()) return false;
-      auto it = cache.plans.find(key);
-      if (it != cache.plans.end()) hit = it->second;
+      if (cache.bad.find(key) != cache.bad.end())
+        known_bad = true;
+      else {
+        auto it = cache.plans.find(key);
+        if (it != cache.plans.end()) hit = it->second;
+      }
+    }
+    if (known_bad) {
+      sdpa_plan_stats().bad_skips.fetch_add(1, std::memory_order_relaxed);
+      return false;
     }
     if (hit != nullptr) {
+      sdpa_plan_stats().hits.fetch_add(1, std::memory_order_relaxed);
       bool hit_ok = false;
       try {
         std::unordered_map<std::shared_ptr<fe::graph::Tensor_attributes>,
@@ -305,6 +347,7 @@ bool sdpa_forward_impl(void* cached_handle, CudnnSdpaScalar dtype,
       }
       return hit_ok;
     }
+    sdpa_plan_stats().misses.fetch_add(1, std::memory_order_relaxed);
   }
 
   // Cache miss: build exactly as before. Any failure returns false so the
@@ -670,6 +713,13 @@ bool cudnn_sdpa_math_forward_ws(void*, const float*, const float*,
                                 int64_t, int64_t, int64_t, int64_t, int64_t,
                                 float, float*, size_t) {
   return false;
+}
+
+void sdpa_plan_cache_stats(uint64_t& hits, uint64_t& misses,
+                           uint64_t& bad_skips) {
+  hits = 0;
+  misses = 0;
+  bad_skips = 0;
 }
 
 }  // namespace Impl
