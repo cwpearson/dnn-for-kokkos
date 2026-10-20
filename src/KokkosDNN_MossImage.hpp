@@ -182,6 +182,85 @@ struct MossRmsNormModulateFunctor {
   }
 };
 
+// Team functor for moss_qk_rmsnorm_rope_forward: one team per (b, s, h)
+// row-pair. The q/k sum-of-squares reductions and the fused norm+RoPE
+// write-back run as TeamThreadRange parallel constructs over Dh, so
+// consecutive threads touch consecutive Dh elements (fully coalesced under
+// LayoutRight, auto-vectorized) with full GPU occupancy. Same two-pass FP32
+// algorithm as the original serial-row code, and the write-back keeps the
+// exact same Scalar rounding of the normalized values and FP32 op order as
+// the unfused norm->rope sequence; only the parallel reductions may
+// reorder summation at ~ulp level. In-place safe (q may alias qout, k may
+// alias kout): reductions only read q/k, and each write reads only its own
+// input elements. Named functor (not a nested extended lambda): nvcc
+// rejects an extended lambda defined inside another extended lambda.
+template <class ExecSpace, class Scalar, class QView, class WView, class RView>
+struct MossQkRmsnormRopeFunctor {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  QView q, k, qout, kout;
+  WView qw, kw;
+  RView rope;
+  float eps;
+  size_t S, H, Dh, Hh;
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& member) const {
+    // Local handles: inner lambdas capture by value without an implicit
+    // `this` capture (quiets -Wdeprecated under C++20).
+    const auto Q = q;
+    const auto K = k;
+    const auto QO = qout;
+    const auto KO = kout;
+    const auto QW = qw;
+    const auto KW = kw;
+    const auto R = rope;
+    const size_t row = static_cast<size_t>(member.league_rank());
+    const size_t SH = S * H;
+    const size_t b = row / SH;
+    const size_t r = row % SH;
+    const size_t s = r / H;
+    const size_t h = r % H;
+    const float Dhn = static_cast<float>(Dh);
+    float ssq = 0, ssk = 0;
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(member, Dh),
+        KOKKOS_LAMBDA(size_t d, float& acc) {
+          const float v = static_cast<float>(Q(b, s, h, d));
+          acc += v * v;
+        },
+        ssq);
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(member, Dh),
+        KOKKOS_LAMBDA(size_t d, float& acc) {
+          const float v = static_cast<float>(K(b, s, h, d));
+          acc += v * v;
+        },
+        ssk);
+    const float invq = 1.0f / sqrt(ssq / Dhn + eps);
+    const float invk = 1.0f / sqrt(ssk / Dhn + eps);
+    Kokkos::parallel_for(
+        Kokkos::TeamThreadRange(member, Hh), KOKKOS_LAMBDA(size_t d) {
+          // Same Scalar rounding as the unfused norm store + reload.
+          const float aq = static_cast<float>(
+              static_cast<Scalar>(static_cast<float>(Q(b, s, h, d)) * invq *
+                                  static_cast<float>(QW(d))));
+          const float bq = static_cast<float>(
+              static_cast<Scalar>(static_cast<float>(Q(b, s, h, d + Hh)) *
+                                  invq * static_cast<float>(QW(d + Hh))));
+          const float ak = static_cast<float>(
+              static_cast<Scalar>(static_cast<float>(K(b, s, h, d)) * invk *
+                                  static_cast<float>(KW(d))));
+          const float bk = static_cast<float>(
+              static_cast<Scalar>(static_cast<float>(K(b, s, h, d + Hh)) *
+                                  invk * static_cast<float>(KW(d + Hh))));
+          const float sn = R(0, s, d), cs = R(0, s, d + Hh);
+          QO(b, s, h, d) = static_cast<Scalar>(aq * cs - bq * sn);
+          QO(b, s, h, d + Hh) = static_cast<Scalar>(bq * cs + aq * sn);
+          KO(b, s, h, d) = static_cast<Scalar>(ak * cs - bk * sn);
+          KO(b, s, h, d + Hh) = static_cast<Scalar>(bk * cs + ak * sn);
+        });
+  }
+};
+
 }  // namespace Impl
 
 // Shift-aware timestep embedding: raw t in [0,1] is first mapped through
@@ -427,15 +506,21 @@ void moss_rope_apply_forward(const XView& x, const RView& rope, const OView& out
 // the NeoX half-rotation with the pipeline-layout rope row (exactly as
 // moss_rope_apply_forward). One launch and one read+write pass per tensor
 // instead of four launches and two passes (norm write + rope re-read).
-// Bitwise identical to the unfused sequence: the normalized values pass
-// through the same Scalar rounding before the rotation (which matters for
-// bhalf_t), and every FP32 multiply/add runs in the same order.
+// The write-back is bitwise identical to the unfused sequence: the
+// normalized values pass through the same Scalar rounding before the
+// rotation (which matters for bhalf_t), and every FP32 multiply/add runs
+// in the same order; only the team-parallel sum-of-squares reductions may
+// reorder summation at ~ulp level (fused-vs-unfused agreement is to
+// tolerance, not bit-for-bit).
 // q/k/qout/kout: [B, S, H, Dh]; qw/kw: [Dh]; rope: [1, S, Dh] from
 // moss_rope_build_forward. Dh must be even and nonzero (the rotation needs
 // pairs). In-place safe (q may alias qout, k may alias kout: each element
 // is read before it is written). Views are layout-agnostic (managed or
 // unmanaged aliases alike; only extents and operator() are used).
-// Dispatch: native elementwise (no TPL).
+// Dispatch: native elementwise (no TPL). Single TeamPolicy launch (one team
+// per (b, s, h) row-pair, TeamThreadRange over Dh): fully coalesced on
+// LayoutRight data, replacing the old one-thread-per-row MDRange kernel
+// whose serial loop over Dh left adjacent threads strided.
 template <class ExecSpace, class Scalar, class QView, class WView, class RView>
 void moss_qk_rmsnorm_rope_forward(const QView& q, const WView& qw,
                                   const QView& k, const WView& kw, float eps,
@@ -459,45 +544,10 @@ void moss_qk_rmsnorm_rope_forward(const QView& q, const WView& qw,
         "moss_qk_rmsnorm_rope_forward: head_dim must be a nonzero even number");
   if (B == 0 || S == 0 || H == 0) return;
   const size_t Hh = Dh / 2;
-  // One thread per (b, s, h) row-pair, same policy as moss_qk_rmsnorm_forward
-  // (each row's math is independent, so the result is bitwise identical to
-  // the unfused norm->rope sequence regardless of thread mapping).
+  Impl::MossQkRmsnormRopeFunctor<ExecSpace, Scalar, QView, WView, RView> f{
+      q, k, qout, kout, qw, kw, rope, eps, S, H, Dh, Hh};
   Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<3>>({0, 0, 0},
-                                                              {B, S, H}),
-      KOKKOS_LAMBDA(size_t b, size_t s, size_t h) {
-        float ssq = 0, ssk = 0;
-        for (size_t d = 0; d < Dh; ++d) {
-          const float vq = static_cast<float>(q(b, s, h, d));
-          const float vk = static_cast<float>(k(b, s, h, d));
-          ssq += vq * vq;
-          ssk += vk * vk;
-        }
-        const float invq =
-            1.0f / sqrt(ssq / static_cast<float>(Dh) + eps);
-        const float invk =
-            1.0f / sqrt(ssk / static_cast<float>(Dh) + eps);
-        for (size_t d = 0; d < Hh; ++d) {
-          // Same Scalar rounding as the unfused norm store + reload.
-          const float aq = static_cast<float>(
-              static_cast<Scalar>(static_cast<float>(q(b, s, h, d)) * invq *
-                                  static_cast<float>(qw(d))));
-          const float bq = static_cast<float>(
-              static_cast<Scalar>(static_cast<float>(q(b, s, h, d + Hh)) *
-                                  invq * static_cast<float>(qw(d + Hh))));
-          const float ak = static_cast<float>(
-              static_cast<Scalar>(static_cast<float>(k(b, s, h, d)) * invk *
-                                  static_cast<float>(kw(d))));
-          const float bk = static_cast<float>(
-              static_cast<Scalar>(static_cast<float>(k(b, s, h, d + Hh)) *
-                                  invk * static_cast<float>(kw(d + Hh))));
-          const float sn = rope(0, s, d), cs = rope(0, s, d + Hh);
-          qout(b, s, h, d) = static_cast<Scalar>(aq * cs - bq * sn);
-          qout(b, s, h, d + Hh) = static_cast<Scalar>(bq * cs + aq * sn);
-          kout(b, s, h, d) = static_cast<Scalar>(ak * cs - bk * sn);
-          kout(b, s, h, d + Hh) = static_cast<Scalar>(bk * cs + ak * sn);
-        }
-      });
+      label, Kokkos::TeamPolicy<ExecSpace>(B * S * H, Kokkos::AUTO), f);
 }
 
 // Joint video+text self-attention for one MMDiT block: dense bidirectional

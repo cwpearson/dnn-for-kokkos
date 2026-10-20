@@ -187,12 +187,13 @@ void check_qk_rmsnorm(float tol) {
 TEST(MossQkRmsnorm, Float) { check_qk_rmsnorm<float>(1e-5f); }
 TEST(MossQkRmsnorm, BHalf) { check_qk_rmsnorm<bhalf>(5e-2f); }
 
-// Fused QK-norm+RoPE must match the unfused norm->rope sequence bit-for-bit
-// (the DiT relies on this: same Scalar rounding of the normalized values,
-// same FP32 op order). In-place fused (as the blocks call it) vs out-of-place
-// unfused.
+// Fused QK-norm+RoPE must match the unfused norm->rope sequence to
+// tolerance (the write-back keeps the same Scalar rounding of the
+// normalized values and FP32 op order, but the team-parallel reductions
+// may reorder summation at ~ulp level). In-place fused (as the blocks call
+// it) vs out-of-place unfused.
 template <class Scalar>
-void check_qk_rmsnorm_rope_fused() {
+void check_qk_rmsnorm_rope_fused(float tol) {
   const int B = 2, S = 5, H = 2, Dh = 8;
   Kokkos::View<Scalar****, Kokkos::LayoutRight, Exec> q("q", B, S, H, Dh),
       k("k", B, S, H, Dh), qf("qf", B, S, H, Dh), kf("kf", B, S, H, Dh),
@@ -248,20 +249,22 @@ void check_qk_rmsnorm_rope_fused() {
     for (int s = 0; s < S; ++s)
       for (int h = 0; h < H; ++h)
         for (int d = 0; d < Dh; ++d) {
-          EXPECT_EQ(gqf(b, s, h, d), grq(b, s, h, d))
+          EXPECT_NEAR(static_cast<double>(gqf(b, s, h, d)),
+                      static_cast<double>(grq(b, s, h, d)), tol)
               << "q mismatch at (" << b << "," << s << "," << h << "," << d
               << ")";
-          EXPECT_EQ(gkf(b, s, h, d), grk(b, s, h, d))
+          EXPECT_NEAR(static_cast<double>(gkf(b, s, h, d)),
+                      static_cast<double>(grk(b, s, h, d)), tol)
               << "k mismatch at (" << b << "," << s << "," << h << "," << d
               << ")";
         }
 }
 
 TEST(MossQkRmsnormRope, FusedMatchesUnfusedFloat) {
-  check_qk_rmsnorm_rope_fused<float>();
+  check_qk_rmsnorm_rope_fused<float>(1e-5f);
 }
 TEST(MossQkRmsnormRope, FusedMatchesUnfusedBHalf) {
-  check_qk_rmsnorm_rope_fused<bhalf>();
+  check_qk_rmsnorm_rope_fused<bhalf>(5e-2f);
 }
 
 TEST(MossRope, BuildApply) {
