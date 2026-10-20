@@ -647,6 +647,8 @@ inline std::map<std::string, DitSafeEntry> dit_parse_header(
 template <class V>
 struct DitViewCache {
   std::map<std::pair<std::string, std::vector<size_t>>, V> m;
+  uint64_t gen_ = 0;  // bumped by clear(): lets callers key cached *contents*
+                      // (e.g. a hoisted RoPE table) against scratch lifetime
   template <class... Dims>
   V get(const std::string& tag, Dims... d) {
     std::vector<size_t> key{(size_t)d...};
@@ -664,12 +666,13 @@ struct DitViewCache {
     if (!fit) v = V(tag, d...);
     return v;
   }
+  uint64_t generation() const { return gen_; }
   size_t bytes(size_t scalar_bytes) const {
     size_t n = 0;
     for (const auto& kv : m) n += kv.second.size() * scalar_bytes;
     return n;
   }
-  void clear() { m.clear(); }
+  void clear() { m.clear(); ++gen_; }
 };
 
 }  // namespace Impl
@@ -1423,6 +1426,39 @@ class MossImageDitModel {
     auto& W = weights_;
     auto& Sc = scratch_;
 
+    // RoPE hoist: the table depends only on (H, W, Sv). When every sample
+    // carries the same valid text length (the common case, trivially true
+    // for B == 1), build it once and share it across samples instead of
+    // rebuilding it per sample; the scratch generation key lets the table
+    // survive across forwards (it is step-independent), so the steady state
+    // is one build per geometry. Mixed lengths fall back to the per-sample
+    // build inside the loop. Reuse is exact: a rebuild with the same
+    // arguments is bitwise identical, so sharing the buffer changes nothing.
+    bool same_len = true;
+    for (size_t b = 1; b < B; ++b)
+      if (nvalid[b] != nvalid[0]) same_len = false;
+    F3 rope_hoist, trope_hoist;
+    if (same_len) {
+      const size_t Sv0 = nvalid[0];
+      rope_hoist = Sc.f3.get("rope_hoist", 1, HW + Sv0, Hd);
+      trope_hoist = Sc.f3.get("trope_hoist", 1, Sv0, Hd);
+      if (!(rope_have_ && rope_H_ == (int)H && rope_W_ == (int)Wd &&
+            rope_Sv_ == Sv0 && rope_gen_ == Sc.f3.generation())) {
+        MossImage::moss_rope_build_forward<ExecSpace>(
+            (int)H, (int)Wd, (int)Sv0, (float)cfg_.rope_base, rope_hoist,
+            label + "_rope");
+        auto rope_tail = Kokkos::subview(
+            rope_hoist, Kokkos::ALL(),
+            std::pair<size_t, size_t>(HW, HW + Sv0), Kokkos::ALL());
+        Kokkos::deep_copy(trope_hoist, rope_tail);
+        rope_H_ = (int)H;
+        rope_W_ = (int)Wd;
+        rope_Sv_ = Sv0;
+        rope_gen_ = Sc.f3.generation();
+        rope_have_ = true;
+      }
+    }
+
     // Time path (batched): float64 sinusoid on the host (reference training
     // path: double freq/phase, cos|sin, float32), cast to Scalar for the
     // SiLU MLP (reference casts the embedding to the MLP weight dtype).
@@ -1430,11 +1466,15 @@ class MossImageDitModel {
     {
       auto htemb = Kokkos::create_mirror_view(temb);
       const size_t Hh = Fr / 2;
+      // The frequency ladder depends only on the column, not the sample:
+      // compute each pow() once instead of B times (identical values).
+      std::vector<double> freq(Hh);
+      for (size_t j = 0; j < Hh; ++j)
+        freq[j] = std::pow(10000.0, -(double)j / (double)Hh);
       for (size_t b = 0; b < B; ++b) {
         const double tb = (double)htime(b);
         for (size_t j = 0; j < Hh; ++j) {
-          const double freq = std::pow(10000.0, -(double)j / (double)Hh);
-          const double ph = tb * freq;
+          const double ph = tb * freq[j];
           htemb(b, j) = static_cast<Scalar>((float)std::cos(ph));
           htemb(b, j + Hh) = static_cast<Scalar>((float)std::sin(ph));
         }
@@ -1505,15 +1545,21 @@ class MossImageDitModel {
         gemm_bias<ExecSpace, Scalar>(handle_, txtin, W.text_proj_W,
                                      W.text_proj_b, txn, label + "_tproj");
         Impl::dit_copy_flat<ExecSpace, Scalar>(row2(txt3).data(), txn.data(), Sv * D);
-        F3 rope = Sc.f3.get("rope", 1, HW + Sv, Hd);
-        MossImage::moss_rope_build_forward<ExecSpace>(
-            (int)H, (int)Wd, (int)Sv, (float)cfg_.rope_base, rope,
-            label + "_rope");
-        F3 trope = Sc.f3.get("trope", 1, Sv, Hd);
-        auto rope_tail = Kokkos::subview(
-            rope, Kokkos::ALL(), std::pair<size_t, size_t>(HW, HW + Sv),
-            Kokkos::ALL());
-        Kokkos::deep_copy(trope, rope_tail);
+        F3 rope, trope;
+        if (same_len) {
+          rope = rope_hoist;
+          trope = trope_hoist;
+        } else {
+          rope = Sc.f3.get("rope", 1, HW + Sv, Hd);
+          MossImage::moss_rope_build_forward<ExecSpace>(
+              (int)H, (int)Wd, (int)Sv, (float)cfg_.rope_base, rope,
+              label + "_rope");
+          trope = Sc.f3.get("trope", 1, Sv, Hd);
+          auto rope_tail = Kokkos::subview(
+              rope, Kokkos::ALL(), std::pair<size_t, size_t>(HW, HW + Sv),
+              Kokkos::ALL());
+          Kokkos::deep_copy(trope, rope_tail);
+        }
         for (size_t ti = 0; ti < 2; ++ti)
           text_block_forward(txt3, trope, W.text_blocks[ti], attn_scale,
                              label);
@@ -1558,6 +1604,13 @@ class MossImageDitModel {
   DNNHandle<ExecSpace> handle_;
   MossImageDitScratch<ExecSpace, Scalar> scratch_;
   static constexpr float kNormEps = 1e-6f;  // reference _RMSNorm eps
+  // Hoisted RoPE key: geometry the cached "rope_hoist"/"trope_hoist"
+  // scratch buffers were built for, plus the scratch generation at build
+  // time (release_scratch() invalidates the cache, forcing a rebuild).
+  int rope_H_ = -1, rope_W_ = -1;
+  size_t rope_Sv_ = 0;
+  uint64_t rope_gen_ = 0;
+  bool rope_have_ = false;
 
   // [1,D] copy of batch row b (modulation lanes are [B,D]).
   static void copy_lane_row(const V2& src, size_t b, const V2& dst1) {
@@ -1605,14 +1658,8 @@ class MossImageDitModel {
     auto vv3 = Impl::dit_alias_attn<ExecSpace, Scalar>(v2, Sv, Nh, Hd);
     V2 ao2 = Sc.c2.get("tao", Sv, D);
     auto ao3 = Impl::dit_alias_attn<ExecSpace, Scalar>(ao2, Sv, Nh, Hd);
-    MossImage::moss_qk_rmsnorm_forward<ExecSpace, Scalar>(q4, T.qn, kNormEps,
-                                                          q4, label + "_tqn");
-    MossImage::moss_qk_rmsnorm_forward<ExecSpace, Scalar>(k4, T.kn, kNormEps,
-                                                          k4, label + "_tkn");
-    MossImage::moss_rope_apply_forward<ExecSpace, Scalar>(q4, trope, q4,
-                                                          label + "_trq");
-    MossImage::moss_rope_apply_forward<ExecSpace, Scalar>(k4, trope, k4,
-                                                          label + "_trk");
+    MossImage::moss_qk_rmsnorm_rope_forward<ExecSpace, Scalar>(
+        q4, T.qn, k4, T.kn, kNormEps, trope, q4, k4, label + "_tqknrope");
     attention_mha_bidirectional<ExecSpace, Scalar>(
         handle_,
         Kokkos::subview(q4, 0, Kokkos::ALL(), Kokkos::ALL(), Kokkos::ALL()),
@@ -1686,14 +1733,8 @@ class MossImageDitModel {
                               static_cast<Scalar>(0), k2, label + "_k");
       gemm<ExecSpace, Scalar>(handle_, static_cast<Scalar>(1), nrm2, L.v_W,
                               static_cast<Scalar>(0), v2, label + "_v");
-      MossImage::moss_qk_rmsnorm_forward<ExecSpace, Scalar>(q4, L.qn, kNormEps,
-                                                            q4, label + "_qn");
-      MossImage::moss_qk_rmsnorm_forward<ExecSpace, Scalar>(k4, L.kn, kNormEps,
-                                                            k4, label + "_kn");
-      MossImage::moss_rope_apply_forward<ExecSpace, Scalar>(q4, rope, q4,
-                                                            label + "_rq");
-      MossImage::moss_rope_apply_forward<ExecSpace, Scalar>(k4, rope, k4,
-                                                            label + "_rk");
+      MossImage::moss_qk_rmsnorm_rope_forward<ExecSpace, Scalar>(
+          q4, L.qn, k4, L.kn, kNormEps, rope, q4, k4, label + "_qknrope");
       attention_mha_bidirectional<ExecSpace, Scalar>(
           handle_,
           Kokkos::subview(q4, 0, Kokkos::ALL(), Kokkos::ALL(), Kokkos::ALL()),
