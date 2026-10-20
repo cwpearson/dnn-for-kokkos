@@ -663,19 +663,22 @@ std::vector<float> run_sample_loop(
     const float frac = (float)i / (float)n;
     const bool skip_active =
         (slg_start <= frac) && (frac < slg_stop);  // gates uncond skip + SLG
+    // No fences inside the step: every forward, deep_copy, and kernel below
+    // runs on the default execution space stream (the cached cuBLAS/cuDNN
+    // handles re-select that stream per call), so launch order already
+    // guarantees correctness. The host consumes device data only after the
+    // loop, where a single fence guards the final device->host copy.
     // Conditional branch (full depth).
     forward(x_d, t_d, y_cond_d, vc_d, no_skip);
-    Kokkos::fence();
     const bool slg_now = want_slg && skip_active;
     if (need_cfg) {
       // Unconditional branch with negative-branch skipping (window-gated).
+      // Same-stream ordering covers the forward -> combine read-after-write.
       forward(x_d, t_d, y_unc_d, vu_d,
               skip_active ? uncond_skips : no_skip);
-      Kokkos::fence();
       if (slg_now) {
         // Positive-branch skipped forward + SLG correction.
         forward(x_d, t_d, y_cond_d, vs_d, slg_layers);
-        Kokkos::fence();
       }
       Kokkos::parallel_for(
           "moss_loop_cfg_slg_step",
@@ -693,7 +696,6 @@ std::vector<float> run_sample_loop(
           });
     } else if (slg_now) {
       forward(x_d, t_d, y_cond_d, vs_d, slg_layers);
-      Kokkos::fence();
       Kokkos::parallel_for(
           "moss_loop_slg_step",
           Kokkos::MDRangePolicy<Exec, Kokkos::Rank<4>>(
@@ -718,8 +720,9 @@ std::vector<float> run_sample_loop(
             x_d(b, c, h, w) = static_cast<DScalar>(xc + dt * v);
           });
     }
-    Kokkos::fence();
   }
+  // Single fence for the whole loop: the host consumes device data only at
+  // the final device->host copy below.
   Kokkos::fence();
   // Single device->host copy of the final latents.
   auto xh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), x_d);
@@ -843,15 +846,12 @@ std::vector<float> run_sample_loop_from_device(
     const bool skip_active =
         (slg_start <= frac) && (frac < slg_stop);
     forward(x_d, t_d, y_cond_d, vc_d, no_skip);
-    Kokkos::fence();
     const bool slg_now = want_slg && skip_active;
     if (use_cfg) {
       forward(x_d, t_d, y_unc_d, vu_d,
               skip_active ? uncond_skips : no_skip);
-      Kokkos::fence();
       if (slg_now) {
         forward(x_d, t_d, y_cond_d, vs_d, slg_layers);
-        Kokkos::fence();
       }
       Kokkos::parallel_for(
           "moss_loop_cfg_slg_step",
@@ -869,7 +869,6 @@ std::vector<float> run_sample_loop_from_device(
           });
     } else if (slg_now) {
       forward(x_d, t_d, y_cond_d, vs_d, slg_layers);
-      Kokkos::fence();
       Kokkos::parallel_for(
           "moss_loop_slg_step",
           Kokkos::MDRangePolicy<Exec, Kokkos::Rank<4>>(
@@ -894,8 +893,9 @@ std::vector<float> run_sample_loop_from_device(
             x_d(b, c, h, w) = static_cast<DScalar>(xc + dt * v);
           });
     }
-    Kokkos::fence();
   }
+  // Single fence for the whole loop: the host consumes device data only at
+  // the final device->host copy below.
   Kokkos::fence();
   auto xh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), x_d);
   std::vector<float> x(C * T);
@@ -907,9 +907,13 @@ std::vector<float> run_sample_loop_from_device(
 }
 
 #ifdef MOSS_DRIVER_HAVE_DIT
-// True DiT forward: (x_d [1,C,H,W], t_d [1], y [1,L,Cc]) -> out, with an
-// all-valid mask. Cc == text_dim and C == latent_channels by construction
-// of the backend traits above. Namespace scope: NVCC rejects function-local
+// True DiT forward: (x_d [1,C,H,W], t_d [1], y [1,L,Cc]) -> out. The loop
+// captions are always all-valid, so this uses the mask-free
+// forward_all_valid entry: no per-forward mask allocation + fill and no
+// mask device->host copy + host scan in the preamble (previously
+// `mask("moss_loop_mask")` + deep_copy per forward). Cc == text_dim and
+// C == latent_channels by construction of the backend traits above.
+// Namespace scope: NVCC rejects function-local
 // closure types as the Forward template argument above extended device
 // lambdas, so the forward callable is a named functor.
 struct DitForward {
@@ -917,10 +921,7 @@ struct DitForward {
   template <class X, class T, class Y, class Out>
   void operator()(const X& x, const T& t, const Y& y, Out& out,
                   const std::vector<int>& skips) const {
-    Kokkos::View<int**, Kokkos::LayoutRight, Exec> mask("moss_loop_mask", 1,
-                                                        y.extent(1));
-    Kokkos::deep_copy(mask, 1);
-    model->forward(x, t, y, mask, out, skips);
+    model->forward_all_valid(x, t, y, out, skips);
   }
 };
 #else

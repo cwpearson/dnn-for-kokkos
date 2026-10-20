@@ -459,6 +459,59 @@ TEST(MossDitForward, SmokeAndDeterminism) {
                std::invalid_argument);
 }
 
+TEST(MossDitForward, AllValidMatchesMasked) {
+  // forward_all_valid must be bitwise identical to forward() with an
+  // all-ones mask (same gather, same kernels, fewer copies).
+  auto cfg = Dit::tiny_test();  // dim 32, heads 4, layers 2, ffn 64
+  KokkosDNN::MossImageDit::MossImageDitModel<Exec, float> model(cfg);
+  model.weights().random_init(11);
+  for (int B = 1; B <= 2; ++B) {
+    const int H = 2, W = 2, S = 6;
+    uint64_t s = 1234;
+    auto lat = dit_rand4<float>(B, cfg.latent_channels, H, W, -0.5f, 0.5f, s);
+    Kokkos::View<float***, Kokkos::LayoutRight, Exec> enc("e", B, S,
+                                                          cfg.text_dim);
+    {
+      auto h = Kokkos::create_mirror_view(enc);
+      for (int b = 0; b < B; ++b)
+        for (int i = 0; i < S; ++i)
+          for (int j = 0; j < cfg.text_dim; ++j)
+            h(b, i, j) = 0.1f * (i + 1) - 0.05f * j + 0.01f * b;
+      Kokkos::deep_copy(enc, h);
+    }
+    Kokkos::View<unsigned char**, Kokkos::LayoutRight, Exec> mask("m", B, S);
+    Kokkos::deep_copy(mask, (unsigned char)1);
+    Kokkos::View<float*, Exec> t("t", B);
+    {
+      auto h = Kokkos::create_mirror_view(t);
+      for (int b = 0; b < B; ++b) h(b) = 0.5f + 0.1f * b;
+      Kokkos::deep_copy(t, h);
+    }
+    Kokkos::View<float****, Kokkos::LayoutRight, Exec> out("o", B,
+                                                           cfg.latent_channels,
+                                                           H, W);
+    Kokkos::View<float****, Kokkos::LayoutRight, Exec> out2("o2", B,
+                                                            cfg.latent_channels,
+                                                            H, W);
+    for (const std::vector<int> skips : {std::vector<int>{},
+                                         std::vector<int>{1}}) {
+      EXPECT_NO_THROW(model.forward(lat, t, enc, mask, out, skips));
+      EXPECT_NO_THROW(model.forward_all_valid(lat, t, enc, out2, skips));
+      Kokkos::fence();
+      auto ho = Kokkos::create_mirror_view(out);
+      Kokkos::deep_copy(ho, out);
+      auto ho2 = Kokkos::create_mirror_view(out2);
+      Kokkos::deep_copy(ho2, out2);
+      for (int b = 0; b < B; ++b)
+        for (int c = 0; c < cfg.latent_channels; ++c)
+          for (int i = 0; i < H; ++i)
+            for (int j = 0; j < W; ++j)
+              EXPECT_FLOAT_EQ(ho2(b, c, i, j), ho(b, c, i, j))
+                  << "B=" << B << " skips=" << skips.size();
+    }
+  }
+}
+
 TEST(MossDitForward, SkipLayersAreIdentity) {
   auto cfg = Dit::tiny_test();
   KokkosDNN::MossImageDit::MossImageDitModel<Exec, float> model(cfg);
