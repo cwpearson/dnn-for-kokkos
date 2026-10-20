@@ -12,5 +12,6 @@
 #include "tpl/cublas/KokkosDNN_CuBLAS_Stream.hpp"
 #include "tpl/cublas/KokkosDNN_CuBLAS_GemmFloat.hpp"
 #include "tpl/cublas/KokkosDNN_CuBLAS_GemmBF16.hpp"
+#include "tpl/cublas/KokkosDNN_CuBLAS_GemmBiasLt.hpp"
 
 #endif

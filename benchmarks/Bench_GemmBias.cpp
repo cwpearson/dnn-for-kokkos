@@ -4,11 +4,12 @@
 //   y[N]   = W[N,K] * x[K] + b[N]        (rank-1: gemv_bias)
 //
 // GEMM reuse: gemm_bias/gemv_bias and dense_forward route the GEMM part
-// through gemm()/gemv(), so the full cuBLAS dispatch ladder applies
-// unchanged (float via sgemm, bhalf_t via cublasGemmEx on CUDA using the
-// handle's cached handle; tiled/naive fallback elsewhere). cuBLAS has no
-// bias operand; the broadcast bias add is a separate device kernel
-// afterwards. Two variants per case:
+// through fused single-pass paths: cublasLt with the BIAS epilogue on
+// CUDA (float via R_32F, bhalf_t via R_16BF with FP32 accumulation, using
+// the handle's cached Lt state), bias folded into the native kernel
+// write-back elsewhere. When Lt cannot serve a shape, the CUDA path falls
+// back to cuBLAS sgemm/cublasGemmEx plus a separate broadcast-bias
+// kernel. Two variants per case:
 //   Native     — handle with use_cublas=false, always the Kokkos kernel.
 //   Dispatched — default handle, routes to cuBLAS when built with
 //                KokkosDNN_ENABLE_CUBLAS on a CUDA space; otherwise native.
