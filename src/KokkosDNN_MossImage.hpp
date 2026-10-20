@@ -375,6 +375,85 @@ void moss_rope_apply_forward(const XView& x, const RView& rope, const OView& out
       });
 }
 
+// Fused per-head QK RMSNorm + RoPE apply for one MMDiT block side (q and k
+// together): for each (b, s, h) row, normalize by the row RMS (times the
+// per-head weight, exactly as moss_qk_rmsnorm_forward) and immediately apply
+// the NeoX half-rotation with the pipeline-layout rope row (exactly as
+// moss_rope_apply_forward). One launch and one read+write pass per tensor
+// instead of four launches and two passes (norm write + rope re-read).
+// Bitwise identical to the unfused sequence: the normalized values pass
+// through the same Scalar rounding before the rotation (which matters for
+// bhalf_t), and every FP32 multiply/add runs in the same order.
+// q/k/qout/kout: [B, S, H, Dh]; qw/kw: [Dh]; rope: [1, S, Dh] from
+// moss_rope_build_forward. Dh must be even and nonzero (the rotation needs
+// pairs). In-place safe (q may alias qout, k may alias kout: each element
+// is read before it is written). Views are layout-agnostic (managed or
+// unmanaged aliases alike; only extents and operator() are used).
+// Dispatch: native elementwise (no TPL).
+template <class ExecSpace, class Scalar, class QView, class WView, class RView>
+void moss_qk_rmsnorm_rope_forward(const QView& q, const WView& qw,
+                                  const QView& k, const WView& kw, float eps,
+                                  const RView& rope, const QView& qout,
+                                  const QView& kout,
+                                  const std::string& label =
+                                      "KokkosDNN::moss_qk_rmsnorm_rope") {
+  const size_t B = q.extent(0), S = q.extent(1), H = q.extent(2),
+                Dh = q.extent(3);
+  if (k.extent(0) != B || k.extent(1) != S || k.extent(2) != H ||
+      k.extent(3) != Dh || qout.extent(0) != B || qout.extent(1) != S ||
+      qout.extent(2) != H || qout.extent(3) != Dh || kout.extent(0) != B ||
+      kout.extent(1) != S || kout.extent(2) != H || kout.extent(3) != Dh ||
+      qw.extent(0) != Dh || kw.extent(0) != Dh || rope.extent(0) != 1 ||
+      rope.extent(1) != S || rope.extent(2) != Dh)
+    throw std::invalid_argument("moss_qk_rmsnorm_rope_forward: dim mismatch");
+  if (!(eps >= 0.0f) || !std::isfinite(eps))
+    throw std::invalid_argument("moss_qk_rmsnorm_rope_forward: bad eps");
+  if (Dh == 0 || Dh % 2 != 0)
+    throw std::invalid_argument(
+        "moss_qk_rmsnorm_rope_forward: head_dim must be a nonzero even number");
+  if (B == 0 || S == 0 || H == 0) return;
+  const size_t Hh = Dh / 2;
+  // One thread per (b, s, h) row-pair, same policy as moss_qk_rmsnorm_forward
+  // (each row's math is independent, so the result is bitwise identical to
+  // the unfused norm->rope sequence regardless of thread mapping).
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<3>>({0, 0, 0},
+                                                              {B, S, H}),
+      KOKKOS_LAMBDA(size_t b, size_t s, size_t h) {
+        float ssq = 0, ssk = 0;
+        for (size_t d = 0; d < Dh; ++d) {
+          const float vq = static_cast<float>(q(b, s, h, d));
+          const float vk = static_cast<float>(k(b, s, h, d));
+          ssq += vq * vq;
+          ssk += vk * vk;
+        }
+        const float invq =
+            1.0f / sqrt(ssq / static_cast<float>(Dh) + eps);
+        const float invk =
+            1.0f / sqrt(ssk / static_cast<float>(Dh) + eps);
+        for (size_t d = 0; d < Hh; ++d) {
+          // Same Scalar rounding as the unfused norm store + reload.
+          const float aq = static_cast<float>(
+              static_cast<Scalar>(static_cast<float>(q(b, s, h, d)) * invq *
+                                  static_cast<float>(qw(d))));
+          const float bq = static_cast<float>(
+              static_cast<Scalar>(static_cast<float>(q(b, s, h, d + Hh)) *
+                                  invq * static_cast<float>(qw(d + Hh))));
+          const float ak = static_cast<float>(
+              static_cast<Scalar>(static_cast<float>(k(b, s, h, d)) * invk *
+                                  static_cast<float>(kw(d))));
+          const float bk = static_cast<float>(
+              static_cast<Scalar>(static_cast<float>(k(b, s, h, d + Hh)) *
+                                  invk * static_cast<float>(kw(d + Hh))));
+          const float sn = rope(0, s, d), cs = rope(0, s, d + Hh);
+          qout(b, s, h, d) = static_cast<Scalar>(aq * cs - bq * sn);
+          qout(b, s, h, d + Hh) = static_cast<Scalar>(bq * cs + aq * sn);
+          kout(b, s, h, d) = static_cast<Scalar>(ak * cs - bk * sn);
+          kout(b, s, h, d + Hh) = static_cast<Scalar>(bk * cs + ak * sn);
+        }
+      });
+}
+
 // Joint video+text self-attention for one MMDiT block: dense bidirectional
 // attention over the concatenated [video, valid-text] sequence
 // (per-sample text padding is truncated before concat, so no mask is
