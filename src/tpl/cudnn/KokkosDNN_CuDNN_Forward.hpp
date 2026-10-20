@@ -86,6 +86,14 @@ bool cudnn_sdpa_forward_sliding(void* cached_handle, CudnnSdpaScalar dtype,
                                 int64_t o_sH, int64_t o_sD, float scale,
                                 int64_t window);
 
+// Cumulative per-process SDPA plan-cache counters (see
+// KokkosDNN_CuDNN_SDPA.cpp): every sdpa_forward_impl call lands in exactly
+// one bucket — cache hit, rebuild miss, or known-bad early-out. Probe-only,
+// numerics-neutral; used by the DiT attention-overhead test to assert the
+// cross-block plan reuse across cond-vs-neg shapes.
+void sdpa_plan_cache_stats(uint64_t& hits, uint64_t& misses,
+                           uint64_t& bad_skips);
+
 }  // namespace Impl
 }  // namespace KokkosDNN
 
