@@ -14,6 +14,7 @@ examples/llama/  Llama inference example (not part of the library)
 examples/smollm2/ SmolLM2 inference example (not part of the library)
 examples/xor/    XOR MLP training example
 examples/dinov3/ DINOv3 image-encoder example (not part of the library)
+examples/kokoro/  Kokoro TTS example (not part of the library)
 tests/           core op unit tests
 benchmarks/      microbenchmarks (native vs TPL dispatch)
 cmake/           config header + package config templates
