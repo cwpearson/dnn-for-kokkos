@@ -62,13 +62,17 @@ void lstm_forward_uni(
   using Mat2u =
       Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace,
                    Kokkos::MemoryUnmanaged>;
-  Mat2u Xf(X.data(), B * T, I);
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> Xf("lstm_xf", B * T,
+                                                             I);
+  Kokkos::parallel_for(
+      label + "_flatten",
+      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<3>>({0, 0, 0}, {B, T, I}),
+      KOKKOS_LAMBDA(size_t b, size_t t, size_t i) {
+        Xf(b * T + t, i) = X(b, t, i);
+      });
   Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> Pi(
       "lstm_xproj", B * T, H4);
-  {
-    Mat2u Wih_u(const_cast<Scalar*>(Wih.data()), H4, I);
-    gemm(handle, Scalar(1), Xf, Wih_u, Scalar(0), Pi, label + "_xproj");
-  }
+  gemm(handle, Scalar(1), Xf, Wih, Scalar(0), Pi, label + "_xproj");
   std::vector<int> hlen(B, (int)T);
   if (lengths.extent(0) != 0) {
     if (lengths.extent(0) != B)
@@ -78,14 +82,11 @@ void lstm_forward_uni(
     for (size_t b = 0; b < B; ++b) hlen[b] = hl(b);
   }
   auto Whh_h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, Whh);
-  auto bih_h = has_bih
-                   ? Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{},
-                                                         bih)
-                   : Kokkos::View<Scalar*, Kokkos::HostSpace>();
-  auto bhh_h = has_bhh
-                   ? Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{},
-                                                         bhh)
-                   : Kokkos::View<Scalar*, Kokkos::HostSpace>();
+  Kokkos::View<Scalar*, Kokkos::HostSpace> bih_h, bhh_h;
+  if (has_bih)
+    bih_h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, bih);
+  if (has_bhh)
+    bhh_h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, bhh);
   auto Pi_h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, Pi);
   auto Y_h = Kokkos::create_mirror_view(Y);
   // Per-batch (h,c) state: the host loop below is t-major, so state must
