@@ -38,7 +38,7 @@ Options:
 | Option | Default | Effect |
 | --- | --- | --- |
 | `KokkosDNN_ENABLE_TESTS` | ON | build `tests/` |
-| `KokkosDNN_ENABLE_EXAMPLES` | ON | build `examples/` (`llama_generate`, `smollm2_generate`, `gemma4_generate`, `xor_train`, `dinov3_encode`, `sana_generate`, + example tests) |
+| `KokkosDNN_ENABLE_EXAMPLES` | ON | build `examples/` (`llama_generate`, `smollm2_generate`, `gemma4_generate`, `xor_train`, `dinov3_encode`, `sana_generate`, `kokoro_tts`, + example tests) |
 | `KokkosDNN_ENABLE_BENCHMARKS` | OFF | build `benchmarks/kokkosdnn_bench` (Google Benchmark, fetched if needed) |
 | `KokkosDNN_ENABLE_CUBLAS` | OFF | GEMM via cuBLAS on CUDA spaces |
 | `KokkosDNN_ENABLE_CUDNN` | OFF | attention via cuDNN SDPA (with automatic native fallback; needs `<cudnn.h>` + `cudnn-frontend`, fetched automatically) |
@@ -53,7 +53,7 @@ Options:
 - [dinov3](examples/dinov3/) — DINOv3 ViT-B/16 image-encoder inference.
 - [sana](examples/sana/) — Sana-0.6B (SanaMS_600M_P1_D28) text-to-image with FlowEuler + CFG (DiT weights load directly from the `.pth` checkpoint; native Gemma-2-2B-IT text encoder via `--text-weights` and native DC-AE f32c32 decoder via `--vae-safetensors`; without them conditioning falls back to the checkpoint null embedding unless `--prompt-embeds` is given, and output is raw latents plus a channel-mean grayscale preview).
 - [moss_image](examples/moss_image/) — MOSS-Image-SFT text-to-image, fully in-process: in-repo BPE tokenizer + on-device Qwen3.5 encoder, FlowEuler + CFG DiT (`--staged` keeps the MiB embeds resident on-device while the 16.8 GB text encoder and 10.2 GB DiT are never resident together on a 24 GB GPU; `--prompt-embeds-in` loads precomputed file embeds, e.g. from `scripts/moss_encode.py`).
-- [kokoro](examples/kokoro/) — Kokoro-82M text-to-speech (StyleTTS2 + ISTFTNet, 24 kHz) from IPA phonemes with the `kokoro_tts` driver.
+- [kokoro](examples/kokoro/) — Kokoro-82M text-to-speech (phoneme input): native StyleTTS2 + ISTFTNet inference with `--voice` packs, 24 kHz WAV out (weights load directly from the `kokoro-v1_0.pth` checkpoint via a dependency-free pickle reader).
 
 See each directory's README for flags, run commands, and design notes.
 
@@ -92,3 +92,9 @@ so subset with `--benchmark_filter` or lower `--benchmark_min_time` there.
   Geometry is fixed at 1024px (32x32x32 latents; `--tiny` uses 4x4). A
   full-resolution run is hours on a Serial CPU build; use a CUDA/cuBLAS
   build for anything beyond smoke tests.
+- Kokoro scope: FP32 only (`--fp32` accepted no-op); `--phonemes` is the
+  primary input (KModel is language-blind, no bundled G2P; `--text` is a
+  naive vocab fallback). SineGen uses its own host RNG stream, so audio
+  differs from the torch reference by RNG (deterministic given `--seed`);
+  durations, F0/N, and ASR features match the reference and are golden
+  tested. Long paragraphs scale linearly (audio = 300·F₂ samples).

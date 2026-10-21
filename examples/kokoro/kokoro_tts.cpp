@@ -1,183 +1,314 @@
-// Kokoro TTS driver: phonemes -> 24kHz WAV via the native Kokkos pipeline.
+// Kokoro-TTS driver: phonemes (or naive text) in, 24 kHz WAV out.
 //
-// Usage:
-//   kokoro_tts --weights kokoro-v1_0.pth --voice voices/af_heart.pt \
-//     --config config-kokoro-v1_0.json --phonemes "hEl@U" --output out.wav
-//   kokoro_tts --tiny --phonemes "hello" --output tiny.wav
+//   kokoro_tts [--weights kokoro-v1_0.pth] [--voice af_heart.pt]
+//              [--phonemes "hɛloʊ wɜːld"] [--text "hello"] [--speed 1]
+//              [--seed 42] [--out kokoro_out.wav] [--tiny]
 //
-// Notes:
-// - Pass IPA phonemes directly (--phonemes). Unknown characters are dropped;
-//   boundary 0s are added automatically. Proper G2P (misaki/espeak) is out
-//   of scope; for English, plain lowercase text is accepted but will sound
-//   mispronounced (each letter mapped through the vocab).
-// - Voice ref vector: row clamp(len(phonemes)-1) of the [N,1,256] voice pack,
-//   matching KPipeline.infer (pack[len(ps)-1]).
-// - Deterministic: harmonic phase accumulation starts at zero and SineGen/
-//   noise draws use a fixed seed, so output differs stochastically from
-//   torch but is reproducible.
-// - Tiny mode: small random model, no downloads (also the unit-test path).
+// KModel is language-blind: it consumes phoneme symbols, not graphemes.
+// --phonemes is the primary input (raw IPA string, e.g. produced by the
+// kokoro KPipeline with model=False, or espeak-ng -v en --ipa). --text is
+// a demo-quality fallback that maps characters present in the vocab
+// directly (no G2P; unmapped characters are skipped). WAV is peak-
+// normalized PCM16; raw float32 is always written to <stem>.f32.
+//
+// --tiny runs a random-weights smoke model (no downloads).
 
+#include <Kokkos_Core.hpp>
+
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <map>
+#include <random>
 #include <string>
+#include <vector>
 
-#include <Kokkos_Core.hpp>
-
+#include "KokkosDNN.hpp"
 #include "KokkosDNN_KokoroConfig.hpp"
 #include "KokkosDNN_KokoroModel.hpp"
 #include "KokkosDNN_KokoroWeights.hpp"
 
 namespace {
-void write_wav(const std::string& path, const std::vector<float>& pcm,
-               int sample_rate = 24000) {
+
+namespace KK = KokkosDNN::Kokoro;
+using Exec = Kokkos::DefaultExecutionSpace;
+using Scalar = KK::DefaultScalar;
+
+// Decode one UTF-8 code point; returns bytes consumed (0 on error).
+size_t utf8_next(const std::string& s, size_t i, uint32_t& cp) {
+  const size_t n = s.size();
+  if (i >= n) return 0;
+  const unsigned char c = (unsigned char)s[i];
+  if (c < 0x80) {
+    cp = c;
+    return 1;
+  }
+  size_t len = 0;
+  uint32_t v = 0;
+  if ((c & 0xE0) == 0xC0) {
+    len = 2;
+    v = c & 0x1F;
+  } else if ((c & 0xF0) == 0xE0) {
+    len = 3;
+    v = c & 0x0F;
+  } else if ((c & 0xF8) == 0xF0) {
+    len = 4;
+    v = c & 0x07;
+  } else {
+    return 0;
+  }
+  if (i + len > n) return 0;
+  for (size_t k = 1; k < len; ++k) {
+    const unsigned char d = (unsigned char)s[i + k];
+    if ((d & 0xC0) != 0x80) return 0;
+    v = (v << 6) | (d & 0x3F);
+  }
+  cp = v;
+  return len;
+}
+
+// Map a UTF-8 phoneme string to vocab ids (unknown code points skipped,
+// mirroring KModel.forward's filter). Returns ids + code point count.
+std::pair<std::vector<int>, size_t> phonemes_to_ids(
+    const std::string& ps, const std::map<std::string, int>& vocab) {
+  std::vector<int> ids;
+  size_t ncp = 0;
+  for (size_t i = 0; i < ps.size();) {
+    uint32_t cp = 0;
+    const size_t len = utf8_next(ps, i, cp);
+    if (len == 0) {
+      ++i;
+      continue;
+    }
+    ++ncp;
+    const std::string sym = ps.substr(i, len);
+    auto it = vocab.find(sym);
+    if (it != vocab.end()) ids.push_back(it->second);
+    i += len;
+  }
+  return {ids, ncp};
+}
+
+void save_wav16(const std::string& path, const std::vector<float>& x,
+                int rate, float& peak_out) {
+  float peak = 0.0f;
+  for (float v : x) peak = std::max(peak, std::fabs(v));
+  peak_out = peak;
+  const float g = (peak > 1e-9f) ? (0.95f / peak) : 1.0f;
   std::ofstream f(path, std::ios::binary);
-  if (!f) throw std::runtime_error("cannot open output " + path);
-  const uint32_t n = (uint32_t)pcm.size();
+  if (!f) throw std::runtime_error("cannot open '" + path + "'");
+  const uint32_t n = (uint32_t)x.size();
   const uint32_t data_bytes = n * 2;
+  auto w32 = [&](uint32_t v) {
+    f.put((char)(v & 0xFF));
+    f.put((char)((v >> 8) & 0xFF));
+    f.put((char)((v >> 16) & 0xFF));
+    f.put((char)((v >> 24) & 0xFF));
+  };
+  auto w16 = [&](uint16_t v) {
+    f.put((char)(v & 0xFF));
+    f.put((char)((v >> 8) & 0xFF));
+  };
   f.write("RIFF", 4);
-  uint32_t chunk = 36 + data_bytes;
-  f.write((char*)&chunk, 4);
+  w32(36 + data_bytes);
   f.write("WAVE", 4);
   f.write("fmt ", 4);
-  uint32_t sub1 = 16;
-  f.write((char*)&sub1, 4);
-  uint16_t audio_fmt = 1;
-  f.write((char*)&audio_fmt, 2);
-  uint16_t ch = 1;
-  f.write((char*)&ch, 2);
-  uint32_t sr = (uint32_t)sample_rate;
-  f.write((char*)&sr, 4);
-  uint32_t br = sr * 2;
-  f.write((char*)&br, 4);
-  uint16_t ba = 2;
-  f.write((char*)&ba, 2);
-  uint16_t bps = 16;
-  f.write((char*)&bps, 2);
+  w32(16);
+  w16(1);
+  w16(1);
+  w32((uint32_t)rate);
+  w32((uint32_t)rate * 2);
+  w16(2);
+  w16(16);
   f.write("data", 4);
-  f.write((char*)&data_bytes, 4);
-  for (float v : pcm) {
-    float c = v;
-    if (!(c == c)) c = 0;
-    c = std::max(-1.0f, std::min(1.0f, c));
-    int16_t s = (int16_t)std::lround(c * 32767.0f);
-    f.write((char*)&s, 2);
+  w32(data_bytes);
+  for (float v : x) {
+    float s = v * g;
+    s = std::max(-1.0f, std::min(1.0f, s));
+    w16((uint16_t)(int16_t)std::lround(s * 32767.0f));
   }
+  if (!f) throw std::runtime_error("short write to '" + path + "'");
+}
+
+void save_raw_f32(const std::string& path, const std::vector<float>& v) {
+  std::ofstream f(path, std::ios::binary);
+  if (!f) throw std::runtime_error("cannot open '" + path + "'");
+  f.write(reinterpret_cast<const char*>(v.data()),
+          (long long)(v.size() * sizeof(float)));
+  if (!f) throw std::runtime_error("short write to '" + path + "'");
+}
+
+std::string with_extension(const std::string& path, const std::string& ext) {
+  const size_t dot = path.find_last_of('.');
+  const size_t sep = path.find_last_of("/\\");
+  if (dot == std::string::npos || (sep != std::string::npos && dot < sep))
+    return path + ext;
+  return path.substr(0, dot) + ext;
 }
 
 void usage() {
-  std::cout
-      << "Usage: kokoro_tts [--tiny] [--weights FILE] [--voice FILE]\n"
-      << "                  [--config FILE] [--phonemes STR] [--text STR]\n"
-      << "                  [--output FILE] [--speed F] [--voice-index I]\n";
+  std::printf(
+      "usage: kokoro_tts [--weights kokoro-v1_0.pth] [--voice af_heart.pt]\n"
+      "                   [--phonemes \"hɛloʊ wɜːld\"] [--text \"hello\"]\n"
+      "                   [--speed 1.0] [--seed 42] [--out kokoro_out.wav]\n"
+      "                   [--tiny]\n"
+      "\n"
+      "  --weights  torch.save Kokoro-82M checkpoint (default kokoro-v1_0.pth;\n"
+      "             `hf download hexgrad/Kokoro-82M kokoro-v1_0.pth`)\n"
+      "  --voice    voice pack (default af_heart.pt;\n"
+      "             `hf download hexgrad/Kokoro-82M voices/af_heart.pt`)\n"
+      "  --phonemes raw IPA string (primary input; KModel is language-blind)\n"
+      "  --text     naive fallback: vocab chars mapped directly, no G2P\n"
+      "  --speed    duration divisor (default 1.0)\n"
+      "  --seed     SineGen RNG seed (default 42; audio differs from torch\n"
+      "             by RNG stream, deterministic given seed)\n"
+      "  --out      WAV path (PCM16 peak-normalized; raw F32 to <stem>.f32)\n"
+      "  --tiny     random-weights smoke model (no files)\n");
 }
+
 }  // namespace
 
 int main(int argc, char** argv) {
+  std::string weights = "kokoro-v1_0.pth", voice = "af_heart.pt";
+  std::string phonemes = "hɛloʊ wɜːld", text, out = "kokoro_out.wav";
+  float speed = 1.0f;
+  uint64_t seed = 42;
+  bool tiny = false, have_phonemes = false;
+
+  for (int i = 1; i < argc; ++i) {
+    const std::string a = argv[i];
+    auto need = [&](std::string& dst) {
+      if (i + 1 >= argc) {
+        std::fprintf(stderr, "error: %s needs a value\n", a.c_str());
+        return false;
+      }
+      dst = argv[++i];
+      return true;
+    };
+    if (a == "--weights") {
+      if (!need(weights)) return 1;
+    } else if (a == "--voice") {
+      if (!need(voice)) return 1;
+    } else if (a == "--phonemes" && i + 1 < argc) {
+      phonemes = argv[++i];
+      have_phonemes = true;
+    } else if (a == "--text" && i + 1 < argc) {
+      text = argv[++i];
+    } else if (a == "--out" && i + 1 < argc) {
+      out = argv[++i];
+    } else if (a == "--speed" && i + 1 < argc) {
+      speed = std::stof(argv[++i]);
+    } else if (a == "--seed" && i + 1 < argc) {
+      seed = (uint64_t)std::stoull(argv[++i]);
+    } else if (a == "--tiny") {
+      tiny = true;
+    } else if (a == "--help" || a == "-h") {
+      usage();
+      return 0;
+    } else {
+      std::fprintf(stderr, "warning: ignoring unknown arg '%s'\n", a.c_str());
+    }
+  }
+
   Kokkos::initialize(argc, argv);
   int rc = 0;
   try {
-    std::string weights, voice,
-        config = "examples/kokoro/config-kokoro-v1_0.json";
-    std::string phonemes, text, output = "kokoro_out.wav";
-    float speed = 1.0f;
-    bool tiny = false;
-    int voice_index = -1;
-    for (int i = 1; i < argc; ++i) {
-      std::string a = argv[i];
-      auto need = [&](std::string& dst) {
-        if (i + 1 >= argc) throw std::runtime_error("missing value for " + a);
-        dst = argv[++i];
-      };
-      if (a == "--weights")
-        need(weights);
-      else if (a == "--voice")
-        need(voice);
-      else if (a == "--config")
-        need(config);
-      else if (a == "--phonemes")
-        need(phonemes);
-      else if (a == "--text")
-        need(text);
-      else if (a == "--output")
-        need(output);
-      else if (a == "--tiny")
-        tiny = true;
-      else if (a == "--speed") {
-        std::string s;
-        need(s);
-        speed = std::stof(s);
-      } else if (a == "--voice-index") {
-        std::string s;
-        need(s);
-        voice_index = std::stoi(s);
-      } else if (a == "--help" || a == "-h") {
-        usage();
-        Kokkos::finalize();
-        return 0;
-      } else {
-        throw std::runtime_error("unknown flag " + a);
-      }
-    }
-    if (!text.empty() && phonemes.empty()) phonemes = text;
-    if (phonemes.empty()) phonemes = "h\xc9\x9b\xcb\x88lo\xca\x8a";
-    using Exec = Kokkos::DefaultExecutionSpace;
-    KokkosDNN::DNNHandle<Exec> handle;
-    if (tiny) {
-      KokkosDNN::Kokoro::Config cfg;
-      cfg.hidden_dim = 16;
-      cfg.style_dim = 8;
-      cfg.plbert_hidden_size = 32;
-      cfg.plbert_heads = 4;
-      cfg.plbert_intermediate = 64;
-      cfg.plbert_layers = 2;
-      cfg.upsample_initial_channel = 32;
-      cfg.max_tokens = 64;
-      cfg.max_frames = 256;
-      cfg.max_samples = 1 << 20;
-      KokkosDNN::Kokoro::Vocab vocab;
-      for (int c = 0; c < 26; ++c)
-        vocab[std::string(1, (char)('a' + c))] = 1 + c;
-      vocab[" "] = 27;
-      vocab["\xc9\x9b"] = 28;
-      vocab["\xcb\x88"] = 29;
-      vocab["\xca\x8a"] = 30;
-      KokkosDNN::Kokoro::Weights<Exec, float> w;
-      KokkosDNN::Kokoro::random_init<Exec, float>(cfg, w, 42);
-      Kokkos::View<float*, Exec> ref_s("ref", cfg.style_dim);
-      Kokkos::deep_copy(ref_s, 0.1f);
-      auto out = KokkosDNN::Kokoro::synthesize<Exec>(cfg, handle, w, vocab,
-                                                     phonemes, ref_s, speed);
-      write_wav(output, out.audio, (int)cfg.sample_rate);
-      std::cout << "tiny: phonemes=" << phonemes.size()
-                << " frames=" << out.durations.size()
-                << " samples=" << out.audio.size() << " -> " << output << "\n";
+    KokkosDNN::print_configuration(std::cout);
+    KK::Config cfg = tiny ? KK::tiny_test_config() : KK::Config();
+    std::printf("[model %s]\n", tiny ? "tiny_test" : "kokoro-82M");
+
+    // Vocab map (only needed for real configs; tiny uses raw ids).
+    std::map<std::string, int> vocab;
+    for (auto& kv : KK::Config::vocab_table()) vocab[kv.first] = kv.second;
+
+    std::vector<int> ids;
+    size_t ncp = 0;
+    if (!text.empty() && !have_phonemes) {
+      std::printf("[text \"%s\"] naive vocab mapping (no G2P)\n",
+                  text.c_str());
+      std::tie(ids, ncp) = phonemes_to_ids(text, vocab);
     } else {
-      if (weights.empty() || voice.empty())
-        throw std::runtime_error("--weights and --voice are required");
-      KokkosDNN::Kokoro::Vocab vocab;
-      KokkosDNN::Kokoro::Config cfg =
-          KokkosDNN::Kokoro::load_config(config, vocab);
-      KokkosDNN::Kokoro::Weights<Exec, float> w;
-      KokkosDNN::Kokoro::load_kokoro_pth<Exec, float>(cfg, weights, w);
-      int idx =
-          voice_index >= 0 ? voice_index : (int)phonemes.size() - 1;
-      Kokkos::View<float*, Exec> ref_s;
-      KokkosDNN::Kokoro::load_voice_row<Exec, float>(voice, idx, ref_s);
-      auto out = KokkosDNN::Kokoro::synthesize<Exec>(cfg, handle, w, vocab,
-                                                     phonemes, ref_s, speed);
-      write_wav(output, out.audio, (int)cfg.sample_rate);
-      std::cout << "wrote " << output << " (" << out.audio.size()
-                << " samples @ " << cfg.sample_rate << "Hz)\n";
-      std::cout << "durations:";
-      for (int d : out.durations) std::cout << " " << d;
-      std::cout << "\n";
+      if (!have_phonemes)
+        std::printf("[default demo phonemes \"%s\"]\n", phonemes.c_str());
+      std::tie(ids, ncp) = phonemes_to_ids(phonemes, vocab);
     }
+    std::printf("[phonemes %zu code points -> %zu ids]\n", ncp, ids.size());
+    if (ids.empty()) throw std::runtime_error("no phoneme ids (empty input?)");
+    if (!(speed > 0.0f) || !std::isfinite(speed))
+      throw std::runtime_error("--speed must be a positive finite number");
+
+    KK::Weights<Exec, Scalar> w;
+    const size_t SD = tiny ? (size_t)cfg.style_dim : 128;
+    std::vector<float> style(2 * SD, 0.0f);
+    if (tiny) {
+      KK::random_init(cfg, w, seed);
+      std::mt19937_64 rng(seed);
+      std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+      for (auto& v : style) v = u(rng);
+      ids = {1, 2, 3, 4, 5};
+      if ((int)ids.size() > cfg.n_token - 2) ids.resize((size_t)cfg.n_token - 2);
+      std::printf("[tiny random weights] %zu ids\n", ids.size());
+    } else {
+      std::printf("[loading %s]\n", weights.c_str());
+      KK::load_pth_weights(cfg, weights, w);
+      std::printf("[loading voice %s]\n", voice.c_str());
+      KK::VoicePack vp = KK::load_voice(voice);
+      const int row = (int)ncp - 1;  // KPipeline.infer: pack[len(ps)-1]
+      if (row < 0 || row >= vp.n_rows)
+        throw std::runtime_error("voice pack has " +
+                                 std::to_string(vp.n_rows) + " rows, need " +
+                                 std::to_string(row + 1));
+      if (vp.rows.size() != (size_t)vp.n_rows * 2 * SD)
+        throw std::runtime_error("voice pack rows are not 256-dim");
+      std::copy(vp.rows.begin() + (size_t)row * 2 * SD,
+                vp.rows.begin() + (size_t)(row + 1) * 2 * SD, style.begin());
+      std::printf("[voice row %d of %d]\n", row, vp.n_rows);
+    }
+
+    KK::Model<Exec, Scalar> model(cfg, w);
+    KK::Intermediates dbg;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<float> audio =
+        model.synthesize(ids, style, speed, seed, &dbg);
+    const double secs =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+            .count();
+    double mean = 0.0, var = 0.0;
+    float mn = audio.empty() ? 0 : audio[0], mx = mn;
+    for (float v : audio) {
+      mean += v;
+      mn = std::min(mn, v);
+      mx = std::max(mx, v);
+    }
+    mean /= (double)std::max<size_t>(audio.size(), 1);
+    for (float v : audio) var += (v - mean) * (v - mean);
+    var /= (double)std::max<size_t>(audio.size(), 1);
+    std::printf("[audio %zu samples @24000Hz = %.2fs] mean=%.6f rms=%.6f "
+                "min=%.4f max=%.4f (synth %.2fs)\n",
+                audio.size(), audio.size() / 24000.0, mean, std::sqrt(var),
+                (double)mn, (double)mx, secs);
+    std::printf("[durations");
+    size_t fsum = 0;
+    for (int d : dbg.pred_dur) {
+      std::printf(" %d", d);
+      fsum += (size_t)d;
+    }
+    std::printf("] frames=%d audio=%zu (expect %zu)\n", dbg.frames,
+                audio.size(), (size_t)dbg.frames * 2 * 300);
+
+    float peak = 0.0f;
+    save_wav16(out, audio, 24000, peak);
+    std::printf("[wrote %s] peak=%.4f (peak-normalized PCM16)\n", out.c_str(),
+                (double)peak);
+    const std::string f32 = with_extension(out, ".f32");
+    save_raw_f32(f32, audio);
+    std::printf("[wrote %s] raw float32\n", f32.c_str());
   } catch (const std::exception& e) {
-    std::cerr << "error: " << e.what() << "\n";
+    std::fprintf(stderr, "error: %s\n", e.what());
     rc = 1;
   }
   Kokkos::finalize();

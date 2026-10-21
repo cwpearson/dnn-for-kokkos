@@ -1,21 +1,27 @@
 #ifndef KOKKOSDNN_KOKORO_PTH_HPP
 #define KOKKOSDNN_KOKORO_PTH_HPP
 
-// Minimal torch.save reader for the Kokoro example.
+// Minimal torch.save (.pth/.pt) reader for the Kokoro example.
 //
-// kokoro-v1_0.pth is a ZIP archive (stored) with data.pkl (protocol-2 pickle)
-// holding {section: OrderedDict} for sections bert/bert_encoder/predictor/
-// decoder/text_encoder, each value being an OrderedDict of tensors via
-// _rebuild_tensor_v2 + persistent FloatStorage IDs, plus one data/<i> record
-// per fp32 storage blob. Voice files (voices/*.pt) hold a single tensor
-// ([510,1,256]) with the same storage layout.
+// The `kokoro-v1_0.pth` checkpoint is a ZIP archive (stored, uncompressed)
+// with `data.pkl` (protocol-2 pickle of `{'bert': ..., 'bert_encoder': ...,
+// 'predictor': ..., 'decoder': ..., 'text_encoder': ...}` where each group
+// is an OrderedDict of float32 tensors via `_rebuild_tensor_v2` +
+// persistent `('storage', FloatStorage, key, ...)`` storage IDs) and one
+// `data/<key>` record per storage blob. Voice packs (`voices/*.pt`) are the
+// same layout with a single tensor at top level.
 //
-// API:
-//   open_kokoro_pth(path) -> inventory of "section.key" tensors.
-//   read_kokoro_storage() -> fp32 blob.
-//   open_voice_pt(path)   -> single-tensor inventory ([N,1,256]).
-// Supported pickle opcodes mirror the Sana reader (GLOBAL, REDUCE, BUILD,
-// BINPERSID, ...); anything else throws. Float32 only.
+// Supported pickle opcodes are the closed set torch.save emits here: PROTO,
+// GLOBAL, REDUCE, BUILD, BINPERSID, EMPTY_DICT, EMPTY_TUPLE, TUPLE[N],
+// TUPLE1/2/3, MARK, SETITEM[S], BINUNICODE, BININT[1,2], BINPUT/LONG_BINPUT,
+// BINGET/LONG_BINGET, NEWFALSE/NEWTRUE, STOP (plus LONG/BINFLOAT defensively).
+// Storage dtype must be a FloatStorage variant (the checkpoint is all F32);
+// anything else throws.
+//
+// Rationale (mirrors examples/sana `KokkosDNN_SanaPth.hpp`): the checkpoint
+// is ~330 MB of plain float32 blobs with a 94 KiB pickle index. Depending
+// on libtorch just to memcpy those blobs would dwarf the example; a voice
+// pack is a single 510x1x256 float tensor with the same framing.
 
 #include <cstdint>
 #include <map>
@@ -26,28 +32,41 @@
 namespace KokkosDNN {
 namespace Kokoro {
 
-struct KokoroTensorMeta {
-  std::string name;  // "section.key" (model) or "tensor" (voice)
-  std::vector<int64_t> shape;
-  std::vector<int64_t> stride;
-  int64_t storage_offset = 0;
-  int storage_id = -1;
-  int64_t numel = 0;
-  std::string dtype;
+// One tensor entry: torch._utils._rebuild_tensor_v2(storage,
+// storage_offset, size, stride, requires_grad, backward_hooks).
+struct PthTensorMeta {
+  std::string name;              // dotted group path, e.g. "decoder.module.encode.conv1.weight"
+  std::vector<int64_t> shape;    // tensor sizes
+  std::vector<int64_t> stride;   // element strides
+  int64_t storage_offset = 0;    // elements into the storage record
+  std::string storage_key;       // data/<storage_key> record id
+  int64_t storage_numel = 0;     // elements in the storage record
+  std::string dtype;             // storage type, e.g. "torch.FloatStorage"
+  int64_t numel = 0;             // elements (== product(shape))
 };
 
-struct KokoroArchive {
+// Parsed archive: ordered tensor inventory + byte ranges of each storage
+// record. Tensor bytes stay on disk until read_pth_storage() is called.
+struct PthArchive {
   std::string path;
-  std::string prefix;
-  std::vector<KokoroTensorMeta> tensors;
-  std::map<int, std::pair<uint64_t, uint64_t>> records;
+  std::string prefix;  // zip entry prefix, e.g. "model" / "af_heart"
+  std::vector<PthTensorMeta> tensors;  // document order
+  // storage_key -> (file offset, byte size) of the data/<key> record.
+  std::map<std::string, std::pair<uint64_t, uint64_t>> records;
 };
 
-KokoroArchive open_kokoro_pth(const std::string& path);
-KokoroArchive open_voice_pt(const std::string& path);
-int64_t kokoro_total_params(const KokoroArchive& archive);
-std::vector<float> read_kokoro_storage(const KokoroArchive& archive,
-                                       int storage_id);
+// Parse the ZIP index + data.pkl. Throws std::runtime_error on I/O errors
+// or an unrecognized layout (not a torch.save archive of dicts/tensors).
+PthArchive open_pth(const std::string& path);
+
+// Total parameter count over the inventory (sum of numel).
+int64_t pth_total_params(const PthArchive& archive);
+
+// Stream one storage record from disk as float32 (little-endian host
+// assumed, matching the archive byteorder marker). Throws if the record is
+// missing, short, or not float32.
+std::vector<float> read_pth_storage(const PthArchive& archive,
+                                    const std::string& storage_key);
 
 }  // namespace Kokoro
 }  // namespace KokkosDNN

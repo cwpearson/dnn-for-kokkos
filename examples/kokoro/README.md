@@ -1,92 +1,110 @@
-# Kokoro example
+# Kokoro-82M text-to-speech example
 
-Kokoro-82M text-to-speech inference (StyleTTS2 + ISTFTNet) built on the
-core library: dependency-free `kokoro-v1_0.pth` checkpoint loader
-(weight_norm fused on host), phoneme tokenization from `config.json`,
-PLBERT encoder, duration/pitch/energy prosody predictor, text encoder,
-length regulation, and the ISTFTNet neural vocoder (harmonic source +
-STFT/iSTFT, 24 kHz output).
-
-Scope: **inference only**, batch-1, **float32**.
+C++20 Kokkos port of the `hexgrad/Kokoro-82M` StyleTTS2 + ISTFTNet inference
+stack (82M params, FP32, 24 kHz output). Reference: the `kokoro` pip package
+(`kokoro/model.py`, `modules.py`, `istftnet.py`, v0.7.x):
+`KModel.forward(phonemes, ref_s, speed)` with `af_heart`-style voice packs.
 
 ## Quickstart (0 to working)
 
-From the worktree root (`/workspace/kokoro-tts`) — build, fetch checkpoint
-files, run:
+Run from the repo root.
 
 ```bash
-cmake -S . -B build -DKokkos_ROOT=/path/to/kokkos-install -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel 8 --target kokoro_tts
+cmake -S . -B build-cuda \
+  -DCMAKE_CXX_COMPILER=<path-to>/kokkos/bin/nvcc_wrapper \
+  -DKokkos_ROOT=<path-to>/kokkos-install \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-cuda --parallel 16 \
+  --target kokoro_tts test_kokoro_smoke test_kokoro_pth test_kokoro_golden
 
-pip install -U huggingface_hub  # provides the `hf` CLI
-export PATH=$HOME/.local/bin:$PATH
-hf download hexgrad/Kokoro-82M \
-  --include "config.json" \
-  --include "kokoro-v1_0.pth" \
-  --include "voices/af_heart.pt" \
-  --local-dir ./kokoro-weights
+# working run: no downloads needed (random weights, tiny channels)
+./build-cuda/examples/kokoro/kokoro_tts --tiny --out tiny.wav
 
-./build/examples/kokoro/kokoro_tts \
+# full stack (downloads ~330 MB model + ~0.5 MB voice)
+hf download hexgrad/Kokoro-82M --local-dir ./kokoro-weights \
+  --include 'kokoro-v1_0.pth' 'voices/af_heart.pt'
+./build-cuda/examples/kokoro/kokoro_tts \
   --weights ./kokoro-weights/kokoro-v1_0.pth \
   --voice ./kokoro-weights/voices/af_heart.pt \
-  --config examples/kokoro/config-kokoro-v1_0.json \
-  --phonemes "hɛˈloʊ" --output hello.wav
+  --phonemes "hɛloʊ wɜːld" --out hello.wav
 ```
 
-Expected tensor inventory: 548 tensors (~82M params); voices are
-`[510,1,256]` float32 packs. The voice vector is row
-`clamp(len(phonemes)-1)` of the pack, matching `KPipeline.infer`
-(`pack[len(ps)-1]`).
+`--phonemes` is the primary input: KModel is language-blind and consumes
+phoneme symbols, not graphemes (produce them with the `kokoro` KPipeline in
+quiet mode, or `espeak-ng -v en --ipa`). `--text` maps characters present in
+the vocab directly (no G2P; unmapped characters are skipped) — demo quality
+only. WAV is peak-normalized PCM16; raw float32 always lands at `<stem>.f32`.
 
-## Example commands
+Driver flags (`kokoro_tts`):
 
-```bash
-# Tiny random model, no downloads (also the unit-test end-to-end path):
-./build/examples/kokoro/kokoro_tts --tiny --phonemes "hello" --output tiny.wav
-
-# Real checkpoint, different speed / voice row:
-./build/examples/kokoro/kokoro_tts \
-  --weights ./kokoro-weights/kokoro-v1_0.pth \
-  --voice ./kokoro-weights/voices/af_heart.pt \
-  --config examples/kokoro/config-kokoro-v1_0.json \
-  --phonemes "hɛˈloʊ wɜːld" --speed 1.1 --voice-index 42 --output out.wav
-```
+| flag | default | meaning |
+|---|---|---|
+| `--weights` | `kokoro-v1_0.pth` | torch.save Kokoro-82M checkpoint |
+| `--voice` | `af_heart.pt` | voice pack (`voices/*.pt`) |
+| `--phonemes` | `hɛloʊ wɜːld` | raw IPA string (primary input) |
+| `--text` | — | naive fallback: vocab chars mapped directly, no G2P |
+| `--speed` | `1.0` | duration divisor |
+| `--seed` | `42` | SineGen RNG seed (see Notes) |
+| `--out` | `kokoro_out.wav` | WAV path (PCM16 peak-normalized; raw F32 to `<stem>.f32`) |
+| `--tiny` | off | random-weights smoke model (no files) |
 
 ## Notes
 
-- Flags (see `kokoro_tts.cpp` header): `--tiny`, `--weights FILE`,
-  `--voice FILE`, `--config FILE` (default
-  `examples/kokoro/config-kokoro-v1_0.json`), `--phonemes STR` / `--text STR`
-  (alias; plain text is mapped letter-by-letter, no G2P), `--output FILE`,
-  `--speed F`, `--voice-index I` (default: `len(phonemes)-1`, clamped).
-- Input is an IPA phoneme string: each UTF-8 character is looked up in the
-  `config.json` vocab (unknown chars dropped), wrapped with boundary id `0`
-  on both sides. Proper G2P (misaki/espeak-ng) is out of scope.
-- Deterministic: harmonic phase accumulation starts at zero and the
-  SineGen/noise draws use a fixed seed, so output is reproducible but differs
-  stochastically from torch (which draws random phases/noise).
-- Output length is exactly `600 * sum(pred_dur)` samples at 24 kHz
-  (upsampling 2x decoder + 10x/6x generator + 5x iSTFT hop, times the
-  doubled F0 frame rate).
-- Layout: `KokkosDNN_KokoroConfig.{hpp,cpp}` (config + vocab JSON),
-  `KokkosDNN_KokoroPth.{hpp,cpp}` (ZIP/pickle reader for the model file
-  and single-tensor voice files), `KokkosDNN_KokoroWeights.{hpp,cpp}`
-  (device views + weight_norm fusion + voice row select),
-  `KokkosDNN_KokoroModel.{hpp,cpp}` (`synthesize()` pipeline),
-  `kokoro_tts.cpp` (driver + WAV writer),
-  `config-kokoro-v1_0.json` (HF config copy), `Test_*` (tests).
+- Architecture: phoneme ids (+BOS/EOS pads) → PL-BERT Albert (128-dim
+  embed, 768 hidden, 12 heads, one shared layer applied 12x, GELU-tanh) →
+  Linear 768→512 → DurationEncoder (3x BiLSTM-640/AdaLN) → duration_proj
+  (50-way sigmoid sum → `pred_dur`, alignment) → shared BiLSTM → F0/N Adain
+  stacks (second block upsamples x2) → F0/N curves; ids → TextEncoder
+  (embed 512, 3x Conv1d k5 + BiLSTM-512) → aligned ASR features; Decoder
+  (F0/N Conv1d k3/s2 downsample, AdainResBlk encode + 4x decode with last
+  block x2) → ISTFTNet Generator (nearest-f0 x300 SineGen excitation, STFT
+  harmonics, ups x10/x6, AdaINResBlocks with Snake activation, conv_post →
+  magnitude/phase) → inverse STFT (n_fft 20, hop 5, Hann) → 300·F₂ samples
+  at 24 kHz. FP32 throughout; batch size is always 1; no padding (masks are
+  all-valid by construction).
+- WeightNorm is fused on the host at load time (`w = g·v/‖v‖`), so every
+  device kernel sees plain dense weights. The `.pth`/`.pt` files are parsed
+  by a dependency-free ZIP + protocol-2 pickle reader
+  (`KokkosDNN_KokoroPth.*`, nested-dict capable, float32 only).
+- SineGen randomness: torch's CPU RNG stream is not reproduced (its
+  uniform/normal draws don't match `std::mt19937` + `<random>`); Kokoro
+  audio therefore differs from the torch reference by RNG stream but is
+  deterministic given `--seed`. Voice row selection follows the pipeline
+  (`pack[len(phonemes)-1]`, length in Unicode code points). Duration,
+  alignment, F0/N, and ASR stages are exactly reproducible and covered by
+  golden tests.
+- Targets (`CMakeLists.txt`): `kokkosdnn_kokoro` lib + `kokoro_tts` +
+  `test_kokoro_{smoke,pth,golden}`. Sources:
+  `KokkosDNN_Kokoro{Config,Weights,Model,Pth}` plus driver `kokoro_tts.cpp`.
+  Core ops added for this example live in `src/`: `KokkosDNN_LSTM` (bidir
+  LSTM), `KokkosDNN_Conv1DGeneral` (dense/transposed conv1d),
+  `KokkosDNN_AdaptiveNorm` (InstanceNorm/AdaIN/AdaLN),
+  `KokkosDNN_AudioDSP` (Hann/STFT/ISTFT/resample), leaky-ReLU + Snake in
+  `KokkosDNN_Activation`.
 
 ## Verification
 
-```bash
-ctest --test-dir build -R Kokoro --output-on-failure
-KOKORO_PTH=./kokoro-weights/kokoro-v1_0.pth \
-KOKORO_VOICE=./kokoro-weights/voices/af_heart.pt \
-KOKORO_CONFIG=examples/kokoro/config-kokoro-v1_0.json \
-  ctest --test-dir build -R KokoroGolden --output-on-failure
-```
+Golden tests (torch reference never runs from ctest):
 
-Unit tests (`Test_KokoroOps`, `Test_KokoroSmoke`) are tiny-synthetic only,
-no downloads. `Test_KokoroGolden` needs the real checkpoint + voice (skips
-otherwise) and checks the 548-tensor inventory, output length, finiteness,
-and non-silence.
+1. `python3 examples/kokoro/generate_kokoro_golden.py --out golden.json`
+   (needs the `kokoro` pip package + checkpoint), then
+   `KOKKOSDNN_KOKORO_WEIGHTS=.../kokoro-v1_0.pth KOKKOSDNN_KOKORO_VOICE=.../af_heart.pt KOKKOSDNN_KOKORO_GOLDEN=golden.json ./build-cuda/examples/kokoro/test_kokoro_golden`
+   (tols `KOKKOSDNN_KOKORO_TOL`, default 1e-3; audio RMS tol
+   `KOKKOSDNN_KOKORO_AUDIO_TOL`, default 0.02).
+2. `.pth` inventory: `KOKKOSDNN_KOKORO_WEIGHTS=... test_kokoro_pth
+   --gtest_filter=KokoroPth.InventoryMatchesRelease` (548 tensors,
+   81,763,410 params, spot shapes).
+3. Weight-free: `test_kokoro_smoke` (tiny random model: length contract,
+   finiteness, seed determinism) and the core-op unit tests
+   (`test_lstm`, `test_conv1dgeneral`, `test_adaptivenorm`, `test_audiodsp` —
+   the STFT test carries embedded torch spectra).
+
+`ctest -R 'Kokoro|lstm|lstm|conv1dgeneral|adaptivenorm|audiodsp'` stays fast:
+real-weight forwards are env-gated.
+
+## Performance
+
+Tiny smoke forward is milliseconds on either backend. Full 82M forward on
+the short demo (~50 frames) is seconds on Serial, well under a second of
+kernel time on CUDA (RTX 3090); the generator convolutions at audio rate
+dominate. Long paragraphs scale linearly in frames (audio = 300·F₂).

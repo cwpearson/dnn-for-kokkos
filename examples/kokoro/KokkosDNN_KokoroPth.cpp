@@ -1,593 +1,592 @@
-// torch.save (.pth) reader for the Sana example: stored-entry ZIP parsing,
-// protocol-2 pickle VM (closed opcode set), and fp32 storage streaming.
-// See KokkosDNN_SanaPth.hpp for the format contract.
+// Kokoro torch.save reader: ZIP index + protocol-2 pickle VM.
+// See KokkosDNN_KokoroPth.hpp for the format contract.
 
 #include "KokkosDNN_KokoroPth.hpp"
 
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iostream>
+#include <map>
 #include <memory>
 #include <stdexcept>
-#include <utility>
+#include <vector>
 
 namespace KokkosDNN {
 namespace Kokoro {
-namespace Impl {
 namespace {
 
-// ---- Little-endian readers -------------------------------------------------
-uint16_t rd_u16(const std::vector<char>& b, size_t p) {
-  uint16_t v = 0;
-  std::memcpy(&v, b.data() + p, 2);
+// ---------------------------------------------------------------------------
+// Little-endian readers.
+// ---------------------------------------------------------------------------
+uint16_t rd16(const std::vector<char>& b, size_t p) {
+  return (uint16_t)((uint8_t)b[p] | ((uint8_t)b[p + 1] << 8));
+}
+uint32_t rd32(const std::vector<char>& b, size_t p) {
+  return (uint32_t)((uint8_t)b[p] | ((uint8_t)b[p + 1] << 8) |
+                    ((uint8_t)b[p + 2] << 16) | ((uint8_t)b[p + 3] << 24));
+}
+uint64_t rd64(const std::vector<char>& b, size_t p) {
+  uint64_t v = 0;
+  for (int i = 7; i >= 0; --i) v = (v << 8) | (uint8_t)b[p + i];
   return v;
 }
 
-uint32_t rd_u32(const std::vector<char>& b, size_t p) {
-  uint32_t v = 0;
-  std::memcpy(&v, b.data() + p, 4);
-  return v;
-}
-
-// ---- Stored-entry ZIP index ------------------------------------------------
-// Central-directory entry we care about.
+// ---------------------------------------------------------------------------
+// ZIP index (stored entries only).
+// ---------------------------------------------------------------------------
 struct ZipEntry {
   std::string name;
+  uint64_t local_offset = 0;  // local file header offset
+  uint64_t comp_size = 0;
+  uint64_t uncomp_size = 0;
   uint16_t method = 0;
-  uint32_t size = 0;
-  uint32_t local_offset = 0;
 };
 
-constexpr uint32_t kEocdSig = 0x06054b50;
-constexpr uint32_t kCdSig = 0x02014b50;
-constexpr uint32_t kLocalSig = 0x04034b50;
-
-// Read the whole file (data.pkl is ~91 KiB; central directory is tiny).
-// Storage blobs are never bulk-loaded: readers seek to record offsets.
 std::vector<char> read_file(const std::string& path) {
-  std::ifstream f(path, std::ios::binary);
+  std::ifstream f(path, std::ios::binary | std::ios::ate);
   if (!f) throw std::runtime_error("open_pth: cannot open '" + path + "'");
-  f.seekg(0, std::ios::end);
   const long long n = (long long)f.tellg();
-  if (n < 0) throw std::runtime_error("open_pth: cannot stat '" + path + "'");
+  if (n <= 0) throw std::runtime_error("open_pth: empty file '" + path + "'");
   f.seekg(0, std::ios::beg);
   std::vector<char> buf((size_t)n);
-  if (n > 0 && !f.read(buf.data(), n))
-    throw std::runtime_error("open_pth: short read of '" + path + "'");
+  f.read(buf.data(), n);
+  if (!f) throw std::runtime_error("open_pth: short read '" + path + "'");
   return buf;
 }
 
-std::vector<ZipEntry> read_central_directory(const std::vector<char>& buf,
-                                             const std::string& path) {
-  // EOCD is within the last 22 + 64 KiB (max comment length).
+std::vector<ZipEntry> zip_index(const std::vector<char>& buf) {
   const size_t n = buf.size();
-  if (n < 22) throw std::runtime_error("open_pth: '" + path + "' too small");
-  const size_t lo = (n > (22 + 65535)) ? n - (22 + 65535) : 0;
-  size_t eocd = n;  // not found
-  for (size_t p = n - 22;; --p) {
-    if (rd_u32(buf, p) == kEocdSig) {
+  if (n < 22) throw std::runtime_error("open_pth: too small for ZIP");
+  // Find EOCD (PK\x05\x06) scanning the tail (comment <= 64KB).
+  size_t eocd = n;
+  const size_t lo = (n > (65536 + 22)) ? n - (65536 + 22) : 0;
+  for (size_t p = n - 22; ; --p) {
+    if (buf[p] == 'P' && buf[p + 1] == 'K' && buf[p + 2] == '\x05' &&
+        buf[p + 3] == '\x06') {
       eocd = p;
       break;
     }
-    if (p == lo) break;
+    if (p == lo) throw std::runtime_error("open_pth: EOCD not found");
   }
-  if (eocd == n)
-    throw std::runtime_error("open_pth: '" + path + "': EOCD not found");
-  const uint32_t count = rd_u16(buf, eocd + 10);
-  const uint32_t cd_size = rd_u32(buf, eocd + 12);
-  const uint32_t cd_off = rd_u32(buf, eocd + 16);
-  if ((uint64_t)cd_off + cd_size > n)
-    throw std::runtime_error("open_pth: '" + path + "': bad central dir");
+  const uint16_t nrec = rd16(buf, eocd + 8);
+  const uint32_t cd_size = rd32(buf, eocd + 12);
+  const uint32_t cd_off = rd32(buf, eocd + 16);
+  (void)cd_size;
   std::vector<ZipEntry> out;
   size_t p = cd_off;
-  for (uint32_t i = 0; i < count; ++i) {
-    if (p + 46 > n || rd_u32(buf, p) != kCdSig)
-      throw std::runtime_error("open_pth: '" + path + "': bad entry");
-    ZipEntry e;
-    e.method = rd_u16(buf, p + 10);
-    e.size = rd_u32(buf, p + 24);
-    e.local_offset = rd_u32(buf, p + 42);
-    const uint16_t nl = rd_u16(buf, p + 28), el = rd_u16(buf, p + 30),
-                   cl = rd_u16(buf, p + 32);
+  for (uint16_t i = 0; i < nrec; ++i) {
+    if (p + 46 > n || !(buf[p] == 'P' && buf[p + 1] == 'K' && buf[p + 2] == '\x01' &&
+                        buf[p + 3] == '\x02'))
+      throw std::runtime_error("open_pth: bad central directory entry");
+    const uint16_t method = rd16(buf, p + 10);
+    const uint32_t cs = rd32(buf, p + 20), us = rd32(buf, p + 24);
+    const uint16_t nl = rd16(buf, p + 28), el = rd16(buf, p + 30),
+                   cl = rd16(buf, p + 32);
+    const uint32_t lh = rd32(buf, p + 42);
     if (p + 46 + nl > n)
-      throw std::runtime_error("open_pth: '" + path + "': bad name");
+      throw std::runtime_error("open_pth: central directory overrun");
+    ZipEntry e;
     e.name.assign(buf.data() + p + 46, nl);
-    p += 46 + nl + el + cl;
+    e.method = method;
+    e.comp_size = cs;
+    e.uncomp_size = us;
+    e.local_offset = lh;
     out.push_back(e);
+    p += 46 + nl + el + cl;
   }
   return out;
 }
 
-// Byte range of a stored record's payload.
-std::pair<uint64_t, uint64_t> record_range(
-    const std::vector<char>& buf, const std::vector<ZipEntry>& entries,
-    const std::string& name, const std::string& path) {
-  for (const auto& e : entries) {
-    if (e.name != name) continue;
-    if (e.method != 0)
-      throw std::runtime_error("open_pth: '" + path + "': '" + name +
-                               "' uses deflate; only stored records supported");
-    const size_t lh = (size_t)e.local_offset;
-    if (lh + 30 > buf.size() || rd_u32(buf, lh) != kLocalSig)
-      throw std::runtime_error("open_pth: '" + path + "': bad local header");
-    const uint16_t nl = rd_u16(buf, lh + 26), el = rd_u16(buf, lh + 28);
-    const uint64_t data = (uint64_t)lh + 30 + nl + el;
-    if (data + e.size > buf.size())
-      throw std::runtime_error("open_pth: '" + path + "': truncated record");
-    return {data, e.size};
-  }
-  throw std::runtime_error("open_pth: '" + path + "': missing record '" +
-                           name + "'");
+// Data range of a stored entry: local header gives name/extra lengths.
+std::pair<uint64_t, uint64_t> zip_data_range(const std::vector<char>& buf,
+                                             const ZipEntry& e) {
+  if (e.method != 0)
+    throw std::runtime_error("open_pth: entry '" + e.name +
+                             "' is compressed (only stored supported)");
+  const size_t p = (size_t)e.local_offset;
+  if (p + 30 > buf.size() || !(buf[p] == 'P' && buf[p + 1] == 'K' &&
+                              buf[p + 2] == '\x03' && buf[p + 3] == '\x04'))
+    throw std::runtime_error("open_pth: bad local header for '" + e.name +
+                             "'");
+  const uint16_t nl = rd16(buf, p + 26), el = rd16(buf, p + 28);
+  const uint64_t start = (uint64_t)p + 30 + nl + el;
+  if (start + e.comp_size > buf.size())
+    throw std::runtime_error("open_pth: entry '" + e.name + "' overruns file");
+  return {start, e.comp_size};
 }
 
-// ---- Minimal pickle VM -----------------------------------------------------
-// Closed opcode set torch.save emits for a cpu fp32 state_dict (protocol 2).
-// Values beyond strings/ints/tuples/maps never occur here.
-
-struct Value;
-using Dict = std::vector<std::pair<std::string, std::shared_ptr<Value>>>;
-
-struct Value {
-  enum class Type { Nil, Bool, Int, Str, Tuple, Global, Storage, Tensor, Dict };
-  Type type = Type::Nil;
-  bool boolean = false;
-  int64_t integer = 0;
-  std::string str;  // Str text, Global "module name", Storage dtype
-  std::vector<Value> items;  // Tuple elements
-  // Tensor fields:
-  int storage_id = -1;
-  int64_t storage_offset = 0, numel = 0;
-  std::vector<int64_t> shape, stride;
-  // Dict fields:
-  std::shared_ptr<Dict> dict = nullptr;
-  // Storage fields: str=dtype, integer=numel, storage_id=record id.
+// ---------------------------------------------------------------------------
+// Pickle VM.
+// ---------------------------------------------------------------------------
+struct Node;
+using NodePtr = std::shared_ptr<Node>;
+struct Node {
+  enum class Kind { None, Bool, Int, Double, Unicode, Global, Tuple, Dict,
+                    Storage, Tensor, Mark };
+  Kind kind = Kind::None;
+  bool flag = false;
+  int64_t ival = 0;
+  double dval = 0.0;
+  std::string sval;                      // Unicode / Global "mod \x1f name"
+  std::vector<NodePtr> items;            // Tuple
+  std::vector<std::pair<std::string, NodePtr>> dict;  // Dict (ordered)
+  // Storage: sval = storage key; ival = numel; dict-note = dtype in `extra`.
+  // Tensor: items = {storage, offset, size-tuple, stride-tuple}; ival = unused.
+  std::string extra;                     // Storage dtype / Global display
 };
 
-class Unpickler {
- public:
-  explicit Unpickler(const std::vector<char>& bytes) : b_(bytes) {}
-
-  Value run() {
-    for (;;) {
-      const uint8_t op = get();
-      switch (op) {
-        case 0x80: {  // PROTO
-          const uint8_t v = get();
-          if (v != 2)
-            fail("unsupported protocol " + std::to_string(v));
-          break;
-        }
-        case 0x28:  // MARK '('
-          stack_.push_back(mark());
-          break;
-        case 0x2e:  // STOP '.'
-          if (stack_.size() != 1) fail("STOP with stack depth != 1");
-          return stack_.back();
-        case 0x29: {  // EMPTY_TUPLE ')'
-          Value v;
-          v.type = Value::Type::Tuple;
-          stack_.push_back(v);
-          break;
-        }
-        case 0x74: {  // TUPLE 't'
-          Value v;
-          v.type = Value::Type::Tuple;
-          v.items = pop_mark();
-          stack_.push_back(v);
-          break;
-        }
-        case 0x85:  // TUPLE1
-        case 0x86:  // TUPLE2
-        case 0x87: {  // TUPLE3
-          const int k = (int)op - 0x84;
-          if (stack_.size() < (size_t)k) fail("TUPLE stack underflow");
-          Value v;
-          v.type = Value::Type::Tuple;
-          v.items.assign(stack_.end() - k, stack_.end());
-          stack_.erase(stack_.end() - k, stack_.end());
-          stack_.push_back(v);
-          break;
-        }
-        case 0x7d: {  // EMPTY_DICT '}'
-          Value v;
-          v.type = Value::Type::Dict;
-          v.dict = std::make_shared<Dict>();
-          stack_.push_back(v);
-          break;
-        }
-        case 0x73: {  // SETITEM 's'
-          Value val = pop(), key = pop();
-          Value& obj = top();
-          dict_set(obj, key, val);
-          break;
-        }
-        case 0x75: {  // SETITEMS 'u'
-          std::vector<Value> items = pop_mark();
-          if (items.size() % 2 != 0) fail("SETITEMS odd items");
-          Value& obj = top();
-          for (size_t i = 0; i < items.size(); i += 2)
-            dict_set(obj, items[i], items[i + 1]);
-          break;
-        }
-        case 0x63: {  // GLOBAL 'c'  module\nname\n
-          Value v;
-          v.type = Value::Type::Global;
-          const std::string mod = get_line(), name = get_line();
-          v.str = mod + " " + name;
-          stack_.push_back(v);
-          break;
-        }
-        case 0x52: {  // REDUCE 'R'
-          Value args = pop(), fn = pop();
-          stack_.push_back(do_reduce(fn, args));
-          break;
-        }
-        case 0x62: {  // BUILD 'b'
-          // Kokoro checkpoints finish each section OrderedDict (and the
-          // top dict) with BUILD carrying module-version metadata. Tensor
-          // data is unaffected; drop the state and keep stack discipline.
-          Value state = pop();
-          (void)state;
-          if (stack_.empty()) fail("BUILD on empty stack");
-          break;
-        }
-        case 0x51: {  // BINPERSID 'Q'
-          Value pid = pop();
-          if (pid.type != Value::Type::Tuple || pid.items.size() != 5)
-            fail("BINPERSID bad pid");
-          const Value& kind = pid.items[0];
-          const Value& stype = pid.items[1];
-          const Value& key = pid.items[2];
-          const Value& numel = pid.items[4];
-          if (kind.type != Value::Type::Str || kind.str != "storage")
-            fail("BINPERSID non-storage pid");
-          if (stype.type != Value::Type::Global ||
-              key.type != Value::Type::Str ||
-              numel.type != Value::Type::Int)
-            fail("BINPERSID bad pid fields");
-          Value v;
-          v.type = Value::Type::Storage;
-          v.str = stype.str;  // e.g. "torch FloatStorage"
-          v.storage_id = std::stoi(key.str);
-          v.integer = numel.integer;
-          stack_.push_back(v);
-          break;
-        }
-        case 0x58: {  // BINUNICODE 'X'
-          const uint32_t n = rd_u32();
-          Value v;
-          v.type = Value::Type::Str;
-          v.str.assign(&b_[pos_], n);
-          pos_ += n;
-          stack_.push_back(v);
-          break;
-        }
-        case 0x4a: {  // BININT 'J'
-          Value v;
-          v.type = Value::Type::Int;
-          v.integer = (int64_t)rd_i32();
-          stack_.push_back(v);
-          break;
-        }
-        case 0x4b: {  // BININT1 'K'
-          Value v;
-          v.type = Value::Type::Int;
-          v.integer = (int64_t)get();
-          stack_.push_back(v);
-          break;
-        }
-        case 0x4d: {  // BININT2 'M'
-          Value v;
-          v.type = Value::Type::Int;
-          v.integer = (int64_t)rd_u16();
-          stack_.push_back(v);
-          break;
-        }
-        case 0x89: {  // NEWFALSE
-          Value v;
-          v.type = Value::Type::Bool;
-          v.boolean = false;
-          stack_.push_back(v);
-          break;
-        }
-        case 0x71: {  // BINPUT 'q'
-          const uint8_t i = get();
-          memo_put(i, top());
-          break;
-        }
-        case 0x72: {  // LONG_BINPUT 'r'
-          const uint32_t i = rd_u32();
-          memo_put(i, top());
-          break;
-        }
-        case 0x68: {  // BINGET 'h'
-          const uint8_t i = get();
-          stack_.push_back(memo_get(i));
-          break;
-        }
-        case 0x6a: {  // LONG_BINGET 'j'
-          const uint32_t i = rd_u32();
-          stack_.push_back(memo_get(i));
-          break;
-        }
-        default:
-          fail("unsupported opcode 0x" + hex2(op));
-      }
-    }
-  }
-
-  // _metadata dict captured from the single BUILD (module prefix -> version).
-  std::shared_ptr<Dict> pending_metadata_;
-
- private:
-  const std::vector<char>& b_;
-  size_t pos_ = 0;
-  std::vector<Value> stack_;
-  std::vector<Value> memo_;
-  std::vector<char> memo_set_;
-
-  [[noreturn]] void fail(const std::string& m) {
-    throw std::runtime_error("open_pth: pickle error at byte " +
-                             std::to_string(pos_) + ": " + m);
-  }
-
-  static std::string hex2(uint8_t v) {
-    const char* h = "0123456789abcdef";
-    return std::string{h[v >> 4], h[v & 15]};
-  }
-
-  uint8_t get() {
-    if (pos_ >= b_.size()) fail("truncated stream");
-    return (uint8_t)b_[pos_++];
-  }
-
-  uint16_t rd_u16() {
-    if (pos_ + 2 > b_.size()) fail("truncated u16");
-    uint16_t v;
-    std::memcpy(&v, &b_[pos_], 2);
-    pos_ += 2;
-    return v;
-  }
-
-  uint32_t rd_u32() {
-    if (pos_ + 4 > b_.size()) fail("truncated u32");
-    uint32_t v;
-    std::memcpy(&v, &b_[pos_], 4);
-    pos_ += 4;
-    return v;
-  }
-
-  int32_t rd_i32() {
-    uint32_t u = rd_u32();
-    int32_t v;
-    std::memcpy(&v, &u, 4);
-    return v;
-  }
-
-  std::string get_line() {
-    size_t e = pos_;
-    while (e < b_.size() && b_[e] != '\n') ++e;
-    if (e >= b_.size()) fail("truncated GLOBAL line");
-    std::string s(&b_[pos_], e - pos_);
-    pos_ = e + 1;
-    return s;
-  }
-
-  Value& top() {
-    if (stack_.empty()) fail("stack underflow");
-    return stack_.back();
-  }
-
-  Value pop() {
-    if (stack_.empty()) fail("stack underflow");
-    Value v = stack_.back();
-    stack_.pop_back();
-    return v;
-  }
-
-  static Value mark() {
-    Value v;  // Nil marks the MARK slot (Nil never occurs otherwise).
-    return v;
-  }
-
-  std::vector<Value> pop_mark() {
-    std::vector<Value> items;
-    while (!stack_.empty() && stack_.back().type != Value::Type::Nil) {
-      items.push_back(stack_.back());
-      stack_.pop_back();
-    }
-    if (stack_.empty()) fail("MARK not found");
-    stack_.pop_back();  // drop the mark
-    // Items were collected LIFO; restore file order.
-    for (size_t i = 0, n = items.size(); i < n / 2; ++i) {
-      Value t = items[i];
-      items[i] = items[n - 1 - i];
-      items[n - 1 - i] = t;
-    }
-    return items;
-  }
-
-  void memo_put(uint32_t i, const Value& v) {
-    if (i >= memo_.size()) {
-      memo_.resize(i + 1);
-      memo_set_.resize(i + 1, 0);
-    }
-    memo_[i] = v;
-    memo_set_[i] = 1;
-  }
-
-  Value memo_get(uint32_t i) {
-    if (i >= memo_.size() || !memo_set_[i]) fail("bad memo index");
-    return memo_[i];
-  }
-
-  static void dict_set(Value& obj, const Value& key, const Value& val) {
-    if (obj.type != Value::Type::Dict || !obj.dict)
-      throw std::runtime_error("open_pth: SETITEM on non-dict");
-    if (key.type != Value::Type::Str)
-      throw std::runtime_error("open_pth: non-string dict key");
-    // Keys are unique in this archive; emplace preserves file order.
-    obj.dict->emplace_back(key.str, std::make_shared<Value>(val));
-  }
-
-  static int64_t as_int(const Value& v, const char* ctx) {
-    if (v.type != Value::Type::Int)
-      throw std::runtime_error(
-          std::string("open_pth: ") + ctx + " is not an int");
-    return v.integer;
-  }
-
-  // REDUCE dispatch for the two globals torch.save emits here.
-  static Value do_reduce(const Value& fn, const Value& args) {
-    if (fn.type != Value::Type::Global)
-      throw std::runtime_error("open_pth: REDUCE of non-global");
-    if (args.type != Value::Type::Tuple)
-      throw std::runtime_error("open_pth: REDUCE args not a tuple");
-    if (fn.str == "collections OrderedDict") {
-      if (!args.items.empty())
-        throw std::runtime_error("open_pth: OrderedDict with args");
-      Value v;
-      v.type = Value::Type::Dict;
-      v.dict = std::make_shared<Dict>();
-      return v;
-    }
-    if (fn.str == "torch._utils _rebuild_tensor_v2") {
-      if (args.items.size() != 6)
-        throw std::runtime_error("open_pth: bad tensor rebuild args");
-      const Value& st = args.items[0];
-      const Value& off = args.items[1];
-      const Value& size = args.items[2];
-      const Value& stride = args.items[3];
-      if (st.type != Value::Type::Storage)
-        throw std::runtime_error("open_pth: tensor without storage ref");
-      Value v;
-      v.type = Value::Type::Tensor;
-      v.storage_id = st.storage_id;
-      v.str = st.str;
-      v.integer = st.integer;  // storage numel
-      v.storage_offset = as_int(off, "storage_offset");
-      for (const auto& d : size.items) v.shape.push_back(as_int(d, "size"));
-      for (const auto& d : stride.items)
-        v.stride.push_back(as_int(d, "stride"));
-      int64_t n = 1;
-      for (int64_t d : v.shape) n *= d;
-      v.numel = n;
-      return v;
-    }
-    throw std::runtime_error("open_pth: REDUCE of unknown " + fn.str);
-  }
-};
-
-}  // namespace
-
-}  // namespace Impl
-
-static KokoroArchive open_archive_impl(const std::string& path, bool is_voice) {
-  const std::vector<char> file = Impl::read_file(path);
-  const std::vector<Impl::ZipEntry> entries =
-      Impl::read_central_directory(file, path);
-  std::string pkl_name;
-  for (const auto& e : entries) {
-    if (e.name.size() >= 8 &&
-        e.name.compare(e.name.size() - 8, 8, "data.pkl") == 0) {
-      pkl_name = e.name;
-      break;
-    }
-  }
-  if (pkl_name.empty())
-    throw std::runtime_error("kokoro_pth: '" + path + "': no data.pkl record");
-  const std::string prefix = pkl_name.substr(0, pkl_name.size() - 8);
-  const auto pkl_range = Impl::record_range(file, entries, pkl_name, path);
-  std::vector<char> pkl(file.begin() + (long long)pkl_range.first,
-                        file.begin() + (long long)(pkl_range.first +
-                                                  pkl_range.second));
-  Impl::Unpickler up(pkl);
-  Impl::Value top = up.run();
-  KokoroArchive ar;
-  ar.path = path;
-  ar.prefix = prefix;
-  const auto add_tensor = [&](const std::string& name, const Impl::Value& v) {
-    if (v.type != Impl::Value::Type::Tensor)
-      throw std::runtime_error("kokoro_pth: '" + path + "': entry '" + name +
-                               "' is not a tensor");
-    if (v.str != "torch FloatStorage")
-      throw std::runtime_error("kokoro_pth: '" + path + "': entry '" + name +
-                               "' has " + v.str +
-                               " (only float32 supported)");
-    KokoroTensorMeta m;
-    m.name = name;
-    m.shape = v.shape;
-    m.stride = v.stride;
-    m.storage_offset = v.storage_offset;
-    m.storage_id = v.storage_id;
-    m.numel = v.numel;
-    m.dtype = v.str;
-    ar.tensors.push_back(std::move(m));
-    if (!ar.records.count(v.storage_id)) {
-      const std::string rec =
-          prefix + "data/" + std::to_string(v.storage_id);
-      ar.records[v.storage_id] =
-          Impl::record_range(file, entries, rec, path);
-    }
-  };
-  if (is_voice) {
-    if (top.type != Impl::Value::Type::Tensor)
-      throw std::runtime_error("kokoro_pth: '" + path +
-                               "': voice top is not a tensor");
-    add_tensor("tensor", top);
-    return ar;
-  }
-  if (top.type != Impl::Value::Type::Dict || !top.dict || top.dict->empty())
-    throw std::runtime_error("kokoro_pth: '" + path + "': top is not a dict");
-  for (const auto& sec : *top.dict) {
-    const std::string& section = sec.first;
-    const auto& val = sec.second;
-    if (!val || val->type != Impl::Value::Type::Dict || !val->dict)
-      throw std::runtime_error("kokoro_pth: '" + path + "': section '" +
-                               section + "' is not a dict");
-    for (const auto& kv : *val->dict) {
-      std::string name = section + "." + kv.first;
-      const std::string mod = "module.";
-      size_t pos = name.find(mod);
-      if (pos != std::string::npos) name.erase(pos, mod.size());
-      add_tensor(name, *kv.second);
-    }
-  }
-  return ar;
-}
-
-KokoroArchive open_kokoro_pth(const std::string& path) {
-  return open_archive_impl(path, false);
-}
-
-KokoroArchive open_voice_pt(const std::string& path) {
-  return open_archive_impl(path, true);
-}
-
-int64_t kokoro_total_params(const KokoroArchive& archive) {
-  int64_t n = 0;
-  for (const auto& t : archive.tensors) n += t.numel;
+NodePtr mk(Node::Kind k) {
+  NodePtr n = std::make_shared<Node>();
+  n->kind = k;
   return n;
 }
 
-std::vector<float> read_kokoro_storage(const KokoroArchive& archive,
-                                       int storage_id) {
-  auto it = archive.records.find(storage_id);
+struct Cursor {
+  const char* p;
+  const char* end;
+  void need(size_t n, const char* what) {
+    if ((size_t)(end - p) < n)
+      throw std::runtime_error(std::string("open_pth: truncated pickle (") +
+                               what + ")");
+  }
+  uint8_t u8() {
+    need(1, "u8");
+    return (uint8_t)*p++;
+  }
+  uint16_t u16() {
+    need(2, "u16");
+    uint16_t v = (uint8_t)p[0] | ((uint8_t)p[1] << 8);
+    p += 2;
+    return v;
+  }
+  uint32_t u32() {
+    need(4, "u32");
+    uint32_t v = (uint8_t)p[0] | ((uint8_t)p[1] << 8) | ((uint8_t)p[2] << 16) |
+                 ((uint8_t)p[3] << 24);
+    p += 4;
+    return v;
+  }
+  int32_t i32() { return (int32_t)u32(); }
+  std::string bytes(size_t n) {
+    need(n, "bytes");
+    std::string s(p, n);
+    p += n;
+    return s;
+  }
+  std::string line() {  // up to and including '\n'
+    const char* q = p;
+    while (q != end && *q != '\n') ++q;
+    if (q == end) throw std::runtime_error("open_pth: unterminated line");
+    std::string s(p, (size_t)(q - p + 1));
+    p = q + 1;
+    return s;
+  }
+};
+
+int64_t node_int(const NodePtr& n, const char* what) {
+  if (!n || n->kind != Node::Kind::Int)
+    throw std::runtime_error(std::string("open_pth: expected int for ") + what);
+  return n->ival;
+}
+
+void parse_pickle(const std::vector<char>& data, NodePtr& root) {
+  Cursor c{data.data(), data.data() + data.size()};
+  std::vector<NodePtr> stack;
+  std::vector<NodePtr> memo;
+  auto pop = [&]() -> NodePtr {
+    if (stack.empty()) throw std::runtime_error("open_pth: stack underflow");
+    NodePtr n = stack.back();
+    stack.pop_back();
+    return n;
+  };
+  auto pop_mark = [&]() -> std::vector<NodePtr> {
+    std::vector<NodePtr> items;
+    while (!stack.empty() && stack.back()->kind != Node::Kind::Mark) {
+      items.push_back(stack.back());
+      stack.pop_back();
+    }
+    if (stack.empty()) throw std::runtime_error("open_pth: MARK not found");
+    stack.pop_back();  // drop MARK
+    // items were collected reversed; restore stack order (key,value,...).
+    std::reverse(items.begin(), items.end());
+    return items;
+  };
+  bool done = false;
+  while (!done) {
+    c.need(1, "opcode");
+    const uint8_t op = c.u8();
+    switch (op) {
+      case 0x80: {  // PROTO
+        const uint8_t ver = c.u8();
+        if (ver > 4)
+          throw std::runtime_error("open_pth: unsupported protocol");
+        break;
+      }
+      case 'c': {  // GLOBAL: line module, line name
+        std::string mod = c.line(), name = c.line();
+        if (!mod.empty() && mod.back() == '\n') mod.pop_back();
+        if (!name.empty() && name.back() == '\n') name.pop_back();
+        NodePtr n = mk(Node::Kind::Global);
+        n->sval = mod;
+        n->extra = name;
+        stack.push_back(n);
+        break;
+      }
+      case 'R': {  // REDUCE
+        NodePtr args = pop(), fn = pop();
+        if (fn->kind != Node::Kind::Global)
+          throw std::runtime_error("open_pth: REDUCE of non-global");
+        if (fn->sval == "collections" && fn->extra == "OrderedDict") {
+          if (args->kind != Node::Kind::Tuple || !args->items.empty())
+            throw std::runtime_error(
+                "open_pth: unexpected OrderedDict args");
+          stack.push_back(mk(Node::Kind::Dict));
+        } else if (fn->sval == "torch._utils" &&
+                   fn->extra == "_rebuild_tensor_v2") {
+          if (args->kind != Node::Kind::Tuple || args->items.size() != 6)
+            throw std::runtime_error(
+                "open_pth: bad _rebuild_tensor_v2 args");
+          NodePtr t = mk(Node::Kind::Tensor);
+          t->items = args->items;
+          stack.push_back(t);
+        } else {
+          throw std::runtime_error("open_pth: unsupported REDUCE " + fn->sval +
+                                   "." + fn->extra);
+        }
+        break;
+      }
+      case 'b': {  // BUILD
+        NodePtr state = pop();
+        if (stack.empty())
+          throw std::runtime_error("open_pth: BUILD with empty stack");
+        NodePtr inst = stack.back();
+        if (state->kind == Node::Kind::None) break;  // no-op
+        if (state->kind == Node::Kind::Dict &&
+            inst->kind == Node::Kind::Dict) {
+          // __dict__ state (e.g. {'version': 1}); informational only.
+          break;
+        }
+        throw std::runtime_error("open_pth: unsupported BUILD state");
+      }
+      case 'Q': {  // BINPERSID
+        NodePtr pid = pop();
+        if (pid->kind != Node::Kind::Tuple || pid->items.size() != 5 ||
+            pid->items[0]->kind != Node::Kind::Unicode ||
+            pid->items[0]->sval != "storage" ||
+            pid->items[1]->kind != Node::Kind::Global ||
+            pid->items[2]->kind != Node::Kind::Unicode ||
+            pid->items[4]->kind != Node::Kind::Int)
+          throw std::runtime_error("open_pth: bad persistent id");
+        NodePtr s = mk(Node::Kind::Storage);
+        s->sval = pid->items[2]->sval;  // storage key
+        s->ival = pid->items[4]->ival;  // numel
+        s->extra = pid->items[1]->sval + "." + pid->items[1]->extra;
+        stack.push_back(s);
+        break;
+      }
+      case '}': stack.push_back(mk(Node::Kind::Dict)); break;  // EMPTY_DICT
+      case ')': {  // EMPTY_TUPLE
+        NodePtr n = mk(Node::Kind::Tuple);
+        stack.push_back(n);
+        break;
+      }
+      case 't': {  // TUPLE
+        NodePtr n = mk(Node::Kind::Tuple);
+        n->items = pop_mark();
+        stack.push_back(n);
+        break;
+      }
+      case 0x85: {  // TUPLE1
+        NodePtr a = pop(), n = mk(Node::Kind::Tuple);
+        n->items = {a};
+        stack.push_back(n);
+        break;
+      }
+      case 0x86: {  // TUPLE2
+        NodePtr b = pop(), a = pop(), n = mk(Node::Kind::Tuple);
+        n->items = {a, b};
+        stack.push_back(n);
+        break;
+      }
+      case 0x87: {  // TUPLE3
+        NodePtr cc = pop(), b = pop(), a = pop(), n = mk(Node::Kind::Tuple);
+        n->items = {a, b, cc};
+        stack.push_back(n);
+        break;
+      }
+      case '(': stack.push_back(mk(Node::Kind::Mark)); break;  // MARK
+      case 's': {  // SETITEM
+        NodePtr v = pop(), k = pop();
+        if (stack.empty() || stack.back()->kind != Node::Kind::Dict)
+          throw std::runtime_error("open_pth: SETITEM on non-dict");
+        if (k->kind != Node::Kind::Unicode)
+          throw std::runtime_error("open_pth: non-string dict key");
+        stack.back()->dict.emplace_back(k->sval, v);
+        break;
+      }
+      case 'u': {  // SETITEMS
+        std::vector<NodePtr> items = pop_mark();
+        if (items.size() % 2 != 0)
+          throw std::runtime_error("open_pth: odd SETITEMS");
+        if (stack.empty() || stack.back()->kind != Node::Kind::Dict)
+          throw std::runtime_error("open_pth: SETITEMS on non-dict");
+        for (size_t i = 0; i < items.size(); i += 2) {
+          if (items[i]->kind != Node::Kind::Unicode)
+            throw std::runtime_error("open_pth: non-string dict key");
+          stack.back()->dict.emplace_back(items[i]->sval, items[i + 1]);
+        }
+        break;
+      }
+      case 'X': {  // BINUNICODE
+        uint32_t n = c.u32();
+        NodePtr s = mk(Node::Kind::Unicode);
+        s->sval = c.bytes(n);
+        stack.push_back(s);
+        break;
+      }
+      case 'U': {  // SHORT_BINUNICODE
+        uint8_t n = c.u8();
+        NodePtr s = mk(Node::Kind::Unicode);
+        s->sval = c.bytes(n);
+        stack.push_back(s);
+        break;
+      }
+      case 'J': {  // BININT
+        NodePtr n = mk(Node::Kind::Int);
+        n->ival = c.i32();
+        stack.push_back(n);
+        break;
+      }
+      case 'K': {  // BININT1
+        NodePtr n = mk(Node::Kind::Int);
+        n->ival = c.u8();
+        stack.push_back(n);
+        break;
+      }
+      case 'M': {  // BININT2
+        NodePtr n = mk(Node::Kind::Int);
+        n->ival = c.u16();
+        stack.push_back(n);
+        break;
+      }
+      case 'L': {  // LONG (decimal + 'L')
+        std::string s = c.line();
+        if (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+        if (!s.empty() && s.back() == 'L') s.pop_back();
+        NodePtr n = mk(Node::Kind::Int);
+        try {
+          n->ival = std::stoll(s);
+        } catch (...) {
+          throw std::runtime_error("open_pth: bad LONG '" + s + "'");
+        }
+        stack.push_back(n);
+        break;
+      }
+      case 'G': {  // BINFLOAT (big-endian double)
+        c.need(8, "double");
+        uint64_t u = 0;
+        for (int i = 0; i < 8; ++i) u = (u << 8) | (uint8_t)c.p[i];
+        c.p += 8;
+        double d;
+        std::memcpy(&d, &u, 8);
+        // Big-endian to host (host assumed little-endian like the file).
+        uint64_t le = __builtin_bswap64(u);
+        std::memcpy(&d, &le, 8);
+        NodePtr n = mk(Node::Kind::Double);
+        n->dval = d;
+        stack.push_back(n);
+        break;
+      }
+      case 'F': {  // FLOAT (ascii)
+        std::string s = c.line();
+        NodePtr n = mk(Node::Kind::Double);
+        try {
+          n->dval = std::stod(s);
+        } catch (...) {
+          throw std::runtime_error("open_pth: bad FLOAT");
+        }
+        stack.push_back(n);
+        break;
+      }
+      case 'q': {  // BINPUT
+        uint8_t idx = c.u8();
+        if (memo.size() <= idx) memo.resize(idx + 1);
+        memo[idx] = stack.back();
+        break;
+      }
+      case 'r': {  // LONG_BINPUT
+        uint32_t idx = c.u32();
+        if (memo.size() <= idx) memo.resize(idx + 1);
+        memo[idx] = stack.back();
+        break;
+      }
+      case 'h': {  // BINGET
+        uint8_t idx = c.u8();
+        if (idx >= memo.size() || !memo[idx])
+          throw std::runtime_error("open_pth: bad BINGET");
+        stack.push_back(memo[idx]);
+        break;
+      }
+      case 'j': {  // LONG_BINGET
+        uint32_t idx = c.u32();
+        if (idx >= memo.size() || !memo[idx])
+          throw std::runtime_error("open_pth: bad LONG_BINGET");
+        stack.push_back(memo[idx]);
+        break;
+      }
+      case 'N': stack.push_back(mk(Node::Kind::None)); break;  // NONE
+      case 0x88: {  // NEWTRUE
+        NodePtr n = mk(Node::Kind::Bool);
+        n->flag = true;
+        stack.push_back(n);
+        break;
+      }
+      case 0x89: {  // NEWFALSE
+        NodePtr n = mk(Node::Kind::Bool);
+        n->flag = false;
+        stack.push_back(n);
+        break;
+      }
+      case '.': done = true; break;  // STOP
+      default: {
+        char msg[64];
+        std::snprintf(msg, sizeof(msg), "open_pth: unsupported opcode 0x%02x",
+                      op);
+        throw std::runtime_error(msg);
+      }
+    }
+  }
+  if (stack.size() != 1)
+    throw std::runtime_error("open_pth: pickle left " +
+                             std::to_string(stack.size()) + " stack items");
+  root = stack.back();
+}
+
+// Walk the parsed structure, collecting tensor inventory with dotted names.
+void collect(const NodePtr& n, const std::string& prefix,
+             std::vector<PthTensorMeta>& out) {
+  if (!n) return;
+  if (n->kind == Node::Kind::Tensor) {
+    if (n->items.size() != 6)
+      throw std::runtime_error("open_pth: bad tensor record");
+    NodePtr stor = n->items[0], off = n->items[1], sz = n->items[2],
+            st = n->items[3];
+    if (stor->kind != Node::Kind::Storage)
+      throw std::runtime_error("open_pth: tensor without storage");
+    if (sz->kind != Node::Kind::Tuple || st->kind != Node::Kind::Tuple)
+      throw std::runtime_error("open_pth: bad tensor size/stride");
+    PthTensorMeta m;
+    m.name = prefix;
+    m.storage_key = stor->sval;
+    m.storage_numel = stor->ival;
+    m.dtype = stor->extra;
+    m.storage_offset = node_int(off, "storage_offset");
+    for (auto& e : sz->items) m.shape.push_back(node_int(e, "size"));
+    for (auto& e : st->items) m.stride.push_back(node_int(e, "stride"));
+    m.numel = 1;
+    for (auto d : m.shape) m.numel *= d;
+    out.push_back(m);
+    return;
+  }
+  if (n->kind == Node::Kind::Dict) {
+    for (auto& kv : n->dict) {
+      const std::string nm = prefix.empty() ? kv.first : prefix + "." + kv.first;
+      collect(kv.second, nm, out);
+    }
+    return;
+  }
+  // Anything else at top level (e.g. a lone tensor handled above) is an
+  // error unless it is the voice-pack single tensor... which is a Tensor.
+  throw std::runtime_error("open_pth: unexpected top-level node");
+}
+
+}  // namespace
+
+PthArchive open_pth(const std::string& path) {
+  std::vector<char> buf = read_file(path);
+  std::vector<ZipEntry> entries = zip_index(buf);
+  // Discover the prefix: entry ending in "/data.pkl".
+  std::string prefix;
+  const ZipEntry* pkl = nullptr;
+  for (auto& e : entries) {
+    if (e.name.size() > 9 &&
+        e.name.compare(e.name.size() - 9, 9, "/data.pkl") == 0) {
+      prefix = e.name.substr(0, e.name.size() - 9);
+      pkl = &e;
+      break;
+    }
+  }
+  if (!pkl) throw std::runtime_error("open_pth: no */data.pkl in '" + path + "'");
+  // Byte order must be little (host assumption for the float records).
+  bool have_bo = false;
+  for (auto& e : entries) {
+    if (e.name == prefix + "/byteorder") {
+      auto r = zip_data_range(buf, e);
+      if (r.second < 6 ||
+          std::string(buf.data() + r.first, 6) != "little")
+        throw std::runtime_error("open_pth: archive is not little-endian");
+      have_bo = true;
+    }
+  }
+  if (!have_bo) throw std::runtime_error("open_pth: no byteorder entry");
+  auto pr = zip_data_range(buf, *pkl);
+  std::vector<char> pkl_bytes(buf.data() + pr.first,
+                              buf.data() + pr.first + pr.second);
+  NodePtr root;
+  parse_pickle(pkl_bytes, root);
+  PthArchive a;
+  a.path = path;
+  a.prefix = prefix;
+  if (root->kind == Node::Kind::Tensor) {
+    // Single-tensor pack (voice .pt): inventory holds one nameless entry.
+    std::vector<PthTensorMeta> tmp;
+    collect(root, "", tmp);
+    a.tensors = tmp;
+  } else if (root->kind == Node::Kind::Dict) {
+    collect(root, "", a.tensors);
+  } else {
+    throw std::runtime_error("open_pth: unexpected pickle root");
+  }
+  // Map storage records.
+  const std::string dprefix = prefix + "/data/";
+  for (auto& e : entries) {
+    if (e.name.size() > dprefix.size() &&
+        e.name.compare(0, dprefix.size(), dprefix) == 0) {
+      auto r = zip_data_range(buf, e);
+      a.records[e.name.substr(dprefix.size())] = r;
+    }
+  }
+  return a;
+}
+
+int64_t pth_total_params(const PthArchive& archive) {
+  int64_t n = 0;
+  for (auto& t : archive.tensors) n += t.numel;
+  return n;
+}
+
+std::vector<float> read_pth_storage(const PthArchive& archive,
+                                    const std::string& storage_key) {
+  auto it = archive.records.find(storage_key);
   if (it == archive.records.end())
-    throw std::runtime_error("read_kokoro_storage: unknown storage " +
-                             std::to_string(storage_id));
+    throw std::runtime_error("read_pth_storage: no record '" + storage_key +
+                             "'");
   std::ifstream f(archive.path, std::ios::binary);
-  if (!f)
-    throw std::runtime_error("read_kokoro_storage: cannot open '" +
-                             archive.path + "'");
+  if (!f) throw std::runtime_error("read_pth_storage: cannot reopen '" +
+                                   archive.path + "'");
   f.seekg((long long)it->second.first, std::ios::beg);
-  if (!f) throw std::runtime_error("read_kokoro_storage: seek failed");
-  std::vector<char> raw(it->second.second);
-  if (!raw.empty() && !f.read(raw.data(), (long long)raw.size()))
-    throw std::runtime_error("read_kokoro_storage: short read");
-  if (raw.size() % 4 != 0)
-    throw std::runtime_error("read_kokoro_storage: non-float32 record size");
-  std::vector<float> out(raw.size() / 4);
-  std::memcpy(out.data(), raw.data(), raw.size());
+  const size_t nbytes = (size_t)it->second.second;
+  if (nbytes % 4 != 0)
+    throw std::runtime_error("read_pth_storage: record '" + storage_key +
+                             "' not a multiple of 4 bytes");
+  std::vector<float> out(nbytes / 4);
+  f.read(reinterpret_cast<char*>(out.data()), (long long)nbytes);
+  if (!f) throw std::runtime_error("read_pth_storage: short read '" +
+                                   storage_key + "'");
   return out;
 }
 
