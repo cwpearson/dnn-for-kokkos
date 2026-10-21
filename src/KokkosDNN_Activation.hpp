@@ -309,6 +309,68 @@ void relu_backward(
       });
 }
 
+// LeakyReLU forward: y = x >= 0 ? x : slope * x, elementwise. Computed
+// in FP32 and cast back to Scalar. In-place safe (x and y may alias).
+// Rank-2 variant (e.g. [frames, channels] conv activations).
+template <class ExecSpace, class Scalar>
+void leaky_relu_forward(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
+    float slope,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& y,
+    const std::string& label = "KokkosDNN::leaky_relu_forward") {
+  if (x.extent(0) != y.extent(0) || x.extent(1) != y.extent(1))
+    throw std::invalid_argument("leaky_relu_forward: dimension mismatch");
+  const size_t R = x.extent(0), C = x.extent(1);
+  if (R == 0 || C == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {R, C}),
+      KOKKOS_LAMBDA(size_t i, size_t j) {
+        float v = static_cast<float>(x(i, j));
+        y(i, j) = static_cast<Scalar>(v >= 0.0f ? v : slope * v);
+      });
+}
+
+// Rank-1 variant.
+template <class ExecSpace, class Scalar>
+void leaky_relu_forward(
+    const Kokkos::View<Scalar*, ExecSpace>& x, float slope,
+    const Kokkos::View<Scalar*, ExecSpace>& y,
+    const std::string& label = "KokkosDNN::leaky_relu_forward") {
+  if (x.extent(0) != y.extent(0))
+    throw std::invalid_argument("leaky_relu_forward: dimension mismatch");
+  const size_t N = x.extent(0);
+  if (N == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::RangePolicy<ExecSpace>(0, N), KOKKOS_LAMBDA(size_t i) {
+        float v = static_cast<float>(x(i));
+        y(i) = static_cast<Scalar>(v >= 0.0f ? v : slope * v);
+      });
+}
+
+// Snake1D activation (ISTFTNet AdaINResBlock1): y = x + (1/a)*sin(a*x)^2,
+// per-channel learnable a [C] (alpha). Time-major [T,C]. Computed in FP32,
+// cast back to Scalar. In-place safe.
+template <class ExecSpace, class Scalar>
+void snake_forward(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
+    const Kokkos::View<Scalar*, ExecSpace>& alpha,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& y,
+    const std::string& label = "KokkosDNN::snake_forward") {
+  if (x.extent(0) != y.extent(0) || x.extent(1) != y.extent(1) ||
+      alpha.extent(0) != x.extent(1))
+    throw std::invalid_argument("snake_forward: dimension mismatch");
+  const size_t T = x.extent(0), C = x.extent(1);
+  if (T == 0 || C == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, C}),
+      KOKKOS_LAMBDA(size_t t, size_t c) {
+        const float v = static_cast<float>(x(t, c));
+        const float a = static_cast<float>(alpha(c));
+        const float s = sinf(a * v);
+        y(t, c) = static_cast<Scalar>(v + (1.0f / a) * s * s);
+      });
+}
+
 }  // namespace KokkosDNN
 
 #endif
