@@ -73,15 +73,10 @@ void adain_forward(
   if (B == 0 || C == 0 || T == 0) return;
   Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> gb("adain_gb", B,
                                                              2 * C);
-  {
-    using Mat2u = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace,
-                               Kokkos::MemoryUnmanaged>;
-    Mat2u wu(const_cast<Scalar*>(fc_w.data()), 2 * C, S);
-    if (biased) {
-      gemm_bias(handle, style, wu, fc_b, gb, label + "_fc");
-    } else {
-      gemm(handle, Scalar(1), style, wu, Scalar(0), gb, label + "_fc");
-    }
+  if (biased) {
+    gemm_bias(handle, style, fc_w, fc_b, gb, label + "_fc");
+  } else {
+    gemm(handle, Scalar(1), style, fc_w, Scalar(0), gb, label + "_fc");
   }
   Kokkos::parallel_for(
       label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {B, C}),
@@ -126,15 +121,10 @@ void adalayernorm_forward(
   if (B == 0 || C == 0 || T == 0) return;
   Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> gb("adaln_gb", B,
                                                              2 * C);
-  {
-    using Mat2u = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace,
-                               Kokkos::MemoryUnmanaged>;
-    Mat2u wu(const_cast<Scalar*>(fc_w.data()), 2 * C, S);
-    if (biased) {
-      gemm_bias(handle, style, wu, fc_b, gb, label + "_fc");
-    } else {
-      gemm(handle, Scalar(1), style, wu, Scalar(0), gb, label + "_fc");
-    }
+  if (biased) {
+    gemm_bias(handle, style, fc_w, fc_b, gb, label + "_fc");
+  } else {
+    gemm(handle, Scalar(1), style, fc_w, Scalar(0), gb, label + "_fc");
   }
   Kokkos::parallel_for(
       label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {B, T}),
