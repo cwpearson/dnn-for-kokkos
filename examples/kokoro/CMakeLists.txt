@@ -1,9 +1,10 @@
-# Kokoro TTS example.
+# Kokoro-82M TTS example: native Kokkos StyleTTS2 + ISTFTNet inference.
+# Not part of libkokkosdnn; model-specific code lives here.
+
 add_library(kokkosdnn_kokoro STATIC
   KokkosDNN_KokoroConfig.cpp
-  KokkosDNN_KokoroWeights.cpp
   KokkosDNN_KokoroPth.cpp
-  KokkosDNN_KokoroModel.cpp
+  KokkosDNN_KokoroWeights.cpp
 )
 add_library(KokkosDNN::kokoro ALIAS kokkosdnn_kokoro)
 target_link_libraries(kokkosdnn_kokoro PUBLIC KokkosDNN::kokkosdnn)
@@ -22,10 +23,10 @@ if(KokkosDNN_ENABLE_TESTS)
   set_target_properties(test_kokoro_smoke PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
   kokkosdnn_discover_tests(test_kokoro_smoke)
 
-  add_executable(test_kokoro_ops Test_KokoroOps.cpp)
-  target_link_libraries(test_kokoro_ops PRIVATE KokkosDNN::kokoro KokkosDNN::gtest_main)
-  set_target_properties(test_kokoro_ops PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
-  kokkosdnn_discover_tests(test_kokoro_ops)
+  add_executable(test_kokoro_pth Test_KokoroPth.cpp)
+  target_link_libraries(test_kokoro_pth PRIVATE KokkosDNN::kokoro KokkosDNN::gtest_main)
+  set_target_properties(test_kokoro_pth PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+  kokkosdnn_discover_tests(test_kokoro_pth)
 
   add_executable(test_kokoro_golden Test_KokoroGolden.cpp)
   target_link_libraries(test_kokoro_golden PRIVATE KokkosDNN::kokoro KokkosDNN::gtest_main)
