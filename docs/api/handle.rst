@@ -6,9 +6,10 @@ Header: ``src/KokkosDNN_Handle.hpp``.
 .. cpp:class:: template <typename ExecSpace> DNNHandle
 
    Records which third-party dispatches are active (``use_cublas``,
-   ``use_cudnn``) and lazily caches the cuBLAS/cuDNN handles. Non-copyable,
-   movable. Native Kokkos paths ignore it, so call sites stay free of
-   ``#ifdef``\ s.
+   ``use_cudnn``, ``use_hipblas``, ``use_miopen``, ``use_accelerate``)
+   and lazily caches the cuBLAS/cuDNN/hipBLAS/MIOpen handles
+   (Accelerate is stateless). Non-copyable, movable. Native Kokkos
+   paths ignore it, so call sites stay free of ``#ifdef``\ s.
 
    .. cpp:function:: void* cublas_raw() const
 
@@ -35,3 +36,6 @@ TPL dispatch notes
 * ``src/tpl/cudnn/`` — attention dispatch to cuDNN SDPA graph API with
   automatic native fallback; handle lifecycle in
   ``KokkosDNN_CuDNN_Handle.hpp``.
+* ``src/tpl/accelerate/`` — GEMM/GEMV dispatch to Apple Accelerate
+  ``cblas_sgemm`` on host spaces (float only, synchronous, no handle);
+  ``KokkosDNN_CuBLAS_Handle.hpp``-style lifecycle not needed.

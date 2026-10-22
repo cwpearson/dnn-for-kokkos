@@ -12,7 +12,7 @@ It provides:
 
 - [Native Kokkos implementations of common DNN operators](https://cwpearson.github.io/dnn-for-kokkos/api.html) (GEMM/GEMV with optional fused bias, dense forward/backward, embedding gather, RMSNorm/LayerNorm/GroupNorm, softmax, causal grouped-query and bidirectional attention, 1D and 2D-axial RoPE, SwiGLU/GELU/SiLU and other activations, convolutions (dense/depthwise/grouped, Conv1D/general), patch embedding, token assembly, LayerScale, LSTM, adaptive norms, audio DSP (STFT/upsample), MoE top-k routing with packed-quant expert GEMM, GGUF checkpoint loading, losses, SGD/Adam, sampling, KV-cache helpers).
 - Diffusion-transformer operators for Sana image generation: SiLU, scaled RMSNorm, affine-free LayerNorm, AdaLN modulation (`x*(1+scale)+shift`), sinusoidal timestep embeddings, LiteLA linear attention (ReLU kernel), bidirectional cross-attention, GLUMBConv MixFFN (1x1 + depthwise 3x3 + SiLU gating), 1x1 patch embedding / unpatchify, and a FlowEuler sampler with classifier-free guidance.
-- Optional dispatch to vendor libraries when enabled at configure time: GEMM to **cuBLAS** on CUDA (FP32 via `sgemm`, BF16 via `cublasGemmEx` with FP32 accumulation, fused GEMM+bias via cublasLt epilogue) or **hipBLAS** on HIP, attention to **cuDNN SDPA**, convolutions (dense/depthwise/grouped) to **cuDNN / MIOpen** — each with automatic fallback to the native kernel where the TPL has no suitable path (MIOpen has no fused SDPA, so its attention path is plumbing with native fallback).
+- Optional dispatch to vendor libraries when enabled at configure time: GEMM to **cuBLAS** on CUDA (FP32 via `sgemm`, BF16 via `cublasGemmEx` with FP32 accumulation, fused GEMM+bias via cublasLt epilogue) or **hipBLAS** on HIP, GEMM/GEMV (FP32) to **Apple Accelerate** on host spaces, attention to **cuDNN SDPA**, convolutions (dense/depthwise/grouped) to **cuDNN / MIOpen** — each with automatic fallback to the native kernel where the TPL has no suitable path (MIOpen has no fused SDPA, so its attention path is plumbing with native fallback).
 - Unit tests plus end-to-end paths in the examples so the full pipelines run without downloading large checkpoints.
 
 Scope is deliberately narrow: **bfloat16 storage/compute by default** (`--fp32` opts in). All ops are templated on the scalar type (`float`, `Kokkos::Experimental::bhalf_t`) with FP32 accumulation; quantized GGUF checkpoints are supported via host-side dequantization (MoE experts stay packed for `quant_gemm`); TPL paths cover GEMM for both scalars (cuBLAS/hipBLAS) plus convolutions/attention (cuDNN/MIOpen) and fall back to native otherwise.
@@ -23,6 +23,7 @@ Scope is deliberately narrow: **bfloat16 storage/compute by default** (`--fp32` 
 - An installed Kokkos (Serial is enough for tests; CUDA backend for GPU)
 - Optional: CUDA Toolkit (for `KokkosDNN_ENABLE_CUBLAS`), cuDNN (for `KokkosDNN_ENABLE_CUDNN`)
 - Optional: ROCm (for `KokkosDNN_ENABLE_HIPBLAS` / `KokkosDNN_ENABLE_MIOPEN`)
+- Optional: Apple Accelerate (for `KokkosDNN_ENABLE_ACCELERATE`, macOS only, no install needed)
 
 ## Build
 
@@ -45,6 +46,7 @@ Options:
 | `KokkosDNN_ENABLE_CUDNN` | OFF | attention + convolutions via cuDNN (with automatic native fallback; needs `<cudnn.h>` + `cudnn-frontend`, fetched automatically) |
 | `KokkosDNN_ENABLE_HIPBLAS` | OFF | GEMM via hipBLAS on HIP spaces |
 | `KokkosDNN_ENABLE_MIOPEN` | OFF | convolutions via MIOpen on HIP spaces (attention path falls back to native; no fused SDPA in MIOpen) |
+| `KokkosDNN_ENABLE_ACCELERATE` | OFF | GEMM/GEMV via Apple Accelerate `cblas_sgemm` on host spaces (float only; native fallback otherwise) |
 | `KokkosDNN_ENABLE_TEST_DISCOVERY` | ON | register gtest tests via `gtest_discover_tests` (set OFF for GPU-less build-only CI, where test binaries cannot run at build time) |
 | `KokkosDNN_ENABLE_IMAGE` | OFF | optional image component (`KokkosDNN::Image`, stb-backed I/O + preprocessing) |
 

@@ -67,6 +67,7 @@ void check_gemm_bias_m1(float tol) {
       h.use_cudnn   = false;
       h.use_hipblas = false;
       h.use_miopen  = false;
+      h.use_accelerate = false;
     }
     const int M = 1, K = 32, N = 48;
     Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> X("X", M, K),
