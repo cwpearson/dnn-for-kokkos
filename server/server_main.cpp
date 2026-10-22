@@ -213,7 +213,27 @@ struct ParsedRequest {
   bool has_seed = false;
   uint64_t seed = 0;
   bool stream = false;
+  // OpenAI function tools: one canonical bare-function JSON object string
+  // per tool ({"name":...,"description":...,"parameters":...}), rendered
+  // into the system prompt as `List of tools: [...]`.
+  std::vector<std::string> tools_json;
+  // "auto" | "none" | "required" | "function:<name>"
+  std::string tool_choice = "auto";
 };
+
+// True when the request asked for tools and wants the model to consider
+// them (`tool_choice: "none"` disables tool use but still accepts the
+// fields so clients can toggle per request).
+bool want_tools(const ParsedRequest& pr) {
+  return !pr.tools_json.empty() && pr.tool_choice != "none";
+}
+
+// Tools rendered into the prompt (empty when tool use is disabled).
+const std::vector<std::string>& prompt_tools(const ParsedRequest& pr) {
+  static const std::vector<std::string> kEmpty;
+  if (!want_tools(pr)) return kEmpty;
+  return pr.tools_json;
+}
 
 // Shared fields: model id, unsupported-feature gates, sampling options,
 // logit_bias, logprobs, stop, seed, stream, max tokens. Returns true on
@@ -237,22 +257,109 @@ bool parse_common(const json& body, const Config& cfg,
     }
   }
   // Unsupported OpenAI features fail loudly instead of being silently
-  // ignored (a wrong answer is worse than an error).
+  // ignored (a wrong answer is worse than an error). Function tools are
+  // supported (see below); the legacy `functions`/`function_call` API is
+  // not.
   if (body.contains("n") && !body["n"].is_null()) {
     if (!body["n"].is_number_integer() || body["n"].get<int>() != 1) {
       err = "only n=1 is supported";
       return false;
     }
   }
-  for (const char* k : {"tools", "functions", "function_call", "tool_choice"}) {
+  for (const char* k : {"functions", "function_call"}) {
     if (body.contains(k) && !body[k].is_null()) {
-      err = std::string("unsupported field '") + k + "' (no tool use)";
+      err = std::string("unsupported field '") + k + "'";
       return false;
     }
   }
   if (body.contains("response_format") && !body["response_format"].is_null()) {
     err = "unsupported field 'response_format'";
     return false;
+  }
+
+  // OpenAI function tools: [{type:"function", function:{name, description?,
+  // parameters?}}]. Stored as canonical bare-function JSON for the prompt
+  // renderer (`List of tools: [...]`).
+  out.tools_json.clear();
+  out.tool_choice = "auto";
+  if (body.contains("tools") && !body["tools"].is_null()) {
+    const auto& tools = body["tools"];
+    if (!tools.is_array()) {
+      err = "'tools' must be an array";
+      return false;
+    }
+    for (const auto& t : tools) {
+      if (!t.is_object()) {
+        err = "'tools' entries must be objects";
+        return false;
+      }
+      if (t.contains("type") && !t["type"].is_null() &&
+          (!t["type"].is_string() ||
+           t["type"].get<std::string>() != "function")) {
+        err = "'tools[].type' must be \"function\"";
+        return false;
+      }
+      auto fit = t.find("function");
+      if (fit == t.end() || !fit->is_object()) {
+        err = "'tools[].function' must be an object";
+        return false;
+      }
+      const auto& fn = *fit;
+      if (!fn.contains("name") || !fn["name"].is_string() ||
+          fn["name"].get<std::string>().empty()) {
+        err = "'tools[].function.name' must be a non-empty string";
+        return false;
+      }
+      json bare{{"name", fn["name"]}};
+      if (fn.contains("description") && !fn["description"].is_null()) {
+        if (!fn["description"].is_string()) {
+          err = "'tools[].function.description' must be a string";
+          return false;
+        }
+        bare["description"] = fn["description"];
+      }
+      if (fn.contains("parameters") && !fn["parameters"].is_null()) {
+        if (!fn["parameters"].is_object()) {
+          err = "'tools[].function.parameters' must be an object";
+          return false;
+        }
+        bare["parameters"] = fn["parameters"];
+      }
+      out.tools_json.push_back(bare.dump());
+    }
+  }
+  if (body.contains("tool_choice") && !body["tool_choice"].is_null()) {
+    const auto& tc = body["tool_choice"];
+    if (tc.is_string()) {
+      const std::string v = tc.get<std::string>();
+      if (v != "auto" && v != "none" && v != "required") {
+        err = "'tool_choice' must be \"auto\", \"none\", \"required\", or a "
+              "function object";
+        return false;
+      }
+      out.tool_choice = v;
+    } else if (tc.is_object()) {
+      if (tc.contains("type") && !tc["type"].is_null() &&
+          (!tc["type"].is_string() ||
+           tc["type"].get<std::string>() != "function")) {
+        err = "'tool_choice.type' must be \"function\"";
+        return false;
+      }
+      auto fit = tc.find("function");
+      if (fit == tc.end() || !fit->is_object() ||
+          !fit->contains("name") || !(*fit)["name"].is_string() ||
+          (*fit)["name"].get<std::string>().empty()) {
+        err = "'tool_choice.function.name' must be a non-empty string";
+        return false;
+      }
+      // Named choice is accepted as a hint (rendered like "auto"; the
+      // model still decides). Enforcement would need constrained decoding.
+      out.tool_choice =
+          "function:" + (*fit)["name"].get<std::string>();
+    } else {
+      err = "'tool_choice' must be a string or an object";
+      return false;
+    }
   }
 
   auto& s = out.opts.sampling;
@@ -409,9 +516,48 @@ bool parse_common(const json& body, const Config& cfg,
   return true;
 }
 
-// messages -> vector<ChatMessage>. "developer" maps to "user". Tool/function
-// roles, tool_calls payloads, and non-text content parts are rejected
-// (400) rather than silently dropped.
+// Extracts message text: string | text-part array | null. Null content is
+// only accepted when `allow_null` (assistant tool-call turns, tool
+// results); otherwise it is a 400 like before.
+bool parse_content_field(const json& m, std::string& content, std::string& err,
+                         bool allow_null) {
+  auto cit = m.find("content");
+  if (cit == m.end() || cit->is_null()) {
+    if (!allow_null) {
+      err = "each message must carry a string 'content'";
+      return false;
+    }
+    content.clear();
+    return true;
+  }
+  if (cit->is_string()) {
+    content = cit->get<std::string>();
+    return true;
+  }
+  if (cit->is_array()) {
+    // Content-part arrays: join text parts, reject anything else.
+    content.clear();
+    for (const auto& part : *cit) {
+      if (!part.is_object() || !part.contains("type") ||
+          !part["type"].is_string() ||
+          part["type"].get<std::string>() != "text" ||
+          !part.contains("text") || !part["text"].is_string()) {
+        err = "only text content parts are supported";
+        return false;
+      }
+      content += part["text"].get<std::string>();
+    }
+    return true;
+  }
+  err = "each message must carry a string 'content'";
+  return false;
+}
+
+// messages -> vector<ChatMessage>. "developer" maps to "user". The `tool`
+// role and assistant `tool_calls` round-trip natively (rendered as
+// <|tool_call_start|>... / <|im_start|>tool blocks); legacy `function`
+// roles and `function_call` payloads stay rejected (400), as do non-text
+// content parts.
 bool parse_messages(const json& body, std::vector<ChatMessage>& out,
                     std::string& err) {
   auto it = body.find("messages");
@@ -430,38 +576,94 @@ bool parse_messages(const json& body, std::vector<ChatMessage>& out,
     }
     std::string role = m["role"].get<std::string>();
     if (role == "developer") role = "user";  // OpenAI reasoning-role alias
-    if (role != "system" && role != "user" && role != "assistant") {
+    if (role != "system" && role != "user" && role != "assistant" &&
+        role != "tool") {
       err = "unsupported message role '" + role +
-            "' (expected system, user, or assistant)";
+            "' (expected system, user, assistant, or tool)";
       return false;
     }
-    if (m.contains("tool_calls") || m.contains("function_call")) {
-      err = "tool/function content is not supported";
+    if (m.contains("function_call") && !m["function_call"].is_null()) {
+      err = "unsupported field 'function_call' (use 'tools')";
       return false;
     }
-    auto cit = m.find("content");
-    if (cit == m.end() || cit->is_null()) {
-      err = "each message must carry a string 'content'";
-      return false;
-    }
-    std::string content;
-    if (cit->is_string()) {
-      content = cit->get<std::string>();
-    } else if (cit->is_array()) {
-      // Content-part arrays: join text parts, reject anything else.
-      for (const auto& part : *cit) {
-        if (!part.is_object() || part.value("type", "") != "text" ||
-            !part.contains("text") || !part["text"].is_string()) {
-          err = "only text content parts are supported";
+    // Assistant tool calls (OpenAI wire format).
+    std::vector<KokkosDNN::LFM25::ToolCall> tool_calls;
+    if (m.contains("tool_calls") && !m["tool_calls"].is_null()) {
+      if (role != "assistant") {
+        err = "'tool_calls' is only allowed on assistant messages";
+        return false;
+      }
+      const auto& tc = m["tool_calls"];
+      if (!tc.is_array()) {
+        err = "'tool_calls' must be an array";
+        return false;
+      }
+      for (const auto& c : tc) {
+        if (!c.is_object()) {
+          err = "'tool_calls' entries must be objects";
           return false;
         }
-        content += part["text"].get<std::string>();
+        if (c.contains("type") && !c["type"].is_null() &&
+            (!c["type"].is_string() ||
+             c["type"].get<std::string>() != "function")) {
+          err = "'tool_calls[].type' must be \"function\"";
+          return false;
+        }
+        std::string id;
+        if (c.contains("id") && !c["id"].is_null()) {
+          if (!c["id"].is_string()) {
+            err = "'tool_calls[].id' must be a string";
+            return false;
+          }
+          id = c["id"].get<std::string>();
+        }
+        auto fit = c.find("function");
+        if (fit == c.end() || !fit->is_object()) {
+          err = "'tool_calls[].function' must be an object";
+          return false;
+        }
+        if (!fit->contains("name") || !(*fit)["name"].is_string() ||
+            (*fit)["name"].get<std::string>().empty()) {
+          err = "'tool_calls[].function.name' must be a non-empty string";
+          return false;
+        }
+        std::string args = "{}";
+        if (fit->contains("arguments") && !(*fit)["arguments"].is_null()) {
+          const auto& a = (*fit)["arguments"];
+          if (a.is_string()) {
+            args = a.get<std::string>();
+          } else if (a.is_object()) {
+            args = a.dump();
+          } else {
+            err = "'tool_calls[].function.arguments' must be a JSON string "
+                  "or object";
+            return false;
+          }
+        }
+        tool_calls.push_back(KokkosDNN::LFM25::ToolCall{
+            id, (*fit)["name"].get<std::string>(), args});
       }
-    } else {
-      err = "each message must carry a string 'content'";
-      return false;
     }
-    out.push_back(ChatMessage{role, content, ""});
+    const bool allow_null =
+        (role == "assistant" && !tool_calls.empty()) || role == "tool";
+    std::string content;
+    if (!parse_content_field(m, content, err, allow_null)) return false;
+    std::string tool_call_id;
+    if (role == "tool" && m.contains("tool_call_id") &&
+        !m["tool_call_id"].is_null()) {
+      if (!m["tool_call_id"].is_string()) {
+        err = "'tool_call_id' must be a string";
+        return false;
+      }
+      tool_call_id = m["tool_call_id"].get<std::string>();
+    }
+    ChatMessage msg;
+    msg.role = role;
+    msg.content = content;
+    msg.thinking.clear();
+    msg.tool_calls = std::move(tool_calls);
+    msg.tool_call_id = tool_call_id;
+    out.push_back(std::move(msg));
   }
   return true;
 }
@@ -520,6 +722,45 @@ GenResult run_session(ServerState& st, const std::vector<int>& prompt_ids,
 }
 
 // ---------------------------------------------------------------------------
+// Tool-call responses (native text <-> OpenAI `tool_calls`)
+// ---------------------------------------------------------------------------
+
+// OpenAI `tool_calls` array for parsed native calls; ids come from the
+// server counter ("call-kdnn-N").
+json to_openai_tool_calls(ServerState& st,
+                          const std::vector<KokkosDNN::LFM25::ToolCall>& calls) {
+  json tc = json::array();
+  for (const auto& c : calls) {
+    tc.push_back(json{{"id", new_id("call", st)},
+                      {"type", "function"},
+                      {"function",
+                       {{"name", c.name}, {"arguments", c.arguments}}}});
+  }
+  return tc;
+}
+
+// Splits generated text into an OpenAI message when the request asked for
+// tools and the model emitted native tool blocks. Returns the
+// finish_reason ("tool_calls" on a hit, otherwise the session's own).
+// `message` is always {role:"assistant", content, [tool_calls]}; content is
+// null when the turn is pure tool calls (OpenAI convention).
+std::string split_tool_result(ServerState& st, const ParsedRequest& pr,
+                              const GenResult& r, json& message) {
+  message = json{{"role", "assistant"}};
+  if (want_tools(pr)) {
+    const auto ptc = KokkosDNN::LFM25::parse_tool_calls(r.text);
+    if (!ptc.calls.empty()) {
+      message["content"] =
+          ptc.text.empty() ? json(nullptr) : json(ptc.text);
+      message["tool_calls"] = to_openai_tool_calls(st, ptc.calls);
+      return "tool_calls";
+    }
+  }
+  message["content"] = r.text;
+  return r.finish;
+}
+
+// ---------------------------------------------------------------------------
 // SSE helpers
 // ---------------------------------------------------------------------------
 
@@ -571,10 +812,12 @@ void chat_handler(ServerState& st, const httplib::Request& req,
   if (!pr.stream) {
     std::lock_guard<std::mutex> lk(st.mu);
     try {
-      const std::vector<int> prompt_ids =
-          KokkosDNN::LFM25::encode_chatml(st.tok, pr.messages, true, true);
+      const std::vector<int> prompt_ids = KokkosDNN::LFM25::encode_chatml(
+          st.tok, pr.messages, true, true, true, prompt_tools(pr));
       GenResult r = run_session(st, prompt_ids, pr.opts, pr.has_seed, pr.seed,
                                 pr.req_max_tokens, nullptr);
+      json message;
+      const std::string finish = split_tool_result(st, pr, r, message);
       send_json(res, 200,
                 json{{"id", id},
                      {"object", "chat.completion"},
@@ -582,10 +825,8 @@ void chat_handler(ServerState& st, const httplib::Request& req,
                      {"model", st.model_id},
                      {"choices",
                       json::array({{{"index", 0},
-                                    {"message",
-                                     {{"role", "assistant"},
-                                      {"content", r.text}}},
-                                    {"finish_reason", r.finish}}})},
+                                    {"message", message},
+                                    {"finish_reason", finish}}})},
                      {"usage",
                       {{"prompt_tokens", r.prompt_tokens},
                        {"completion_tokens", r.completion_tokens},
@@ -619,7 +860,8 @@ void chat_handler(ServerState& st, const httplib::Request& req,
             return false;
           }
           const std::vector<int> prompt_ids =
-              KokkosDNN::LFM25::encode_chatml(st.tok, p.messages, true, true);
+              KokkosDNN::LFM25::encode_chatml(st.tok, p.messages, true, true,
+                                             true, prompt_tools(p));
           auto chunk = [&](const json& delta, const json& finish) {
             json c{{"id", id},
                    {"object", "chat.completion.chunk"},
@@ -633,12 +875,55 @@ void chat_handler(ServerState& st, const httplib::Request& req,
             sse_send(sink, c);
           };
           chunk({{"role", "assistant"}}, nullptr);
-          GenResult r = run_session(
-              st, prompt_ids, p.opts, p.has_seed, p.seed, p.req_max_tokens,
-              [&](const StepOutcome& s) {
-                if (!s.delta.empty()) chunk({{"content", s.delta}}, nullptr);
-              });
-          // (r.text was already streamed piece-wise via on_step.)
+          if (!want_tools(p)) {
+            GenResult r = run_session(
+                st, prompt_ids, p.opts, p.has_seed, p.seed, p.req_max_tokens,
+                [&](const StepOutcome& s) {
+                  if (!s.delta.empty()) chunk({{"content", s.delta}}, nullptr);
+                });
+            // (r.text was already streamed piece-wise via on_step.)
+            json final =
+                json{{"id", id},
+                     {"object", "chat.completion.chunk"},
+                     {"created", created},
+                     {"model", st.model_id},
+                     {"choices",
+                      json::array({{{"index", 0},
+                                    {"delta", json::object()},
+                                    {"finish_reason", r.finish}}})},
+                     {"usage",
+                      {{"prompt_tokens", r.prompt_tokens},
+                       {"completion_tokens", r.completion_tokens},
+                       {"total_tokens",
+                        r.prompt_tokens + r.completion_tokens}}}};
+            sse_send(sink, final);
+            sse_done(sink);
+            return false;
+          }
+          // Tool turns buffer the full generation first: tool calls are
+          // only known once the native `<|tool_call_start|>...` block is
+          // complete, so per-token content streaming would leak native
+          // syntax. The SSE shape stays standard (role, content/tool_calls
+          // deltas, final usage chunk).
+          GenResult r = run_session(st, prompt_ids, p.opts, p.has_seed,
+                                    p.seed, p.req_max_tokens, nullptr);
+          json message;
+          const std::string finish = split_tool_result(st, p, r, message);
+          if (message.contains("content") && message["content"].is_string() &&
+              !message["content"].get<std::string>().empty())
+            chunk({{"content", message["content"]}}, nullptr);
+          if (message.contains("tool_calls")) {
+            int idx = 0;
+            for (const auto& c : message["tool_calls"]) {
+              chunk({{"tool_calls",
+                       json::array({{{"index", idx},
+                                     {"id", c["id"]},
+                                     {"type", "function"},
+                                     {"function", c["function"]}}})}},
+                    nullptr);
+              ++idx;
+            }
+          }
           json final = json{{"id", id},
                             {"object", "chat.completion.chunk"},
                             {"created", created},
@@ -646,7 +931,7 @@ void chat_handler(ServerState& st, const httplib::Request& req,
                             {"choices",
                              json::array({{{"index", 0},
                                            {"delta", json::object()},
-                                           {"finish_reason", r.finish}}})},
+                                           {"finish_reason", finish}}})},
                             {"usage",
                              {{"prompt_tokens", r.prompt_tokens},
                               {"completion_tokens", r.completion_tokens},
@@ -678,6 +963,21 @@ void completions_handler(ServerState& st, const httplib::Request& req,
   if (!parse_common(body, st.cfg, st.model_id, pr, err)) {
     send_bad_request(res, err);
     return;
+  }
+  // The legacy completions API has no tool use; gate here (after
+  // parse_common so malformed `tools` still 400 with the field error).
+  if (body.contains("tools") && !body["tools"].is_null()) {
+    send_bad_request(res, "'tools' is not supported for /v1/completions "
+                          "(use /v1/chat/completions)");
+    return;
+  }
+  if (body.contains("tool_choice") && !body["tool_choice"].is_null()) {
+    const auto& tc = body["tool_choice"];
+    if (!(tc.is_string() && tc.get<std::string>() == "none")) {
+      send_bad_request(res, "'tool_choice' is not supported for "
+                            "/v1/completions (use /v1/chat/completions)");
+      return;
+    }
   }
   auto pit = body.find("prompt");
   if (pit == body.end() || !pit->is_string()) {
@@ -733,6 +1033,21 @@ void completions_handler(ServerState& st, const httplib::Request& req,
           if (!parse_common(b, st.cfg, st.model_id, p, e)) {
             sse_send(sink, openai_error(e));
             return false;
+          }
+          if (b.contains("tools") && !b["tools"].is_null()) {
+            sse_send(sink, openai_error("'tools' is not supported for "
+                                        "/v1/completions (use "
+                                        "/v1/chat/completions)"));
+            return false;
+          }
+          if (b.contains("tool_choice") && !b["tool_choice"].is_null()) {
+            const auto& btc = b["tool_choice"];
+            if (!(btc.is_string() && btc.get<std::string>() == "none")) {
+              sse_send(sink, openai_error("'tool_choice' is not supported "
+                                          "for /v1/completions (use "
+                                          "/v1/chat/completions)"));
+              return false;
+            }
           }
           auto it = b.find("prompt");
           if (it == b.end() || !it->is_string()) {

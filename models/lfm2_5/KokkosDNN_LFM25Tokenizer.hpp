@@ -12,7 +12,8 @@ namespace LFM25 {
 // LFM2.5 special-token ids and literal contents.
 //
 //   pad 124893, bos <|startoftext|> 124894, <|im_start|> 124899,
-//   eos/stop <|im_end|> 124900, think pair 124901/124902.
+//   eos/stop <|im_end|> 124900, think pair 124901/124902,
+//   tool-call markers 124905/124906.
 //
 // The loader resolves every id by literal content from `added_tokens` and
 // falls back to the numeric values below when an entry is absent, so a
@@ -21,12 +22,19 @@ namespace LFM25 {
 // convention used by render_lfm25_chatml; files that spell the think pair
 // differently keep working because resolution is content-driven with the
 // numeric fallback only as a last resort.
+//
+// NOTE: the tool-call markers are `special: false` in the HF tokenizer,
+// so Tokenizer::decode keeps them even with skip_special_tokens=true.
+// parse_tool_calls() relies on that: tool calls are parsed from decoded
+// text.
 inline constexpr int kPadId        = 124893;
 inline constexpr int kBosId        = 124894;
 inline constexpr int kImStartId    = 124899;
 inline constexpr int kEosId        = 124900;
 inline constexpr int kThinkStartId = 124901;
 inline constexpr int kThinkEndId   = 124902;
+inline constexpr int kToolCallStartId = 124905;
+inline constexpr int kToolCallEndId   = 124906;
 
 inline constexpr const char* kPadToken        = "<|pad|>";
 inline constexpr const char* kBosToken        = "<|startoftext|>";
@@ -34,6 +42,8 @@ inline constexpr const char* kImStartToken    = "<|im_start|>";
 inline constexpr const char* kEosToken        = "<|im_end|>";
 inline constexpr const char* kThinkStartToken = "<think>";
 inline constexpr const char* kThinkEndToken   = "</think>";
+inline constexpr const char* kToolCallStartToken = "<|tool_call_start|>";
+inline constexpr const char* kToolCallEndToken   = "<|tool_call_end|>";
 
 // Hugging Face `tokenizer.json` loader for LFM2.5 (byte-level BPE, 128k).
 //
@@ -112,15 +122,28 @@ class Tokenizer {
 };
 
 // ---------------------------------------------------------------------------
-// LFM2.5-Instruct ChatML template with thinking support.
+// LFM2.5-Instruct ChatML template with thinking and tool-call support.
 //
 // Renders the ChatML-style format:
 //
 //   <|im_start|>system\n{system}<|im_end|>\n
 //   <|im_start|>user\n{user}<|im_end|>\n
-//   <|im_start|>assistant\n[<think>{thinking}</think>\n]{content}<|im_end|>\n
+//   <|im_start|>assistant\n[<think>{thinking}</think>\n]{content}[tool calls]<|im_end|>\n
+//   <|im_start|>tool\n{result}<|im_end|>\n
 //   <|im_start|>assistant\n            <- generation prompt
 //
+// Tool definitions (`tools_json`, one JSON object string per tool, e.g.
+// `{"name":"...","description":"...","parameters":{...}}`) are appended to
+// the system prompt as `List of tools: [...]`, matching the official LFM2.5
+// chat template: an existing first system message gets the suffix, otherwise
+// a system block is injected (after `default_system` when set).
+//
+// Assistant tool calls render in the native LFM format:
+//
+//   <|tool_call_start|>[name(arg='val', ...), ...]<|tool_call_end|>
+//
+// with Pythonic argument values (strings single-quoted, True/False/None,
+// nested structures as JSON). Tool results use the `tool` role block.
 // A thinking block is emitted inside an assistant turn only when that
 // turn carries non-empty `thinking` AND `preserve_thinking` is true;
 // otherwise the thinking trace is dropped (content is always kept).
@@ -132,10 +155,19 @@ class Tokenizer {
 // special tokens, so Tokenizer::encode handles it via the special-token
 // split path. The Instruct stop string is "<|im_end|>" (Tokenizer::eot()).
 // ---------------------------------------------------------------------------
+struct ToolCall {
+  std::string id;         // OpenAI call id (may be empty in history)
+  std::string name;       // function name
+  std::string arguments;  // JSON object string, OpenAI wire format (may be
+                          // empty, meaning no arguments)
+};
+
 struct ChatMessage {
-  std::string role;      // "system" | "user" | "assistant"
+  std::string role;      // "system" | "user" | "assistant" | "tool"
   std::string content;
   std::string thinking;  // assistant reasoning trace (may be empty)
+  std::vector<ToolCall> tool_calls;  // assistant tool calls (else empty)
+  std::string tool_call_id;  // tool result id (role "tool", may be empty)
 };
 
 // Build the standard single-turn messages for a raw prompt: optional
@@ -147,7 +179,8 @@ std::vector<ChatMessage> make_chat_messages(const std::string& prompt,
 std::string render_lfm25_chatml(const std::vector<ChatMessage>& messages,
                                 bool add_generation_prompt = true,
                                 bool preserve_thinking = true,
-                                const std::string& default_system = "");
+                                const std::string& default_system = "",
+                                const std::vector<std::string>& tools_json = {});
 
 // BOS handling: collapse any run of leading `bos_id` to exactly one when
 // want_bos (or strip all leading copies when !want_bos). Guarantees the
@@ -170,7 +203,30 @@ std::vector<int> encode_chatml(const Tokenizer& tok,
                                const std::vector<ChatMessage>& messages,
                                bool add_generation_prompt = true,
                                bool add_bos = true,
-                               bool preserve_thinking = true);
+                               bool preserve_thinking = true,
+                               const std::vector<std::string>& tools_json = {});
+
+// Render one native tool call: `name(arg='val', ...)` with Pythonic values
+// converted from the JSON `arguments_json` object string. Empty/absence
+// ("", "{}", "null") renders as `name()`. Unparseable input falls back to
+// `name()` rather than emitting syntax the model was not trained on.
+std::string render_tool_call(const std::string& name,
+                             const std::string& arguments_json);
+
+// Parse native tool calls out of generated text. Every
+// `<|tool_call_start|>[...]<|tool_call_end|>` block that yields at least one
+// well-formed call contributes its calls (in order, `id` left empty for the
+// server to allocate); the block is removed from the returned text
+// (non-call text trailing the call list is kept as reply text).
+// Blocks without a well-formed call are left in place, and when no block
+// parses the input is returned unchanged with empty `calls`. The returned
+// text is trimmed of leading/trailing whitespace.
+struct ParsedToolCalls {
+  std::string text;
+  std::vector<ToolCall> calls;
+};
+
+ParsedToolCalls parse_tool_calls(const std::string& text);
 
 // ---------------------------------------------------------------------------
 // Stop-strings (checked on decoded text): truncate the generated text

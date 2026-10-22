@@ -18,7 +18,10 @@ namespace {
 
 // Minimal GPT-2-style fixture: single lowercase chars + byte-mapped space
 // (U+0120) + two merges; specials mirror LFM2.5 (<|startoftext|> = BOS,
-// <|im_end|> = EOS/stop, <|pad|>, <think> pair).
+// <|im_end|> = EOS/stop, <|pad|>, <think> pair, tool-call markers). The
+// think pair and tool markers are `special: false` in the real tokenizer,
+// exactly as here, so they still encode atomically but survive
+// skip_special_tokens decoding.
 std::string lfm25_fixture_json() {
   return R"({
   "model": {"type": "BPE", "vocab": {
@@ -33,9 +36,13 @@ std::string lfm25_fixture_json() {
     {"id": 100, "content": "<|startoftext|>", "special": true},
     {"id": 101, "content": "<|im_start|>", "special": true},
     {"id": 102, "content": "<|im_end|>", "special": true},
-    {"id": 103, "content": "<think>", "special": true},
-    {"id": 104, "content": "</think>", "special": true},
-    {"id": 105, "content": "<|pad|>", "special": true}
+    {"id": 103, "content": "<think>", "special": false},
+    {"id": 104, "content": "</think>", "special": false},
+    {"id": 105, "content": "<|pad|>", "special": true},
+    {"id": 106, "content": "<|tool_list_start|>", "special": true},
+    {"id": 107, "content": "<|tool_list_end|>", "special": true},
+    {"id": 108, "content": "<|tool_call_start|>", "special": false},
+    {"id": 109, "content": "<|tool_call_end|>", "special": false}
   ]
 })";
 }
@@ -54,7 +61,7 @@ std::string write_tmp(const std::string& body) {
 
 TEST(LFM25Tokenizer, SpecialConventions) {
   KokkosDNN::LFM25::Tokenizer tok(write_tmp(lfm25_fixture_json()));
-  EXPECT_EQ(tok.vocab_size(), 106);  // max id 105 (specials extend vocab)
+  EXPECT_EQ(tok.vocab_size(), 110);  // max id 109 (added tokens extend vocab)
   // LFM2.5 convention: bos=<|startoftext|>, eos/stop=<|im_end|>.
   EXPECT_EQ(tok.bos(), 100);
   EXPECT_EQ(tok.eos(), 102);
@@ -63,7 +70,13 @@ TEST(LFM25Tokenizer, SpecialConventions) {
   EXPECT_EQ(tok.im_start(), 101);
   EXPECT_EQ(tok.think_start(), 103);
   EXPECT_EQ(tok.think_end(), 104);
-  for (int id = 100; id <= 105; ++id) EXPECT_TRUE(tok.is_special(id));
+  for (int id : {100, 101, 102, 105, 106, 107})
+    EXPECT_TRUE(tok.is_special(id));
+  // The think pair and tool-call markers are `special: false` (as in the
+  // real tokenizer): atomic in encode, but kept by skip-specials decode so
+  // parse_tool_calls sees them.
+  for (int id : {103, 104, 108, 109}) EXPECT_FALSE(tok.is_special(id));
+  EXPECT_EQ(tok.decode({108, 109}), "<|tool_call_start|><|tool_call_end|>");
   EXPECT_FALSE(tok.is_special(0));
 }
 
@@ -94,9 +107,13 @@ TEST(LFM25Tokenizer, SpecialAtomicity) {
   EXPECT_EQ(tok.encode("a<|im_start|>b", false),
             (std::vector<int>{0, 101, 1}));
   EXPECT_EQ(tok.encode("<|im_start|>user", false)[0], 101);
-  // The think pair is atomic too (longest-match special split).
+  // The think pair is atomic too (longest-match added-token split),
+  // including as `special: false` entries.
   EXPECT_EQ(tok.encode("<think>hi</think>", false),
             (std::vector<int>{103, 20, 104}));
+  // Tool-call markers are atomic single ids as well.
+  EXPECT_EQ(tok.encode("a<|tool_call_start|>b<|tool_call_end|>d", false),
+            (std::vector<int>{0, 108, 1, 109, 2}));
   // Adjacent specials stay separate ids (no accidental fusion).
   EXPECT_EQ(tok.encode("<|im_start|><|im_end|>", false),
             (std::vector<int>{101, 102}));
@@ -195,4 +212,125 @@ TEST(LFM25Tokenizer, StopStrings) {
             "reply");
   EXPECT_EQ(truncate_at_stop_strings("clean", default_stop_strings()),
             "clean");
+}
+
+TEST(LFM25Tokenizer, ToolRenderGolden) {
+  using KokkosDNN::LFM25::ChatMessage;
+  using KokkosDNN::LFM25::ToolCall;
+  using KokkosDNN::LFM25::render_lfm25_chatml;
+  using KokkosDNN::LFM25::render_tool_call;
+
+  // JSON arguments render Pythonic (official template style).
+  EXPECT_EQ(render_tool_call("get_weather", R"({"location":"Boston"})"),
+            "get_weather(location='Boston')");
+  EXPECT_EQ(render_tool_call("f", "{}"), "f()");
+  EXPECT_EQ(render_tool_call("f", ""), "f()");
+  EXPECT_EQ(render_tool_call("f", R"({"a":1,"b":true,"c":null})"),
+            "f(a=1, b=True, c=None)");
+  EXPECT_EQ(render_tool_call("f", "not-json"), "f()");
+
+  const std::vector<std::string> tools = {
+      R"({"name":"get_weather","parameters":{"type":"object"}})"};
+  // Tools append to an existing system block.
+  EXPECT_EQ(
+      render_lfm25_chatml({{"system", "Be brief.", ""}, {"user", "Hi", ""}},
+                           false, true, "", tools),
+      "<|im_start|>system\nBe brief.\n"
+      "List of tools: "
+      "[{\"name\":\"get_weather\",\"parameters\":{\"type\":\"object\"}}]"
+      "<|im_end|>\n"
+      "<|im_start|>user\nHi<|im_end|>\n");
+  // Without a system block, a system block is injected for the tools.
+  EXPECT_EQ(render_lfm25_chatml({{"user", "Hi", ""}}, false, true, "", tools),
+            "<|im_start|>system\n"
+            "List of tools: "
+            "[{\"name\":\"get_weather\",\"parameters\":{\"type\":\"object\"}}]"
+            "<|im_end|>\n"
+            "<|im_start|>user\nHi<|im_end|>\n");
+  // No tools: rendering is unchanged (no system injection).
+  EXPECT_EQ(render_lfm25_chatml({{"user", "Hi", ""}}, false),
+            "<|im_start|>user\nHi<|im_end|>\n");
+
+  // Assistant history with tool calls renders natively; tool results use
+  // the tool role block.
+  ChatMessage a;
+  a.role = "assistant";
+  a.content = "Checking.";
+  a.tool_calls.push_back(ToolCall{"", "get_weather", "{\"b\":1}"});
+  ChatMessage t;
+  t.role = "tool";
+  t.content = "[{\"b\": 1}]";
+  ChatMessage u;
+  u.role = "user";
+  u.content = "Hi";
+  EXPECT_EQ(
+      render_lfm25_chatml({u, a, t}, false, true, "", tools),
+      "<|im_start|>system\n"
+      "List of tools: "
+      "[{\"name\":\"get_weather\",\"parameters\":{\"type\":\"object\"}}]"
+      "<|im_end|>\n"
+      "<|im_start|>user\nHi<|im_end|>\n"
+      "<|im_start|>assistant\nChecking."
+      "<|tool_call_start|>[get_weather(b=1)]<|tool_call_end|><|im_end|>\n"
+      "<|im_start|>tool\n[{\"b\": 1}]<|im_end|>\n");
+}
+
+TEST(LFM25Tokenizer, ToolParse) {
+  using KokkosDNN::LFM25::parse_tool_calls;
+  using KokkosDNN::LFM25::ParsedToolCalls;
+
+  // Single call with surrounding text: text kept, call extracted as JSON.
+  ParsedToolCalls p = parse_tool_calls(
+      "Sure <|tool_call_start|>[get_weather(location='Boston')]"
+      "<|tool_call_end|> done");
+  ASSERT_EQ(p.calls.size(), 1u);
+  EXPECT_EQ(p.calls[0].name, "get_weather");
+  EXPECT_EQ(p.calls[0].arguments, "{\"location\":\"Boston\"}");
+  EXPECT_EQ(p.text, "Sure  done");
+
+  // Multiple calls, mixed Python/JSON values.
+  p = parse_tool_calls(
+      "<|tool_call_start|>[f(a=1, b=True, c=None, d='x y'), "
+      "g(xs=[1, 'a'], o={\"k\": 2})]<|tool_call_end|>");
+  ASSERT_EQ(p.calls.size(), 2u);
+  EXPECT_EQ(p.calls[0].arguments,
+            "{\"a\":1,\"b\":true,\"c\":null,\"d\":\"x y\"}");
+  EXPECT_EQ(p.calls[1].name, "g");
+  EXPECT_EQ(p.calls[1].arguments, "{\"xs\":[1,\"a\"],\"o\":{\"k\":2}}");
+  EXPECT_TRUE(p.text.empty());
+
+  // Empty args, double quotes, and commas inside quoted strings.
+  p = parse_tool_calls("<|tool_call_start|>[ping()]<|tool_call_end|>");
+  ASSERT_EQ(p.calls.size(), 1u);
+  EXPECT_EQ(p.calls[0].arguments, "{}");
+  p = parse_tool_calls(
+      "<|tool_call_start|>[f(a=\"hi, here\") Nest]<|tool_call_end|>");
+  ASSERT_EQ(p.calls.size(), 0u);  // trailing prose invalidates the call
+  // Trailing punctuation after the list is kept as reply text.
+  p = parse_tool_calls(
+      "<|tool_call_start|>[f(a=\"hi, here\")]. Nice.<|tool_call_end|> tail");
+  ASSERT_EQ(p.calls.size(), 1u);
+  EXPECT_EQ(p.calls[0].arguments, "{\"a\":\"hi, here\"}");
+  EXPECT_EQ(p.text, ". Nice. tail");
+  p = parse_tool_calls(
+      "<|tool_call_start|>[f(a=\"hi, here\") Watts]<|tool_call_end|> "
+      "and <|tool_call_start|>[ok(x=1)]<|tool_call_end|>");
+  ASSERT_EQ(p.calls.size(), 1u);
+  EXPECT_EQ(p.calls[0].name, "ok");
+  p = parse_tool_calls(
+      "<|tool_call_start|>[f(a=\"hi, here\")]<|tool_call_end|>");
+  ASSERT_EQ(p.calls.size(), 1u);
+  EXPECT_EQ(p.calls[0].arguments, "{\"a\":\"hi, here\"}");
+
+  // No markers: input passes through unchanged.
+  p = parse_tool_calls("just text");
+  EXPECT_TRUE(p.calls.empty());
+  EXPECT_EQ(p.text, "just text");
+
+  // Malformed blocks are left in place (never corrupt the reply).
+  p = parse_tool_calls("a <|tool_call_start|>oops<|tool_call_end|> b");
+  EXPECT_TRUE(p.calls.empty());
+  EXPECT_EQ(p.text, "a <|tool_call_start|>oops<|tool_call_end|> b");
+  p = parse_tool_calls("unterminated <|tool_call_start|>[f(a=1)");
+  EXPECT_TRUE(p.calls.empty());
 }
