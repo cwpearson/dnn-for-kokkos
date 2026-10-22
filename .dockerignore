@@ -1,0 +1,21 @@
+# Keep the `COPY .` build context to source + small assets. Local trees
+# routinely carry multi-GB checkpoints, Kokkos checkouts, and build dirs.
+.git
+.opencode/
+build*/
+install*/
+kokkos-src/
+kokkos-build/
+kokkos-install/
+kokkos/
+Testing/
+# Checkpoints / weights / datasets (see each example's README for sources).
+*.gguf
+*.pth
+*.safetensors
+*.bin
+weights/
+Sana_600M_1024px/
+dc-ae-f32c32-sana-1.0*/
+dinov3-vitb16-pretrain-lvd1689m/
+kokoro-tts/

@@ -23,6 +23,27 @@ cmake --build build --target kokkosdnn_server
 `--tokenizer` are required to serve; `--config` is an optional model-config
 JSON overlay on top of the baked-in `lfm2_5_24b_a2b` defaults.
 
+## Docker
+
+`server/Dockerfile` is a multi-stage CUDA build: the builder stage compiles
+Kokkos (CUDA backend, `KOKKOS_VERSION` 5.2.1, `KOKKOS_ARCH` AMPERE80 — both
+overridable via `--build-arg`) plus `kokkosdnn_server` with cuBLAS/cuDNN
+dispatch on top of an `nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04` image
+(same tags as the `tpl=ON` leg of `.github/workflows/cuda.yaml`); the
+runtime stage copies only the server binary onto the matching
+`cudnn-runtime` image. Build from the repo root:
+
+```sh
+docker build -f server/Dockerfile -t kokkosdnn-server:cuda .
+docker run --gpus all -p 8000:8000 \
+    -v /path/to/weights:/models:ro \
+    kokkosdnn-server:cuda \
+    --weights /models/lfm2_5.gguf --tokenizer /models/tokenizer.json
+```
+
+For a non-Ampere GPU, target it natively with
+`--build-arg KOKKOS_ARCH=HOPPER90` (any `Kokkos_ARCH_*` suffix works).
+
 ## Routes
 
 - `GET /v1/models` — `{object:"list", data:[{id, object:"model",
