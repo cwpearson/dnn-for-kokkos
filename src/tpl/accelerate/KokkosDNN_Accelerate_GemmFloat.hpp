@@ -11,6 +11,16 @@
 
 #if defined(KOKKOSDNN_ENABLE_ACCELERATE)
 #if defined(__APPLE__)
+// Opt into Accelerate's LAPACK 3.9.1+ CBLAS interface. Since macOS 13.3 the
+// legacy vecLib cblas_* declarations are marked deprecated (turning into a
+// hard error under our -Werror builds); defining ACCELERATE_NEW_LAPACK
+// before any Accelerate/vecLib header selects the non-deprecated
+// declarations. LP64 signatures are unchanged when ACCELERATE_LAPACK_ILP64
+// is not defined, so the cblas_sgemm call below is unaffected. Harmless on
+// older SDKs that predate the macro.
+#if !defined(ACCELERATE_NEW_LAPACK)
+#define ACCELERATE_NEW_LAPACK 1
+#endif
 #include <Accelerate/Accelerate.h>
 #else
 #error "KokkosDNN_ENABLE_ACCELERATE requires Apple Accelerate (macOS/iOS)"
@@ -39,8 +49,24 @@ inline bool accelerate_gemm_nt_float(int M, int N, int K, float alpha,
     return false;
   // RowMajor: A=X MxK NoTrans (lda=K), B=W NxK Trans -> op KxN (ldb=K),
   // C=Y MxN (ldc=N).
+  // Pragmas are belt-and-braces for SDKs where the deprecation attribute is
+  // still present (e.g. pre-13.3 SDKs that ignore ACCELERATE_NEW_LAPACK):
+  // the call itself is unaffected, and our -Werror build would otherwise
+  // fail on -Wdeprecated-declarations.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
   cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, alpha, X, K,
               W, K, beta, Y, N);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
   return true;
 }
 
