@@ -3,7 +3,7 @@
 
 Reference implementation of the host-side frontend (tokenizer/BPE +
 chat template via transformers AutoTokenizer) whose exact outputs the
-in-process C++ tokenizer (`src/KokkosDNN_QwenTokenizer.hpp`, used by
+in-process C++ tokenizer (`models/moss_image/KokkosDNN_QwenTokenizer.hpp`, used by
 `moss_image_generate --tokenizer/--text-encoder`) reproduces id-for-id
 (see tests/Test_QwenTokenizer.cpp goldens). It also produces the token
 ids consumed by the C++ Qwen3.5 encoder

@@ -74,13 +74,13 @@
 
 // ---- True-pipeline compatibility shim ------------------------------------
 //
-// The real MOSS-Image-SFT pipeline interfaces land in top-level src/ from
-// parallel worktrees as:
-//   src/KokkosDNN_MossImageDit.hpp      (MossImageDit::Model/Weights)
-//   src/KokkosDNN_MossImageEncoder.hpp  (MossImageEncoder::encode_prompt)
-//   src/KokkosDNN_MossImageVae.hpp      (MossImageVae::decode_latents)
+// The real MOSS-Image-SFT pipeline interfaces live in models/moss_image/
+// as:
+//   models/moss_image/KokkosDNN_MossImageDit.hpp      (MossImageDit::Model/Weights)
+//   models/moss_image/KokkosDNN_MossImageEncoder.hpp  (MossImageEncoder::encode_prompt)
+//   models/moss_image/KokkosDNN_MossImageVae.hpp      (MossImageVae::decode_latents)
 //   (+ GroupNorm for the VAE decoder)
-// True geometry/ops already merged in src/KokkosDNN_MossImage.hpp
+// True geometry/ops already merged in models/moss_image/KokkosDNN_MossImage.hpp
 // (MossImage::Config: dim 3072, 42 layers, 24 heads, text_dim 4096,
 // latent_channels 128) is picked up the same way.
 //

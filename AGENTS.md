@@ -7,9 +7,15 @@ Example for Muse Spark 1.3:
 # Project layout
 
 ```text
-src/             core library (native Kokkos ops)
+src/             core library (native Kokkos ops; no model-specific code)
 src/tpl/         optional CUDA TPL dispatch (cublas, cudnn)
 src/images/      optional image component (stb-backed I/O + preprocessing)
+models/          installable per-model components (KokkosDNN::lfm25, KokkosDNN::moss)
+models/common/   shared model-support scaffold (JSON/BPE/chat/sampling/detok; header-only)
+models/lfm2_5/   LFM2.5 model library (weights/tokenizer/config)
+models/moss_image/ MOSS-Image pipeline headers (DiT/encoder/VAE/Qwen tokenizer)
+server/          OpenAI-compatible HTTP server stub (thin binary; no model logic)
+examples/        thin drivers linking models/* or core (lfm2_5, moss_image, llama, ...)
 examples/llama/  Llama inference example (not part of the library)
 examples/smollm2/ SmolLM2 inference example (not part of the library)
 examples/xor/    XOR MLP training example

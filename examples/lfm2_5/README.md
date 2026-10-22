@@ -2,6 +2,10 @@
 
 LFM2.5-24B-A2B hybrid-MoE text inference built on the core library: 40 blocks (10 full-attention + 30 short-conv), SwiGLU dense FFNs in the first 2 layers then 64-expert top-4 MoE, GGUF checkpoint loader, byte-level BPE `tokenizer.json` loader, and the `lfm2_5_generate` driver (bfloat16 by default, inference only).
 
+> Note: the model library (`KokkosDNN_LFM25*.hpp/.cpp`, `config-lfm2_5-24b-a2b.json`)
+> now lives in `models/lfm2_5/` as the installable `KokkosDNN::lfm25` target;
+> this directory keeps only the driver, tests, and docs.
+
 ## Quickstart (0 to working)
 
 From repo root `/workspace` — build, fetch checkpoint files, run:
@@ -20,7 +24,7 @@ pip install -U huggingface_hub  # provides the `hf` CLI
 ./build/examples/lfm2_5/lfm2_5_generate \
   --weights ./weights/lfm2_5/lfm2_5-24b-a2b-q4_k_m.gguf \
   --tokenizer ./weights/lfm2_5/tokenizer.json \
-  --config examples/lfm2_5/config-lfm2_5-24b-a2b.json \
+  --config models/lfm2_5/config-lfm2_5-24b-a2b.json \
   --prompt "Explain attention in one sentence." --max-new 64
 ```
 
@@ -38,7 +42,7 @@ pip install -U huggingface_hub  # provides the `hf` CLI
 ./build/examples/lfm2_5/lfm2_5_generate \
   --weights ./weights/lfm2_5/lfm2_5-24b-a2b-q4_k_m.gguf \
   --tokenizer ./weights/lfm2_5/tokenizer.json \
-  --config examples/lfm2_5/config-lfm2_5-24b-a2b.json \
+  --config models/lfm2_5/config-lfm2_5-24b-a2b.json \
   --chat --system "You are a concise assistant." \
   --prompt "What is 2+2?" --max-new 128
 

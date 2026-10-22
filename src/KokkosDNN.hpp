@@ -33,10 +33,11 @@
 #include "KokkosDNN_AdaptiveNorm.hpp"
 #include "KokkosDNN_AudioDSP.hpp"
 #include "KokkosDNN_GroupNorm.hpp"
-#include "KokkosDNN_MossImage.hpp"
-#include "KokkosDNN_MossImageDit.hpp"
-#include "KokkosDNN_MossImageEncoder.hpp"
-#include "KokkosDNN_MossImageVae.hpp"
+
+// NOTE: model-specific pipelines live outside src/. The MOSS-Image/Qwen
+// headers moved to models/moss_image/
+// (KokkosDNN_MossImage{,Dit,Encoder,Vae}.hpp, KokkosDNN_QwenTokenizer.hpp);
+// include them from there, e.g. via the kokkosdnn_moss target.
 
 #ifdef KOKKOSDNN_ENABLE_IMAGE
 #include "images/KokkosDNN_Image.hpp"

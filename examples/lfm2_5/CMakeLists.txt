@@ -1,19 +1,9 @@
-# LFM2.5-24B-A2B example: model-specific inference built on top of the core
-# library. Not part of libkokkosdnn; kept here as example/support code.
+# LFM2.5-24B-A2B example driver: model implementation lives in
+# models/lfm2_5 (KokkosDNN::lfm25); this directory only builds the
+# lfm2_5_generate driver plus its tests.
 # Separate family from examples/llama (config/weights/model/tokenizer are
 # split-form duplicates in KokkosDNN::LFM25; only the core src/ ops are
 # shared). Weights load from GGUF (Q4_K_M); --tiny needs no download.
-
-add_library(kokkosdnn_lfm25 STATIC
-  KokkosDNN_LFM25Weights.cpp
-  KokkosDNN_LFM25Tokenizer.cpp
-)
-add_library(KokkosDNN::lfm25 ALIAS kokkosdnn_lfm25)
-target_link_libraries(kokkosdnn_lfm25 PUBLIC KokkosDNN::kokkosdnn)
-target_include_directories(kokkosdnn_lfm25 PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
-)
-set_target_properties(kokkosdnn_lfm25 PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
 
 add_executable(lfm2_5_generate lfm2_5_generate.cpp)
 target_link_libraries(lfm2_5_generate PRIVATE KokkosDNN::lfm25)

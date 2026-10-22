@@ -61,8 +61,8 @@ released, so there is no disk round-trip and no second command):
 End-to-end with the public `OpenMOSS-Team/MOSS-Image-SFT` checkpoint
 (Apache-2.0). The driver builds against both the checked-in placeholder
 geometry and the true-pipeline headers
-(`src/KokkosDNN_MossImageDit.hpp`, `src/KokkosDNN_MossImageEncoder.hpp`,
-`src/KokkosDNN_MossImageVae.hpp`): each
+(`models/moss_image/KokkosDNN_MossImageDit.hpp`, `models/moss_image/KokkosDNN_MossImageEncoder.hpp`,
+`models/moss_image/KokkosDNN_MossImageVae.hpp`): each
 phase is probed with `__has_include` and falls back with a logged reason,
 so the `[backend dit=... encoder=... vae=...]` banner tells you exactly
 which path a run took. With a normal build all three true-pipeline headers
@@ -201,10 +201,10 @@ print `[backend dit=moss-image-dit encoder=qwen vae=moss-image-vae]` —
 sampling runs the true 42x3072 MMDiT (per-sample text mask, 4D RoPE, SiTU),
 decode runs the FLUX.2-small VAE when `--vae-weights --vae-decode` are
 given (else grayscale preview). Encode runs fully in-process: the repo's
-byte-level BPE (`src/KokkosDNN_QwenTokenizer.hpp`, NFC + pre-tokenizer +
+byte-level BPE (`models/moss_image/KokkosDNN_QwenTokenizer.hpp`, NFC + pre-tokenizer +
 merges verified id-for-id against transformers 5.12.1) tokenizes the
 prompt, and the on-device Qwen35::EncoderModel (full + Gated-DeltaNet
-linear attention, no stubs, `src/KokkosDNN_MossImageEncoder.hpp`) encodes
+linear attention, no stubs, `models/moss_image/KokkosDNN_MossImageEncoder.hpp`) encodes
 the prompt and `--negative-prompt` in one batched forward; its weights are
 released before the DiT load. `--prompt-embeds-in` remains as the
 file-embed fallback (cross-machine / offline; produce with

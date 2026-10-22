@@ -37,6 +37,11 @@ kokkosdnn_add_test(test_mossimageddit Test_MossImageDit.cpp)
 kokkosdnn_add_test(test_mossimage_encoder Test_MossImageEncoder.cpp)
 kokkosdnn_add_test(test_qwen_tokenizer Test_QwenTokenizer.cpp)
 kokkosdnn_add_test(test_mossimagevae Test_MossImageVae.cpp)
+# Model-specific headers moved out of src/ to models/moss_image/; only the
+# MOSS/Qwen tests get that directory on their include path.
+foreach(t test_mossimage test_mossimageddit test_mossimage_encoder test_qwen_tokenizer test_mossimagevae)
+  target_include_directories(${t} PRIVATE ${CMAKE_SOURCE_DIR}/models/moss_image)
+endforeach()
 
 if(KokkosDNN_ENABLE_IMAGE)
   kokkosdnn_add_test(test_image Test_Image.cpp)

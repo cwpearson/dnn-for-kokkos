@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "KokkosDNN.hpp"
+#include "KokkosDNN_MossImageVae.hpp"
 
 namespace {
 
