@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
-#include <cstdio>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -694,7 +693,7 @@ void Tokenizer::load(const std::string& path) {
   // (124894), eos/stop=<|im_end|> (124900).
   auto resolve = [&](const char* content, int fallback) {
     for (auto& t : added_tokens_)
-      if (t.content == content) return t.id;
+      if (t.content == content && t.special) return t.id;
     return fallback;
   };
   bos_id_         = resolve(kBosToken, kBosId);
@@ -703,6 +702,20 @@ void Tokenizer::load(const std::string& path) {
   im_start_id_    = resolve(kImStartToken, kImStartId);
   think_start_id_ = resolve(kThinkStartToken, kThinkStartId);
   think_end_id_   = resolve(kThinkEndToken, kThinkEndId);
+
+  // LFM2.5 tool-call markers are control tokens even when a tokenizer.json
+  // files them as non-special (the stock file does): force them special so
+  // they encode atomically to single ids and stay out of default
+  // skip-specials decodes, where the tool parser consumes them
+  // structurally instead.
+  for (auto& tok : added_tokens_) {
+    if (tok.content == kToolCallStartToken ||
+        tok.content == kToolCallEndToken) {
+      tok.special = true;
+      special_ids_.insert(tok.id);
+      special_content_[tok.id] = tok.content;
+    }
+  }
 
   // Sibling tokenizer_config.json override (best-effort, never throws):
   // the config file records the bos/eos choice when content resolution is
@@ -781,17 +794,14 @@ std::vector<int> Tokenizer::encode(const std::string& text,
   if (add_bos) ids.push_back(bos_id_);
   if (text.empty() || !loaded()) return ids;
 
-  // Split out literal special tokens first (longest match wins). All added
-  // tokens are isolated (HF behavior), special or not: the ChatML/think
-  // markers (<|startoftext|>, <|im_start|>, <|im_end|>, <think>, ...) and
-  // the tool-call markers (<|tool_call_start|>, <|tool_call_end|>, which
-  // are `special: false` in the HF file so they survive
-  // skip_special_tokens decoding for parse_tool_calls) each encode as one
-  // atomic id.
+  // Split out literal special tokens first (longest match wins). The '<'
+  // fast path holds for the ChatML/think specials (<|startoftext|>,
+  // <|im_start|>, <|im_end|>, <think>, ...) alike.
   auto special_at = [&](size_t pos) -> const AddedToken* {
-    if (text[pos] != '<') return nullptr;  // all known markers start here
+    if (text[pos] != '<') return nullptr;  // all known specials start here
     for (auto& t : added_tokens_) {
-      if (text.compare(pos, t.content.size(), t.content) == 0) return &t;
+      if (t.special && text.compare(pos, t.content.size(), t.content) == 0)
+        return &t;
     }
     return nullptr;
   };
@@ -880,627 +890,26 @@ std::vector<int> encode_rendered_chat(const Tokenizer& tok,
   return ensure_bos(body, tok.bos(), add_bos);
 }
 
-// ---------------------------------------------------------------------------
-// Native tool-call format:
-//
-//   <|tool_call_start|>[name(arg='val', ...), ...]<|tool_call_end|>
-//
-// Rendering converts OpenAI wire-format JSON arguments to Pythonic values
-// (official template: strings single-quoted, True/False/None, nested
-// structures as JSON); parsing converts them back. Both directions are
-// dependency-free and best-effort: unparseable input yields `name()` on
-// render and drops that call on parse (never corrupt syntax).
-// ---------------------------------------------------------------------------
-
-std::string trim_ws(const std::string& s) {
-  size_t b = 0;
-  while (b < s.size() && (s[b] == ' ' || s[b] == '\t' || s[b] == '\n' ||
-                           s[b] == '\r'))
-    ++b;
-  size_t e = s.size();
-  while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\n' ||
-                    s[e - 1] == '\r'))
-    --e;
-  return s.substr(b, e - b);
-}
-
-// Split at each top-level `sep` (depth 0 outside quotes). Handles
-// ()[]{} nesting plus single/double-quoted spans with backslash escapes.
-std::vector<std::string> split_top_level(const std::string& s, char sep) {
-  std::vector<std::string> parts;
-  int depth = 0;
-  char quote = 0;
-  size_t start = 0;
-  for (size_t i = 0; i < s.size(); ++i) {
-    char c = s[i];
-    if (quote) {
-      if (c == '\\')
-        ++i;
-      else if (c == quote)
-        quote = 0;
-    } else if (c == '\'' || c == '"') {
-      quote = c;
-    } else if (c == '(' || c == '[' || c == '{') {
-      ++depth;
-    } else if (c == ')' || c == ']' || c == '}') {
-      if (depth > 0) --depth;
-    } else if (c == sep && depth == 0) {
-      parts.push_back(s.substr(start, i - start));
-      start = i + 1;
-    }
-  }
-  parts.push_back(s.substr(start));
-  return parts;
-}
-
-// First top-level occurrence of `want` (depth 0, outside quotes) or npos.
-size_t find_top_level(const std::string& s, char want) {
-  int depth = 0;
-  char quote = 0;
-  for (size_t i = 0; i < s.size(); ++i) {
-    char c = s[i];
-    if (quote) {
-      if (c == '\\')
-        ++i;
-      else if (c == quote)
-        quote = 0;
-      continue;
-    }
-    if (c == '\'' || c == '"') {
-      quote = c;
-      continue;
-    }
-    // Match before depth tracking so callers can search for brackets too.
-    if (depth == 0 && c == want) return i;
-    if (c == '(' || c == '[' || c == '{')
-      ++depth;
-    else if ((c == ')' || c == ']' || c == '}') && depth > 0)
-      --depth;
-  }
-  return std::string::npos;
-}
-
-void utf8_encode_cp_tool(uint32_t cp, std::string& out) {
-  if (cp < 0x80) {
-    out += (char)cp;
-  } else if (cp < 0x800) {
-    out += (char)(0xC0 | (cp >> 6));
-    out += (char)(0x80 | (cp & 0x3F));
-  } else if (cp < 0x10000) {
-    out += (char)(0xE0 | (cp >> 12));
-    out += (char)(0x80 | ((cp >> 6) & 0x3F));
-    out += (char)(0x80 | (cp & 0x3F));
-  } else {
-    out += (char)(0xF0 | (cp >> 18));
-    out += (char)(0x80 | ((cp >> 12) & 0x3F));
-    out += (char)(0x80 | ((cp >> 6) & 0x3F));
-    out += (char)(0x80 | (cp & 0x3F));
-  }
-}
-
-// Decode a quoted string token (single- or double-quoted) with backslash
-// escapes. Throws std::runtime_error on unterminated/malformed input.
-std::string decode_quoted(const std::string& tok) {
-  if (tok.size() < 2 || (tok.front() != '\'' && tok.front() != '"') ||
-      tok.back() != tok.front())
-    throw std::runtime_error("tool: bad quoted string");
-  const char q = tok.front();
-  std::string out;
-  for (size_t i = 1; i + 1 < tok.size(); ++i) {
-    char c = tok[i];
-    if (c != '\\') {
-      out += c;
-      continue;
-    }
-    if (++i >= tok.size() - 1) throw std::runtime_error("tool: bad escape");
-    char e = tok[i];
-    switch (e) {
-      case 'n': out += '\n'; break;
-      case 't': out += '\t'; break;
-      case 'r': out += '\r'; break;
-      case 'b': out += '\b'; break;
-      case 'f': out += '\f'; break;
-      case '\\': out += '\\'; break;
-      case '\'': out += '\''; break;
-      case '"': out += '"'; break;
-      case '/': out += '/'; break;
-      case 'u': {
-        if (i + 4 >= tok.size())
-          throw std::runtime_error("tool: bad \\u escape");
-        uint32_t cp = 0;
-        for (int k = 1; k <= 4; ++k) {
-          char h = tok[i + k];
-          cp <<= 4;
-          if (h >= '0' && h <= '9') cp += (uint32_t)(h - '0');
-          else if (h >= 'a' && h <= 'f') cp += (uint32_t)(h - 'a' + 10);
-          else if (h >= 'A' && h <= 'F') cp += (uint32_t)(h - 'A' + 10);
-          else throw std::runtime_error("tool: bad \\u escape");
-        }
-        i += 4;
-        // surrogate pair?
-        if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 < tok.size() &&
-            tok[i + 1] == '\\' && tok[i + 2] == 'u') {
-          uint32_t lo = 0;
-          bool ok = true;
-          for (int k = 3; k <= 6; ++k) {
-            char h = tok[i + k];
-            lo <<= 4;
-            if (h >= '0' && h <= '9') lo += (uint32_t)(h - '0');
-            else if (h >= 'a' && h <= 'f') lo += (uint32_t)(h - 'a' + 10);
-            else if (h >= 'A' && h <= 'F') lo += (uint32_t)(h - 'A' + 10);
-            else ok = false;
-          }
-          if (ok && lo >= 0xDC00 && lo <= 0xDFFF) {
-            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-            i += 6;
-          }
-        }
-        utf8_encode_cp_tool(cp, out);
-        break;
-      }
-      default:
-        // Lenient: keep unknown escapes literally (e.g. "\d" -> "d" would
-        // lose data; keep the backslash instead).
-        out += '\\';
-        out += e;
-        break;
-    }
-    (void)q;
-  }
-  return out;
-}
-
-std::string json_escape_str(const std::string& s) {
-  std::string out = "\"";
-  for (unsigned char c : s) {
-    switch (c) {
-      case '"': out += "\\\""; break;
-      case '\\': out += "\\\\"; break;
-      case '\b': out += "\\b"; break;
-      case '\f': out += "\\f"; break;
-      case '\n': out += "\\n"; break;
-      case '\r': out += "\\r"; break;
-      case '\t': out += "\\t"; break;
-      default:
-        if (c < 0x20) {
-          char buf[7];
-          std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-          out += buf;
-        } else {
-          out += (char)c;
-        }
-        break;
-    }
-  }
-  out += "\"";
-  return out;
-}
-
-// Official template string style: single quotes, escaping only
-// backslash, quote, and line breaks.
-std::string python_quote(const std::string& s) {
-  std::string out = "'";
-  for (char c : s) {
-    if (c == '\\') out += "\\\\";
-    else if (c == '\'') out += "\\'";
-    else if (c == '\n') out += "\\n";
-    else if (c == '\r') out += "\\r";
-    else out += c;
-  }
-  out += "'";
-  return out;
-}
-
-bool is_number_tok(const std::string& t) {
-  if (t.empty()) return false;
-  size_t i = 0;
-  if (t[i] == '+' || t[i] == '-') ++i;
-  bool digits = false, dot = false;
-  for (; i < t.size(); ++i) {
-    char c = t[i];
-    if (c >= '0' && c <= '9') {
-      digits = true;
-    } else if (c == '.' && !dot) {
-      dot = true;
-    } else if ((c == 'e' || c == 'E') && digits) {
-      ++i;
-      if (i < t.size() && (t[i] == '+' || t[i] == '-')) ++i;
-      bool ed = false;
-      for (; i < t.size(); ++i) {
-        if (t[i] < '0' || t[i] > '9') return false;
-        ed = true;
-      }
-      return ed;
-    } else {
-      return false;
-    }
-  }
-  return digits;
-}
-
-bool is_tool_name(const std::string& n) {
-  if (n.empty()) return false;
-  for (char c : n) {
-    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-          (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.'))
-      return false;
-  }
-  return true;
-}
-
-// JSON value (raw span) -> Pythonic value for the prompt. Throws on error.
-std::string json_value_to_python(const std::string& raw) {
-  const std::string t = trim_ws(raw);
-  if (t.size() >= 2 && t.front() == '"' && t.back() == '"')
-    return python_quote(decode_quoted(t));
-  if (t == "true") return "True";
-  if (t == "false") return "False";
-  if (t == "null") return "None";
-  if (!t.empty() && (t.front() == '[' || t.front() == '{')) {
-    if (t.front() == '[' && t.back() != ']')
-      throw std::runtime_error("tool: unbalanced list");
-    if (t.front() == '{' && t.back() != '}')
-      throw std::runtime_error("tool: unbalanced object");
-    return t;  // nested JSON passes through (tojson style)
-  }
-  if (is_number_tok(t)) return t;
-  throw std::runtime_error("tool: bad JSON value");
-}
-
-std::string render_tool_call(const std::string& name,
-                             const std::string& arguments_json) {
-  const std::string args = trim_ws(arguments_json);
-  if (!is_tool_name(name) || args.empty() || args == "{}" || args == "null")
-    return name + "()";
-  try {
-    if (args.front() != '{' || args.back() != '}')
-      throw std::runtime_error("tool: args not an object");
-    std::string body = args.substr(1, args.size() - 2);
-    std::vector<std::string> pairs;
-    for (const auto& e : split_top_level(body, ',')) {
-      const std::string entry = trim_ws(e);
-      if (entry.empty()) continue;  // lenient trailing comma
-      size_t c = find_top_level(entry, ':');
-      if (c == std::string::npos)
-        throw std::runtime_error("tool: bad arg entry");
-      std::string key = trim_ws(entry.substr(0, c));
-      if (key.size() >= 2 && (key.front() == '"' || key.front() == '\''))
-        key = decode_quoted(key);
-      pairs.push_back(key + "=" +
-                      json_value_to_python(entry.substr(c + 1)));
-    }
-    std::string out = name + "(";
-    for (size_t i = 0; i < pairs.size(); ++i) {
-      if (i != 0) out += ", ";
-      out += pairs[i];
-    }
-    return out + ")";
-  } catch (...) {
-    return name + "()";
-  }
-}
-
-// Python/JSON value -> canonical JSON. Recursive-descent over `s` at `*p`.
-// Throws std::runtime_error on malformed input.
-struct PyParser {
-  const std::string& s;
-  size_t p = 0;
-  explicit PyParser(const std::string& str) : s(str) {}
-
-  void ws() {
-    while (p < s.size() && (s[p] == ' ' || s[p] == '\t' || s[p] == '\n' ||
-                             s[p] == '\r'))
-      ++p;
-  }
-  bool eat(char c) {
-    ws();
-    if (p < s.size() && s[p] == c) {
-      ++p;
-      return true;
-    }
-    return false;
-  }
-  std::string parse_value() {
-    ws();
-    if (p >= s.size()) throw std::runtime_error("tool: empty value");
-    char c = s[p];
-    if (c == '\'' || c == '"') return parse_quoted_span();
-    if (c == '[') return parse_seq('[', ']');
-    if (c == '{') return parse_dict();
-    if (c == '(') return parse_seq('(', ')');
-    return parse_bare();
-  }
-  // Consumes one quoted span ( honouring backslash escapes) and returns it
-  // decoded + re-encoded as JSON.
-  std::string parse_quoted_span() {
-    char q = s[p];
-    size_t i = p + 1;
-    while (i < s.size()) {
-      if (s[i] == '\\') {
-        i += 2;
-        continue;
-      }
-      if (s[i] == q) break;
-      ++i;
-    }
-    if (i >= s.size()) throw std::runtime_error("tool: unterminated string");
-    std::string tok = s.substr(p, i - p + 1);
-    p = i + 1;
-    return json_escape_str(decode_quoted(tok));
-  }
-  std::string parse_seq(char open, char close) {
-    ++p;  // open
-    std::vector<std::string> items;
-    ws();
-    if (eat(close)) return std::string("[") + "]";
-    while (true) {
-      ws();
-      if (p < s.size() && s[p] == close) {
-        ++p;
-        break;  // lenient trailing comma
-      }
-      items.push_back(parse_value());
-      ws();
-      if (eat(',')) continue;
-      if (p < s.size() && s[p] == close) {
-        ++p;
-        break;
-      }
-      throw std::runtime_error("tool: bad sequence");
-    }
-    (void)open;
-    std::string out = "[";
-    for (size_t i = 0; i < items.size(); ++i) {
-      if (i != 0) out += ",";
-      out += items[i];
-    }
-    return out + "]";
-  }
-  std::string parse_dict() {
-    ++p;  // {
-    std::vector<std::string> items;
-    ws();
-    if (eat('}')) return "{}";
-    while (true) {
-      ws();
-      if (p < s.size() && s[p] == '}') {
-        ++p;
-        break;  // lenient trailing comma
-      }
-      std::string key;
-      if (p < s.size() && (s[p] == '\'' || s[p] == '"')) {
-        key = parse_quoted_span();
-      } else {
-        size_t b = p;
-        while (p < s.size() && (GluedKeyChar(s[p]))) ++p;
-        if (b == p) throw std::runtime_error("tool: bad dict key");
-        key = json_escape_str(s.substr(b, p - b));
-      }
-      ws();
-      if (p < s.size() && (s[p] == ':' || s[p] == '=')) {
-        ++p;
-      } else {
-        throw std::runtime_error("tool: expected ':'");
-      }
-      items.push_back(key + ":" + parse_value());
-      ws();
-      if (eat(',')) continue;
-      if (p < s.size() && s[p] == '}') {
-        ++p;
-        break;
-      }
-      throw std::runtime_error("tool: bad dict");
-    }
-    std::string out = "{";
-    for (size_t i = 0; i < items.size(); ++i) {
-      if (i != 0) out += ",";
-      out += items[i];
-    }
-    return out + "}";
-  }
-  static bool GluedKeyChar(char c) {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-           (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
-  }
-  std::string parse_bare() {
-    size_t b = p;
-    while (p < s.size() && s[p] != ',' && s[p] != ']' && s[p] != '}' &&
-           s[p] != ')' && s[p] != ':' && s[p] != '=' && s[p] != ' ' &&
-           s[p] != '\t' && s[p] != '\n' && s[p] != '\r')
-      ++p;
-    std::string tok = s.substr(b, p - b);
-    if (tok == "True" || tok == "true") return "true";
-    if (tok == "False" || tok == "false") return "false";
-    if (tok == "None" || tok == "null") return "null";
-    if (is_number_tok(tok)) return tok;
-    throw std::runtime_error("tool: bad scalar '" + tok + "'");
-  }
-};
-
-std::string python_value_to_json(const std::string& raw) {
-  PyParser ps(raw);
-  std::string v = ps.parse_value();
-  ps.ws();
-  if (ps.p != ps.s.size())
-    throw std::runtime_error("tool: trailing characters");
-  return v;
-}
-
-// Parse one `name(k=v, ...)` call. Returns false (no throw) when malformed.
-bool parse_one_tool_call(const std::string& part, ToolCall& call) {
-  const std::string t = trim_ws(part);
-  if (t.empty()) return false;
-  size_t open = find_top_level(t, '(');
-  if (open == std::string::npos || t.back() != ')') return false;
-  const std::string name = trim_ws(t.substr(0, open));
-  if (!is_tool_name(name)) return false;
-  const std::string inside =
-      trim_ws(t.substr(open + 1, t.size() - open - 2));
-  std::string args = "{}";
-  if (!inside.empty()) {
-    std::vector<std::string> kvs;
-    for (const auto& e : split_top_level(inside, ',')) {
-      const std::string entry = trim_ws(e);
-      if (entry.empty()) continue;  // lenient trailing comma
-      size_t eq = find_top_level(entry, '=');
-      if (eq == std::string::npos) return false;
-      std::string key = trim_ws(entry.substr(0, eq));
-      if (key.size() >= 2 && (key.front() == '"' || key.front() == '\''))
-        key = decode_quoted(key);
-      if (key.empty()) return false;
-      kvs.push_back(json_escape_str(key) + ":" +
-                    python_value_to_json(entry.substr(eq + 1)));
-    }
-    args = "{";
-    for (size_t i = 0; i < kvs.size(); ++i) {
-      if (i != 0) args += ",";
-      args += kvs[i];
-    }
-    args += "}";
-  }
-  call.id.clear();
-  call.name = name;
-  call.arguments = args;
-  return true;
-}
-
-ParsedToolCalls parse_tool_calls(const std::string& text) {
-  ParsedToolCalls out;
-  out.text = text;
-  struct Hit {
-    size_t begin = 0, end = 0;
-    std::vector<ToolCall> calls;
-    std::string tail;  // non-call text after the [...] span, kept in place
-  };
-  std::vector<Hit> hits;
-  const std::string kStart(kToolCallStartToken), kEnd(kToolCallEndToken);
-  size_t pos = 0;
-  while ((pos = text.find(kStart, pos)) != std::string::npos) {
-    size_t es = text.find(kEnd, pos + kStart.size());
-    if (es == std::string::npos) break;
-    const std::string inner = trim_ws(
-        text.substr(pos + kStart.size(), es - pos - kStart.size()));
-    std::vector<ToolCall> calls;
-    std::string tail;
-    // The call list runs from the opening `[` to its matching `]`; text
-    // after it (e.g. stray punctuation) is kept as regular reply text.
-    if (!inner.empty() && inner.front() == '[') {
-      int depth = 0;
-      char quote = 0;
-      size_t close = std::string::npos;
-      for (size_t i = 0; i < inner.size(); ++i) {
-        char c = inner[i];
-        if (quote) {
-          if (c == '\\') ++i;
-          else if (c == quote) quote = 0;
-        } else if (c == '\'' || c == '"') {
-          quote = c;
-        } else if (c == '[') {
-          ++depth;
-        } else if (c == ']') {
-          if (--depth == 0) {
-            close = i;
-            break;
-          }
-        }
-      }
-      if (close != std::string::npos) {
-        try {
-          const std::string list = inner.substr(1, close - 1);
-          for (const auto& part : split_top_level(list, ',')) {
-            if (trim_ws(part).empty()) continue;
-            ToolCall c;
-            if (parse_one_tool_call(part, c)) calls.push_back(c);
-          }
-        } catch (...) {
-          calls.clear();
-        }
-        tail = trim_ws(inner.substr(close + 1));
-      }
-    }
-    if (!calls.empty()) {
-      Hit h;
-      h.begin = pos;
-      h.end = es + kEnd.size();
-      h.calls = std::move(calls);
-      h.tail = std::move(tail);
-      hits.push_back(std::move(h));
-    }
-    pos = es + kEnd.size();
-  }
-  if (hits.empty()) return out;
-  std::string kept;
-  size_t cur = 0;
-  for (const auto& h : hits) {
-    kept += text.substr(cur, h.begin - cur);
-    if (!h.tail.empty()) {
-      if (!kept.empty() && kept.back() != ' ' && kept.back() != '\n')
-        kept += ' ';
-      kept += h.tail;
-    }
-    for (const auto& c : h.calls) out.calls.push_back(c);
-    cur = h.end;
-  }
-  kept += text.substr(cur);
-  out.text = trim_ws(kept);
-  return out;
-}
-
 std::string render_lfm25_chatml(const std::vector<ChatMessage>& messages,
                                 bool add_generation_prompt,
                                 bool preserve_thinking,
-                                const std::string& default_system,
-                                const std::vector<std::string>& tools_json) {
+                                const std::string& default_system) {
   std::string out;
-  // Tool definitions ride in the system prompt ("List of tools: [...]"),
-  // matching the official LFM2.5 chat template.
-  std::string tools_block;
-  if (!tools_json.empty()) {
-    tools_block = "List of tools: [";
-    for (size_t i = 0; i < tools_json.size(); ++i) {
-      if (i != 0) tools_block += ", ";
-      tools_block += tools_json[i];
-    }
-    tools_block += "]";
-  }
-  size_t first_system = messages.size();
-  for (size_t i = 0; i < messages.size(); ++i) {
-    if (messages[i].role == "system") {
-      first_system = i;
+  bool has_system = false;
+  for (const auto& m : messages)
+    if (m.role == "system") {
+      has_system = true;
       break;
     }
-  }
-  if (first_system == messages.size() &&
-      (!default_system.empty() || !tools_block.empty())) {
-    std::string sys = default_system;
-    if (!tools_block.empty()) sys += (sys.empty() ? "" : "\n") + tools_block;
-    out += std::string(kImStartToken) + "system\n" + sys + kEosToken + "\n";
-  }
-  for (size_t i = 0; i < messages.size(); ++i) {
-    const auto& m = messages[i];
-    if (m.role == "system" && i == first_system && !tools_block.empty()) {
-      out += std::string(kImStartToken) + "system\n" + m.content + "\n" +
-             tools_block + kEosToken + "\n";
-      continue;
-    }
+  if (!has_system && !default_system.empty())
+    out += std::string(kImStartToken) + "system\n" + default_system +
+           kEosToken + "\n";
+  for (const auto& m : messages) {
     out += std::string(kImStartToken) + m.role + "\n";
-    if (m.role == "assistant") {
-      if (preserve_thinking && !m.thinking.empty())
-        out += std::string(kThinkStartToken) + m.thinking + kThinkEndToken +
-               "\n";
-      out += m.content;
-      if (!m.tool_calls.empty()) {
-        out += std::string(kToolCallStartToken) + "[";
-        for (size_t k = 0; k < m.tool_calls.size(); ++k) {
-          if (k != 0) out += ", ";
-          out += render_tool_call(m.tool_calls[k].name,
-                                  m.tool_calls[k].arguments);
-        }
-        out += std::string("]") + kToolCallEndToken;
-      }
-    } else {
-      out += m.content;
-    }
+    if (preserve_thinking && m.role == "assistant" && !m.thinking.empty())
+      out += std::string(kThinkStartToken) + m.thinking + kThinkEndToken +
+             "\n";
+    out += m.content;
     out += std::string(kEosToken) + "\n";
   }
   if (add_generation_prompt)
@@ -1511,13 +920,749 @@ std::string render_lfm25_chatml(const std::vector<ChatMessage>& messages,
 std::vector<int> encode_chatml(const Tokenizer& tok,
                                const std::vector<ChatMessage>& messages,
                                bool add_generation_prompt, bool add_bos,
-                               bool preserve_thinking,
-                               const std::vector<std::string>& tools_json) {
+                               bool preserve_thinking) {
   return encode_rendered_chat(
       tok,
-      render_lfm25_chatml(messages, add_generation_prompt, preserve_thinking,
-                           "", tools_json),
+      render_lfm25_chatml(messages, add_generation_prompt, preserve_thinking),
       add_bos);
+}
+
+// ---------------------------------------------------------------------------
+// Native tool-use support (render + parse).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Trim ASCII whitespace (space, \t, \n, \r, \f, \v) from both ends.
+std::string tool_trim(const std::string& s) {
+  size_t b = 0;
+  while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
+  size_t e = s.size();
+  while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
+  return s.substr(b, e - b);
+}
+
+// Append a JSON string literal for `v` (double-quoted, minimal escapes).
+void tool_append_json_string(const std::string& v, std::string& out) {
+  static const char* kHex = "0123456789abcdef";
+  out += '"';
+  for (char c : v) {
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      case '\b': out += "\\b"; break;
+      case '\f': out += "\\f"; break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          out += "\\u00";
+          out += kHex[(c >> 4) & 0xF];
+          out += kHex[c & 0xF];
+        } else {
+          out += c;
+        }
+    }
+  }
+  out += '"';
+}
+
+// Split on `sep` at nesting depth 0, respecting single/double quotes
+// (with backslash escapes) and (), [], {} nesting.
+std::vector<std::string> tool_split_top(const std::string& s, char sep) {
+  std::vector<std::string> parts;
+  std::string cur;
+  int depth = 0;
+  char quote = 0;
+  for (size_t i = 0; i < s.size(); ++i) {
+    const char c = s[i];
+    if (quote) {
+      cur += c;
+      if (c == '\\' && i + 1 < s.size()) cur += s[++i];
+      else if (c == quote) quote = 0;
+      continue;
+    }
+    if (c == '"' || c == '\'') {
+      quote = c;
+      cur += c;
+    } else if (c == '(' || c == '[' || c == '{') {
+      ++depth;
+      cur += c;
+    } else if (c == ')' || c == ']' || c == '}') {
+      if (depth > 0) --depth;
+      cur += c;
+    } else if (c == sep && depth == 0) {
+      parts.push_back(cur);
+      cur.clear();
+    } else {
+      cur += c;
+    }
+  }
+  parts.push_back(cur);
+  return parts;
+}
+
+bool tool_is_ident(const std::string& s) {
+  if (s.empty()) return false;
+  for (size_t i = 0; i < s.size(); ++i) {
+    const char c = s[i];
+    const bool ok = (c == '_') || (c >= 'A' && c <= 'Z') ||
+                    (c >= 'a' && c <= 'z') || (i > 0 && c >= '0' && c <= '9');
+    if (!ok) return false;
+  }
+  return true;
+}
+
+bool tool_looks_number(const std::string& s) {
+  if (s.empty()) return false;
+  size_t i = (s[0] == '-' || s[0] == '+') ? 1 : 0;
+  bool digits = false, dot = false;
+  for (; i < s.size(); ++i) {
+    const char c = s[i];
+    if (c >= '0' && c <= '9') {
+      digits = true;
+    } else if (c == '.' && !dot) {
+      dot = true;
+    } else if ((c == 'e' || c == 'E') && digits) {
+      ++i;
+      if (i < s.size() && (s[i] == '-' || s[i] == '+')) ++i;
+      bool ed = false;
+      for (; i < s.size(); ++i) {
+        if (s[i] < '0' || s[i] > '9') return false;
+        ed = true;
+      }
+      return ed;
+    } else {
+      return false;
+    }
+  }
+  return digits;
+}
+
+// Decode standard escapes inside a quoted pythonic string body.
+std::string tool_unescape_py(const std::string& body) {
+  std::string out;
+  for (size_t i = 0; i < body.size(); ++i) {
+    const char c = body[i];
+    if (c != '\\' || i + 1 >= body.size()) {
+      out += c;
+      continue;
+    }
+    const char e = body[++i];
+    switch (e) {
+      case 'n': out += '\n'; break;
+      case 't': out += '\t'; break;
+      case 'r': out += '\r'; break;
+      case 'b': out += '\b'; break;
+      case 'f': out += '\f'; break;
+      case '0': out += '\0'; break;
+      default: out += e; break;  // \\, \', \", and lenient passthrough
+    }
+  }
+  return out;
+}
+
+// Recursive-descent native pythonic value -> JSON value. Lenient: bare
+// words become JSON strings, garbage becomes null; entries always survive.
+struct ToolPyValueParser {
+  const std::string& s;
+  size_t p = 0;
+
+  void ws() {
+    while (p < s.size() && std::isspace(static_cast<unsigned char>(s[p]))) ++p;
+  }
+  std::string parse_value() {
+    ws();
+    if (p >= s.size()) return "null";
+    const char c = s[p];
+    if (c == '"' || c == '\'') {
+      const char q = s[p++];
+      std::string body;
+      while (p < s.size() && s[p] != q) {
+        if (s[p] == '\\' && p + 1 < s.size()) {
+          body += s[p++];
+          body += s[p++];
+        } else {
+          body += s[p++];
+        }
+      }
+      if (p < s.size()) ++p;  // closing quote
+      std::string out;
+      tool_append_json_string(tool_unescape_py(body), out);
+      return out;
+    }
+    if (c == '[' || c == '{') {
+      const char open = c;
+      const char close = (open == '[') ? ']' : '}';
+      ++p;
+      std::string out;
+      out += open;
+      bool first = true;
+      while (true) {
+        ws();
+        if (p >= s.size()) break;  // unterminated: close leniently
+        if (s[p] == close) {
+          ++p;
+          break;
+        }
+        std::string key_prefix;
+        if (open == '{') {
+          // Key: quoted string or bare word.
+          if (s[p] == '"' || s[p] == '\'') {
+            key_prefix = parse_value();
+          } else {
+            size_t b = p;
+            while (p < s.size() && s[p] != ':' && s[p] != ',' && s[p] != close &&
+                   !std::isspace(static_cast<unsigned char>(s[p])))
+              ++p;
+            tool_append_json_string(tool_trim(s.substr(b, p - b)),
+                                    key_prefix);
+          }
+          ws();
+          if (p < s.size() && s[p] == ':') {
+            ++p;
+          } else {
+            // Not a pair: treat the key text as a positional value.
+            if (!first) out += ",";
+            first = false;
+            out += key_prefix;
+            ws();
+            if (p < s.size() && s[p] == ',') {
+              ++p;
+              continue;
+            }
+            continue;
+          }
+        }
+        const std::string val = parse_value();
+        if (!first) out += ",";
+        first = false;
+        out += key_prefix;
+        if (open == '{') out += ":";
+        out += val;
+        ws();
+        if (p < s.size() && s[p] == ',') {
+          ++p;
+          continue;
+        }
+        if (p < s.size() && s[p] == close) continue;
+        break;  // garbage: stop, close below
+      }
+      ws();
+      if (p < s.size() && s[p] == close) ++p;
+      return out + close;
+    }
+    if (s.compare(p, 4, "True") == 0) {
+      p += 4;
+      return "true";
+    }
+    if (s.compare(p, 5, "False") == 0) {
+      p += 5;
+      return "false";
+    }
+    if (s.compare(p, 4, "None") == 0) {
+      p += 4;
+      return "null";
+    }
+    // Number or bare word: consume to the next structural char.
+    size_t b = p;
+    int depth = 0;
+    while (p < s.size()) {
+      const char d = s[p];
+      if (d == '(' || d == '[' || d == '{') ++depth;
+      if (d == ')' || d == ']' || d == '}') {
+        if (depth == 0) break;
+        --depth;
+      }
+      if (depth == 0 && d == ',') break;
+      ++p;
+    }
+    const std::string tok = tool_trim(s.substr(b, p - b));
+    if (tool_looks_number(tok)) return tok;
+    std::string out;
+    tool_append_json_string(tok, out);
+    return out;
+  }
+};
+
+// Minimal JSON value -> pythonic converter for history rendering.
+// Returns "" when the top level is not a JSON object; sets ok=false on
+// any malformed input.
+struct ToolJsonArgParser {
+  const std::string& s;
+  size_t p = 0;
+  bool ok = true;
+
+  void ws() {
+    while (p < s.size() && std::isspace(static_cast<unsigned char>(s[p]))) ++p;
+  }
+  bool expect(char c) {
+    ws();
+    if (p < s.size() && s[p] == c) {
+      ++p;
+      return true;
+    }
+    ok = false;
+    return false;
+  }
+  // Parses any JSON value into its pythonic spelling.
+  std::string parse_value() {
+    ws();
+    if (p >= s.size()) {
+      ok = false;
+      return "None";
+    }
+    const char c = s[p];
+    if (c == '"') {
+      ++p;
+      std::string body;
+      while (p < s.size() && s[p] != '"') {
+        if (s[p] == '\\' && p + 1 < s.size()) {
+          const char e = s[++p];
+          switch (e) {
+            case 'n': body += '\n'; break;
+            case 't': body += '\t'; break;
+            case 'r': body += '\r'; break;
+            case 'b': body += '\b'; break;
+            case 'f': body += '\f'; break;
+            case 'u': {
+              // Best-effort \uXXXX: BMP values that fit one UTF-8 sequence.
+              unsigned cp = 0;
+              bool good = (p + 4 < s.size());
+              for (int k = 1; good && k <= 4; ++k) {
+                const char h = s[p + k];
+                cp <<= 4;
+                if (h >= '0' && h <= '9') cp |= (unsigned)(h - '0');
+                else if (h >= 'a' && h <= 'f') cp |= (unsigned)(h - 'a' + 10);
+                else if (h >= 'A' && h <= 'F') cp |= (unsigned)(h - 'A' + 10);
+                else good = false;
+              }
+              if (good) {
+                if (cp < 0x80) {
+                  body += (char)cp;
+                } else if (cp < 0x800) {
+                  body += (char)(0xC0 | (cp >> 6));
+                  body += (char)(0x80 | (cp & 0x3F));
+                } else {
+                  body += (char)(0xE0 | (cp >> 12));
+                  body += (char)(0x80 | ((cp >> 6) & 0x3F));
+                  body += (char)(0x80 | (cp & 0x3F));
+                }
+                p += 4;
+              } else {
+                body += 'u';
+              }
+              break;
+            }
+            default: body += e; break;
+          }
+          ++p;
+        } else {
+          body += s[p++];
+        }
+      }
+      if (p < s.size()) ++p;  // closing quote
+      std::string out = "\"";
+      for (char b : body) {
+        if (b == '"') out += "\\\"";
+        else if (b == '\\') out += "\\\\";
+        else if (b == '\n') out += "\\n";
+        else out += b;
+      }
+      return out + "\"";
+    }
+    if (c == '{' || c == '[') {
+      const char open = c;
+      const char close = (open == '{') ? '}' : ']';
+      ++p;
+      std::string out;
+      out += open;
+      bool first = true;
+      bool closed = false;
+      while (p < s.size()) {
+        ws();
+        if (p < s.size() && s[p] == close) {
+          ++p;
+          closed = true;
+          break;
+        }
+        if (open == '{') {
+          if (p >= s.size() || s[p] != '"') {
+            ok = false;
+            break;
+          }
+          const std::string key = parse_value();
+          if (!expect(':')) break;
+          const std::string val = parse_value();
+          if (!first) out += ", ";
+          first = false;
+          out += key + ": " + val;
+        } else {
+          const std::string v = parse_value();
+          if (!first) out += ", ";
+          first = false;
+          out += v;
+        }
+        ws();
+        if (p < s.size() && s[p] == ',') {
+          ++p;
+          continue;
+        }
+        if (p < s.size() && s[p] == close) {
+          ++p;
+          closed = true;
+          break;
+        }
+        ok = false;
+        break;
+      }
+      if (!closed) ok = false;
+      return out + close;
+    }
+    if (s.compare(p, 4, "true") == 0) {
+      p += 4;
+      return "True";
+    }
+    if (s.compare(p, 5, "false") == 0) {
+      p += 5;
+      return "False";
+    }
+    if (s.compare(p, 4, "null") == 0) {
+      p += 4;
+      return "None";
+    }
+    size_t b = p;
+    while (p < s.size() && s[p] != ',' && s[p] != ']' && s[p] != '}' &&
+           !std::isspace(static_cast<unsigned char>(s[p])))
+      ++p;
+    const std::string tok = s.substr(b, p - b);
+    if (tok.empty() || !tool_looks_number(tok)) ok = false;
+    return tok;
+  }
+};
+
+// Format one parsed call back into native `name(args)` form.
+std::string tool_format_call(const ToolCall& c) {
+  return c.name + "(" + args_json_to_pythonic(c.arguments) + ")";
+}
+
+// Length of the trailing incomplete UTF-8 sequence in b (0 when the end
+// is character-complete). Mirrors IncrementalDetokenizer policy.
+size_t tool_trailing_partial_utf8(const std::string& b) {
+  const size_t n = b.size();
+  if (n == 0) return 0;
+  size_t cont = 0;
+  while (cont < n && cont < 4 &&
+         (static_cast<unsigned char>(b[n - 1 - cont]) & 0xC0u) == 0x80u)
+    ++cont;
+  if (cont >= 4 || cont == n) return 0;
+  const unsigned char lead = static_cast<unsigned char>(b[n - 1 - cont]);
+  size_t want = 1;
+  if (lead >= 0xC0u && lead < 0xE0u) want = 2;
+  else if (lead >= 0xE0u && lead < 0xF0u) want = 3;
+  else if (lead >= 0xF0u && lead < 0xF8u) want = 4;
+  else return 0;
+  return (1 + cont < want) ? 1 + cont : 0;
+}
+
+}  // namespace
+
+std::string args_pythonic_to_json(const std::string& args) {
+  try {
+    const std::string t = tool_trim(args);
+    if (t.empty()) return "{}";
+    std::string out = "{";
+    bool first = true;
+    for (const std::string& entry : tool_split_top(t, ',')) {
+      const size_t eq = entry.find('=');
+      if (eq == std::string::npos) continue;
+      const std::string key = tool_trim(entry.substr(0, eq));
+      if (!tool_is_ident(key)) continue;
+      ToolPyValueParser pv{tool_trim(entry.substr(eq + 1)), 0};
+      const std::string val = pv.parse_value();
+      std::string jk;
+      tool_append_json_string(key, jk);
+      if (!first) out += ",";
+      first = false;
+      out += jk + ":" + val;
+    }
+    return out + "}";
+  } catch (...) {
+    return "{}";
+  }
+}
+
+std::string args_json_to_pythonic(const std::string& args_json) {
+  try {
+    const std::string t = tool_trim(args_json);
+    if (t.empty() || t == "{}") return "";
+    ToolJsonArgParser jp{t, 0, true};
+    if (!jp.expect('{')) return "";
+    std::string out;
+    bool first = true;
+    jp.ws();
+    if (jp.p < jp.s.size() && jp.s[jp.p] == '}') return "";
+    while (jp.p < jp.s.size()) {
+      jp.ws();
+      if (jp.p < jp.s.size() && jp.s[jp.p] == '}') {
+        ++jp.p;
+        break;
+      }
+      if (jp.p >= jp.s.size() || jp.s[jp.p] != '"') return "";
+      ++jp.p;  // opening quote of the key
+      std::string key;
+      while (jp.p < jp.s.size() && jp.s[jp.p] != '"') {
+        if (jp.s[jp.p] == '\\' && jp.p + 1 < jp.s.size()) {
+          key += jp.s[jp.p++];
+          key += jp.s[jp.p++];
+        } else {
+          key += jp.s[jp.p++];
+        }
+      }
+      if (jp.p >= jp.s.size()) return "";
+      ++jp.p;  // closing quote
+      if (!tool_is_ident(key)) return "";
+      if (!jp.expect(':')) return "";
+      const std::string val = jp.parse_value();
+      if (!jp.ok) return "";
+      if (!first) out += ", ";
+      first = false;
+      out += key + "=" + val;
+      jp.ws();
+      if (jp.p < jp.s.size() && jp.s[jp.p] == ',') {
+        ++jp.p;
+        continue;
+      }
+      if (jp.p < jp.s.size() && jp.s[jp.p] == '}') continue;
+      break;
+    }
+    if (!jp.ok) return "";
+    jp.ws();
+    if (jp.p < jp.s.size()) return "";  // closing '}' already consumed above
+    return out;
+  } catch (...) {
+    return "";
+  }
+}
+
+std::vector<ToolCall> parse_tool_call_block(const std::string& block) {
+  std::vector<ToolCall> calls;
+  try {
+    std::string t = tool_trim(block);
+    // Native blocks wrap calls in [...]; tolerate a missing pair.
+    if (t.size() >= 2 && t.front() == '[' && t.back() == ']')
+      t = tool_trim(t.substr(1, t.size() - 2));
+    if (t.empty()) return calls;
+    for (const std::string& item : tool_split_top(t, ',')) {
+      const std::string e = tool_trim(item);
+      if (e.empty()) continue;
+      const size_t open = e.find('(');
+      if (open == std::string::npos || e.back() != ')') continue;
+      const std::string name = tool_trim(e.substr(0, open));
+      if (!tool_is_ident(name)) continue;
+      const std::string args = e.substr(open + 1, e.size() - open - 2);
+      ToolCall c;
+      c.name = name;
+      c.arguments = args_pythonic_to_json(args);
+      calls.push_back(std::move(c));
+    }
+  } catch (...) {
+  }
+  return calls;
+}
+
+ToolParseResult parse_tool_calls(const std::string& raw) {
+  ToolParseResult r;
+  try {
+    const std::string start = kToolCallStartToken;
+    const std::string end = kToolCallEndToken;
+    std::string text;
+    size_t pos = 0;
+    while (true) {
+      const size_t s = raw.find(start, pos);
+      if (s == std::string::npos) {
+        text += raw.substr(pos);
+        break;
+      }
+      text += raw.substr(pos, s - pos);
+      const size_t e = raw.find(end, s + start.size());
+      if (e == std::string::npos) {
+        // Unclosed marker: keep the inner bytes as text, drop the marker.
+        text += raw.substr(s + start.size());
+        break;
+      }
+      for (auto& c :
+           parse_tool_call_block(raw.substr(s + start.size(),
+                                            e - s - start.size())))
+        r.calls.push_back(std::move(c));
+      pos = e + end.size();
+    }
+    // The turn terminator ends the turn; anything after it is not content.
+    const size_t stop = text.find(kEosToken);
+    if (stop != std::string::npos) text.erase(stop);
+    r.text = std::move(text);
+  } catch (...) {
+    r.calls.clear();
+  }
+  return r;
+}
+
+std::string render_lfm25_chatml_with_tools(
+    const std::vector<ChatMessage>& messages, const std::string& tools_json,
+    const std::string& system_suffix, bool add_generation_prompt,
+    bool preserve_thinking, const std::string& default_system) {
+  // Effective system block: first system message (if any) + default +
+  // tools catalogue + caller directives.
+  std::string sys;
+  bool has_system = false;
+  for (const auto& m : messages)
+    if (m.role == "system") {
+      has_system = true;
+      if (!m.content.empty()) sys += (sys.empty() ? "" : "\n") + m.content;
+    }
+  if (!has_system && !default_system.empty()) sys = default_system;
+  if (!tools_json.empty())
+    sys += (sys.empty() ? "" : "\n") + std::string("List of tools: ") +
+           tools_json;
+  if (!system_suffix.empty())
+    sys += (sys.empty() ? "" : "\n") + system_suffix;
+
+  std::string out;
+  if (has_system || !sys.empty())
+    out += std::string(kImStartToken) + "system\n" + sys + kEosToken + "\n";
+  for (const auto& m : messages) {
+    if (m.role == "system") continue;  // folded into the block above
+    const std::string role = (m.role == "tool") ? "tool" : m.role;
+    out += std::string(kImStartToken) + role + "\n";
+    if (preserve_thinking && m.role == "assistant" && !m.thinking.empty())
+      out += std::string(kThinkStartToken) + m.thinking + kThinkEndToken +
+             "\n";
+    out += m.content;
+    if (m.role == "assistant" && !m.tool_calls.empty()) {
+      if (!m.content.empty()) out += "\n";
+      out += kToolCallStartToken;
+      out += "[";
+      bool first = true;
+      for (const auto& c : m.tool_calls) {
+        if (c.name.empty() || !tool_is_ident(c.name)) continue;
+        if (!first) out += ", ";
+        first = false;
+        out += tool_format_call(c);
+      }
+      out += "]";
+      out += kToolCallEndToken;
+    }
+    out += std::string(kEosToken) + "\n";
+  }
+  if (add_generation_prompt)
+    out += std::string(kImStartToken) + "assistant\n";
+  return out;
+}
+
+std::vector<int> encode_chatml_with_tools(
+    const Tokenizer& tok, const std::vector<ChatMessage>& messages,
+    const std::string& tools_json, const std::string& system_suffix,
+    bool add_generation_prompt, bool add_bos, bool preserve_thinking) {
+  return encode_rendered_chat(
+      tok,
+      render_lfm25_chatml_with_tools(messages, tools_json, system_suffix,
+                                     add_generation_prompt,
+                                     preserve_thinking),
+      add_bos);
+}
+
+ToolCallStreamParser::ToolCallStreamParser(
+    const std::vector<std::string>& stop_strings)
+    : stops_(stop_strings) {
+  if (stops_.empty()) stops_ = default_stop_strings();
+}
+
+std::string ToolCallStreamParser::push(const std::string& raw_piece) {
+  raw_ += raw_piece;
+  // Settled region: everything before the first unclosed call marker.
+  const std::string start = kToolCallStartToken;
+  const std::string end = kToolCallEndToken;
+  size_t limit = raw_.size();
+  size_t p = 0;
+  while (true) {
+    const size_t s = raw_.find(start, p);
+    if (s == std::string::npos) break;
+    const size_t e = raw_.find(end, s + start.size());
+    if (e == std::string::npos) {
+      limit = s;
+      break;
+    }
+    p = e + end.size();
+  }
+  std::string region = raw_.substr(0, limit);
+  // Turn terminator / stop strings end the settled text.
+  size_t cut = std::string::npos;
+  for (const auto& s : stops_) {
+    if (s.empty()) continue;
+    const size_t f = region.find(s);
+    if (f != std::string::npos && (cut == std::string::npos || f < cut))
+      cut = f;
+  }
+  if (cut != std::string::npos) region.erase(cut);
+  // Strip complete call blocks from the settled region for display.
+  std::string outside;
+  {
+    size_t q = 0;
+    while (true) {
+      const size_t s = region.find(start, q);
+      if (s == std::string::npos) {
+        outside += region.substr(q);
+        break;
+      }
+      outside += region.substr(q, s - q);
+      const size_t e = region.find(end, s + start.size());
+      if (e == std::string::npos) {
+        outside += region.substr(s);  // unreachable (settled); stay safe
+        break;
+      }
+      q = e + end.size();
+    }
+  }
+  // Hold back trailing partial UTF-8 and possible marker heads so a chunk
+  // boundary never splits a codepoint or a control marker.
+  static const char* kSensitive[] = {kToolCallStartToken, kToolCallEndToken,
+                                     kEosToken};
+  size_t safe = outside.size();
+  const size_t hold_utf8 = tool_trailing_partial_utf8(outside);
+  if (hold_utf8 > 0 && hold_utf8 <= safe) safe -= hold_utf8;
+  while (safe > emitted_) {
+    bool held = false;
+    for (const char* s : kSensitive) {
+      const size_t slen = std::string(s).size();
+      if (slen <= 1) continue;
+      const size_t max_k = std::min(safe - emitted_, slen - 1);
+      for (size_t k = 1; k <= max_k; ++k) {
+        if (outside.compare(safe - k, k, s, 0, k) == 0) {
+          safe -= k;
+          held = true;
+          break;
+        }
+      }
+      if (held) break;
+    }
+    if (!held) break;
+  }
+  if (safe < emitted_) safe = emitted_;  // stops_ changed mid-stream; guard
+  std::string delta = outside.substr(emitted_, safe - emitted_);
+  emitted_ = safe;
+  return delta;
+}
+
+ToolParseResult ToolCallStreamParser::finish() {
+  ToolParseResult full = parse_tool_calls(raw_);
+  ToolParseResult tail;
+  tail.calls = std::move(full.calls);
+  // emitted_ counts chars of the untruncated outside text; the parsed text
+  // may additionally end at a stop marker, so clamp defensively.
+  tail.text =
+      (emitted_ <= full.text.size()) ? full.text.substr(emitted_) : "";
+  return tail;
 }
 
 size_t find_stop_string(const std::string& text,

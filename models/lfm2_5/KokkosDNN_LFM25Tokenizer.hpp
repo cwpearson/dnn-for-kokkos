@@ -13,7 +13,7 @@ namespace LFM25 {
 //
 //   pad 124893, bos <|startoftext|> 124894, <|im_start|> 124899,
 //   eos/stop <|im_end|> 124900, think pair 124901/124902,
-//   tool-call markers 124905/124906.
+//   tool-list pair 124903/124904, tool-call pair 124905/124906.
 //
 // The loader resolves every id by literal content from `added_tokens` and
 // falls back to the numeric values below when an entry is absent, so a
@@ -22,17 +22,14 @@ namespace LFM25 {
 // convention used by render_lfm25_chatml; files that spell the think pair
 // differently keep working because resolution is content-driven with the
 // numeric fallback only as a last resort.
-//
-// NOTE: the tool-call markers are `special: false` in the HF tokenizer,
-// so Tokenizer::decode keeps them even with skip_special_tokens=true.
-// parse_tool_calls() relies on that: tool calls are parsed from decoded
-// text.
 inline constexpr int kPadId        = 124893;
 inline constexpr int kBosId        = 124894;
 inline constexpr int kImStartId    = 124899;
 inline constexpr int kEosId        = 124900;
 inline constexpr int kThinkStartId = 124901;
 inline constexpr int kThinkEndId   = 124902;
+inline constexpr int kToolListStartId = 124903;
+inline constexpr int kToolListEndId   = 124904;
 inline constexpr int kToolCallStartId = 124905;
 inline constexpr int kToolCallEndId   = 124906;
 
@@ -42,8 +39,12 @@ inline constexpr const char* kImStartToken    = "<|im_start|>";
 inline constexpr const char* kEosToken        = "<|im_end|>";
 inline constexpr const char* kThinkStartToken = "<think>";
 inline constexpr const char* kThinkEndToken   = "</think>";
+inline constexpr const char* kToolListStartToken = "<|tool_list_start|>";
+inline constexpr const char* kToolListEndToken   = "<|tool_list_end|>";
 inline constexpr const char* kToolCallStartToken = "<|tool_call_start|>";
 inline constexpr const char* kToolCallEndToken   = "<|tool_call_end|>";
+// Exact assistant tool-call wrapper used by the Instruct template:
+//   <|tool_call_start|>[name(k="v", ...), ...]<|tool_call_end|>
 
 // Hugging Face `tokenizer.json` loader for LFM2.5 (byte-level BPE, 128k).
 //
@@ -122,28 +123,15 @@ class Tokenizer {
 };
 
 // ---------------------------------------------------------------------------
-// LFM2.5-Instruct ChatML template with thinking and tool-call support.
+// LFM2.5-Instruct ChatML template with thinking support.
 //
 // Renders the ChatML-style format:
 //
 //   <|im_start|>system\n{system}<|im_end|>\n
 //   <|im_start|>user\n{user}<|im_end|>\n
-//   <|im_start|>assistant\n[<think>{thinking}</think>\n]{content}[tool calls]<|im_end|>\n
-//   <|im_start|>tool\n{result}<|im_end|>\n
+//   <|im_start|>assistant\n[<think>{thinking}</think>\n]{content}<|im_end|>\n
 //   <|im_start|>assistant\n            <- generation prompt
 //
-// Tool definitions (`tools_json`, one JSON object string per tool, e.g.
-// `{"name":"...","description":"...","parameters":{...}}`) are appended to
-// the system prompt as `List of tools: [...]`, matching the official LFM2.5
-// chat template: an existing first system message gets the suffix, otherwise
-// a system block is injected (after `default_system` when set).
-//
-// Assistant tool calls render in the native LFM format:
-//
-//   <|tool_call_start|>[name(arg='val', ...), ...]<|tool_call_end|>
-//
-// with Pythonic argument values (strings single-quoted, True/False/None,
-// nested structures as JSON). Tool results use the `tool` role block.
 // A thinking block is emitted inside an assistant turn only when that
 // turn carries non-empty `thinking` AND `preserve_thinking` is true;
 // otherwise the thinking trace is dropped (content is always kept).
@@ -155,19 +143,29 @@ class Tokenizer {
 // special tokens, so Tokenizer::encode handles it via the special-token
 // split path. The Instruct stop string is "<|im_end|>" (Tokenizer::eot()).
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// One function invocation. `arguments` is a JSON object string
+// (OpenAI `function.arguments` wire form, e.g. `{"location":"SF"}`);
+// the renderer converts it to the native pythonic form and the parser
+// converts the native form back, so both directions stay lossless for
+// JSON-representable values.
 struct ToolCall {
-  std::string id;         // OpenAI call id (may be empty in history)
+  std::string id;         // OpenAI tool_call id ("" when unknown/unparsed)
   std::string name;       // function name
-  std::string arguments;  // JSON object string, OpenAI wire format (may be
-                          // empty, meaning no arguments)
+  std::string arguments;  // JSON object string ("" or "{}" when none)
 };
 
 struct ChatMessage {
   std::string role;      // "system" | "user" | "assistant" | "tool"
   std::string content;
   std::string thinking;  // assistant reasoning trace (may be empty)
-  std::vector<ToolCall> tool_calls;  // assistant tool calls (else empty)
-  std::string tool_call_id;  // tool result id (role "tool", may be empty)
+  // Agentic history: assistant turns may carry structured tool calls
+  // (reconstructed into the native <|tool_call_start|>...<|tool_call_end|>
+  // form by the renderer); "tool" turns carry the function result in
+  // `content` and optionally link it via `tool_call_id`. Defaulted so the
+  // existing {"role", "content", "thinking"} aggregate init keeps working.
+  std::vector<ToolCall> tool_calls;
+  std::string tool_call_id;
 };
 
 // Build the standard single-turn messages for a raw prompt: optional
@@ -179,8 +177,7 @@ std::vector<ChatMessage> make_chat_messages(const std::string& prompt,
 std::string render_lfm25_chatml(const std::vector<ChatMessage>& messages,
                                 bool add_generation_prompt = true,
                                 bool preserve_thinking = true,
-                                const std::string& default_system = "",
-                                const std::vector<std::string>& tools_json = {});
+                                const std::string& default_system = "");
 
 // BOS handling: collapse any run of leading `bos_id` to exactly one when
 // want_bos (or strip all leading copies when !want_bos). Guarantees the
@@ -203,30 +200,90 @@ std::vector<int> encode_chatml(const Tokenizer& tok,
                                const std::vector<ChatMessage>& messages,
                                bool add_generation_prompt = true,
                                bool add_bos = true,
-                               bool preserve_thinking = true,
-                               const std::vector<std::string>& tools_json = {});
+                               bool preserve_thinking = true);
 
-// Render one native tool call: `name(arg='val', ...)` with Pythonic values
-// converted from the JSON `arguments_json` object string. Empty/absence
-// ("", "{}", "null") renders as `name()`. Unparseable input falls back to
-// `name()` rather than emitting syntax the model was not trained on.
-std::string render_tool_call(const std::string& name,
-                             const std::string& arguments_json);
+// ---------------------------------------------------------------------------
+// Native tool-use (function calling) support.
+//
+// LFM2.5-Instruct emits tool calls in the native pythonic form
+//   <|tool_call_start|>[name(k="v", ...), ...]<|tool_call_end|>
+// with the tool catalogue supplied as `List of tools: [...]` JSON text in
+// the system prompt (this mirrors apply_chat_template(tools=...)); tool
+// results arrive as <|im_start|>tool turns. Everything here is plain-text
+// translation with no JSON-library dependency: the OpenAI-protocol mapping
+// (tools/tool_choice/message tool_calls/JSON arguments) lives in server/.
+// ---------------------------------------------------------------------------
 
-// Parse native tool calls out of generated text. Every
-// `<|tool_call_start|>[...]<|tool_call_end|>` block that yields at least one
-// well-formed call contributes its calls (in order, `id` left empty for the
-// server to allocate); the block is removed from the returned text
-// (non-call text trailing the call list is kept as reply text).
-// Blocks without a well-formed call are left in place, and when no block
-// parses the input is returned unchanged with empty `calls`. The returned
-// text is trimmed of leading/trailing whitespace.
-struct ParsedToolCalls {
+// Like render_lfm25_chatml, plus native tool support:
+//  - tools_json (compact-serialized OpenAI `tools` array, "" = none):
+//    appended to the system prompt as "\nList of tools: <json>" (a system
+//    block is injected when no system message exists).
+//  - system_suffix ("" = none): extra instruction sentence(s) appended to
+//    the system block (tool_choice required/named directives, JSON-mode
+//    bias). The server builds these from the OpenAI request.
+//  - role "tool" renders as <|im_start|>tool\n{content}<|im_end|>\n.
+//  - assistant messages with tool_calls render text content followed by the
+//    native call block (arguments converted JSON -> pythonic).
+std::string render_lfm25_chatml_with_tools(
+    const std::vector<ChatMessage>& messages, const std::string& tools_json,
+    const std::string& system_suffix = "", bool add_generation_prompt = true,
+    bool preserve_thinking = true, const std::string& default_system = "");
+
+// Render + encode with tool support (same BOS semantics as
+// encode_rendered_chat).
+std::vector<int> encode_chatml_with_tools(
+    const Tokenizer& tok, const std::vector<ChatMessage>& messages,
+    const std::string& tools_json, const std::string& system_suffix = "",
+    bool add_generation_prompt = true, bool add_bos = true,
+    bool preserve_thinking = true);
+
+// Split raw completion text (decoded with skip_special_tokens=false) into
+// display text + tool calls. Every complete
+// <|tool_call_start|>...<|tool_call_end|> region becomes calls (in order;
+// ids are empty, the server assigns them); surrounding text, truncated at
+// the first <|im_end|> and trimmed of blank lines left by excision, is the
+// display content. Unclosed trailing markers are treated as text, not
+// calls. Never throws on model output (malformed blocks are skipped).
+struct ToolParseResult {
   std::string text;
   std::vector<ToolCall> calls;
 };
+ToolParseResult parse_tool_calls(const std::string& raw);
 
-ParsedToolCalls parse_tool_calls(const std::string& text);
+// Convert one native call-block body, e.g. `[f(a="1"), g(x=2)]` (brackets
+// optional), into calls. Arguments convert from the native pythonic form
+// (strings, numbers, True/False/None, lists, dicts, bare words) to a JSON
+// object string. Never throws; malformed entries are skipped.
+std::vector<ToolCall> parse_tool_call_block(const std::string& block);
+
+// Incremental variant of parse_tool_calls for SSE streaming: feed raw
+// pieces (each sampled id decoded with skip_special_tokens=false); push()
+// returns display text newly safe to stream (call regions, stop markers,
+// and partial UTF-8 tails are held back); finish() flushes the tail and
+// returns the parsed calls. Total display text = concatenated push()
+// deltas + finish().text.
+class ToolCallStreamParser {
+ public:
+  explicit ToolCallStreamParser(
+      const std::vector<std::string>& stop_strings = {});
+  // Returns display text newly safe to stream (may be empty = "hold").
+  std::string push(const std::string& raw_piece);
+  // Tail text (not yet emitted) + parsed calls.
+  ToolParseResult finish();
+
+ private:
+  std::string raw_;
+  size_t emitted_ = 0;  // chars of display text already returned
+  std::vector<std::string> stops_;
+};
+
+// Argument conversion between the native pythonic form and JSON.
+// args_pythonic_to_json("a=\"x\", n=3, ok=True") -> {"a":"x","n":3,"ok":true}
+// args_json_to_pythonic("{\"a\":\"x\",\"n\":3}") -> a="x", n=3
+// Both are lenient and never throw: unparseable pythonic input yields "{}";
+// unparseable JSON input is carried as a single raw string value.
+std::string args_pythonic_to_json(const std::string& args);
+std::string args_json_to_pythonic(const std::string& args_json);
 
 // ---------------------------------------------------------------------------
 // Stop-strings (checked on decoded text): truncate the generated text
