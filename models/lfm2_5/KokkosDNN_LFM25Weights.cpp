@@ -98,6 +98,38 @@ void load_dense_vec(const Gguf::GgufFile& file, const std::string& stem,
   Kokkos::deep_copy(dst, h);
 }
 
+// Load one 1-D tensor trying `primary` first, then `fallback` (same suffix).
+// Used for names that differ between llama.cpp checkpoints
+// (`token_embd_norm` vs `output_norm`, `exp_probs_b` vs `ffn_exp_probs_b`).
+template <class ExecSpace, class Scalar>
+void load_dense_vec_alias(const Gguf::GgufFile& file,
+                          const std::string& primary,
+                          const std::string& fallback, const char* suffix,
+                          const Kokkos::View<Scalar*, ExecSpace>& dst) {
+  const Gguf::GgufTensorInfo* info = resolve(file, primary, suffix);
+  if (!info) info = resolve(file, fallback, suffix);
+  if (!info)
+    throw std::runtime_error("tensor not found in checkpoint: '" + primary +
+                             suffix + "' (also tried '" + fallback + suffix +
+                             "')");
+  if (info->numel != dst.extent(0))
+    throw std::runtime_error("shape mismatch for '" + info->name +
+                             "': checkpoint has " + info_shape_str(*info) +
+                             ", expected [" +
+                             std::to_string(dst.extent(0)) + "]");
+  std::vector<float> tmp;
+  try {
+    Gguf::dequant_tensor_to_float(file, *info, tmp);
+  } catch (const std::exception& e) {
+    throw std::runtime_error("cannot decode '" + info->name + "': " +
+                             e.what());
+  }
+  auto h = Kokkos::create_mirror_view(dst);
+  for (size_t i = 0; i < tmp.size(); ++i)
+    h(i) = static_cast<Scalar>(tmp[i]);
+  Kokkos::deep_copy(dst, h);
+}
+
 // Slice expert `e` out of a stacked 3-D MoE tensor (ggml dim order
 // {cols, rows, n_experts}) into a packed device QuantWeight.
 template <class ExecSpace>
@@ -238,8 +270,9 @@ void load_gguf(const Config& cfg, const std::string& path,
 
   load_dense_mat<ExecSpace, Scalar>(file, "token_embd", (size_t)cfg.vocab_size,
                                    D, w.embed);
-  load_dense_vec<ExecSpace, Scalar>(file, "output_norm", ".weight",
-                                   w.final_norm);
+  load_dense_vec_alias<ExecSpace, Scalar>(file, "token_embd_norm",
+                                           "output_norm", ".weight",
+                                           w.final_norm);
   // Tied embeddings fallback (LFM2.5 ships tie_word_embeddings=true).
   if (resolve(file, "output", ".weight") != nullptr) {
     load_dense_mat<ExecSpace, Scalar>(file, "output", (size_t)cfg.vocab_size,
@@ -298,8 +331,9 @@ void load_gguf(const Config& cfg, const std::string& path,
         b.down_exps[e] = load_expert_slice<ExecSpace>(file, di, e, D, MI, E);
       }
       if (cfg.use_expert_bias) {
-        load_dense_vec<ExecSpace, Scalar>(file, blk(l, "ffn_exp_probs_b"),
-                                         ".bias", b.exp_bias);
+        load_dense_vec_alias<ExecSpace, Scalar>(file, blk(l, "exp_probs_b"),
+                                               blk(l, "ffn_exp_probs_b"),
+                                               ".bias", b.exp_bias);
       }
     }
   }
