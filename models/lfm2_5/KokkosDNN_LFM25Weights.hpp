@@ -143,8 +143,8 @@ void random_init(const Config& cfg, Weights<ExecSpace, Scalar>& w,
 // stay packed per expert. Throws on missing tensors or shape mismatch.
 // Expected GGUF names (llama.cpp `tn()` convention, ".weight"/".bias"
 // suffix; the loader also accepts the bare stems):
-//   token_embd, output_norm, output (tied fallback onto token_embd when
-//     cfg.tie_word_embeddings and output is absent),
+//   token_embd, token_embd_norm (alias: output_norm), output (tied fallback
+//     onto token_embd when cfg.tie_word_embeddings and output is absent),
 //   blk.{l}.attn_norm, blk.{l}.ffn_norm,
 //   attention layers: blk.{l}.attn_q/k/v/output,
 //     blk.{l}.attn_q_norm/k_norm,
@@ -152,7 +152,7 @@ void random_init(const Config& cfg, Weights<ExecSpace, Scalar>& w,
 //   dense layers: blk.{l}.ffn_gate/up/down,
 //   MoE layers: blk.{l}.ffn_gate_inp,
 //     blk.{l}.ffn_gate_exps/up_exps/down_exps (stacked 3-D),
-//     blk.{l}.ffn_exp_probs_b (bias suffix).
+//     blk.{l}.exp_probs_b (alias: blk.{l}.ffn_exp_probs_b, bias suffix).
 template <class ExecSpace, class Scalar = DefaultScalar>
 void load_gguf(const Config& cfg, const std::string& path,
                Weights<ExecSpace, Scalar>& w);
