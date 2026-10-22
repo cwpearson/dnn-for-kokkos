@@ -244,6 +244,10 @@ if(KokkosDNN_ENABLE_ACCELERATE)
   endif()
   find_library(ACCELERATE_LIBRARY Accelerate REQUIRED)
   target_link_libraries(kokkosdnn PUBLIC ${ACCELERATE_LIBRARY})
+  # Select Accelerate's non-deprecated LAPACK 3.9.1+ CBLAS declarations (see
+  # src/tpl/accelerate/KokkosDNN_Accelerate_GemmFloat.hpp). PUBLIC so every
+  # consumer TU that reaches <Accelerate/...> sees it before the headers.
+  target_compile_definitions(kokkosdnn PUBLIC ACCELERATE_NEW_LAPACK=1)
 endif()
 
 kokkosdnn_enable_compiler_warnings(kokkosdnn)
