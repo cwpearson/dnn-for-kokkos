@@ -6,8 +6,25 @@ library back (dependency direction: `models/* -> common -> core`).
 
 ## Status
 
-Scaffold only: `KokkosDNN_Common.hpp` is an empty-namespace placeholder.
-No behavior has moved here yet.
+`KokkosDNN_Common.hpp` umbrellas two header-only utilities (both
+tokenizer-agnostic, no Kokkos dependency):
+
+- `KokkosDNN_Detokenizer.hpp` — `Common::IncrementalDetokenizer`:
+  streaming detokenizer with stop-string handling. Construct with the
+  request's stop strings; per sampled token call
+  `push(id, Tokenizer::decode({id}))` and emit `Step::delta` as the SSE
+  delta. Partial UTF-8 tails and trailing stop-string prefixes are held
+  back (not emitted) until completed or ruled out; a full stop match
+  sets `Step::stop_hit` (with `Step::matched`), truncates before the
+  match, and latches (sticky until `reset()`). `flush()` emits the
+  remainder at end of stream; `buffered()` exposes the held-back bytes.
+- `KokkosDNN_Usage.hpp` — `Common::Usage` (`prompt_tokens`,
+  `completion_tokens`, `total()`) plus `Common::FinishReason`
+  (`Stop`/`Length`/`Error`) with `to_string()` mapping to the OpenAI
+  `finish_reason` strings (`"stop"`/`"length"`; `Error` -> `"error"`).
+
+Rule: the server must use these headers for SSE deltas, stop truncation,
+usage, and finish reasons — no own buffering/truncation logic.
 
 ## Planned extractions (from `models/*`, when duplicated a second time)
 
@@ -15,7 +32,6 @@ No behavior has moved here yet.
 - BPE tokenizer core (today: `KokkosDNN_LFM25Tokenizer`, `KokkosDNN_QwenTokenizer`)
 - Chat templates / prompt formatting
 - Samplers (today: `KokkosDNN_MossSampler`)
-- Detokenizers / stop-string streamers (server-SSE support)
 
 ## Rules
 

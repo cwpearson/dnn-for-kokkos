@@ -219,6 +219,38 @@ if(KokkosDNN_ENABLE_IMAGE)
 endif()
 
 # ---------------------------------------------------------------------------
+# GTest setup (must precede models/: models/*/tests register via
+# kokkosdnn_discover_tests, which needs include(GoogleTest) to have run
+# and KokkosDNN::gtest_main to exist).
+# ---------------------------------------------------------------------------
+if(KokkosDNN_ENABLE_TESTS)
+  enable_testing()
+  find_package(GTest QUIET)
+  if(NOT GTest_FOUND)
+    include(FetchContent)
+    # CMP0135 (CMake >= 3.24): use extraction time instead of archive
+    # timestamps for FetchContent URLs, so URL changes trigger a rebuild.
+    # Guarded for our cmake_minimum_required(VERSION 3.22) floor.
+    if(POLICY CMP0135)
+      cmake_policy(SET CMP0135 NEW)
+    endif()
+    FetchContent_Declare(
+      googletest
+      URL https://github.com/google/googletest/archive/v1.14.0.zip
+    )
+    set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+  endif()
+  include(GoogleTest)
+  # Shared GoogleTest main that initializes/finalizes Kokkos.
+  add_library(kokkosdnn_gtest_main STATIC tests/GTestMain.cpp)
+  add_library(KokkosDNN::gtest_main ALIAS kokkosdnn_gtest_main)
+  target_link_libraries(kokkosdnn_gtest_main PUBLIC Kokkos::kokkos GTest::gtest)
+  set_target_properties(kokkosdnn_gtest_main PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+endif()
+
+# ---------------------------------------------------------------------------
 # Model components (installable per-model libs + shared support).
 # Must precede examples/ so thin drivers can link KokkosDNN::lfm25 /
 # KokkosDNN::moss. Each model dir installs its own headers (see
@@ -260,30 +292,6 @@ install(FILES
 # Tests / examples
 # ---------------------------------------------------------------------------
 if(KokkosDNN_ENABLE_TESTS)
-  enable_testing()
-  find_package(GTest QUIET)
-  if(NOT GTest_FOUND)
-    include(FetchContent)
-    # CMP0135 (CMake >= 3.24): use extraction time instead of archive
-    # timestamps for FetchContent URLs, so URL changes trigger a rebuild.
-    # Guarded for our cmake_minimum_required(VERSION 3.22) floor.
-    if(POLICY CMP0135)
-      cmake_policy(SET CMP0135 NEW)
-    endif()
-    FetchContent_Declare(
-      googletest
-      URL https://github.com/google/googletest/archive/v1.14.0.zip
-    )
-    set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
-    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
-    FetchContent_MakeAvailable(googletest)
-  endif()
-  include(GoogleTest)
-  # Shared GoogleTest main that initializes/finalizes Kokkos.
-  add_library(kokkosdnn_gtest_main STATIC tests/GTestMain.cpp)
-  add_library(KokkosDNN::gtest_main ALIAS kokkosdnn_gtest_main)
-  target_link_libraries(kokkosdnn_gtest_main PUBLIC Kokkos::kokkos GTest::gtest)
-  set_target_properties(kokkosdnn_gtest_main PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
   add_subdirectory(tests)
 endif()
 if(KokkosDNN_ENABLE_EXAMPLES)
