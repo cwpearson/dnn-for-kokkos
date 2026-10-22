@@ -2,7 +2,7 @@
 #define KOKKOSDNN_MOSSIMAGEDIT_HPP
 
 // TRUE MOSS-Image flow transformer (MOSSImageTransformer) + weights loader +
-// flow-grid scheduler, on top of src/KokkosDNN_MossImage.hpp ops.
+// flow-grid scheduler, on top of KokkosDNN_MossImage.hpp ops.
 //
 // Ground truth (retrieved, not guessed): OpenMOSS-Team/MOSS-Image-SFT
 // transformer/config.json (dim=3072, ffn_dim=8192, num_heads=24,

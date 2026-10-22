@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "KokkosDNN.hpp"
+#include "KokkosDNN_MossImage.hpp"
 
 namespace {
 

@@ -2,7 +2,7 @@
 """Usage:
   python3 scripts/gen_qwen_tokenizer_tables.py
 
-Generates src/KokkosDNN_QwenTokenizerTables.inc from the local Python's
+Generates models/moss_image/KokkosDNN_QwenTokenizerTables.inc from the local Python's
 unicodedata tables (composability is probed with NFC itself, so no UCD
 data files and no version-skew risk):
 
@@ -20,7 +20,7 @@ import unicodedata
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-OUT = REPO / "src" / "KokkosDNN_QwenTokenizerTables.inc"
+OUT = REPO / "models" / "moss_image" / "KokkosDNN_QwenTokenizerTables.inc"
 
 HANG_LO, HANG_HI = 0xAC00, 0xD7A3
 # Exact White_Space set stripped by CPython str.strip().

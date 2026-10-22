@@ -21,6 +21,12 @@ option(KokkosDNN_ENABLE_CUDNN "Dispatch attention to cuDNN SDPA when ExecSpace i
 option(KokkosDNN_ENABLE_HIPBLAS "Dispatch GEMM to hipBLAS when ExecSpace is HIP" OFF)
 option(KokkosDNN_ENABLE_MIOPEN "Dispatch conv/attention-helpers to MIOpen when ExecSpace is HIP" OFF)
 option(KokkosDNN_ENABLE_IMAGE "Build optional image I/O component (stb-based decode, JPEG/PNG/BMP)" OFF)
+option(KokkosDNN_ENABLE_MODEL_LFM25 "Build LFM2.5 model component (KokkosDNN::lfm25)" ON)
+option(KokkosDNN_ENABLE_MODEL_MOSS "Build MOSS-Image model component (KokkosDNN::moss)" ON)
+# Server is a stub (binds no port, serves no routes yet), so it stays OFF by
+# default to keep existing CI builds unaffected. -DKokkosDNN_ENABLE_SERVER=ON
+# to build kokkosdnn_server (requires KokkosDNN_ENABLE_MODEL_LFM25=ON).
+option(KokkosDNN_ENABLE_SERVER "Build OpenAI-compatible HTTP server stub" OFF)
 option(KokkosDNN_ENABLE_COMPILER_WARNINGS "Enable compiler warnings" OFF)
 option(BUILD_SHARED_LIBS "Build shared libraries" OFF)
 # gtest_discover_tests executes each test binary at build time. On GPU-less
@@ -210,6 +216,17 @@ set_target_properties(kokkosdnn PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
 # ---------------------------------------------------------------------------
 if(KokkosDNN_ENABLE_IMAGE)
   add_subdirectory(src/images)
+endif()
+
+# ---------------------------------------------------------------------------
+# Model components (installable per-model libs + shared support).
+# Must precede examples/ so thin drivers can link KokkosDNN::lfm25 /
+# KokkosDNN::moss. Each model dir installs its own headers (see
+# models/<name>/CMakeLists.txt); the core install() below covers src/ only.
+# ---------------------------------------------------------------------------
+add_subdirectory(models)
+if(KokkosDNN_ENABLE_SERVER)
+  add_subdirectory(server)
 endif()
 
 # ---------------------------------------------------------------------------

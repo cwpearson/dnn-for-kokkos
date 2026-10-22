@@ -62,7 +62,7 @@ TEST(LFM25Config, TinyTestValid) {
   EXPECT_NO_THROW(c.validate());
 }
 
-// Exact content of examples/lfm2_5/config-lfm2_5-24b-a2b.json, exercised
+// Exact content of models/lfm2_5/config-lfm2_5-24b-a2b.json, exercised
 // through from_json_string (no file I/O, no downloads).
 TEST(LFM25Config, ShippedJsonContent) {
   const std::string js = R"({
