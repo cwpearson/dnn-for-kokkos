@@ -391,34 +391,30 @@ bool is_space(uint32_t cp) {
 }
 
 // ---------------------------------------------------------------------------
-// GPT-2 ByteLevel pre-tokenizer (use_regex=true) + Digits splitting.
+// ByteLevel pre-tokenizer with the LFM2 regex (tokenizer.json
+// pre_tokenizer = Sequence[Split(regex, Isolated), ByteLevel(no prefix)]):
 //
-// The LFM2.5 pipeline mirrors the SmolLM2 one: Sequence[Digits(
-// individual_digits=true), ByteLevel(add_prefix_space=false,
-// use_regex=true)]. HF applies them in
-// order: Digits first isolates every ASCII digit into its own piece
-// (boundaries before and after each digit; all other bytes, spaces
-// included, stay with the neighboring non-digit run), then ByteLevel
-// applies the GPT-2 regex to each piece:
+//   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}|
+//    ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
 //
-//   's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|
-//    \s+(?!\S)|\s+
-//
-// Contractions are case-SENSITIVE, the optional prefix on letter/number/
-// symbol runs is a single literal U+0020 space (not \s), numbers group
-// greedily (\p{N}+, although Digits has already isolated ASCII digits by
-// the time ByteLevel runs), and there is no special CR/LF handling
-// (\r,\n are plain \s). Leftmost-first alternation. Non-ASCII numbers
-// are NOT pre-isolated (HF Digits keys on ASCII digits); they fall
-// through to the ` ?\p{N}+` alternative.
+// This is NOT the GPT-2 pattern: contractions are case-INsensitive, the
+// optional prefix on a letter run is any single non-CR/LF/letter/number
+// character, numbers group in runs of at most three, symbol runs absorb
+// trailing CR/LF, and a whitespace run that contains a newline breaks at
+// the last newline (llama.cpp's LLAMA_VOCAB_PRE_TYPE_LLAMA3, which it also
+// selects for `tokenizer.ggml.pre == "lfm2"`). Leftmost-first
+// alternation; lengths are in codepoints.
 // ---------------------------------------------------------------------------
 
-// Alternative 1 (case-sensitive): 's|'t|'re|'ve|'m|'ll|'d.
-size_t match_contraction_gpt2(const std::vector<uint32_t>& cp, size_t i) {
+bool is_crlf(uint32_t cp) { return cp == '\r' || cp == '\n'; }
+
+// Alternative 1 (case-insensitive): 's|'t|'re|'ve|'m|'ll|'d.
+size_t match_contraction_lfm2(const std::vector<uint32_t>& cp, size_t i) {
   size_t n = cp.size();
   if (i >= n || cp[i] != '\'') return 0;
   auto at = [&](size_t k) -> uint32_t {
-    return i + k < n ? cp[i + k] : 0;
+    uint32_t c = i + k < n ? cp[i + k] : 0;
+    return (c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c;
   };
   if (at(1) == 's' || at(1) == 't' || at(1) == 'm' || at(1) == 'd') return 2;
   if ((at(1) == 'r' && at(2) == 'e') || (at(1) == 'v' && at(2) == 'e') ||
@@ -427,79 +423,84 @@ size_t match_contraction_gpt2(const std::vector<uint32_t>& cp, size_t i) {
   return 0;
 }
 
-// One GPT-2 regex match at codepoint position i; length in codepoints
+// One pre-token match at codepoint position i; length in codepoints
 // (always >= 1, so scanning terminates).
-size_t gpt2_match_at(const std::vector<uint32_t>& cp, size_t i) {
+size_t lfm2_match_at(const std::vector<uint32_t>& cp, size_t i) {
   const size_t n = cp.size();
   size_t len = 0;
-  if ((len = match_contraction_gpt2(cp, i)) != 0) return len;
-  // Alts 2-4 share one optional literal-' ' prefix.
-  const size_t j = (cp[i] == ' ') ? i + 1 : i;
-  if (j < n && is_letter(cp[j])) {
-    size_t k = j;
-    while (k < n && is_letter(cp[k])) ++k;
+  if ((len = match_contraction_lfm2(cp, i)) != 0) return len;
+
+  // Alt 2: [^\r\n\p{L}\p{N}]?\p{L}+
+  {
+    size_t j = i;
+    if (!is_crlf(cp[i]) && !is_letter(cp[i]) && !is_number(cp[i])) j = i + 1;
+    if (j < n && is_letter(cp[j])) {
+      size_t k = j;
+      while (k < n && is_letter(cp[k])) ++k;
+      return k - i;
+    }
+  }
+
+  // Alt 3: \p{N}{1,3}
+  if (is_number(cp[i])) {
+    size_t k = i;
+    while (k < n && k - i < 3 && is_number(cp[k])) ++k;
     return k - i;
   }
-  if (j < n && is_number(cp[j])) {
-    size_t k = j;
-    while (k < n && is_number(cp[k])) ++k;
-    return k - i;
+
+  // Alt 4: " ?[^\s\p{L}\p{N}]+[\r\n]*"
+  {
+    size_t j = (cp[i] == ' ') ? i + 1 : i;
+    if (j < n && !is_space(cp[j]) && !is_letter(cp[j]) && !is_number(cp[j])) {
+      size_t k = j;
+      while (k < n && !is_space(cp[k]) && !is_letter(cp[k]) &&
+             !is_number(cp[k]))
+        ++k;
+      while (k < n && is_crlf(cp[k])) ++k;
+      return k - i;
+    }
   }
-  if (j < n && !is_space(cp[j]) && !is_letter(cp[j]) &&
-      !is_number(cp[j])) {
-    size_t k = j;
-    while (k < n && !is_space(cp[k]) && !is_letter(cp[k]) &&
-           !is_number(cp[k]))
-      ++k;
-    return k - i;
-  }
+
   if (is_space(cp[i])) {
-    // Alts 5/6: \s+(?!\S)|\s+. A maximal ws run matches fully at end of
-    // input, otherwise all but one char (the (?!\S) lookahead backtracks
-    // so the next match may start with a literal-' ' prefix or \s+).
     size_t r = i;
     while (r < n && is_space(cp[r])) ++r;
+    // Alt 5: \s*[\r\n]+ -- the greedy \s* backs off to the last newline of
+    // the run, so the match ends right after it (consecutive newlines
+    // there are part of [\r\n]+).
+    size_t last_nl = 0;
+    bool has_nl = false;
+    for (size_t t = i; t < r; ++t)
+      if (is_crlf(cp[t])) {
+        last_nl = t;
+        has_nl = true;
+      }
+    if (has_nl) return last_nl + 1 - i;
+    // Alt 6/7: \s+(?!\S)|\s+. A newline-free run matches fully at end of
+    // input, otherwise all but one char (the (?!\S) lookahead backtracks
+    // so the next match may start with a literal-' ' prefix or \s+).
     if (r >= n) return r - i;
     return (r - i >= 2) ? r - i - 1 : r - i;
   }
   return 1;  // unreachable for well-formed input; guarantees termination
 }
 
-// HF Digits(individual_digits=true): cut before and after every ASCII
-// digit. Digits 0-9 are single bytes that never occur inside multibyte
-// UTF-8 sequences, so a byte scan is exact. Returns byte-offset segments.
-std::vector<std::string> split_ascii_digits(const std::string& text) {
-  std::vector<std::string> segs;
-  size_t start = 0;
-  for (size_t b = 0; b < text.size(); ++b) {
-    if (text[b] >= '0' && text[b] <= '9') {
-      if (b > start) segs.push_back(text.substr(start, b - start));
-      segs.push_back(text.substr(b, 1));
-      start = b + 1;
-    }
-  }
-  if (text.size() > start) segs.push_back(text.substr(start));
-  return segs;
-}
-
-std::vector<std::string> split_pretokens_gpt2(const std::string& text) {
+std::vector<std::string> split_pretokens_lfm2(const std::string& text) {
   std::vector<std::string> pieces;
-  for (const std::string& seg : split_ascii_digits(text)) {
-    std::vector<uint32_t> cp = utf8_decode(seg);
-    std::vector<size_t> off;
-    off.reserve(cp.size() + 1);
-    for (size_t b = 0, k = 0; k < cp.size(); ++k) {
-      off.push_back(b);
-      uint32_t c = cp[k];
-      b += (c < 0x80) ? 1 : (c < 0x800) ? 2 : (c < 0x10000) ? 3 : 4;
-    }
-    off.push_back(seg.size());
-    size_t i = 0;
-    while (i < cp.size()) {
-      size_t len = gpt2_match_at(cp, i);
-      pieces.push_back(seg.substr(off[i], off[i + len] - off[i]));
-      i += len;
-    }
+  const std::string& seg = text;
+  std::vector<uint32_t> cp = utf8_decode(seg);
+  std::vector<size_t> off;
+  off.reserve(cp.size() + 1);
+  for (size_t b = 0, k = 0; k < cp.size(); ++k) {
+    off.push_back(b);
+    uint32_t c = cp[k];
+    b += (c < 0x80) ? 1 : (c < 0x800) ? 2 : (c < 0x10000) ? 3 : 4;
+  }
+  off.push_back(seg.size());
+  size_t i = 0;
+  while (i < cp.size()) {
+    size_t len = lfm2_match_at(cp, i);
+    pieces.push_back(seg.substr(off[i], off[i + len] - off[i]));
+    i += len;
   }
   return pieces;
 }
@@ -615,16 +616,33 @@ void Tokenizer::load(const std::string& path) {
     for (auto& kv : idmap) id_to_token_[kv.first] = kv.second;
   }
 
+  // merges: two on-disk spellings share this key.
+  //   legacy (transformers <= 4.x): ["a b", ...]
+  //   current (transformers 5.x):   [["a", "b"], ...]
+  // BPE looks pairs up as "left right", so both forms land in the same
+  // table. Parsing only the string form silently drops every merge on a
+  // 5.x file, which degrades encoding to pure byte fallback.
   std::string merges = array_body(js, "merges", model_pos, "model.merges");
   {
     size_t j = 0;
     int rank = 0;
     while (j < merges.size()) {
-      size_t q = merges.find('"', j);
+      size_t q = merges.find_first_of("\"[", j);
       if (q == std::string::npos) break;
-      std::string m = json_parse_string(merges, q);
-      merge_rank_[m] = rank++;
-      j = q;
+      if (merges[q] == '[') {
+        size_t k = merges.find('"', q + 1);
+        if (k == std::string::npos) break;
+        std::string left = json_parse_string(merges, k);
+        size_t k2 = merges.find('"', k);
+        if (k2 == std::string::npos) break;
+        std::string right = json_parse_string(merges, k2);
+        merge_rank_[left + " " + right] = rank++;
+        j = k2;
+      } else {
+        std::string m = json_parse_string(merges, q);
+        merge_rank_[m] = rank++;
+        j = q;
+      }
     }
   }
 
@@ -809,7 +827,7 @@ std::vector<int> Tokenizer::encode(const std::string& text,
   std::string buf;
   auto flush = [&]() {
     if (buf.empty()) return;
-    for (const auto& piece : split_pretokens_gpt2(buf)) {
+    for (const auto& piece : split_pretokens_lfm2(buf)) {
       std::string mapped = bytes_to_unicode(piece);
       bpe_piece(mapped, ids);
     }
