@@ -17,13 +17,15 @@
 #     kokkosdnn-server:cuda \
 #     --weights /models/lfm2_5.gguf --tokenizer /models/tokenizer.json
 #
-# Cross-GPU note: KOKKOS_ARCH selects the Kokkos CUDA arch flag
-# (-DKokkos_ARCH_<arch>=ON). The default AMPERE80 build also carries PTX, so
+# Cross-GPU note: CUDA_ARCH is a Kokkos CUDA arch name
+# (--build-arg CUDA_ARCH=HOPPER90, default AMPERE80) passed straight to
+# -DKokkos_ARCH_<arch>=ON. The default Ampere build also carries PTX, so
 # the driver JIT-compiles it forward onto newer GPUs (Hopper/Blackwell);
-# pass --build-arg KOKKOS_ARCH=HOPPER90 (etc.) to target a GPU natively.
+# pass --build-arg CUDA_ARCH=HOPPER90 (etc.) to target a GPU natively.
 
 ARG CUDA_VERSION=12.8.1
 ARG UBUNTU_VERSION=24.04
+ARG CUDA_ARCH=AMPERE80
 
 # ---------------------------------------------------------------------------
 # Builder: full CUDA toolkit + cuDNN headers, Kokkos + server compiled here.
@@ -32,7 +34,7 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu${UBUNTU_VERSION} AS builder
 
 # Re-declare stage-local build args (ARGs reset at each FROM).
 ARG KOKKOS_VERSION=5.2.1
-ARG KOKKOS_ARCH=AMPERE80
+ARG CUDA_ARCH
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -51,7 +53,7 @@ RUN git clone --depth 1 --branch ${KOKKOS_VERSION} \
       -DCMAKE_CXX_COMPILER=/src/kokkos-src/bin/nvcc_wrapper \
       -DKokkos_ENABLE_CUDA=ON \
       -DKokkos_ENABLE_SERIAL=ON \
-      -DKokkos_ARCH_${KOKKOS_ARCH}=ON \
+      -DKokkos_ARCH_${CUDA_ARCH}=ON \
       -DKokkos_ENABLE_TESTS=OFF \
  && cmake --build kokkos-build --parallel "$(nproc)" \
  && cmake --install kokkos-build
