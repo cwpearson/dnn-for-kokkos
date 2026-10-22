@@ -557,9 +557,9 @@ void random_init(const Config& cfg, Weights<ExecSpace, Scalar>& w,
   };
   for (auto& r : w.gen.rb) fill_res(r);
   for (auto& r : w.gen.nres) fill_res(r);
-  for (auto& u : w.gen.ups) {
-    fill(u.w);
-    fill_zero(u.b);
+  for (auto& up : w.gen.ups) {
+    fill(up.w);
+    fill_zero(up.b);
   }
   fill(w.gen.nc0.w);
   fill_zero(w.gen.nc0.b);

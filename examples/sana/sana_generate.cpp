@@ -114,6 +114,9 @@ std::vector<unsigned char> render_preview(const std::vector<float>& lat,
   return img;
 }
 
+#ifndef KOKKOSDNN_ENABLE_IMAGE
+// PPM fallback writers: only the non-image build paths (below) use these;
+// guard them so image-enabled builds do not see unused functions.
 void save_ppm_rgb(const std::string& path,
                   const std::vector<unsigned char>& rgb, size_t H, size_t W) {
   std::ofstream f(path, std::ios::binary);
@@ -133,6 +136,7 @@ void save_ppm(const std::string& path, const std::vector<unsigned char>& gray,
           (long long)gray.size());
   if (!f) throw std::runtime_error("short write to '" + path + "'");
 }
+#endif
 
 std::string with_extension(const std::string& path, const std::string& ext) {
   const size_t dot = path.find_last_of('.');

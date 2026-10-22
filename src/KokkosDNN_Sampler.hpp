@@ -598,7 +598,7 @@ SampleResult sample_token_result(
       (opt.frequency_penalty != 0.0f) || (opt.presence_penalty != 0.0f) ||
       (!opt.logit_bias.empty()) || (opt.logprobs > 0);
   if (!need_host && opt.logprobs <= 0)
-    return SampleResult{device_argmax<ExecSpace, Scalar>(logits)};
+    return SampleResult{device_argmax<ExecSpace, Scalar>(logits), {}, {}};
   auto h = Kokkos::create_mirror_view(logits);
   Kokkos::deep_copy(h, logits);
   std::vector<float> fh(V);

@@ -14,19 +14,23 @@ target_include_directories(kokkosdnn_smollm2 PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
 )
 set_target_properties(kokkosdnn_smollm2 PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+kokkosdnn_enable_compiler_warnings(kokkosdnn_smollm2)
 
 add_executable(smollm2_generate smollm2_generate.cpp)
 target_link_libraries(smollm2_generate PRIVATE KokkosDNN::smollm2)
 set_target_properties(smollm2_generate PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+kokkosdnn_enable_compiler_warnings(smollm2_generate)
 
 if(KokkosDNN_ENABLE_TESTS)
   add_executable(test_smollm2_generate Test_SmolLM2Generate.cpp)
   target_link_libraries(test_smollm2_generate PRIVATE KokkosDNN::smollm2 KokkosDNN::gtest_main)
   set_target_properties(test_smollm2_generate PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+  kokkosdnn_enable_compiler_warnings(test_smollm2_generate)
   kokkosdnn_discover_tests(test_smollm2_generate)
 
   add_executable(test_smollm2_tokenizer Test_SmolLM2Tokenizer.cpp)
   target_link_libraries(test_smollm2_tokenizer PRIVATE KokkosDNN::smollm2 KokkosDNN::gtest_main)
   set_target_properties(test_smollm2_tokenizer PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+  kokkosdnn_enable_compiler_warnings(test_smollm2_tokenizer)
   kokkosdnn_discover_tests(test_smollm2_tokenizer)
 endif()

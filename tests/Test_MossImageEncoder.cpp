@@ -369,10 +369,10 @@ std::vector<double> href_forward_sample(const HostModel& m,
       // owns qg[t, h*2*Hd .. h*2*Hd+Hd) for q and the following Hd for gate.
       std::vector<double> q((size_t)T * Qd), gate((size_t)T * Qd);
       for (int t = 0; t < T; ++t)
-        for (int h = 0; h < Nq; ++h)
-          for (int d = 0; d < Hd; ++d) {
-            const size_t src = ((size_t)t * Nq + h) * 2 * Hd + d;
-            const size_t dst = ((size_t)t * Nq + h) * Hd + d;
+        for (int hh = 0; hh < Nq; ++hh)
+          for (int dd = 0; dd < Hd; ++dd) {
+            const size_t src = ((size_t)t * Nq + hh) * 2 * Hd + dd;
+            const size_t dst = ((size_t)t * Nq + hh) * Hd + dd;
             q[dst] = qg[src];
             gate[dst] = qg[src + Hd];
           }

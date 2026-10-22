@@ -96,7 +96,7 @@ void run_route(const std::vector<std::vector<float>>& logits,
 
 TEST(MoE, TopKSoftmaxMatchesHost) {
   const auto logits = fixed_logits();
-  const size_t T = logits.size(), E = logits[0].size();
+  const size_t T = logits.size();
   const int K = 2;
   Kokkos::View<int**, Kokkos::LayoutRight, Exec> idx("idx", T, K);
   Kokkos::View<float**, Kokkos::LayoutRight, Exec> w("w", T, K);
@@ -146,7 +146,7 @@ TEST(MoE, ExpertBiasShiftsSelection) {
 
 TEST(MoE, NoRenormMatchesGlobalSoftmax) {
   const auto logits = fixed_logits();
-  const size_t T = logits.size(), E = logits[0].size();
+  const size_t T = logits.size();
   const int K = 2;
   Kokkos::View<int**, Kokkos::LayoutRight, Exec> idx("idx", T, K);
   Kokkos::View<float**, Kokkos::LayoutRight, Exec> w("w", T, K);

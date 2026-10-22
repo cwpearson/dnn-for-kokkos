@@ -26,8 +26,14 @@ if(NOT benchmark_FOUND)
   set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
   set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
   set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+  # Third-party policy: no -Werror in benchmark's own build (its
+  # unconditional -pedantic-errors trips hipcc on __COUNTER__).
+  set(BENCHMARK_ENABLE_WERROR OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(googlebenchmark)
 endif()
+# Third-party policy: benchmark builds warning-free (its own -w) and its
+# headers reach kokkosdnn_bench as SYSTEM, so they can never trip -Werror.
+kokkosdnn_suppress_third_party_warnings(benchmark)
 
 add_executable(kokkosdnn_bench
   BenchmarkMain.cpp
@@ -40,6 +46,15 @@ add_executable(kokkosdnn_bench
 )
 target_link_libraries(kokkosdnn_bench PRIVATE KokkosDNN::kokkosdnn benchmark::benchmark)
 set_target_properties(kokkosdnn_bench PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+kokkosdnn_enable_compiler_warnings(kokkosdnn_bench)
+# BENCHMARK() pastes __COUNTER__ into this TU; Clang-family compilers flag
+# it as a C2y extension under -pedantic. Probe-and-disable just that
+# warning for this target (GCC never warns here, MSVC has no equivalent).
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag(-Wno-c2y-extensions KOKKOSDNN_HAS_WNO_C2Y_EXTENSIONS)
+if(KOKKOSDNN_HAS_WNO_C2Y_EXTENSIONS)
+  target_compile_options(kokkosdnn_bench PRIVATE -Wno-c2y-extensions)
+endif()
 
 # Smoke entry for ctest: list benchmarks (fast, exercises Kokkos init).
 include(CTest)

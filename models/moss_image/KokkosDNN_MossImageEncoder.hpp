@@ -1203,7 +1203,7 @@ void load_weights_safetensors(Weights<ExecSpace, Scalar>& w,
   }
 
   // Resolve each Need to its destination view (rank-preserving).
-  auto dest1 = [&w, &cfg](const Need& nd) -> typename Weights<ExecSpace,
+  auto dest1 = [&w](const Need& nd) -> typename Weights<ExecSpace,
                                                               Scalar>::View1 {
     using V1 = typename Weights<ExecSpace, Scalar>::View1;
     if (nd.name == "language_model.norm.weight") return w.final_norm;
@@ -1223,7 +1223,7 @@ void load_weights_safetensors(Weights<ExecSpace, Scalar>& w,
     throw std::runtime_error("no destination: " + nd.name);
     return V1();
   };
-  auto dest2 = [&w, &cfg](const Need& nd) -> typename Weights<ExecSpace,
+  auto dest2 = [&w](const Need& nd) -> typename Weights<ExecSpace,
                                                               Scalar>::View2 {
     using V2 = typename Weights<ExecSpace, Scalar>::View2;
     if (nd.name == "language_model.embed_tokens.weight") return w.embed;
@@ -1380,10 +1380,9 @@ void forward_full_layer(
                               Kokkos::MemoryUnmanaged>;
   using UView3 = Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace,
                               Kokkos::MemoryUnmanaged>;
-  const size_t T = h.extent(0), H = (size_t)cfg.hidden;
+  const size_t T = h.extent(0);
   const size_t Nq = (size_t)cfg.num_q_heads, Nk = (size_t)cfg.num_kv_heads;
   const size_t Hd = (size_t)cfg.head_dim, Qd = Nq * Hd;
-  const size_t I = (size_t)cfg.intermediate;
   const auto rT = std::make_pair(size_t{0}, T);
   View2 n = Kokkos::subview(sc.n, rT, Kokkos::ALL);
   rmsnorm_one_plus<ExecSpace, Scalar>(h, L.input_norm, cfg.rms_eps, n,
@@ -1411,9 +1410,9 @@ void forward_full_layer(
       "Qwen35::pack_qg",
       Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, Qd}),
       KOKKOS_LAMBDA(size_t t, size_t d) {
-        const size_t h = d / Hd, dd = d % Hd;
-        q2(t, d) = qg(t, h * 2 * Hd + dd);
-        gate2(t, d) = qg(t, h * 2 * Hd + Hd + dd);
+        const size_t hh = d / Hd, dd = d % Hd;
+        q2(t, d) = qg(t, hh * 2 * Hd + dd);
+        gate2(t, d) = qg(t, hh * 2 * Hd + Hd + dd);
       });
   // No fence: q2/gate2 are consumed by kernels on this same stream, so
   // launch order already guarantees visibility (a fence only idles host).
@@ -1465,17 +1464,14 @@ void forward_linear_layer(
     const Impl::LinScratch<ExecSpace, Scalar>& sc) {
   using View1 = Kokkos::View<Scalar*, ExecSpace>;
   using View2 = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
-  using UView2 = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace,
-                              Kokkos::MemoryUnmanaged>;
   using UView3 = Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace,
                               Kokkos::MemoryUnmanaged>;
   using FView2 = Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>;
   using FView3 = Kokkos::View<float***, Kokkos::LayoutRight, ExecSpace>;
-  const size_t T = h.extent(0), H = (size_t)cfg.hidden;
+  const size_t T = h.extent(0);
   const size_t Kd = (size_t)cfg.lin_key_dim(), Vd = (size_t)cfg.lin_value_dim();
   const size_t Kh = (size_t)cfg.lin_k_heads, Vh = (size_t)cfg.lin_v_heads;
   const size_t Kdh = (size_t)cfg.lin_k_dim, Vdh = (size_t)cfg.lin_v_dim;
-  const size_t I = (size_t)cfg.intermediate;
   const int rep = cfg.lin_v_heads / cfg.lin_k_heads;
   const auto rT = std::make_pair(size_t{0}, T);
   View2 n = Kokkos::subview(sc.n, rT, Kokkos::ALL);

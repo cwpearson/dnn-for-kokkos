@@ -5,9 +5,11 @@
 add_executable(test_common_detokenizer Test_Detokenizer.cpp)
 target_link_libraries(test_common_detokenizer PRIVATE KokkosDNN::common KokkosDNN::gtest_main)
 set_target_properties(test_common_detokenizer PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+kokkosdnn_enable_compiler_warnings(test_common_detokenizer)
 kokkosdnn_discover_tests(test_common_detokenizer)
 
 add_executable(test_common_usage Test_Usage.cpp)
 target_link_libraries(test_common_usage PRIVATE KokkosDNN::common KokkosDNN::gtest_main)
 set_target_properties(test_common_usage PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+kokkosdnn_enable_compiler_warnings(test_common_usage)
 kokkosdnn_discover_tests(test_common_usage)

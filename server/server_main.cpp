@@ -73,7 +73,7 @@ void handle_stop_signal(int) {
   }
 }
 
-void install_stop_handlers() {
+[[maybe_unused]] void install_stop_handlers() {
   std::signal(SIGINT, handle_stop_signal);
   std::signal(SIGTERM, handle_stop_signal);
 }
@@ -81,7 +81,7 @@ void install_stop_handlers() {
 // Startup progress goes to stderr (unbuffered enough for `podman logs` to
 // show it while weights load) with an explicit flush per line. Per-request
 // traffic stays silent by design.
-void startup_log(const std::string& msg) {
+[[maybe_unused]] void startup_log(const std::string& msg) {
   std::fprintf(stderr, "%s\n", msg.c_str());
   std::fflush(stderr);
 }
@@ -100,7 +100,7 @@ struct CliOptions {
 
 // Returns an exit code when the process should stop after parse_cli
 // (0 = ok to continue serving, anything else = exit with that code).
-int parse_cli(int argc, char* argv[], CliOptions& out) {
+[[maybe_unused]] int parse_cli(int argc, char* argv[], CliOptions& out) {
   auto help = [&]() {
     std::printf(
         "Usage: %s [--port N] [--model ID] [--weights PATH] [--tokenizer "
@@ -182,7 +182,7 @@ struct ServerState {
 // Loads Config (HF defaults + optional JSON overlay), GGUF weights, and the
 // tokenizer. Requires Kokkos to be initialized (allocates device views).
 // Returns true on success; on failure `err` describes the problem.
-bool load_model(const CliOptions& o, ServerState& st, std::string& err) {
+[[maybe_unused]] bool load_model(const CliOptions& o, ServerState& st, std::string& err) {
   if (o.weights.empty()) {
     err = "missing required --weights PATH (GGUF checkpoint)";
     return false;
@@ -939,7 +939,7 @@ void sse_done(httplib::DataSink& sink) {
 // Route handlers
 // ---------------------------------------------------------------------------
 
-void models_handler(ServerState& st, httplib::Response& res) {
+[[maybe_unused]] void models_handler(ServerState& st, httplib::Response& res) {
   send_json(res, 200,
             json{{"object", "list"},
                  {"data",
@@ -950,7 +950,7 @@ void models_handler(ServerState& st, httplib::Response& res) {
                         {"owned_by", "kokkosdnn"}}})}});
 }
 
-void chat_handler(ServerState& st, const httplib::Request& req,
+[[maybe_unused]] void chat_handler(ServerState& st, const httplib::Request& req,
                   httplib::Response& res) {
   json body;
   try {
@@ -1113,7 +1113,7 @@ void chat_handler(ServerState& st, const httplib::Request& req,
 // POST /v1/completions: legacy alias. {prompt: string} becomes a single
 // user message; the rest of the pipeline (sampling, stop, seed, max tokens,
 // streaming envelope excepted) is shared with chat.
-void completions_handler(ServerState& st, const httplib::Request& req,
+[[maybe_unused]] void completions_handler(ServerState& st, const httplib::Request& req,
                          httplib::Response& res) {
   json body;
   try {
@@ -1242,7 +1242,9 @@ void completions_handler(ServerState& st, const httplib::Request& req,
 
 // Unit tests (server/test_server_parsing.cpp) define
 // KOKKOSDNN_SERVER_NO_MAIN and #include this file to exercise the pure
-// JSON helpers above without starting the server.
+// JSON helpers above without starting the server. main() and the route
+// handlers it alone references are therefore unreferenced in that TU;
+// they carry [[maybe_unused]] so the test build stays -Werror-clean.
 #ifndef KOKKOSDNN_SERVER_NO_MAIN
 int main(int argc, char* argv[]) {
   CliOptions opt;

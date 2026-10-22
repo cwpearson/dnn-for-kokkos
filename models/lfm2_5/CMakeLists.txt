@@ -14,6 +14,7 @@ target_include_directories(kokkosdnn_lfm25 PUBLIC
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 set_target_properties(kokkosdnn_lfm25 PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+kokkosdnn_enable_compiler_warnings(kokkosdnn_lfm25)
 
 install(TARGETS kokkosdnn_lfm25 EXPORT KokkosDNNTragets
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}

@@ -429,12 +429,13 @@ void check_sliding_reference(size_t window, float tol) {
             << "," << d << ")";
       }
       // Window >= sequence length (or 0) must equal full causal.
-      if (window == 0 || window >= (size_t)T)
+      if (window == 0 || window >= (size_t)T) {
         for (int d = 0; d < D; ++d)
           EXPECT_NEAR(static_cast<float>(got(t, hh, d)),
                       static_cast<float>(got_full(t, hh, d)), tol)
               << "sliding(w=" << window << ") != full at (" << t << "," << hh
               << "," << d << ")";
+      }
     }
   }
 }

@@ -878,12 +878,6 @@ struct MossImageDitWeights {
           h(i, j) = static_cast<Scalar>(dist(eng));
       Kokkos::deep_copy(v, h);
     };
-    auto rnd1 = [&](auto& v) {
-      auto h = Kokkos::create_mirror_view(Kokkos::HostSpace(), v);
-      for (size_t i = 0; i < v.extent(0); ++i)
-        h(i) = static_cast<Scalar>(dist(eng));
-      Kokkos::deep_copy(v, h);
-    };
     auto ones1 = [&](auto& v) {
       Kokkos::deep_copy(v, static_cast<Scalar>(1.0f));
     };
@@ -1476,11 +1470,9 @@ class MossImageDitModel {
                     const V3& encoder, const L4& out,
                     const std::vector<int>& skips, const std::string& label) {
     const size_t B = latents.extent(0);
-    const size_t S = encoder.extent(1);
     const size_t H = latents.extent(2), Wd = latents.extent(3);
     const size_t C = latents.extent(1), Td = encoder.extent(2);
-    const size_t D = (size_t)cfg_.dim, F = (size_t)cfg_.ffn_dim,
-                 Fr = (size_t)cfg_.freq_dim;
+    const size_t D = (size_t)cfg_.dim, Fr = (size_t)cfg_.freq_dim;
     const size_t Nh = (size_t)cfg_.num_heads, Hd = D / Nh;
     const size_t HW = H * Wd;
     const float attn_scale = 1.0f / std::sqrt((float)Hd);

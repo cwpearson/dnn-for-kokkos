@@ -213,6 +213,7 @@ struct MossQkRmsnormRopeFunctor {
     const auto QW = qw;
     const auto KW = kw;
     const auto R = rope;
+    const size_t HH = Hh;  // hoisted: write-back lambda below must not capture `this`
     const size_t row = static_cast<size_t>(member.league_rank());
     const size_t SH = S * H;
     const size_t b = row / SH;
@@ -244,19 +245,19 @@ struct MossQkRmsnormRopeFunctor {
               static_cast<Scalar>(static_cast<float>(Q(b, s, h, d)) * invq *
                                   static_cast<float>(QW(d))));
           const float bq = static_cast<float>(
-              static_cast<Scalar>(static_cast<float>(Q(b, s, h, d + Hh)) *
-                                  invq * static_cast<float>(QW(d + Hh))));
+              static_cast<Scalar>(static_cast<float>(Q(b, s, h, d + HH)) *
+                                  invq * static_cast<float>(QW(d + HH))));
           const float ak = static_cast<float>(
               static_cast<Scalar>(static_cast<float>(K(b, s, h, d)) * invk *
                                   static_cast<float>(KW(d))));
           const float bk = static_cast<float>(
-              static_cast<Scalar>(static_cast<float>(K(b, s, h, d + Hh)) *
-                                  invk * static_cast<float>(KW(d + Hh))));
-          const float sn = R(0, s, d), cs = R(0, s, d + Hh);
+              static_cast<Scalar>(static_cast<float>(K(b, s, h, d + HH)) *
+                                  invk * static_cast<float>(KW(d + HH))));
+          const float sn = R(0, s, d), cs = R(0, s, d + HH);
           QO(b, s, h, d) = static_cast<Scalar>(aq * cs - bq * sn);
-          QO(b, s, h, d + Hh) = static_cast<Scalar>(bq * cs + aq * sn);
+          QO(b, s, h, d + HH) = static_cast<Scalar>(bq * cs + aq * sn);
           KO(b, s, h, d) = static_cast<Scalar>(ak * cs - bk * sn);
-          KO(b, s, h, d + Hh) = static_cast<Scalar>(bk * cs + ak * sn);
+          KO(b, s, h, d + HH) = static_cast<Scalar>(bk * cs + ak * sn);
         });
   }
 };

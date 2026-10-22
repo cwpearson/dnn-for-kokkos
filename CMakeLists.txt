@@ -28,7 +28,7 @@ option(KokkosDNN_ENABLE_MODEL_MOSS "Build MOSS-Image model component (KokkosDNN:
 # default to keep existing CI builds unaffected. -DKokkosDNN_ENABLE_SERVER=ON
 # to build kokkosdnn_server (requires KokkosDNN_ENABLE_MODEL_LFM25=ON).
 option(KokkosDNN_ENABLE_SERVER "Build OpenAI-compatible HTTP server stub" OFF)
-option(KokkosDNN_ENABLE_COMPILER_WARNINGS "Enable compiler warnings" OFF)
+option(KokkosDNN_ENABLE_COMPILER_WARNINGS "Enable compiler warnings (as errors, mirroring Kokkos_ENABLE_COMPILER_WARNINGS)" OFF)
 option(BUILD_SHARED_LIBS "Build shared libraries" OFF)
 # gtest_discover_tests executes each test binary at build time. On GPU-less
 # build-only CI (CUDA/ROCm runners have no GPU) the binaries abort inside
@@ -189,7 +189,7 @@ if(KokkosDNN_ENABLE_CUDNN)
   if(TARGET CUDNN::cudnn)
     target_link_libraries(kokkosdnn PUBLIC CUDNN::cudnn)
   elseif(CUDNN_LIBRARY)
-    target_include_directories(kokkosdnn PUBLIC ${CUDNN_INCLUDE_DIR})
+    target_include_directories(kokkosdnn SYSTEM PUBLIC ${CUDNN_INCLUDE_DIR})
     target_link_libraries(kokkosdnn PUBLIC ${CUDNN_LIBRARY})
   endif()
   target_link_libraries(kokkosdnn PUBLIC cudnn_frontend)
@@ -205,10 +205,36 @@ if(KokkosDNN_ENABLE_MIOPEN)
   if(TARGET MIOpen)
     target_link_libraries(kokkosdnn PUBLIC MIOpen)
   elseif(MIOPEN_LIBRARY)
-    target_include_directories(kokkosdnn PUBLIC ${MIOPEN_INCLUDE_DIR})
+    target_include_directories(kokkosdnn SYSTEM PUBLIC ${MIOPEN_INCLUDE_DIR})
     target_link_libraries(kokkosdnn PUBLIC ${MIOPEN_LIBRARY})
   endif()
 endif()
+# Kokkos_ENABLE_COMPILER_WARNINGS only affects the Kokkos build itself (its
+# flags are deliberately not exported downstream), so KokkosDNN carries its
+# own equivalent: KokkosDNN_ENABLE_COMPILER_WARNINGS plus -Werror (/WX).
+# The helper applies per-target PRIVATE/INTERFACE options so FetchContent
+# third-party targets never inherit them.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/KokkosDNNCompilerWarnings.cmake)
+
+# Third-party policy (warnings are enforced on first-party code only):
+# silence every TPL target so its headers cannot trip -Werror in our TUs.
+if(KokkosDNN_ENABLE_CUBLAS)
+  kokkosdnn_suppress_third_party_warnings(CUDA::cublas)
+  kokkosdnn_suppress_third_party_warnings(CUDA::cublasLt)
+endif()
+if(KokkosDNN_ENABLE_CUDNN)
+  kokkosdnn_suppress_third_party_warnings(cudnn_frontend)
+  kokkosdnn_suppress_third_party_warnings(CUDNN::cudnn)
+  kokkosdnn_suppress_third_party_warnings(CUDA::nvrtc)
+  kokkosdnn_suppress_third_party_warnings(CUDA::cudart)
+endif()
+if(KokkosDNN_ENABLE_HIPBLAS)
+  kokkosdnn_suppress_third_party_warnings(roc::hipblas)
+endif()
+if(KokkosDNN_ENABLE_MIOPEN)
+  kokkosdnn_suppress_third_party_warnings(MIOpen)
+endif()
+
 if(KokkosDNN_ENABLE_ACCELERATE)
   # Apple-only system framework (AMX/SME-backed sgemm, no install needed).
   # Fail loudly off-Apple so a stray -DKokkosDNN_ENABLE_ACCELERATE=ON on
@@ -220,9 +246,7 @@ if(KokkosDNN_ENABLE_ACCELERATE)
   target_link_libraries(kokkosdnn PUBLIC ${ACCELERATE_LIBRARY})
 endif()
 
-if(KokkosDNN_ENABLE_COMPILER_WARNINGS)
-  target_compile_options(kokkosdnn PRIVATE -Wall -Wextra -Werror)
-endif()
+kokkosdnn_enable_compiler_warnings(kokkosdnn)
 
 set_target_properties(kokkosdnn PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
 
@@ -257,12 +281,16 @@ if(KokkosDNN_ENABLE_TESTS)
     set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(googletest)
   endif()
+  # Third-party policy: gtest builds warning-free (its own -w) and its
+  # headers reach our test TUs as SYSTEM, so they can never trip -Werror.
+  kokkosdnn_suppress_third_party_warnings(gtest)
   include(GoogleTest)
   # Shared GoogleTest main that initializes/finalizes Kokkos.
   add_library(kokkosdnn_gtest_main STATIC tests/GTestMain.cpp)
   add_library(KokkosDNN::gtest_main ALIAS kokkosdnn_gtest_main)
   target_link_libraries(kokkosdnn_gtest_main PUBLIC Kokkos::kokkos GTest::gtest)
   set_target_properties(kokkosdnn_gtest_main PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+  kokkosdnn_enable_compiler_warnings(kokkosdnn_gtest_main)
 endif()
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,10 @@ FetchContent_Declare(
   GIT_TAG v3.11.3
 )
 FetchContent_MakeAvailable(cpp_httplib nlohmann_json)
+# Third-party policy: header-only front-ends reach our TUs as SYSTEM, so
+# they can never trip -Werror.
+kokkosdnn_suppress_third_party_warnings(httplib)
+kokkosdnn_suppress_third_party_warnings(nlohmann_json)
 
 add_executable(kokkosdnn_server server_main.cpp)
 target_link_libraries(kokkosdnn_server PRIVATE
@@ -35,6 +39,7 @@ target_link_libraries(kokkosdnn_server PRIVATE
   httplib::httplib nlohmann_json::nlohmann_json)
 set_target_properties(kokkosdnn_server PROPERTIES
   CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+kokkosdnn_enable_compiler_warnings(kokkosdnn_server)
 
 # Parsing unit tests (pure JSON helpers; no weights/tokenizer needed).
 # NOTE: server/ is added before the top-level enable_testing(), so enable
@@ -47,6 +52,7 @@ if(KokkosDNN_ENABLE_TESTS)
     httplib::httplib nlohmann_json::nlohmann_json)
   set_target_properties(kokkosdnn_server_parsing_tests PROPERTIES
     CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+  kokkosdnn_enable_compiler_warnings(kokkosdnn_server_parsing_tests)
   add_test(NAME kokkosdnn_server_parsing
     COMMAND kokkosdnn_server_parsing_tests)
 endif()

@@ -2,6 +2,7 @@ function(kokkosdnn_add_test NAME SRC)
   add_executable(${NAME} ${SRC})
   target_link_libraries(${NAME} PRIVATE KokkosDNN::kokkosdnn KokkosDNN::gtest_main)
   set_target_properties(${NAME} PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+  kokkosdnn_enable_compiler_warnings(${NAME})
   kokkosdnn_discover_tests(${NAME})
 endfunction()
 

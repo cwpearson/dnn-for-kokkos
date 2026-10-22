@@ -717,7 +717,7 @@ struct TransposeTileFunctor {
     // tile[dc][dt]: dc = channel within tile, dt = position within tile.
     auto at = [&](int dc, int dt) -> float& { return sh[dc * (TT + 1) + dt]; };
     const size_t C = nchw.extent(0), T = H * W;
-    const size_t nCT = (C + TT - 1) / TT, nTT = (T + TT - 1) / TT;
+    const size_t nTT = (T + TT - 1) / TT;
     const size_t tile = static_cast<size_t>(team.league_rank());
     const size_t tc = tile / nTT, tt = tile % nTT;
     const size_t c0 = tc * TT, t0 = tt * TT;

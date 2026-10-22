@@ -29,11 +29,6 @@ uint32_t rd32(const std::vector<char>& b, size_t p) {
   return (uint32_t)((uint8_t)b[p] | ((uint8_t)b[p + 1] << 8) |
                     ((uint8_t)b[p + 2] << 16) | ((uint8_t)b[p + 3] << 24));
 }
-uint64_t rd64(const std::vector<char>& b, size_t p) {
-  uint64_t v = 0;
-  for (int i = 7; i >= 0; --i) v = (v << 8) | (uint8_t)b[p + i];
-  return v;
-}
 
 // ---------------------------------------------------------------------------
 // ZIP index (stored entries only).

@@ -57,13 +57,16 @@ jobs:
         run: |
           # KokkosDNN_ENABLE_IMAGE=ON builds src/images (KokkosDNN::Image,
           # stb-backed I/O) and registers its unit tests (Test_Image).
+          # -Werror is bundled into the option, so CI builds are
+          # warnings-clean under the Kokkos warning set.
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DKokkos_ROOT="${KOKKOS_INSTALL}" \
             -DKokkosDNN_ENABLE_TESTS=ON \
             -DKokkosDNN_ENABLE_EXAMPLES=ON \
             -DKokkosDNN_ENABLE_BENCHMARKS=ON \
-            -DKokkosDNN_ENABLE_IMAGE=ON
+            -DKokkosDNN_ENABLE_IMAGE=ON \
+            -DKokkosDNN_ENABLE_COMPILER_WARNINGS=ON
 
       # Build every target (library, tests, examples, benchmarks).
       - name: Build everything

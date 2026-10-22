@@ -17,6 +17,7 @@ if(KokkosDNN_ENABLE_IMAGE)
   target_link_libraries(kokkosdnn_moss INTERFACE KokkosDNN::image)
 endif()
 target_compile_features(kokkosdnn_moss INTERFACE cxx_std_20)
+kokkosdnn_enable_compiler_warnings(kokkosdnn_moss)
 
 install(TARGETS kokkosdnn_moss EXPORT KokkosDNNTragets)
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/

@@ -285,7 +285,6 @@ void load_gguf(const Config& cfg, const std::string& path,
 
   const size_t hq  = (size_t)cfg.n_heads * (size_t)cfg.head_dim;
   const size_t hkv = (size_t)cfg.n_kv_heads * (size_t)cfg.head_dim;
-  const size_t HD  = (size_t)cfg.head_dim;
   const size_t K   = (size_t)cfg.conv_L_cache;
   for (int l = 0; l < cfg.n_layers; ++l) {
     auto& b = w.blocks[l];
@@ -321,9 +320,15 @@ void load_gguf(const Config& cfg, const std::string& path,
     } else {
       load_dense_mat<ExecSpace, Scalar>(file, blk(l, "ffn_gate_inp"), E, D,
                                        b.gate_inp);
-      const auto& gi = require(file, blk(l, "ffn_gate_exps"), ".weight");
-      const auto& ui = require(file, blk(l, "ffn_up_exps"), ".weight");
-      const auto& di = require(file, blk(l, "ffn_down_exps"), ".weight");
+      // Hoist the stems into locals: binding the returned reference
+      // directly to `require(file, blk(...) + ".weight")` dangles (the
+      // stem temporary dies at the end of the full expression).
+      const std::string gi_stem = blk(l, "ffn_gate_exps");
+      const std::string ui_stem = blk(l, "ffn_up_exps");
+      const std::string di_stem = blk(l, "ffn_down_exps");
+      const auto& gi = require(file, gi_stem, ".weight");
+      const auto& ui = require(file, ui_stem, ".weight");
+      const auto& di = require(file, di_stem, ".weight");
       const size_t MI = (size_t)cfg.moe_intermediate;
       for (size_t e = 0; e < E; ++e) {
         b.gate_exps[e] = load_expert_slice<ExecSpace>(file, gi, e, MI, D, E);
