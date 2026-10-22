@@ -21,14 +21,15 @@ struct Usage {
 };
 
 // Why generation stopped. Maps to the OpenAI `finish_reason` strings via
-// to_string() below ("stop" / "length"; Error surfaces transport or
-// inference failures that OpenAI has no code for as "error").
-enum class FinishReason { Stop, Length, Error };
+// to_string() below ("stop" / "length" / "tool_calls"; Error surfaces
+// transport or inference failures that OpenAI has no code for as "error").
+enum class FinishReason { Stop, Length, ToolCalls, Error };
 
 inline const char* to_string(FinishReason r) {
   switch (r) {
     case FinishReason::Stop: return "stop";
     case FinishReason::Length: return "length";
+    case FinishReason::ToolCalls: return "tool_calls";
     case FinishReason::Error: return "error";
   }
   return "error";
