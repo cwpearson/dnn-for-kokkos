@@ -25,6 +25,7 @@
 
 #include <atomic>
 #include <cctype>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -57,6 +58,33 @@ constexpr const char* kVersion = "0.1.0";
 constexpr int kDefaultPort = 8000;
 constexpr const char* kDefaultModel = "lfm2_5";
 constexpr int kDefaultMaxTokens = 256;
+
+// The server runs as PID 1 in its container image, where SIGINT/SIGTERM
+// revert to "ignore" unless the process installs a handler — that's why
+// `podman run` ctrl-C and `podman stop` used to hang until SIGKILL. The
+// handler below asks the httplib listener to stop so shutdown is prompt.
+std::atomic<httplib::Server*> g_listening_server{nullptr};
+std::atomic<bool> g_stop_requested{false};
+
+void handle_stop_signal(int) {
+  g_stop_requested.store(true, std::memory_order_relaxed);
+  if (auto* svr = g_listening_server.load(std::memory_order_acquire)) {
+    svr->stop();
+  }
+}
+
+void install_stop_handlers() {
+  std::signal(SIGINT, handle_stop_signal);
+  std::signal(SIGTERM, handle_stop_signal);
+}
+
+// Startup progress goes to stderr (unbuffered enough for `podman logs` to
+// show it while weights load) with an explicit flush per line. Per-request
+// traffic stays silent by design.
+void startup_log(const std::string& msg) {
+  std::fprintf(stderr, "%s\n", msg.c_str());
+  std::fflush(stderr);
+}
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -1225,18 +1253,33 @@ int main(int argc, char* argv[]) {
   }
 
   Kokkos::initialize(argc, argv);
+  install_stop_handlers();
   int exit_code = 0;
   {
+    startup_log(std::string("kokkosdnn_server ") + kVersion + " starting...");
+    startup_log("  model: " + opt.model);
+    startup_log("  weights: " +
+                (opt.weights.empty() ? std::string("(none)") : opt.weights));
+    startup_log("  tokenizer: " +
+                (opt.tokenizer.empty() ? std::string("(none)")
+                                       : opt.tokenizer));
+    startup_log("  config: " +
+                (opt.config_path.empty() ? std::string("(baked-in defaults)")
+                                         : opt.config_path));
+    startup_log("loading weights...");
     ServerState st;
     std::string err;
     if (!load_model(opt, st, err)) {
-      std::printf("kokkosdnn_server: %s\n", err.c_str());
+      startup_log(std::string("kokkosdnn_server: ") + err);
       exit_code = 1;
+    } else if (g_stop_requested.load(std::memory_order_relaxed)) {
+      startup_log("kokkosdnn_server: shutdown requested during load, exiting");
+      exit_code = 0;
     } else {
-      std::printf("kokkosdnn_server %s\n", kVersion);
-      std::printf("  model: %s (max_seq_len=%d)\n", st.model_id.c_str(),
-                  st.cfg.max_seq_len);
-      std::printf("  listening on port %d\n", opt.port);
+      startup_log("model loaded: " + st.model_id + " (max_seq_len=" +
+                  std::to_string(st.cfg.max_seq_len) + ")");
+      startup_log("listening on 0.0.0.0:" + std::to_string(opt.port) +
+                  " — ready to serve");
       httplib::Server svr;
       svr.Get("/v1/models", [&](const httplib::Request&,
                                 httplib::Response& res) {
@@ -1250,9 +1293,18 @@ int main(int argc, char* argv[]) {
                [&](const httplib::Request& req, httplib::Response& res) {
                  completions_handler(st, req, res);
                });
-      if (!svr.listen("0.0.0.0", opt.port)) {
-        std::printf("kokkosdnn_server: failed to bind port %d\n", opt.port);
+      g_listening_server.store(&svr, std::memory_order_release);
+      const bool ok = svr.listen("0.0.0.0", opt.port);
+      g_listening_server.store(nullptr, std::memory_order_release);
+      if (g_stop_requested.load(std::memory_order_relaxed)) {
+        startup_log("kokkosdnn_server: received shutdown signal, stopped");
+        exit_code = 0;
+      } else if (!ok) {
+        startup_log("kokkosdnn_server: failed to bind port " +
+                    std::to_string(opt.port));
         exit_code = 1;
+      } else {
+        startup_log("kokkosdnn_server: stopped");
       }
     }
   }
