@@ -12,6 +12,7 @@
 #include <numeric>
 #include <random>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace KokkosDNN {
@@ -34,6 +35,25 @@ struct SampleOptions {
   float min_p = 0.0f;
   float repetition_penalty = 1.0f;
   uint64_t seed = 0;
+  // OpenAI-mapped sampling fields (all neutral by default: existing paths
+  // behave exactly as before when these are untouched).
+  //
+  //  frequency_penalty: OpenAI-style logit penalty proportional to how
+  //    often each id already appears in `prior`:
+  //    logits[id] -= frequency_penalty * count(id).
+  //    == 0: disabled. > 0 suppresses repeated ids; < 0 encourages them.
+  //  presence_penalty: binary variant applied once per distinct id seen:
+  //    logits[id] -= presence_penalty  (iff count(id) > 0).
+  //    == 0: disabled.
+  //  logit_bias: per-id additive bias, logits[id] += bias, applied to
+  //    every decode step. Out-of-range ids are ignored. Empty: disabled.
+  //  logprobs: 0 (default) means off — no logprob bookkeeping, zero
+  //    overhead. > 0 requests the top-N token logprobs alongside the
+  //    sampled token (clamped to vocab size).
+  float frequency_penalty = 0.0f;
+  float presence_penalty = 0.0f;
+  std::vector<std::pair<int, float>> logit_bias;
+  int logprobs = 0;
 
   bool is_greedy() const { return temperature <= 0.0f || top_k == 1; }
 
@@ -150,6 +170,114 @@ inline void apply_repetition_penalty(std::vector<float>& logits,
   }
 }
 
+// Per-id additive logit bias (OpenAI `logit_bias`): logits[id] += bias.
+// Applied after the repetition penalty, before frequency/presence
+// penalties and temperature scaling. Out-of-range ids are ignored.
+// Empty bias list is a no-op.
+inline void apply_logit_bias(
+    std::vector<float>& logits,
+    const std::vector<std::pair<int, float>>& bias) {
+  if (bias.empty() || logits.empty()) return;
+  for (const auto& kv : bias) {
+    int id = kv.first;
+    if (id < 0 || (size_t)id >= logits.size()) continue;
+    logits[(size_t)id] += kv.second;
+  }
+}
+
+// OpenAI-style frequency + presence penalties on LOGITS (pre-softmax):
+//   logits[id] -= frequency_penalty * count(id) +
+//                 (count(id) > 0 ? presence_penalty : 0),
+// where count(id) is the number of occurrences of id in `prior`.
+// Both zero is a no-op. Negative values encourage (rather than suppress)
+// repetition. Out-of-range prior ids are ignored. Counts are built
+// internally from `prior` so call sites stay simple.
+inline void apply_frequency_presence(std::vector<float>& logits,
+                                     const std::vector<int>& prior,
+                                     float frequency_penalty,
+                                     float presence_penalty) {
+  if ((frequency_penalty == 0.0f && presence_penalty == 0.0f) ||
+      logits.empty() || prior.empty())
+    return;
+  std::vector<int> counts(logits.size(), 0);
+  for (int id : prior) {
+    if (id < 0 || (size_t)id >= logits.size()) continue;
+    counts[(size_t)id]++;
+  }
+  for (size_t i = 0; i < logits.size(); ++i) {
+    if (counts[i] == 0) continue;
+    logits[i] -= frequency_penalty * static_cast<float>(counts[i]) +
+                 presence_penalty;
+  }
+}
+
+// Sampled token plus (optionally) the top-N token logprobs.
+// `logprobs`/`top_ids` are empty when `SampleOptions::logprobs <= 0;
+// otherwise they hold the top-N entries (N = min(logprobs, V)) of the
+// temperature-scaled full-vocab distribution, in descending-logprob order,
+// with `logprobs[i]` the natural-log probability of `top_ids[i]`.
+struct SampleResult {
+  int id = 0;
+  std::vector<float> logprobs;
+  std::vector<int> top_ids;
+};
+
+namespace Impl {
+
+// Full-vocab log-softmax (max-subtracted, natural log). Empty on empty
+// input; all -inf falls back to uniform (log(1/V)).
+inline std::vector<float> log_softmax(const std::vector<float>& vals) {
+  std::vector<float> lp(vals.size());
+  if (vals.empty()) return lp;
+  float m = *std::max_element(vals.begin(), vals.end());
+  double sum = 0.0;
+  for (size_t i = 0; i < vals.size(); ++i) {
+    double e = std::exp(static_cast<double>(vals[i]) - m);
+    sum += e;
+    lp[i] = static_cast<float>(e);  // reuse as scratch for exp values
+  }
+  if (!(sum > 0.0)) {  // all -inf: uniform
+    float u = -std::log(static_cast<double>(vals.size()));
+    std::fill(lp.begin(), lp.end(), u);
+    return lp;
+  }
+  double log_sum = std::log(sum);
+  for (size_t i = 0; i < vals.size(); ++i)
+    lp[i] = static_cast<float>(
+        (static_cast<double>(vals[i]) - m) - log_sum);
+  return lp;
+}
+
+// Top-N selection over log-probs: O(V) average via nth_element, then sort
+// only the top N. Descending-logprob order; ties broken by smaller id
+// (deterministic). N is clamped to [0, V].
+inline void top_logprobs(const std::vector<float>& logp, int n,
+                         std::vector<int>& top_ids,
+                         std::vector<float>& top_lp) {
+  top_ids.clear();
+  top_lp.clear();
+  const size_t V = logp.size();
+  if (V == 0 || n <= 0) return;
+  size_t N = (size_t)n < V ? (size_t)n : V;
+  std::vector<int> ids(V);
+  std::iota(ids.begin(), ids.end(), 0);
+  std::nth_element(ids.begin(), ids.begin() + N, ids.end(),
+                   [&](int a, int b) {
+                     return logp[(size_t)a] > logp[(size_t)b];
+                   });
+  ids.resize(N);
+  std::sort(ids.begin(), ids.end(), [&](int a, int b) {
+    if (logp[(size_t)a] != logp[(size_t)b])
+      return logp[(size_t)a] > logp[(size_t)b];
+    return a < b;
+  });
+  top_ids = ids;
+  top_lp.resize(N);
+  for (size_t i = 0; i < N; ++i) top_lp[i] = logp[(size_t)ids[i]];
+}
+
+}  // namespace Impl
+
 // Top-k keep set via partial selection (nth_element, O(V) average, no full
 // sort of the 128k vocab). Returns kept ids sorted by descending logit for
 // deterministic test/order semantics. k <= 0 or k >= V keeps everything
@@ -243,26 +371,62 @@ inline std::vector<int> min_p_keep(const std::vector<float>& logits,
   return min_p_keep(logits.data(), logits.size(), min_p);
 }
 
-// Host sampling over float logits (already on host).
+// Host sampling over float logits (already on host), returning the sampled
+// id plus optional top-N logprobs.
 //
-// Pipeline: repetition penalty (on `prior`) -> greedy short-circuit ->
-// temperature scale -> top-k partial selection -> softmax -> top-p ->
-// min-p -> renormalize -> categorical draw with `rng`.
+// Pipeline (every logit adjustment applies pre-softmax, on LOGITS):
+//   repetition penalty (on `prior`)
+//     -> logit_bias (additive per-id)
+//     -> frequency / presence penalties (from occurrence counts in `prior`)
+//     -> greedy short-circuit (argmax, RNG untouched)
+//     -> temperature scale
+//     -> top-k partial selection -> softmax -> top-p -> min-p ->
+//        renormalize -> categorical draw with `rng`.
 //
-// Greedy (temperature <= 0 or top_k == 1) returns argmax of the
-// penalty-adjusted logits and never touches `rng`.
-inline int sample_host_logits(const float* logits, size_t V,
-                              const SampleOptions& opt,
-                              const std::vector<int>& prior, HostRNG& rng) {
-  if (V == 0) throw std::invalid_argument("sample_host_logits: empty logits");
+// When `opt.logprobs > 0`, the returned top-N entries come from the
+// full-vocab temperature-scaled distribution: softmax over the
+// penalty/bias-adjusted, temperature-scaled logits BEFORE top-k
+// truncation (OpenAI reports logprobs over the final distribution, not
+// the truncated candidate set). Greedy draws report the same
+// distribution (temperature <= 0 treated as 1.0, i.e. unscaled — there
+// is no meaningful divide-by-zero scaling); the RNG is still never
+// touched on the greedy path.
+//
+// Neutral-by-default: frequency_penalty == 0, presence_penalty == 0,
+// empty logit_bias, and logprobs == 0 reproduce the legacy pipeline
+// bit-for-bit.
+inline SampleResult sample_host_logits_result(
+    const float* logits, size_t V, const SampleOptions& opt,
+    const std::vector<int>& prior, HostRNG& rng) {
+  if (V == 0)
+    throw std::invalid_argument("sample_host_logits_result: empty logits");
   std::vector<float> work(logits, logits + V);
   apply_repetition_penalty(work, prior, opt.repetition_penalty);
+  apply_logit_bias(work, opt.logit_bias);
+  apply_frequency_presence(work, prior, opt.frequency_penalty,
+                           opt.presence_penalty);
+
+  // Full-vocab logprobs distribution: penalty/bias-adjusted logits,
+  // temperature-scaled when meaningful (temp > 0), pre-truncation.
+  // temperature <= 0 (greedy) is treated as 1.0 (unscaled).
+  auto full_logprobs = [&]() {
+    std::vector<float> scaled = work;
+    if (opt.temperature > 0.0f && opt.temperature != 1.0f)
+      for (auto& v : scaled) v /= opt.temperature;
+    return Impl::log_softmax(scaled);
+  };
 
   if (opt.is_greedy()) {
     int best = 0;
     for (size_t v = 1; v < V; ++v)
       if (work[v] > work[best]) best = static_cast<int>(v);
-    return best;
+    SampleResult r;
+    r.id = best;
+    if (opt.logprobs > 0) {
+      std::vector<float> lp = full_logprobs();
+      Impl::top_logprobs(lp, opt.logprobs, r.top_ids, r.logprobs);
+    }
+    return r;
   }
 
   float temp = opt.temperature;
@@ -270,7 +434,13 @@ inline int sample_host_logits(const float* logits, size_t V,
     int best = 0;
     for (size_t v = 1; v < V; ++v)
       if (work[v] > work[best]) best = static_cast<int>(v);
-    return best;
+    SampleResult r;
+    r.id = best;
+    if (opt.logprobs > 0) {
+      std::vector<float> lp = Impl::log_softmax(work);
+      Impl::top_logprobs(lp, opt.logprobs, r.top_ids, r.logprobs);
+    }
+    return r;
   }
   if (temp != 1.0f)
     for (auto& v : work) v /= temp;
@@ -325,7 +495,31 @@ inline int sample_host_logits(const float* logits, size_t V,
   std::vector<float> final_w(kept.size());
   for (size_t i = 0; i < kept.size(); ++i) final_w[i] = probs[(size_t)kept[i]];
   int pick = Impl::categorical(final_w, rng);
-  return cand[(size_t)kept[(size_t)pick]];
+  SampleResult r;
+  r.id = cand[(size_t)kept[(size_t)pick]];
+  if (opt.logprobs > 0) {
+    // `work` is already temperature-scaled here: log_softmax(work) is the
+    // final full-vocab distribution.
+    std::vector<float> lp = Impl::log_softmax(work);
+    Impl::top_logprobs(lp, opt.logprobs, r.top_ids, r.logprobs);
+  }
+  return r;
+}
+
+inline SampleResult sample_host_logits_result(
+    const std::vector<float>& logits, const SampleOptions& opt,
+    const std::vector<int>& prior, HostRNG& rng) {
+  return sample_host_logits_result(logits.data(), logits.size(), opt, prior,
+                                   rng);
+}
+
+// Legacy entry point: identical sampling, logprobs discarded. Signature
+// UNCHANGED (Model::generate and all existing callers compile untouched;
+// neutral new-option defaults reproduce the legacy draws bit-for-bit).
+inline int sample_host_logits(const float* logits, size_t V,
+                              const SampleOptions& opt,
+                              const std::vector<int>& prior, HostRNG& rng) {
+  return sample_host_logits_result(logits, V, opt, prior, rng).id;
 }
 
 inline int sample_host_logits(const std::vector<float>& logits,
@@ -363,11 +557,13 @@ int device_argmax(const Kokkos::View<Scalar*, ExecSpace>& logits) {
 
 // Device sampling entry point.
 //
-// Fast path: greedy (temperature <= 0 or top_k == 1) with no repetition
-// penalty stays on device (parallel_reduce argmax, single-int result).
-// Everything else mirrors the logits once and runs the host pipeline
-// (penalty / temperature / top-k partial selection / top-p / min-p /
-// categorical). Scalar-agnostic; comparison and softmax are FP32.
+// Fast path: greedy (temperature <= 0 or top_k == 1) with all penalties
+// neutral (repetition_penalty == 1, frequency/presence == 0, empty
+// logit_bias) and no logprobs request stays on device (parallel_reduce
+// argmax, single-int result). Everything else mirrors the logits once
+// and runs the host pipeline (penalties / bias / temperature / top-k
+// partial selection / top-p / min-p / categorical, plus optional
+// top-N logprobs). Scalar-agnostic; comparison and softmax are FP32.
 template <class ExecSpace, class Scalar>
 int sample_token(const Kokkos::View<Scalar*, ExecSpace>& logits,
                  const SampleOptions& opt, const std::vector<int>& prior,
@@ -375,13 +571,39 @@ int sample_token(const Kokkos::View<Scalar*, ExecSpace>& logits,
   const size_t V = logits.extent(0);
   if (V == 0) throw std::invalid_argument("sample_token: empty logits");
   const bool need_host =
-      !opt.is_greedy() || (opt.repetition_penalty != 1.0f);
+      !opt.is_greedy() || (opt.repetition_penalty != 1.0f) ||
+      (opt.frequency_penalty != 0.0f) || (opt.presence_penalty != 0.0f) ||
+      (!opt.logit_bias.empty()) || (opt.logprobs > 0);
   if (!need_host) return device_argmax<ExecSpace, Scalar>(logits);
   auto h = Kokkos::create_mirror_view(logits);
   Kokkos::deep_copy(h, logits);
   std::vector<float> fh(V);
   for (size_t i = 0; i < V; ++i) fh[i] = static_cast<float>(h(i));
   return sample_host_logits(fh.data(), V, opt, prior, rng);
+}
+
+// Device sampling with top-N logprobs. Same routing as sample_token():
+// neutral-options greedy stays on device (empty logprobs vectors, since
+// the fast path requires opt.logprobs <= 0); everything else mirrors once
+// and returns the full SampleResult (id + top logprobs). Signature
+// mirrors sample_token() with the SampleResult return.
+template <class ExecSpace, class Scalar>
+SampleResult sample_token_result(
+    const Kokkos::View<Scalar*, ExecSpace>& logits, const SampleOptions& opt,
+    const std::vector<int>& prior, HostRNG& rng) {
+  const size_t V = logits.extent(0);
+  if (V == 0) throw std::invalid_argument("sample_token_result: empty logits");
+  const bool need_host =
+      !opt.is_greedy() || (opt.repetition_penalty != 1.0f) ||
+      (opt.frequency_penalty != 0.0f) || (opt.presence_penalty != 0.0f) ||
+      (!opt.logit_bias.empty()) || (opt.logprobs > 0);
+  if (!need_host && opt.logprobs <= 0)
+    return SampleResult{device_argmax<ExecSpace, Scalar>(logits)};
+  auto h = Kokkos::create_mirror_view(logits);
+  Kokkos::deep_copy(h, logits);
+  std::vector<float> fh(V);
+  for (size_t i = 0; i < V; ++i) fh[i] = static_cast<float>(h(i));
+  return sample_host_logits_result(fh.data(), V, opt, prior, rng);
 }
 
 // Back-compatible greedy sampler: next_token = argmax(logits).
