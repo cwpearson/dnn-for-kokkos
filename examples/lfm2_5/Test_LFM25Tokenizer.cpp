@@ -40,6 +40,31 @@ std::string lfm25_fixture_json() {
 })";
 }
 
+
+// Same fixture with the transformers 5.x merge spelling: each merge is a
+// two-element array instead of an "a b" string. Adds digit tokens so the
+// LFM2 pre-tokenizer's \p{N}{1,3} grouping is observable.
+std::string lfm25_fixture_json_pairs() {
+  return R"({
+  "model": {"type": "BPE", "vocab": {
+    "a": 0, "b": 1, "d": 2, "e": 3, "h": 4, "i": 5, "l": 6, "m": 7,
+    "n": 8, "o": 9, "r": 10, "s": 11, "t": 12, "u": 13, "w": 14, "y": 15,
+    "H": 16,
+    "1": 30, "2": 31, "3": 32, "12": 33, "123": 34,
+    "hi": 20, "th": 21,
+    "\u0120": 17, "\u010a": 18
+  }, "merges": [["h","i"], ["t","h"], ["1","2"], ["12","3"]]},
+  "added_tokens": [
+    {"id": 100, "content": "<|startoftext|>", "special": true},
+    {"id": 101, "content": "<|im_start|>", "special": true},
+    {"id": 102, "content": "<|im_end|>", "special": true},
+    {"id": 103, "content": " thinking", "special": true},
+    {"id": 104, "content": "</think>", "special": true},
+    {"id": 105, "content": "<|pad|>", "special": true}
+  ]
+})";
+}
+
 std::string write_tmp(const std::string& body) {
   std::string p =
       "/tmp/kokkosdnn_lfm25_tok_fixture_" + std::to_string(::getpid()) + ".json";
@@ -86,6 +111,43 @@ TEST(LFM25Tokenizer, Roundtrip) {
   EXPECT_EQ(tok.decode({100, 4, 3, 102}), "he");
   EXPECT_EQ(tok.decode({100, 4, 3, 102}, false),
             "<|startoftext|>he<|im_end|>");
+}
+
+
+// transformers 5.x writes merges as ["a", "b"] pairs instead of the legacy
+// "a b" strings. Both spellings must produce identical encodings; parsing
+// only the string form silently disables every merge (pure byte fallback).
+TEST(LFM25Tokenizer, PairFormMerges) {
+  KokkosDNN::LFM25::Tokenizer strings_tok(write_tmp(lfm25_fixture_json()));
+  KokkosDNN::LFM25::Tokenizer pairs_tok(
+      write_tmp(lfm25_fixture_json_pairs()));
+  for (const char* text : {"hi", "the", "hi there", "he1"}) {
+    EXPECT_EQ(pairs_tok.encode(text, false), strings_tok.encode(text, false))
+        << "text='" << text << "'";
+  }
+  EXPECT_EQ(pairs_tok.encode("hi", false), (std::vector<int>{20}));
+  EXPECT_EQ(pairs_tok.encode("the", false), (std::vector<int>{21, 3}));
+}
+
+// LFM2 pre-tokenizer regex (not the GPT-2 one): number runs group up to
+// three digits, and a whitespace run that contains a newline breaks after
+// its last newline.
+TEST(LFM25Tokenizer, PretokenizerRegex) {
+  KokkosDNN::LFM25::Tokenizer tok(write_tmp(lfm25_fixture_json_pairs()));
+  // "123" is one pre-token, so the two merges fuse it to a single id
+  // (digit-splitting would have emitted 1, 2, 3).
+  EXPECT_EQ(tok.encode("123", false), (std::vector<int>{34}));
+  // Symbol/space handling is unchanged from the byte-level mapping.
+  EXPECT_EQ(tok.encode("hi there", false),
+            (std::vector<int>{20, 17, 21, 3, 10, 3}));
+  // Two spaces: the run keeps all but the last space, which prefixes the
+  // following word (\s+(?!\S) backtracking).
+  EXPECT_EQ(tok.encode("hi  there", false),
+            (std::vector<int>{20, 17, 17, 21, 3, 10, 3}));
+  // "\n\n" is one pre-token (\s*[\r\n]+); the fixture has no "\n\n"
+  // merge, so it still encodes as two newline ids.
+  EXPECT_EQ(tok.encode("hi\n\nthere", false),
+            (std::vector<int>{20, 18, 18, 21, 3, 10, 3}));
 }
 
 TEST(LFM25Tokenizer, SpecialAtomicity) {
