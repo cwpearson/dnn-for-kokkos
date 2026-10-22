@@ -56,6 +56,11 @@ struct DNNHandle {
   bool use_cudnn   = false;
   bool use_hipblas = false;
   bool use_miopen  = false;
+  // Apple Accelerate (CPU BLAS) dispatch. Stateless -- no cached handle;
+  // active on host-memory execution spaces (Serial/OpenMP/Threads) when
+  // KokkosDNN_ENABLE_ACCELERATE is set. float only; other scalars fall back
+  // to the native kernel at the call site.
+  bool use_accelerate = false;
 
   // Opaque cached TPL handles (cublasHandle_t / cudnnHandle_t /
   // hipblasHandle_t / miopenHandle_t when the matching TPL is enabled on a
@@ -99,6 +104,17 @@ struct DNNHandle {
 #endif
     }
 #endif
+#ifdef KOKKOSDNN_ENABLE_ACCELERATE
+    // Host-memory spaces only (Serial/OpenMP/Threads/...), never a device
+    // space: CUDA/HIP/SYCL device memory is not CPU-addressable, so
+    // Accelerate must not claim those execution spaces. Keyed off the
+    // memory space (a Kokkos property) rather than a backend name list.
+    constexpr bool is_host_mem =
+        std::is_same_v<typename ExecSpace::memory_space, Kokkos::HostSpace>;
+    if constexpr (is_host_mem) {
+      use_accelerate = true;
+    }
+#endif
   }
 
   ~DNNHandle() { destroy(); }
@@ -111,6 +127,7 @@ struct DNNHandle {
         use_cudnn(other.use_cudnn),
         use_hipblas(other.use_hipblas),
         use_miopen(other.use_miopen),
+        use_accelerate(other.use_accelerate),
         cublas_ptr_(other.cublas_ptr_),
         cudnn_ptr_(other.cudnn_ptr_),
         hipblas_ptr_(other.hipblas_ptr_),
@@ -120,6 +137,7 @@ struct DNNHandle {
     other.use_cudnn    = false;
     other.use_hipblas  = false;
     other.use_miopen   = false;
+    other.use_accelerate = false;
     other.cublas_ptr_  = nullptr;
     other.cudnn_ptr_   = nullptr;
     other.hipblas_ptr_ = nullptr;
@@ -134,6 +152,7 @@ struct DNNHandle {
       use_cudnn    = other.use_cudnn;
       use_hipblas  = other.use_hipblas;
       use_miopen   = other.use_miopen;
+      use_accelerate = other.use_accelerate;
       cublas_ptr_  = other.cublas_ptr_;
       cudnn_ptr_   = other.cudnn_ptr_;
       hipblas_ptr_ = other.hipblas_ptr_;
@@ -143,6 +162,7 @@ struct DNNHandle {
       other.use_cudnn    = false;
       other.use_hipblas  = false;
       other.use_miopen   = false;
+      other.use_accelerate = false;
       other.cublas_ptr_  = nullptr;
       other.cudnn_ptr_   = nullptr;
       other.hipblas_ptr_ = nullptr;
