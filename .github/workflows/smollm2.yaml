@@ -64,7 +64,8 @@ jobs:
             -DKokkos_ROOT="${KOKKOS_INSTALL}" \
             -DKokkosDNN_ENABLE_TESTS=OFF \
             -DKokkosDNN_ENABLE_EXAMPLES=ON \
-            -DKokkosDNN_ENABLE_BENCHMARKS=OFF
+            -DKokkosDNN_ENABLE_BENCHMARKS=OFF \
+            -DKokkosDNN_ENABLE_COMPILER_WARNINGS=ON
 
       - name: Build examples
         run: cmake --build build --parallel "$(nproc)"

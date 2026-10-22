@@ -26,6 +26,16 @@ benchmarks/      microbenchmarks (native vs TPL dispatch)
 cmake/           config header + package config templates
 ```
 
+# Build Guidelines
+
+- All builds must be clean with `-DKokkosDNN_ENABLE_COMPILER_WARNINGS=ON`
+  (warning set mirroring `Kokkos_ENABLE_COMPILER_WARNINGS`, plus `-Werror`).
+  Every first-party target gets the flags via
+  `kokkosdnn_enable_compiler_warnings(<target>)`
+  (`cmake/KokkosDNNCompilerWarnings.cmake`); call it for each new target.
+  CI enables the option on every workflow, so a warning introduced anywhere
+  (library, tests, examples, benchmarks, server) fails CI.
+
 # Design Guidelines
 
 - Follow the Kokkos performance portability ethos. Unless necessary for some reason, implementations should not be gated on specific Kokkos backends or execution space types.

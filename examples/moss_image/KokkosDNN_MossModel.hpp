@@ -289,7 +289,6 @@ class Model {
 
     // Hoisted dims (device lambdas must not capture `this`/`cfg`).
     const size_t D = (size_t)cfg.hidden_size;
-    const size_t Hh = (size_t)cfg.mlp_hidden();
     const size_t nH = (size_t)cfg.num_heads;
     const size_t hd = D / nH;
     const float EPS = static_cast<float>(cfg.norm_eps);

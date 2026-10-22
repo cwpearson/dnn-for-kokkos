@@ -65,6 +65,9 @@ inline float bf16_to_fp32(uint16_t h) {
   return out;
 }
 
+#if !KOKKOSDNN_HAS_MMAP
+// Only the non-mmap (ifstream) checkpoint path uses this; guard the
+// definition so mmap builds do not see an unused function.
 uint64_t read_le64(std::ifstream& f) {
   unsigned char b[8];
   f.read(reinterpret_cast<char*>(b), 8);
@@ -73,6 +76,7 @@ uint64_t read_le64(std::ifstream& f) {
   for (int i = 7; i >= 0; --i) v = (v << 8) | b[i];
   return v;
 }
+#endif
 
 static uint64_t load_le64(const char* p) {
   const auto* b = reinterpret_cast<const unsigned char*>(p);
@@ -151,7 +155,7 @@ std::map<std::string, TensorMeta> parse_header(const std::string& js) {
   while (i < js.size()) {
     size_t a = js.find('"', i);
     if (a == std::string::npos) break;
-    size_t b = a + 1, esc = false;
+    size_t b = a + 1;
     // find closing quote
     std::string name;
     {

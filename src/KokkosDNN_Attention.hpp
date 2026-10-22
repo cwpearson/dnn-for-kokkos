@@ -10,6 +10,7 @@
 #include <string>
 #include <type_traits>
 #include "KokkosDNN_Handle.hpp"
+#include "KokkosDNN_Macros.hpp"
 #ifdef KOKKOSDNN_ENABLE_CUDNN
 #include "tpl/cudnn/KokkosDNN_CuDNN.hpp"
 #endif
@@ -305,7 +306,7 @@ struct GqaStreamingFunctor {
       // NaN can poison it). With vector_length == 1 there are no lanes: the
       // dots, the scalars, and the updates are plain serial code with no
       // coherence hazards, and skipping rows is always safe.
-      for (int rr = rank; rr < nqr; rr += team_n) {
+      for (int rr = rank; rr < (int)nqr; rr += team_n) {
         const size_t t = tbase + rr / HC;
         if (t >= Tloc) continue;  // dummy row of a partial edge chunk
         size_t klo_t = 0, khi_t = 0;
@@ -398,7 +399,7 @@ struct GqaStreamingFunctor {
     }
     // Write back: rows with no contributing key (l == 0) keep zeros,
     // matching the previous kernel's zero-init contract.
-    for (int rr = rank; rr < nqr; rr += team_n) {
+    for (int rr = rank; rr < (int)nqr; rr += team_n) {
       const size_t t = tbase + rr / HC;
       if (t >= Tloc) continue;  // dummy row of a partial edge chunk: no row
       const size_t h = hbase + rr % HC;
@@ -971,11 +972,11 @@ struct BidirFlashFunctor {
       float* __restrict__ qdst = qb + row * SQ + s * QSEG;
       if (t < Tloc) {
         const QP* qrowp = qbase + t * qs0 + h * qs1 + s * QSEG;
-#pragma unroll
+KOKKOSDNN_PRAGMA_UNROLL()
         for (int w = 0; w < 16; ++w)
           qdst[w] = static_cast<float>(qrowp[w]);
       } else {
-#pragma unroll
+KOKKOSDNN_PRAGMA_UNROLL()
         for (int w = 0; w < 16; ++w) qdst[w] = 0.0f;
       }
     }
@@ -1071,7 +1072,7 @@ struct BidirFlashFunctor {
             // Tile row bases hoisted out of the per-key loop.
             const float* __restrict__ kbase_r = buf.data() + koff + jj0 * KT * SD;
             const float* __restrict__ vbase_r = buf.data() + voff + jj0 * KT * SD;
-#pragma unroll 2
+KOKKOSDNN_PRAGMA_UNROLL_N(2)
             for (int kki = 0; kki < KT; ++kki) {
               const size_t kk = k0 + kki;
               if (kk >= Kloc) break;
@@ -1112,7 +1113,7 @@ struct BidirFlashFunctor {
                 const float aa = bidir_expf(m - st);
                 const float l_new = l * aa + 1.0f;
                 if constexpr (DMAX > 0) {
-#pragma unroll
+KOKKOSDNN_PRAGMA_UNROLL()
                   for (int e = 0; e < DMAX; e += 4) {
                     areg[e] = areg[e] * aa + vrow[e];
                     areg[e + 1] = areg[e + 1] * aa + vrow[e + 1];
@@ -1120,20 +1121,20 @@ struct BidirFlashFunctor {
                     areg[e + 3] = areg[e + 3] * aa + vrow[e + 3];
                   }
                 } else {
-                  size_t dd = 0;
-                  const size_t dend8 = Dloc & ~size_t(7);
-                  for (; dd < dend8; dd += 8) {
-                    accrow[dd] = accrow[dd] * aa + vrow[dd];
-                    accrow[dd + 1] = accrow[dd + 1] * aa + vrow[dd + 1];
-                    accrow[dd + 2] = accrow[dd + 2] * aa + vrow[dd + 2];
-                    accrow[dd + 3] = accrow[dd + 3] * aa + vrow[dd + 3];
-                    accrow[dd + 4] = accrow[dd + 4] * aa + vrow[dd + 4];
-                    accrow[dd + 5] = accrow[dd + 5] * aa + vrow[dd + 5];
-                    accrow[dd + 6] = accrow[dd + 6] * aa + vrow[dd + 6];
-                    accrow[dd + 7] = accrow[dd + 7] * aa + vrow[dd + 7];
+                  size_t dd2 = 0;
+                  const size_t dend8_2 = Dloc & ~size_t(7);
+                  for (; dd2 < dend8_2; dd2 += 8) {
+                    accrow[dd2] = accrow[dd2] * aa + vrow[dd2];
+                    accrow[dd2 + 1] = accrow[dd2 + 1] * aa + vrow[dd2 + 1];
+                    accrow[dd2 + 2] = accrow[dd2 + 2] * aa + vrow[dd2 + 2];
+                    accrow[dd2 + 3] = accrow[dd2 + 3] * aa + vrow[dd2 + 3];
+                    accrow[dd2 + 4] = accrow[dd2 + 4] * aa + vrow[dd2 + 4];
+                    accrow[dd2 + 5] = accrow[dd2 + 5] * aa + vrow[dd2 + 5];
+                    accrow[dd2 + 6] = accrow[dd2 + 6] * aa + vrow[dd2 + 6];
+                    accrow[dd2 + 7] = accrow[dd2 + 7] * aa + vrow[dd2 + 7];
                   }
-                  for (; dd < Dloc; ++dd)
-                    accrow[dd] = accrow[dd] * aa + vrow[dd];
+                  for (; dd2 < Dloc; ++dd2)
+                    accrow[dd2] = accrow[dd2] * aa + vrow[dd2];
                 }
                 m = st;
                 l = l_new;
@@ -1144,7 +1145,7 @@ struct BidirFlashFunctor {
                 const float gg = 1.0f / bidir_expf(m - st);
                 const float l_new = l + gg;
                 if constexpr (DMAX > 0) {
-#pragma unroll
+KOKKOSDNN_PRAGMA_UNROLL()
                   for (int e = 0; e < DMAX; e += 4) {
                     areg[e] += vrow[e] * gg;
                     areg[e + 1] += vrow[e + 1] * gg;
@@ -1152,19 +1153,19 @@ struct BidirFlashFunctor {
                     areg[e + 3] += vrow[e + 3] * gg;
                   }
                 } else {
-                  size_t dd = 0;
-                  const size_t dend8 = Dloc & ~size_t(7);
-                  for (; dd < dend8; dd += 8) {
-                    accrow[dd] += vrow[dd] * gg;
-                    accrow[dd + 1] += vrow[dd + 1] * gg;
-                    accrow[dd + 2] += vrow[dd + 2] * gg;
-                    accrow[dd + 3] += vrow[dd + 3] * gg;
-                    accrow[dd + 4] += vrow[dd + 4] * gg;
-                    accrow[dd + 5] += vrow[dd + 5] * gg;
-                    accrow[dd + 6] += vrow[dd + 6] * gg;
-                    accrow[dd + 7] += vrow[dd + 7] * gg;
+                  size_t dd2 = 0;
+                  const size_t dend8_2 = Dloc & ~size_t(7);
+                  for (; dd2 < dend8_2; dd2 += 8) {
+                    accrow[dd2] += vrow[dd2] * gg;
+                    accrow[dd2 + 1] += vrow[dd2 + 1] * gg;
+                    accrow[dd2 + 2] += vrow[dd2 + 2] * gg;
+                    accrow[dd2 + 3] += vrow[dd2 + 3] * gg;
+                    accrow[dd2 + 4] += vrow[dd2 + 4] * gg;
+                    accrow[dd2 + 5] += vrow[dd2 + 5] * gg;
+                    accrow[dd2 + 6] += vrow[dd2 + 6] * gg;
+                    accrow[dd2 + 7] += vrow[dd2 + 7] * gg;
                   }
-                  for (; dd < Dloc; ++dd) accrow[dd] += vrow[dd] * gg;
+                  for (; dd2 < Dloc; ++dd2) accrow[dd2] += vrow[dd2] * gg;
                 }
                 l = l_new;
               }
@@ -1182,7 +1183,7 @@ struct BidirFlashFunctor {
         if (l > 0.0f) {
           const float inv_l = 1.0f / l;
           if constexpr (DMAX > 0) {
-#pragma unroll
+KOKKOSDNN_PRAGMA_UNROLL()
             for (int e = 0; e < DMAX; e += 4) {
               const float w0 = areg[e] * inv_l;
               const float w1 = areg[e + 1] * inv_l;
@@ -1524,6 +1525,9 @@ void attention_bidirectional_streaming(const DNNHandle<ExecSpace>& handle,
   }
 #else
   (void)handle;
+  // attn_ws/attn_ws_elems feed only the cuDNN SDPA path above.
+  (void)attn_ws;
+  (void)attn_ws_elems;
 #endif
 #if defined(KOKKOSDNN_ENABLE_MIOPEN) && defined(KOKKOS_ENABLE_HIP)
   if constexpr (std::is_same_v<Scalar, float> ||

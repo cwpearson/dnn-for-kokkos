@@ -124,7 +124,7 @@ std::pair<uint64_t, uint64_t> record_range(
 // Values beyond strings/ints/tuples/maps never occur here.
 
 struct Value;
-using Dict = std::vector<std::pair<std::string, std::shared_ptr<Value>>>;
+using DictEntries = std::vector<std::pair<std::string, std::shared_ptr<Value>>>;
 
 struct Value {
   enum class Type { Nil, Bool, Int, Str, Tuple, Global, Storage, Tensor, Dict };
@@ -137,8 +137,8 @@ struct Value {
   int storage_id = -1;
   int64_t storage_offset = 0, numel = 0;
   std::vector<int64_t> shape, stride;
-  // Dict fields:
-  std::shared_ptr<Dict> dict = nullptr;
+  // DictEntries fields:
+  std::shared_ptr<DictEntries> dict = nullptr;
   // Storage fields: str=dtype, integer=numel, storage_id=record id.
 };
 
@@ -190,7 +190,7 @@ class Unpickler {
         case 0x7d: {  // EMPTY_DICT '}'
           Value v;
           v.type = Value::Type::Dict;
-          v.dict = std::make_shared<Dict>();
+          v.dict = std::make_shared<DictEntries>();
           stack_.push_back(v);
           break;
         }
@@ -325,7 +325,7 @@ class Unpickler {
   }
 
   // _metadata dict captured from the single BUILD (module prefix -> version).
-  std::shared_ptr<Dict> pending_metadata_;
+  std::shared_ptr<DictEntries> pending_metadata_;
 
  private:
   const std::vector<char>& b_;
@@ -456,7 +456,7 @@ class Unpickler {
         throw std::runtime_error("open_pth: OrderedDict with args");
       Value v;
       v.type = Value::Type::Dict;
-      v.dict = std::make_shared<Dict>();
+      v.dict = std::make_shared<DictEntries>();
       return v;
     }
     if (fn.str == "torch._utils _rebuild_tensor_v2") {
@@ -574,7 +574,7 @@ PthArchive open_pth(const std::string& path) {
       (*top.dict)[0].second->type != Impl::Value::Type::Dict)
     throw std::runtime_error("open_pth: '" + path +
                              "': expected {'state_dict': ...}");
-  const Impl::Dict& sd = *(*top.dict)[0].second->dict;
+  const Impl::DictEntries& sd = *(*top.dict)[0].second->dict;
 
   PthArchive ar;
   ar.path = path;

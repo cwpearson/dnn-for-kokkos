@@ -413,7 +413,7 @@ std::vector<std::string> expected_keys(const Config& cfg) {
   return ks;
 }
 
-size_t expected_numel(const Config& cfg, const std::string& key) {
+[[maybe_unused]] size_t expected_numel(const Config& cfg, const std::string& key) {
   (void)cfg;  // geometry cross-check helper (kept for diagnostics/tests)
   const size_t D = (size_t)cfg.hidden_size;
   const size_t Hh = (size_t)cfg.mlp_hidden();

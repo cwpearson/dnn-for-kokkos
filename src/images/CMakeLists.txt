@@ -88,11 +88,8 @@ target_link_libraries(kokkosdnn_image PUBLIC Kokkos::kokkos stb::stb)
 # stb warnings are silenced via the SYSTEM (-isystem) include above, so this
 # target keeps normal warning flags: only third-party stb code is muted,
 # our own code (here and header-inline in consumers) is still checked.
-if(KokkosDNN_ENABLE_COMPILER_WARNINGS)
-  target_compile_options(kokkosdnn_image PRIVATE -Wall -Wextra -Werror)
-endif()
-
 set_target_properties(kokkosdnn_image PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+kokkosdnn_enable_compiler_warnings(kokkosdnn_image)
 
 install(TARGETS kokkosdnn_image EXPORT KokkosDNNTragets
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}

@@ -44,6 +44,17 @@ struct LstmBidirStepFunctor {
 
   KOKKOS_INLINE_FUNCTION
   void operator()(const Member& m) const {
+    // Local handles: the KOKKOS_LAMBDAs below capture by value, so bind
+    // members to locals to avoid an implicit `this` capture (deprecated
+    // in C++20; an error under -Werror on the nvcc path).
+    const auto bia_ = bia;
+    const auto wih_ = wih;
+    const auto whh_ = whh;
+    const auto hc_ = hc;
+    const auto x_ = x;
+    const auto y_ = y;
+    const auto gates_ = gates;
+    const size_t H_ = H, D_ = D;
     const size_t r = (size_t)m.league_rank();
     const size_t b = r / 2;
     const size_t dir = r % 2;
@@ -54,25 +65,25 @@ struct LstmBidirStepFunctor {
       // Gate pre-activations: input part + bias + recurrent part.
       Kokkos::parallel_for(
           Kokkos::TeamThreadRange(m, H4), KOKKOS_LAMBDA(size_t k) {
-            float acc = bia(dir, k);
-            for (size_t j = 0; j < D; ++j) acc += wih(dir, k, j) * x(b, t, j);
-            for (size_t j = 0; j < H; ++j) acc += whh(dir, k, j) * hc(r, H + j);
-            gates(r, k) = acc;
+            float acc = bia_(dir, k);
+            for (size_t j = 0; j < D_; ++j) acc += wih_(dir, k, j) * x_(b, t, j);
+            for (size_t j = 0; j < H_; ++j) acc += whh_(dir, k, j) * hc_(r, H_ + j);
+            gates_(r, k) = acc;
           });
       m.team_barrier();
       // Recurrence update + output write, parallel over H (each h touches
       // only its own 4 gates and its own state/output slots).
       Kokkos::parallel_for(
           Kokkos::TeamThreadRange(m, H), KOKKOS_LAMBDA(size_t h) {
-            const float i = 1.0f / (1.0f + expf(-gates(r, h)));
-            const float f = 1.0f / (1.0f + expf(-gates(r, H + h)));
-            const float g = tanhf(gates(r, 2 * H + h));
-            const float o = 1.0f / (1.0f + expf(-gates(r, 3 * H + h)));
-            const float c = f * hc(r, h) + i * g;
+            const float i = 1.0f / (1.0f + expf(-gates_(r, h)));
+            const float f = 1.0f / (1.0f + expf(-gates_(r, H_ + h)));
+            const float g = tanhf(gates_(r, 2 * H_ + h));
+            const float o = 1.0f / (1.0f + expf(-gates_(r, 3 * H_ + h)));
+            const float c = f * hc_(r, h) + i * g;
             const float hh = o * tanhf(c);
-            hc(r, h) = c;
-            hc(r, H + h) = hh;
-            y(b, t, dir * H + h) = hh;
+            hc_(r, h) = c;
+            hc_(r, H_ + h) = hh;
+            y_(b, t, dir * H_ + h) = hh;
           });
       m.team_barrier();
     }

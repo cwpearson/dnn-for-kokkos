@@ -143,6 +143,12 @@ using DScalar = Scalar;  // placeholder model is float-only
 // backend-generic. The driver truncation length for the true config is 512
 // (the pipeline allows max_sequence_length up to 4096; longer prompts need
 // precomputed file embeds at this geometry — see README).
+// Backend-generic geometry helpers. The MO::Config (placeholder) overloads
+// are only reachable in non-DIT builds (cfg is MossImage::Config when the
+// DiT header is present); guard them so toolchain-strict -Wunused-function
+// (Clang) stays clean in DIT builds. The MossImage::Config overloads below
+// are likewise gated on MOSS_DRIVER_HAVE_MOSSIMAGE_OPS.
+#ifndef MOSS_DRIVER_HAVE_DIT
 inline size_t be_latent_channels(const MO::Config& c) {
   return (size_t)c.in_channels;
 }
@@ -157,6 +163,7 @@ inline int be_patch(const MO::Config& c) { return c.patch_size; }
 inline const char* be_label(const MO::Config&) {
   return "moss-sft (placeholder 24x1536/16ch/cap2048 geometry)";
 }
+#endif  // !MOSS_DRIVER_HAVE_DIT
 #ifdef MOSS_DRIVER_HAVE_MOSSIMAGE_OPS
 inline size_t be_latent_channels(const KokkosDNN::MossImage::Config& c) {
   return (size_t)c.latent_channels;
@@ -227,6 +234,9 @@ std::vector<unsigned char> render_preview(const std::vector<float>& lat,
   return img;
 }
 
+#ifndef KOKKOSDNN_ENABLE_IMAGE
+// PPM fallback writers: only the non-image build path (below) uses these;
+// guard them so image-enabled builds do not see unused functions.
 void save_ppm_rgb(const std::string& path,
                   const std::vector<unsigned char>& rgb, size_t H, size_t W) {
   std::ofstream f(path, std::ios::binary);
@@ -246,6 +256,7 @@ void save_ppm(const std::string& path, const std::vector<unsigned char>& gray,
           (long long)gray.size());
   if (!f) throw std::runtime_error("short write to '" + path + "'");
 }
+#endif
 
 std::string with_extension(const std::string& path, const std::string& ext) {
   const size_t dot = path.find_last_of('.');
@@ -1469,6 +1480,8 @@ int main(int argc, char** argv) {
       } else {
         save_ppm(ppm, pix, oH, oW);
       }
+      // oCh is only consumed by the PNG path above.
+      (void)oCh;
       std::printf("[wrote %s] %zux%zu %s (PPM)\n", ppm.c_str(), oH, oW,
                   decoded ? "VAE RGB" : "grayscale preview");
     }

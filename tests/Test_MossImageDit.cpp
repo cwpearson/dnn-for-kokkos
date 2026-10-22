@@ -335,7 +335,6 @@ TEST(MossDitLoader, Errors) {
     std::vector<SynthTensor> ts;
     for (size_t k = 0; k < specs.size(); ++k) {
       const auto& s = specs[k];
-      size_t n = s.matrix ? (size_t)s.d0 * (size_t)s.d1 : (size_t)s.d0;
       std::vector<int64_t> shape = s.matrix
                                        ? std::vector<int64_t>{s.d0, s.d1}
                                        : std::vector<int64_t>{s.d0};
@@ -494,7 +493,7 @@ TEST(MossDitForward, AllValidMatchesMasked) {
     Kokkos::View<float****, Kokkos::LayoutRight, Exec> out2("o2", B,
                                                             cfg.latent_channels,
                                                             H, W);
-    for (const std::vector<int> skips : {std::vector<int>{},
+    for (const auto& skips : {std::vector<int>{},
                                          std::vector<int>{1}}) {
       EXPECT_NO_THROW(model.forward(lat, t, enc, mask, out, skips));
       EXPECT_NO_THROW(model.forward_all_valid(lat, t, enc, out2, skips));

@@ -861,8 +861,8 @@ std::vector<ChatMessage> make_chat_messages(const std::string& prompt,
                                             const std::string& system,
                                             const std::string& role) {
   std::vector<ChatMessage> msgs;
-  if (!system.empty()) msgs.push_back({"system", system, ""});
-  msgs.push_back({role.empty() ? "user" : role, prompt, ""});
+  if (!system.empty()) msgs.push_back({"system", system, "", {}, ""});
+  msgs.push_back({role.empty() ? "user" : role, prompt, "", {}, ""});
   return msgs;
 }
 

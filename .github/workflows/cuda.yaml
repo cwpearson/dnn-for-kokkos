@@ -121,6 +121,7 @@ jobs:
             -DKokkosDNN_ENABLE_TEST_DISCOVERY=OFF \
             -DKokkosDNN_ENABLE_EXAMPLES=ON \
             -DKokkosDNN_ENABLE_BENCHMARKS=ON \
+            -DKokkosDNN_ENABLE_COMPILER_WARNINGS=ON \
             ${TPL_FLAGS}
 
       # Build every target (library, tests, examples). Deliberately does
