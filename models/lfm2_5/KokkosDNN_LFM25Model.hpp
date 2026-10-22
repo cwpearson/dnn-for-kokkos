@@ -110,33 +110,6 @@ void shortconv_state_update(
       });
 }
 
-// Add one expert's contribution: y[t,d] += sum_{k: idx[t,k]==e} w[t,k]*oe[t,d].
-// The expert outputs oe cover all tokens (no gather needed); rows the expert
-// was not routed to contribute nothing. Scalar-agnostic; FP32 accumulation.
-template <class ExecSpace, class Scalar>
-void moe_masked_accumulate(
-    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& oe,
-    const Kokkos::View<int**, Kokkos::LayoutRight, ExecSpace>& idx,
-    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& w,
-    int expert,
-    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& y,
-    const std::string& label = "KokkosDNN::LFM25::moe_accum") {
-  const size_t C = y.extent(0), D = y.extent(1), K = w.extent(1);
-  if (oe.extent(0) != C || oe.extent(1) != D || idx.extent(0) != C ||
-      idx.extent(1) != K || w.extent(0) != C)
-    throw std::invalid_argument("moe_masked_accumulate: dimension mismatch");
-  if (C == 0 || D == 0 || K == 0) return;
-  Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {C, D}),
-      KOKKOS_LAMBDA(size_t t, size_t d) {
-        float a = 0.0f;
-        for (size_t k = 0; k < K; ++k)
-          if (idx(t, k) == expert)
-            a += w(t, k) * static_cast<float>(oe(t, d));
-        y(t, d) = static_cast<Scalar>(static_cast<float>(y(t, d)) + a);
-      });
-}
-
 }  // namespace Impl
 
 // Autoregressive LFM2.5 hybrid model. Owns KV caches (attention layers
@@ -155,8 +128,9 @@ void moe_masked_accumulate(
 //     out_proj; then residual, ffn_norm, and
 //   dense SwiGLU FFN, or MoE (router gemm -> sigmoid moe_route_sigmoid
 //     with the optional expert bias for selection only, top-k norm and
-//     routing scale -> per-expert SwiGLU via
-//     quant_gemm -> weight-masked accumulation); then residual.
+//     routing scale -> sparse top-k dispatch: host groups each (token,
+//     slot) under its expert, then per routed expert a gathered SwiGLU
+//     via packed quant_gemm plus a weighted scatter-add); then residual.
 // Final rmsnorm + (possibly tied) lm_head gemv.
 //
 // KV cache: dense FP per attention layer ([max_seq_len, n_kv, head_dim],
@@ -198,6 +172,20 @@ class Model {
   MatR moe_logits_buf_, moe_oe_buf_;
   Kokkos::View<int**, Kokkos::LayoutRight, ExecSpace> moe_idx_buf_;
   Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace> moe_w_buf_;
+  // Sparse top-k dispatch staging: gathered expert inputs plus the row-id /
+  // weight vectors for the expert currently being processed. Sized by chunk
+  // capacity (one expert's rows N <= C always fit); carved via subview so
+  // steady decode performs no View allocations. Host mirrors and grouping
+  // workspace persist for the same reason (no per-layer host allocations).
+  MatR moe_gather_buf_;
+  ViewInt moe_row_buf_;
+  HostInt moe_row_host_;
+  Kokkos::View<float*, ExecSpace> moe_wstage_buf_;
+  typename Kokkos::View<float*, ExecSpace>::host_mirror_type moe_wstage_host_;
+  Kokkos::View<int**, Kokkos::LayoutRight, Kokkos::HostSpace> moe_idx_host_;
+  Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace> moe_w_host_;
+  std::vector<int> moe_cnt_, moe_off_, moe_pos_, moe_perm_;
+  std::vector<float> moe_perm_w_;
   View3 q3_buf_, k3_buf_, v3_buf_, attn_out_buf_;
   ViewInt pos_buf_;
   View1 last_buf_, logits_buf_;
@@ -305,7 +293,13 @@ class Model {
         k3_buf_.extent(1) == NKV && k3_buf_.extent(2) == HD &&
         pos_buf_.extent(0) >= T &&
         (E == 0 || (moe_logits_buf_.extent(1) == E &&
-                    moe_idx_buf_.extent(1) == TK)))
+                    moe_idx_buf_.extent(1) == TK &&
+                    moe_gather_buf_.extent(0) >= T &&
+                    moe_gather_buf_.extent(1) == DIM &&
+                    moe_row_buf_.extent(0) >= T &&
+                    moe_wstage_buf_.extent(0) >= T &&
+                    moe_idx_host_.extent(0) >= T &&
+                    moe_w_host_.extent(0) >= T)))
       return;
     h_buf_ = MatR("h", T, DIM);
     tmp_buf_ = MatR("tmp", T, DIM);
@@ -332,6 +326,22 @@ class Model {
       moe_w_buf_ = Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>(
           "moe_w", T, TK);
       moe_oe_buf_ = MatR("moe_oe", T, DIM);
+      // Sparse dispatch staging (capacity T rows; one expert's N <= C rows
+      // always fit). Host mirrors persist so steady decode allocates
+      // neither device nor host Views.
+      moe_gather_buf_ = MatR("moe_gather", T, DIM);
+      moe_row_buf_    = ViewInt("moe_row", T);
+      moe_row_host_   = HostInt("moe_row_host", T);
+      moe_wstage_buf_ = Kokkos::View<float*, ExecSpace>("moe_ws", T);
+      moe_wstage_host_ =
+          typename Kokkos::View<float*, ExecSpace>::host_mirror_type(
+              "moe_ws_host", T);
+      moe_idx_host_ =
+          Kokkos::View<int**, Kokkos::LayoutRight, Kokkos::HostSpace>(
+              "moe_idx_host", T, TK);
+      moe_w_host_ =
+          Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace>(
+              "moe_w_host", T, TK);
     }
     q3_buf_ = View3("q", T, NH, HD);
     k3_buf_ = View3("k", T, NKV, HD);
@@ -350,6 +360,99 @@ class Model {
     tok_buf_ = ViewInt("toks", n);
     tok_host_ = HostInt("toks_host", n);
     tok_cap_ = n;
+  }
+
+  // Sparse top-k MoE dispatch for one chunk: group the C*K (token, slot)
+  // pairs by selected expert on the host (counting sort over persistent
+  // workspace), then run each routed expert's SwiGLU over its gathered
+  // rows only and scatter-add the weighted outputs into y (which must be
+  // zeroed by the caller). Only routed experts launch GEMMs; unrouted
+  // experts contribute nothing and are skipped entirely.
+  // Only device subviews of persistent buffers are used (no View
+  // allocations); host grouping reuses moe_*_ workspace (no per-layer
+  // news). The two deep_copies per expert (<= C ints + floats) are the
+  // only host synchronization.
+  void moe_forward_sparse(
+      const BlockWeights<ExecSpace, Scalar>& b, const MatR& x,
+      const Kokkos::View<int**, Kokkos::LayoutRight, ExecSpace>& idx,
+      const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& w,
+      const MatR& y, size_t C, size_t MI) {
+    const size_t NE = b.gate_exps.size();
+    const size_t KK = idx.extent(1);
+    if (NE == 0 || KK == 0 || C == 0) return;
+    auto h_idx = Kokkos::subview(moe_idx_host_, std::make_pair(size_t(0), C),
+                                 Kokkos::ALL);
+    auto h_w = Kokkos::subview(moe_w_host_, std::make_pair(size_t(0), C),
+                               Kokkos::ALL);
+    Kokkos::deep_copy(h_idx, idx);
+    Kokkos::deep_copy(h_w, w);
+    if (moe_cnt_.size() != NE) {
+      moe_cnt_.assign(NE, 0);
+      moe_off_.resize(NE);
+      moe_pos_.resize(NE);
+    } else {
+      std::fill(moe_cnt_.begin(), moe_cnt_.end(), 0);
+    }
+    for (size_t t = 0; t < C; ++t)
+      for (size_t k = 0; k < KK; ++k) {
+        const int e = h_idx(t, k);
+        if (e < 0 || (size_t)e >= NE)
+          throw std::runtime_error(
+              "moe_forward_sparse: expert id out of range");
+        moe_cnt_[(size_t)e]++;
+      }
+    size_t total = 0;
+    for (size_t e = 0; e < NE; ++e) {
+      moe_off_[e] = (int)total;
+      total += (size_t)moe_cnt_[e];
+    }
+    if (moe_perm_.size() < total) {
+      moe_perm_.resize(total);
+      moe_perm_w_.resize(total);
+    }
+    moe_pos_ = moe_off_;
+    for (size_t t = 0; t < C; ++t)
+      for (size_t k = 0; k < KK; ++k) {
+        const size_t e = (size_t)h_idx(t, k);
+        const size_t p = (size_t)moe_pos_[e]++;
+        moe_perm_[p]   = (int)t;
+        moe_perm_w_[p] = h_w(t, k);
+      }
+    for (size_t e = 0; e < NE; ++e) {
+      const size_t N = (size_t)moe_cnt_[e];
+      if (N == 0) continue;
+      const size_t base = (size_t)moe_off_[e];
+      for (size_t n = 0; n < N; ++n) {
+        moe_row_host_(n)    = moe_perm_[base + n];
+        moe_wstage_host_(n) = moe_perm_w_[base + n];
+      }
+      auto rows = Kokkos::subview(moe_row_buf_, std::make_pair(size_t(0), N));
+      auto rhost =
+          Kokkos::subview(moe_row_host_, std::make_pair(size_t(0), N));
+      auto ws =
+          Kokkos::subview(moe_wstage_buf_, std::make_pair(size_t(0), N));
+      auto whost =
+          Kokkos::subview(moe_wstage_host_, std::make_pair(size_t(0), N));
+      Kokkos::deep_copy(rows, rhost);
+      Kokkos::deep_copy(ws, whost);
+      auto gx = Kokkos::subview(moe_gather_buf_, std::make_pair(size_t(0), N),
+                                Kokkos::ALL);
+      auto egate =
+          Kokkos::subview(gate_buf_, std::make_pair(size_t(0), N),
+                          std::make_pair(size_t(0), MI));
+      auto eup = Kokkos::subview(up_buf_, std::make_pair(size_t(0), N),
+                                 std::make_pair(size_t(0), MI));
+      auto eact = Kokkos::subview(act_buf_, std::make_pair(size_t(0), N),
+                                  std::make_pair(size_t(0), MI));
+      auto eoe = Kokkos::subview(moe_oe_buf_, std::make_pair(size_t(0), N),
+                                 Kokkos::ALL);
+      moe_gather_rows<ExecSpace, Scalar>(x, rows, gx);
+      Gguf::quant_gemm<ExecSpace, Scalar>(handle, gx, b.gate_exps[e], egate);
+      Gguf::quant_gemm<ExecSpace, Scalar>(handle, gx, b.up_exps[e], eup);
+      swiglu<ExecSpace, Scalar>(egate, eup, eact);
+      Gguf::quant_gemm<ExecSpace, Scalar>(handle, eact, b.down_exps[e], eoe);
+      moe_scatter_add_weighted<ExecSpace, Scalar>(eoe, rows, ws, y);
+    }
   }
 
  public:
@@ -554,10 +657,13 @@ class Model {
                                   static_cast<Scalar>(0), down);
         } else {
           // MoE: router -> sigmoid top-k route (optional expert bias for
-          // selection only, top-k norm, routing scale) -> per-expert SwiGLU
-          // via packed quant_gemm -> weight-masked accumulation. O(n_experts)
-          // GEMMs per layer: the PoC trades kernel count for zero host
-          // synchronization (no gather/scatter index juggling).
+          // selection only, top-k norm, routing scale) -> sparse top-k
+          // dispatch: each (token, slot) is grouped under its selected
+          // expert on the host (counting sort, persistent workspace), then
+          // per expert with N > 0 rows: gather N inputs -> SwiGLU via
+          // packed quant_gemm -> weighted scatter-add. Only routed experts
+          // run GEMMs (decode: <= top_k narrow GEMMs vs n_experts full
+          // ones).
           auto mlogits = Kokkos::subview(moe_logits_buf_,
                                          std::make_pair(size_t(0), C),
                                          Kokkos::ALL);
@@ -566,34 +672,13 @@ class Model {
                                       Kokkos::ALL);
           auto mw = Kokkos::subview(moe_w_buf_,
                                     std::make_pair(size_t(0), C), Kokkos::ALL);
-          auto moe_oe = Kokkos::subview(moe_oe_buf_,
-                                        std::make_pair(size_t(0), C),
-                                        Kokkos::ALL);
-          // Narrow expert-width working views out of the FFNm buffers.
-          auto egate = Kokkos::subview(
-              gate, Kokkos::ALL, std::make_pair(size_t(0), MI));
-          auto eup = Kokkos::subview(up, Kokkos::ALL,
-                                     std::make_pair(size_t(0), MI));
-          auto eact = Kokkos::subview(act, Kokkos::ALL,
-                                      std::make_pair(size_t(0), MI));
           gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), tmp2,
                                   b.gate_inp, static_cast<Scalar>(0), mlogits);
           moe_route_sigmoid<ExecSpace, Scalar>(mlogits, b.exp_bias, TOP_K,
                                                 ROT_NORM_TOPK, ROUTED_SCALE,
                                                 midx, mw);
           Kokkos::deep_copy(down, static_cast<Scalar>(0));
-          const size_t NE = b.gate_exps.size();
-          for (size_t e = 0; e < NE; ++e) {
-            Gguf::quant_gemm<ExecSpace, Scalar>(handle, tmp2, b.gate_exps[e],
-                                                egate);
-            Gguf::quant_gemm<ExecSpace, Scalar>(handle, tmp2, b.up_exps[e],
-                                                eup);
-            swiglu<ExecSpace, Scalar>(egate, eup, eact);
-            Gguf::quant_gemm<ExecSpace, Scalar>(handle, eact, b.down_exps[e],
-                                                moe_oe);
-            Impl::moe_masked_accumulate<ExecSpace, Scalar>(
-                moe_oe, midx, mw, (int)e, down);
-          }
+          moe_forward_sparse(b, tmp2, midx, mw, down, C, MI);
           (void)FFN;
         }
         Kokkos::parallel_for(

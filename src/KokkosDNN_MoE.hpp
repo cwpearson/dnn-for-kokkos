@@ -299,6 +299,55 @@ void moe_expert_weighted_sum(
       });
 }
 
+// Gather rows for sparse MoE dispatch: dst[n,d] = src[rows[n],d].
+// src [C,D], rows [N] with 0 <= rows[n] < C, dst [N,D]. Scalar-agnostic;
+// backend-portable MDRange kernel. No-op when N or D is 0.
+template <class ExecSpace, class Scalar>
+void moe_gather_rows(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& src,
+    const Kokkos::View<int*, ExecSpace>& rows,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& dst,
+    const std::string& label = "KokkosDNN::moe_gather") {
+  const size_t C = src.extent(0), D = src.extent(1), N = rows.extent(0);
+  if (dst.extent(0) != N || (N > 0 && dst.extent(1) != D) ||
+      (N > 0 && src.extent(1) != D))
+    throw std::invalid_argument("moe_gather_rows: dimension mismatch");
+  if (N == 0 || D == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {N, D}),
+      KOKKOS_LAMBDA(size_t n, size_t d) { dst(n, d) = src(rows(n), d); });
+}
+
+// Weighted scatter-add for sparse MoE combine:
+// dst[rows[n],d] += weights[n] * src[n,d] (FP32 accumulation).
+// src [N,D], rows [N], weights [N], dst [C,D]. `rows` must hold unique
+// entries (true for top-k dispatch: one token routes to distinct experts,
+// so it appears at most once in any single expert's list); each (n,d)
+// thread then owns its (t,d) output and no atomics are needed.
+// Scalar-agnostic; backend-portable MDRange kernel. No-op when N or D is 0.
+template <class ExecSpace, class Scalar>
+void moe_scatter_add_weighted(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& src,
+    const Kokkos::View<int*, ExecSpace>& rows,
+    const Kokkos::View<float*, ExecSpace>& weights,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& dst,
+    const std::string& label = "KokkosDNN::moe_scatter") {
+  const size_t N = rows.extent(0), D = dst.extent(1), C = dst.extent(0);
+  if (src.extent(0) != N || weights.extent(0) != N ||
+      (N > 0 && src.extent(1) != D))
+    throw std::invalid_argument(
+        "moe_scatter_add_weighted: dimension mismatch");
+  if (N == 0 || D == 0 || C == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {N, D}),
+      KOKKOS_LAMBDA(size_t n, size_t d) {
+        const size_t t = static_cast<size_t>(rows(n));
+        dst(t, d) = static_cast<Scalar>(static_cast<float>(dst(t, d)) +
+                                        weights(n) *
+                                            static_cast<float>(src(n, d)));
+      });
+}
+
 }  // namespace KokkosDNN
 
 #endif

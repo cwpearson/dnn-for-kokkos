@@ -92,4 +92,4 @@ Unit tests (`Test_LFM25Config`, `Test_LFM25Generate`, `Test_LFM25Tokenizer`) are
 
 - KV cache: only the 10 attention layers rent KV (`10 × seq × 8 kv heads × 64 head_dim × 2 (K+V) × elem`): 160 MiB BF16 at the PoC default `max_seq_len=8192` (320 MiB FP32); the full 131072 arch window rents ~2.5 GiB BF16 — raise via `--max-seq-len` / `--config` explicitly. The 30 conv layers rent only fixed `[dim, conv_L_cache-1]` state each (~240 KiB total at dim 2048).
 - `--prefill-chunk N` caps prefill activations at `O(N·dim)`; chunking is exact (KV prefix + conv-state chaining).
-- MoE path runs one GEMM per expert per layer (kernel count scales with expert count); no TPL dispatch on the gather-GEMM path yet.
+- MoE path runs one narrow GEMM per routed expert per layer (decode: at most top_k); unrouted experts are skipped. No TPL dispatch on the gather-GEMM path yet.

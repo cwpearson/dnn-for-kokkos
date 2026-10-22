@@ -255,6 +255,89 @@ TEST(MoE, RejectsBadArgs) {
       std::invalid_argument);
 }
 
+TEST(MoE, GatherRowsMatchesHost) {
+  // dst[n,d] = src[rows[n],d], incl. repeated and permuted rows.
+  const size_t C = 4, D = 3, N = 5;
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> src("src", C, D);
+  Kokkos::View<int*, Exec> rows("rows", N);
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> dst("dst", N, D);
+  auto hsrc = Kokkos::create_mirror_view(src);
+  auto hrows = Kokkos::create_mirror_view(rows);
+  for (size_t t = 0; t < C; ++t)
+    for (size_t d = 0; d < D; ++d)
+      hsrc(t, d) = 10.0f * (float)t + (float)d;
+  const int order[5] = {3, 0, 3, 1, 2};
+  for (size_t n = 0; n < N; ++n) hrows(n) = order[n];
+  Kokkos::deep_copy(src, hsrc);
+  Kokkos::deep_copy(rows, hrows);
+  KokkosDNN::moe_gather_rows<Exec, float>(src, rows, dst);
+  Kokkos::fence();
+  auto got = Kokkos::create_mirror_view(dst);
+  Kokkos::deep_copy(got, dst);
+  for (size_t n = 0; n < N; ++n)
+    for (size_t d = 0; d < D; ++d)
+      EXPECT_FLOAT_EQ(got(n, d), hsrc(order[n], d)) << " at (" << n << "," << d
+                                                    << ")";
+  // Empty gather is a no-op (dst untouched, no throw).
+  Kokkos::View<int*, Exec> norows("norows", 0);
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> nodst("nodst", 0, D);
+  EXPECT_NO_THROW(
+      (KokkosDNN::moe_gather_rows<Exec, float>(src, norows, nodst)));
+  // Mismatched dst rows throw.
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> bad("bad", N + 1, D);
+  EXPECT_THROW((KokkosDNN::moe_gather_rows<Exec, float>(src, rows, bad)),
+               std::invalid_argument);
+}
+
+TEST(MoE, ScatterAddWeightedMatchesHost) {
+  // dst[t,d] += weights[n] * src[n,d] over unique rows.
+  const size_t C = 4, D = 3, N = 3;
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> src("ssrc", N, D);
+  Kokkos::View<int*, Exec> rows("srows", N);
+  Kokkos::View<float*, Exec> weights("sw", N);
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> dst("sdst", C, D);
+  auto hsrc = Kokkos::create_mirror_view(src);
+  auto hrows = Kokkos::create_mirror_view(rows);
+  auto hw = Kokkos::create_mirror_view(weights);
+  auto hdst = Kokkos::create_mirror_view(dst);
+  const int order[3] = {2, 0, 3};
+  const float wv[3] = {0.5f, -1.0f, 2.0f};
+  for (size_t n = 0; n < N; ++n) {
+    hrows(n) = order[n];
+    hw(n) = wv[n];
+    for (size_t d = 0; d < D; ++d)
+      hsrc(n, d) = (float)(n * 10 + d) - 3.0f;
+  }
+  for (size_t t = 0; t < C; ++t)
+    for (size_t d = 0; d < D; ++d) hdst(t, d) = 0.25f * (float)(t + d);
+  Kokkos::deep_copy(src, hsrc);
+  Kokkos::deep_copy(rows, hrows);
+  Kokkos::deep_copy(weights, hw);
+  Kokkos::deep_copy(dst, hdst);
+  KokkosDNN::moe_scatter_add_weighted<Exec, float>(src, rows, weights, dst);
+  Kokkos::fence();
+  auto got = Kokkos::create_mirror_view(dst);
+  Kokkos::deep_copy(got, dst);
+  for (size_t n = 0; n < N; ++n)
+    for (size_t d = 0; d < D; ++d)
+      hdst(order[n], d) += wv[n] * hsrc(n, d);
+  for (size_t t = 0; t < C; ++t)
+    for (size_t d = 0; d < D; ++d)
+      EXPECT_FLOAT_EQ(got(t, d), hdst(t, d)) << " at (" << t << "," << d << ")";
+  // Empty scatter is a no-op.
+  Kokkos::View<int*, Exec> norows("snorows", 0);
+  Kokkos::View<float*, Exec> now("snow", 0);
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> nosrc("snosrc", 0, D);
+  EXPECT_NO_THROW(
+      (KokkosDNN::moe_scatter_add_weighted<Exec, float>(nosrc, norows, now,
+                                                        dst)));
+  // Mismatched weight count throws.
+  Kokkos::View<float*, Exec> badw("sbadw", N + 1);
+  EXPECT_THROW(
+      (KokkosDNN::moe_scatter_add_weighted<Exec, float>(src, rows, badw, dst)),
+      std::invalid_argument);
+}
+
 // Independent host reference for sigmoid routing (HF Lfm2MoeTopKRouter):
 // selection over sigmoid(logit) + bias, weights are gathered sigmoids
 // (bias excluded), renormalized over K with the HF 1e-6 epsilon when
