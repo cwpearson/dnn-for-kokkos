@@ -59,12 +59,11 @@ For a non-Ampere GPU, target it natively with
 
 | Param | Mapping |
 |---|---|
-| `messages[]` | `role` in `system,user,assistant,tool` (`developer`→`user`); string `content` (text-part arrays joined; `null` allowed on assistant turns with `tool_calls` and on `tool` results); assistant `tool_calls[]` (`{id?, function:{name, arguments}}`, arguments string or object); rendered via `render_lfm25_chatml` + `encode_chatml` |
-| `tools[]` | OpenAI function tools (`{type:"function", function:{name, description?, parameters?}}`); bare-function JSON appended to the system prompt as `List of tools: [...]` (official LFM2.5 template) |
-| `tool_choice` | `"auto"` (default) consider tools; `"none"` disables tool use; `"required"` / `{"type":"function","function":{"name"}}` accepted as a hint (rendered like `"auto"` — forcing a call would need constrained decoding, so the model still decides) |
-| `messages[]` history | `tool` role blocks render as `<|im_start|>tool`; assistant `tool_calls` render as native `<|tool_call_start|>[name(arg='v', ...)]<|tool_call_end|>` |
-| tool results | model-native tool blocks are parsed back: `finish_reason:"tool_calls"`, `message:{role, content, tool_calls:[{id,type:"function",function:{name,arguments}}]}` (`content` is `null` for pure calls); no tool blocks → plain `stop`/`length` reply |
-| `stream` + tools | buffered: full generation first (tool calls are only known once the native block completes), then standard SSE `role` / `content` / per-call `tool_calls[{index,id,...}]` deltas + final usage chunk; without tools, per-token content streaming as before |
+| `messages[]` | `role` in `system,user,assistant,tool` (`developer`→`user`, `function`→`tool`); string `content` (text-part arrays joined); assistant turns may carry `tool_calls` (validated, `content` may be `null`); rendered via `render_lfm25_chatml_with_tools` + `encode_chatml_with_tools` |
+| `tools[]` | `[{type:"function", function:{name, description?, parameters?, strict?}}]` validated, then injected as `List of tools: [...]` JSON in the system prompt (native LFM2.5 tool format); `[]` = no-op |
+| `tool_choice` | `"auto"` (default) \| `"none"` (no injection) \| `"required"` / `{"type":"function","function":{"name"}}` (best-effort `MUST call` system directive — prompted, not constrained) |
+| `parallel_tool_calls` | `false` keeps only the first parsed call (default `true`) |
+| `response_format` | `{"type":"text"}` (default) \| `{"type":"json_object"}` \| `{"type":"json_schema", json_schema:{...}}`: adds a JSON-only system instruction and strips ``` fences (non-streaming); the schema is recorded but **not enforced** (no grammar-constrained decoding — validate client-side) |
 | `temperature, top_p, top_k, min_p, repetition_penalty` | `SampleOptions` verbatim (absent = session default; `temperature` 0 = greedy) |
 | `frequency_penalty, presence_penalty` | `SampleOptions` verbatim |
 | `logit_bias` | `{token_id: bias}` dict → `vector<pair<int,float>>` |
@@ -76,11 +75,32 @@ For a non-Ampere GPU, target it natively with
 | `model` | must match `--model` or be absent, else 400 |
 | unknown fields | ignored |
 
+Agentic loop: with `tools` set, a turn that emits native
+`<|tool_call_start|>[name(args)]<|tool_call_end|>` blocks returns
+`finish_reason:"tool_calls"` with an OpenAI `tool_calls` payload (fresh
+`call-kdnn-N` ids, `content` is the surrounding text or `null`) instead of
+leaking marker text into `content`. Execute the functions, append the
+assistant turn (with its `tool_calls`) plus one `tool`-role message per
+result, and call again. Streaming emits content deltas live, then one
+`tool_calls` delta chunk per call, then the `tool_calls` finish chunk.
+`tool` history turns render natively, so multi-turn loops are exact.
+
 Unsupported (400 `invalid_request_error`, never silently ignored):
-`n>1`, legacy `functions` / `function_call`, `response_format`,
-`function` message roles, non-text content parts, prompts past
-`max_seq_len`. (`tools` on the legacy `/v1/completions` route is also 400 —
-use `/v1/chat/completions`.)
+`n>1`, legacy `functions` / `function_call` (retired; use
+`tools`/`tool_choice`), unknown `tool_choice`/`response_format` shapes,
+`tool_calls` on non-assistant messages, message-level `function_call`,
+non-text content parts, prompts past `max_seq_len`. `tools`,
+`tool_choice`, `response_format` are rejected on `POST /v1/completions`
+(chat only).
+
+Limits to know:
+- `tool_choice:"required"`/named and `response_format` JSON modes are
+  prompt-level hints, not hard guarantees: without constrained decoding
+  the model can still answer in plain text. Treat a missing `tool_calls`
+  (or non-JSON content) as a normal `stop` turn and retry/reprompt.
+- Only `function` tools / `function` tool_choice targets are supported.
+- `response_format` fence-stripping applies to non-streaming replies;
+  streamed JSON deltas arrive unmodified.
 
 ## Errors
 
