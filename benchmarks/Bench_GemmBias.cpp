@@ -81,6 +81,7 @@ void run_gemm_bias(benchmark::State& state, bool force_native) {
   KokkosDNN::DNNHandle<Exec> h_native;
   h_native.use_cublas = false;
   h_native.use_cudnn  = false;
+  h_native.use_accelerate = false;
   KokkosDNN::DNNHandle<Exec> h_tpl;  // configured default (TPL when enabled)
   const KokkosDNN::DNNHandle<Exec>* hp = force_native ? &h_native : &h_tpl;
 
@@ -110,6 +111,7 @@ void run_gemv_bias(benchmark::State& state, bool force_native) {
   KokkosDNN::DNNHandle<Exec> h_native;
   h_native.use_cublas = false;
   h_native.use_cudnn  = false;
+  h_native.use_accelerate = false;
   KokkosDNN::DNNHandle<Exec> h_tpl;
   const KokkosDNN::DNNHandle<Exec>* hp = force_native ? &h_native : &h_tpl;
 
@@ -139,6 +141,7 @@ void run_dense_forward(benchmark::State& state, bool force_native) {
   KokkosDNN::DNNHandle<Exec> h_native;
   h_native.use_cublas = false;
   h_native.use_cudnn  = false;
+  h_native.use_accelerate = false;
   KokkosDNN::DNNHandle<Exec> h_tpl;
   const KokkosDNN::DNNHandle<Exec>* hp = force_native ? &h_native : &h_tpl;
 

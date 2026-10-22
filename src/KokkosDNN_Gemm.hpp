@@ -4,6 +4,7 @@
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -13,6 +14,9 @@
 #endif
 #ifdef KOKKOSDNN_ENABLE_HIPBLAS
 #include "tpl/hipblas/KokkosDNN_HIPBLAS.hpp"
+#endif
+#ifdef KOKKOSDNN_ENABLE_ACCELERATE
+#include "tpl/accelerate/KokkosDNN_Accelerate.hpp"
 #endif
 
 namespace KokkosDNN {
@@ -764,6 +768,31 @@ void gemm(const DNNHandle<ExecSpace>& handle, Scalar alpha,
     }
   }
 #endif
+#ifdef KOKKOSDNN_ENABLE_ACCELERATE
+  // Host-memory spaces only (Serial/OpenMP/Threads): Accelerate's CPU
+  // sgemm reads/writes the View buffers directly. float only; other
+  // scalars (e.g. bhalf_t) fall through to the native kernel. Stateless,
+  // so no handle caching -- fence once so prior Kokkos work on the
+  // buffers is complete before the synchronous CPU call.
+  constexpr bool is_host_mem_gemm =
+      std::is_same_v<typename ExecSpace::memory_space, Kokkos::HostSpace>;
+  if constexpr (is_host_mem_gemm) {
+    if (handle.use_accelerate) {
+      if constexpr (std::is_same_v<Scalar, float>) {
+        constexpr size_t kMax = static_cast<size_t>(
+            (std::numeric_limits<int>::max)());
+        if (M > 0 && N > 0 && K > 0 && M <= kMax && N <= kMax && K <= kMax) {
+          Kokkos::fence();
+          if (Impl::accelerate_gemm_nt_float(
+                  static_cast<int>(M), static_cast<int>(N),
+                  static_cast<int>(K), alpha, X.data(), X.stride(0), W.data(),
+                  W.stride(0), beta, Y.data(), Y.stride(0)))
+            return;
+        }
+      }
+    }
+  }
+#endif
   // Native: rank-2 M == 1 is the same working set as GEMV (lm_head/vocab
   // row), so it reuses the team-per-row GEMV kernel with alpha/beta (one
   // team per N-row, vector-parallel K) instead of the tiled GEMM; M > 1
@@ -852,6 +881,27 @@ void gemv(const DNNHandle<ExecSpace>& handle,
         }
         if (ok) return;
         // else fall through to native (unsupported scalar or hipBLAS failure)
+      }
+    }
+  }
+#endif
+#ifdef KOKKOSDNN_ENABLE_ACCELERATE
+  // Host-memory M==1 GEMM via Accelerate (same NT sgemm as gemm(); x is a
+  // contiguous [K] row, y a contiguous [N] row). float only.
+  constexpr bool is_host_mem_gemv =
+      std::is_same_v<typename ExecSpace::memory_space, Kokkos::HostSpace>;
+  if constexpr (is_host_mem_gemv) {
+    if (handle.use_accelerate && N > 0 && K > 0) {
+      if constexpr (std::is_same_v<Scalar, float>) {
+        constexpr size_t kMaxV = static_cast<size_t>(
+            (std::numeric_limits<int>::max)());
+        if (N <= kMaxV && K <= kMaxV) {
+          Kokkos::fence();
+          if (Impl::accelerate_gemm_nt_float(
+                  1, static_cast<int>(N), static_cast<int>(K), 1.0f, x.data(),
+                  K, W.data(), W.stride(0), 0.0f, y.data(), N))
+            return;
+        }
       }
     }
   }

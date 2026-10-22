@@ -347,11 +347,18 @@ void check_reset_chunked() {
   auto second = logits_vec(m.forward(make_tok_view(m, prompt)));
   expect_logits_eq<Scalar>(first, second);
 
-  // Chunked-after-reset matches single-shot fresh reference.
+  // Chunked-after-reset matches single-shot fresh reference. Same-shapes
+  // reruns above stay bit-exact, but chunked (M=2) vs single-shot (M=T)
+  // GEMMs are not: the vendor kernel/tiling depends on M (documented for
+  // cuBLAS in check_chunked_prefill; Accelerate sgemm behaves the same),
+  // differing by ~1e-7 in FP32. Compare with tolerance, as there.
+  constexpr float tol = std::is_same_v<Scalar, float> ? 1e-5f : 1e-2f;
   Model<Exec, Scalar> ref(cfg, w);
   ref.cfg.prefill_chunk_size = 0;
   auto expect = logits_vec(ref.forward(make_tok_view(ref, prompt)));
-  expect_logits_eq<Scalar>(second, expect);
+  ASSERT_EQ(second.size(), expect.size());
+  for (size_t i = 0; i < second.size(); ++i)
+    EXPECT_NEAR(second[i], expect[i], tol) << "logit " << i;
 }
 
 TEST(LlamaReset, ChunkedPathFloat) { check_reset_chunked<float>(); }

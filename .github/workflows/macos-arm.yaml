@@ -28,6 +28,16 @@ jobs:
     # 2026; Intel images are suffixed -intel). Unpinned on purpose: the build
     # (Serial + Threads, no arch-specific flags) is portable across Apple
     # Silicon generations, and tracking latest keeps Xcode/AppleClang fresh.
+    # Two legs via matrix (quotes are load-bearing: unquoted ON/OFF parse
+    # as YAML booleans):
+    #  - accelerate=OFF: pure native Kokkos GEMM.
+    #  - accelerate=ON: GEMM/GEMV via Apple Accelerate cblas_sgemm
+    #    (KokkosDNN_ENABLE_ACCELERATE); Mac-only, no extra install.
+    name: macos-arm (accelerate=${{ matrix.accelerate }})
+    strategy:
+      fail-fast: false
+      matrix:
+        accelerate: ['OFF', 'ON']
     runs-on: macos-latest
     env:
       KOKKOS_VERSION: 5.2.1
@@ -83,7 +93,8 @@ jobs:
             -DKokkosDNN_ENABLE_TESTS=ON \
             -DKokkosDNN_ENABLE_EXAMPLES=ON \
             -DKokkosDNN_ENABLE_BENCHMARKS=ON \
-            -DKokkosDNN_ENABLE_IMAGE=ON
+            -DKokkosDNN_ENABLE_IMAGE=ON \
+            -DKokkosDNN_ENABLE_ACCELERATE=${{ matrix.accelerate }}
 
       # Build every target (library, tests, examples, benchmarks).
       - name: Build everything

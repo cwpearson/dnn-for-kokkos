@@ -77,6 +77,7 @@ void check_gemm_edges(int M, int N, int K, float tol) {
   KokkosDNN::DNNHandle<Exec> h;
   h.use_cublas = false;
   h.use_cudnn  = false;
+  h.use_accelerate = false;
   Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> X("X", M, K), W("W", N, K),
       Y("Y", M, N);
   auto hx = Kokkos::create_mirror_view(X);

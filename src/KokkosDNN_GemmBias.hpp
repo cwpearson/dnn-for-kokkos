@@ -78,6 +78,8 @@ void add_bias_1d(const Kokkos::View<Scalar*, ExecSpace>& y,
 //     sgemm/cublasGemmEx + add_bias_2d when Lt cannot serve the shape.
 //   * HIP + hipBLAS, float/bhalf_t: hipBLAS GEMM + add_bias_2d (unchanged
 //     split; no hipBLASLt epilogue wired up -- no GEMM-speed regression).
+//   * Host + Accelerate, float: Accelerate sgemm + add_bias_2d (split;
+//     bhalf_t and strided shapes fall back to native).
 //   * Native (TPL off/unavailable, other scalars): bias is folded into the
 //     tiled GEMM (or M == 1 GEMV) write-back, so the native path is exactly
 //     one kernel launch.
@@ -152,6 +154,22 @@ void gemm_bias(
         (std::is_same_v<Scalar, float> ||
          std::is_same_v<Scalar, Kokkos::Experimental::bhalf_t>) &&
         handle.hipblas_raw() != nullptr) {
+      gemm(handle, static_cast<Scalar>(1), X, W, static_cast<Scalar>(0), Y,
+           label);
+      Impl::add_bias_2d<ExecSpace, Scalar>(Y, b, label + "_bias");
+      return;
+    }
+  }
+#endif
+#ifdef KOKKOSDNN_ENABLE_ACCELERATE
+  // Host-memory split only (no fused epilogue): Accelerate sgemm for the
+  // GEMM plus the portable bias kernel. float only; the gemm() call below
+  // re-enters the Accelerate ladder, so non-contiguous/strided shapes still
+  // fall back cleanly to native.
+  constexpr bool is_host_mem_bias =
+      std::is_same_v<typename ExecSpace::memory_space, Kokkos::HostSpace>;
+  if constexpr (is_host_mem_bias) {
+    if (handle.use_accelerate && std::is_same_v<Scalar, float>) {
       gemm(handle, static_cast<Scalar>(1), X, W, static_cast<Scalar>(0), Y,
            label);
       Impl::add_bias_2d<ExecSpace, Scalar>(Y, b, label + "_bias");
@@ -234,6 +252,18 @@ void gemv_bias(
         (std::is_same_v<Scalar, float> ||
          std::is_same_v<Scalar, Kokkos::Experimental::bhalf_t>) &&
         handle.hipblas_raw() != nullptr) {
+      gemv(handle, x, W, y, label);
+      Impl::add_bias_1d<ExecSpace, Scalar>(y, b, label + "_bias");
+      return;
+    }
+  }
+#endif
+#ifdef KOKKOSDNN_ENABLE_ACCELERATE
+  // Host-memory split only (mirrors the rank-2 path above).
+  constexpr bool is_host_mem_gemv_bias =
+      std::is_same_v<typename ExecSpace::memory_space, Kokkos::HostSpace>;
+  if constexpr (is_host_mem_gemv_bias) {
+    if (handle.use_accelerate && std::is_same_v<Scalar, float>) {
       gemv(handle, x, W, y, label);
       Impl::add_bias_1d<ExecSpace, Scalar>(y, b, label + "_bias");
       return;

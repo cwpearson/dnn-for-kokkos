@@ -27,6 +27,11 @@ void print_configuration(std::ostream& os) {
 #else
   os << "  MIOpen dispatch: OFF (native Kokkos conv/attention)\n";
 #endif
+#ifdef KOKKOSDNN_ENABLE_ACCELERATE
+  os << "  Accelerate dispatch: ON\n";
+#else
+  os << "  Accelerate dispatch: OFF (native Kokkos GEMM)\n";
+#endif
   os << "  Kokkos backends:";
 #ifdef KOKKOS_ENABLE_SERIAL
   os << " Serial";
