@@ -59,7 +59,12 @@ For a non-Ampere GPU, target it natively with
 
 | Param | Mapping |
 |---|---|
-| `messages[]` | `role` in `system,user,assistant` (`developer`→`user`); string `content` (text-part arrays joined); rendered via `render_lfm25_chatml` + `encode_chatml` |
+| `messages[]` | `role` in `system,user,assistant,tool` (`developer`→`user`); string `content` (text-part arrays joined; `null` allowed on assistant turns with `tool_calls` and on `tool` results); assistant `tool_calls[]` (`{id?, function:{name, arguments}}`, arguments string or object); rendered via `render_lfm25_chatml` + `encode_chatml` |
+| `tools[]` | OpenAI function tools (`{type:"function", function:{name, description?, parameters?}}`); bare-function JSON appended to the system prompt as `List of tools: [...]` (official LFM2.5 template) |
+| `tool_choice` | `"auto"` (default) consider tools; `"none"` disables tool use; `"required"` / `{"type":"function","function":{"name"}}` accepted as a hint (rendered like `"auto"` — forcing a call would need constrained decoding, so the model still decides) |
+| `messages[]` history | `tool` role blocks render as `<|im_start|>tool`; assistant `tool_calls` render as native `<|tool_call_start|>[name(arg='v', ...)]<|tool_call_end|>` |
+| tool results | model-native tool blocks are parsed back: `finish_reason:"tool_calls"`, `message:{role, content, tool_calls:[{id,type:"function",function:{name,arguments}}]}` (`content` is `null` for pure calls); no tool blocks → plain `stop`/`length` reply |
+| `stream` + tools | buffered: full generation first (tool calls are only known once the native block completes), then standard SSE `role` / `content` / per-call `tool_calls[{index,id,...}]` deltas + final usage chunk; without tools, per-token content streaming as before |
 | `temperature, top_p, top_k, min_p, repetition_penalty` | `SampleOptions` verbatim (absent = session default; `temperature` 0 = greedy) |
 | `frequency_penalty, presence_penalty` | `SampleOptions` verbatim |
 | `logit_bias` | `{token_id: bias}` dict → `vector<pair<int,float>>` |
@@ -72,9 +77,10 @@ For a non-Ampere GPU, target it natively with
 | unknown fields | ignored |
 
 Unsupported (400 `invalid_request_error`, never silently ignored):
-`n>1`, `tools` / `functions` / `function_call` / `tool_choice`,
-`response_format`, `tool`/`function` message roles, `tool_calls` payloads,
-non-text content parts, prompts past `max_seq_len`.
+`n>1`, legacy `functions` / `function_call`, `response_format`,
+`function` message roles, non-text content parts, prompts past
+`max_seq_len`. (`tools` on the legacy `/v1/completions` route is also 400 —
+use `/v1/chat/completions`.)
 
 ## Errors
 
