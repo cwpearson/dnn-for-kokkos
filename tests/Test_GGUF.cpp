@@ -165,16 +165,18 @@ TEST(GgufDequant, Q4KHandComputed) {
   dequant_q4k_block(&b, out);
 
   // Hand-computed spots: val = dall*sc*nib + (-2.0)*mn.
+  // Pairing (ggml): 64-element group `iter` uses sub-block scale 2*iter for
+  // the low nibbles and 2*iter+1 for the high nibbles.
   EXPECT_FLOAT_EQ(out[0], 0.0f);    // iter0 low, grp0: 1*1*0 - 2*0
   EXPECT_FLOAT_EQ(out[5], 5.0f);    // iter0 low, grp0: 1*1*5
-  EXPECT_FLOAT_EQ(out[32], -6.0f);  // iter0 high, grp4: 1*1*0 - 2*3
-  EXPECT_FLOAT_EQ(out[49], -5.0f);  // iter0 high l=17: 1*1*1 - 6
-  EXPECT_FLOAT_EQ(out[67], 4.0f);   // iter1 low l=3: 2*3 - 2*1
-  EXPECT_FLOAT_EQ(out[103], 4.0f);  // iter1 high l=7: 2*2 - 0
-  EXPECT_FLOAT_EQ(out[159], 45.0f);  // iter2 low l=31: 3*15 - 0
-  EXPECT_FLOAT_EQ(out[160], 2.0f);   // iter2 high l=0: 1*4 - 2*1
-  EXPECT_FLOAT_EQ(out[202], 36.0f);  // iter3 low l=10: 4*10 - 2*2
-  EXPECT_FLOAT_EQ(out[244], 24.0f);  // iter3 high l=20: 4*7 - 4
+  EXPECT_FLOAT_EQ(out[32], -2.0f);  // iter0 high, grp1: 2*0 - 2*1
+  EXPECT_FLOAT_EQ(out[49], 0.0f);   // iter0 high l=17: 2*1 - 2*1
+  EXPECT_FLOAT_EQ(out[67], 9.0f);   // iter1 low l=3: 3*3 - 2*0
+  EXPECT_FLOAT_EQ(out[103], 4.0f);  // iter1 high l=7: 4*2 - 2*2
+  EXPECT_FLOAT_EQ(out[159], 9.0f);  // iter2 low l=31: 1*15 - 2*3
+  EXPECT_FLOAT_EQ(out[160], 8.0f);  // iter2 high l=0: 2*4 - 2*0
+  EXPECT_FLOAT_EQ(out[202], 8.0f);  // iter3 low l=10: 1*10 - 2*1
+  EXPECT_FLOAT_EQ(out[244], 24.0f);  // iter3 high l=20: 4*7 - 2*2
 
   // Full-block check with an independent per-lane re-derivation.
   for (int i = 0; i < 256; ++i) {
@@ -182,7 +184,7 @@ TEST(GgufDequant, Q4KHandComputed) {
     const int pos     = i % 64;
     const uint8_t q   = b.qs[iter * 32 + (pos % 32)];
     const uint8_t nib = (pos < 32) ? (uint8_t)(q & 0xF) : (uint8_t)(q >> 4);
-    const int grp     = (pos < 32) ? iter : iter + 4;
+    const int grp     = (pos < 32) ? 2 * iter : 2 * iter + 1;
     uint8_t sc, mn;
     if (grp < 4) {
       sc = s[grp] & 63;
