@@ -260,12 +260,15 @@ KOKKOS_INLINE_FUNCTION void dequant_q4k_block(const BlockQ4K* b, float* out) {
   const float dall = fp16_to_float(b->d);
   const float dmin = -fp16_to_float(b->dmin);
   const uint8_t* q = b->qs;
+  // ggml walks the 256 values in four 64-element groups: low nibbles of a
+  // 32-byte q chunk use sub-block scale 2*j, high nibbles use 2*j+1 (NOT
+  // j / j+4; the 6-bit scale bytes are laid out for that pairing).
   for (int j = 0; j < 4; ++j) {
     uint8_t sc, mn;
-    get_scale_min_k4(j, b->scales, &sc, &mn);
+    get_scale_min_k4(2 * j, b->scales, &sc, &mn);
     const float d1 = dall * (float)sc;
     const float m1 = dmin * (float)mn;
-    get_scale_min_k4(j + 4, b->scales, &sc, &mn);
+    get_scale_min_k4(2 * j + 1, b->scales, &sc, &mn);
     const float d2 = dall * (float)sc;
     const float m2 = dmin * (float)mn;
     for (int l = 0; l < 32; ++l) {
@@ -661,7 +664,7 @@ KOKKOS_INLINE_FUNCTION float quant_elem(GgmlType dtype, const uint8_t* row,
       const size_t pos   = l % 64;
       const uint8_t q    = b->qs[iter * 32 + (pos % 32)];
       const uint8_t nib  = (pos < 32) ? (uint8_t)(q & 0xF) : (uint8_t)(q >> 4);
-      const int grp      = (pos < 32) ? (int)iter : (int)iter + 4;
+      const int grp      = (pos < 32) ? (int)(2 * iter) : (int)(2 * iter + 1);
       uint8_t sc, mn;
       get_scale_min_k4(grp, b->scales, &sc, &mn);
       return fp16_to_float(b->d) * (float)sc * (float)nib +

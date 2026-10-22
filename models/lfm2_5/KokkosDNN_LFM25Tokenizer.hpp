@@ -52,14 +52,15 @@ inline constexpr const char* kToolCallEndToken   = "<|tool_call_end|>";
 // mirrored here (this header is standalone and shares no code with it):
 //   1. literal special/added tokens are split out first (longest match,
 //      never broken up by BPE);
-//   2. remaining text is split by HF Digits (cut before and after every
-//      ASCII digit) and then pre-tokenized with the GPT-2 ByteLevel regex
-//      (use_regex=true):
-//        's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|
-//        \s+(?!\S)|\s+
+//   2. remaining text is pre-tokenized with the LFM2 ByteLevel regex
+//      (use_regex=true, in the tokenizer.json Split step):
+//        (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|
+//        \p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
 //      (Unicode-aware \p{L}/\p{N}, leftmost-first alternation;
-//      contractions are case-SENSITIVE, the optional prefix is a single
-//      literal U+0020 space, numbers group greedily);
+//      contractions are case-INSENSITIVE, the optional prefix on a letter
+//      run is any single non-CR/LF/letter/number char, numbers group in
+//      runs of up to three, symbol runs absorb trailing CR/LF, and a
+//      whitespace run containing a newline breaks after the last newline);
 //   3. each piece is byte-mapped with the GPT-2 bytes_to_unicode table;
 //   4. BPE merges apply per piece (lowest rank first); pieces with no
 //      applicable merge fall back to single-byte token ids (byte-fallback
