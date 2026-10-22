@@ -9,6 +9,7 @@
 #include <string>
 #include <type_traits>
 #include "KokkosDNN_Handle.hpp"
+#include "KokkosDNN_Macros.hpp"
 #ifdef KOKKOSDNN_ENABLE_CUBLAS
 #include "tpl/cublas/KokkosDNN_CuBLAS.hpp"
 #endif
@@ -277,29 +278,29 @@ struct TiledGemmFunctor {
       // full unrolling explodes the live set into 170+ regs/thread and
       // craters occupancy to 1 block/SM.
       if constexpr (UNROLL == 4) {
-#pragma unroll 4
+KOKKOSDNN_PRAGMA_UNROLL_N(4)
         for (int kk = 0; kk < TK; ++kk) {
           float xr[RT];
-#pragma unroll
+KOKKOSDNN_PRAGMA_UNROLL()
           for (int r = 0; r < RT; ++r)
             xr[r] = sX[(tr * RT + r) * SK + kk];
-#pragma unroll
+KOKKOSDNN_PRAGMA_UNROLL()
           for (int r = 0; r < RT; ++r) {
-#pragma unroll
+KOKKOSDNN_PRAGMA_UNROLL()
             for (int c = 0; c < CT; ++c)
               acc[r][c] += xr[r] * sW[(tc * CT + c) * SK + kk];
           }
         }
       } else {
-#pragma unroll 2
+KOKKOSDNN_PRAGMA_UNROLL_N(2)
         for (int kk = 0; kk < TK; ++kk) {
           float xr[RT];
-#pragma unroll
+KOKKOSDNN_PRAGMA_UNROLL()
           for (int r = 0; r < RT; ++r)
             xr[r] = sX[(tr * RT + r) * SK + kk];
-#pragma unroll
+KOKKOSDNN_PRAGMA_UNROLL()
           for (int r = 0; r < RT; ++r) {
-#pragma unroll
+KOKKOSDNN_PRAGMA_UNROLL()
             for (int c = 0; c < CT; ++c)
               acc[r][c] += xr[r] * sW[(tc * CT + c) * SK + kk];
           }
@@ -565,7 +566,7 @@ struct GemvFunctor {
         }
         team.team_barrier();
         // Strided quad dots: consecutive threads, consecutive quads.
-#pragma unroll 4
+KOKKOSDNN_PRAGMA_UNROLL_N(4)
         for (size_t q = size_t(t); q < nq; q += size_t(Tk)) {
           const Vec4 w  = Wv[j * sw4 + k04 + q];
           const float* xs = &sx[4 * q];

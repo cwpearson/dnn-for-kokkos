@@ -348,8 +348,8 @@ int test_tool_wire() {
   }
   // No-tool render matches the plain renderer byte-for-byte.
   {
-    const std::vector<ChatMessage> msgs = {{{"system", "be bold", ""},
-                                            {"user", "hi there", ""}}};
+    const std::vector<ChatMessage> msgs = {{{"system", "be bold", "", {}, ""},
+                                            {"user", "hi there", "", {}, ""}}};
     CHECK(render_lfm25_chatml_with_tools(msgs, "", "", true, true) ==
           KokkosDNN::LFM25::render_lfm25_chatml(msgs, true, true));
   }
@@ -391,7 +391,7 @@ int test_tool_wire() {
     pr.json_directive = "JSON-B.";
     CHECK(make_system_suffix(pr) == "MUST-A.\nJSON-B.");
     const std::string r = render_lfm25_chatml_with_tools(
-        {{{"user", "hi", ""}}}, pr.tools_json, make_system_suffix(pr), true,
+        {{{"user", "hi", "", {}, ""}}}, pr.tools_json, make_system_suffix(pr), true,
         true);
     CHECK(r.find("List of tools: [t]\nMUST-A.\nJSON-B.") !=
           std::string::npos);

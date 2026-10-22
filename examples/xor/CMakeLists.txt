@@ -7,6 +7,7 @@ target_include_directories(xor_train PRIVATE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
 )
 set_target_properties(xor_train PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+kokkosdnn_enable_compiler_warnings(xor_train)
 
 if(KokkosDNN_ENABLE_TESTS)
   add_executable(test_xor Test_Xor.cpp)
@@ -15,5 +16,6 @@ if(KokkosDNN_ENABLE_TESTS)
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
   )
   set_target_properties(test_xor PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+  kokkosdnn_enable_compiler_warnings(test_xor)
   kokkosdnn_discover_tests(test_xor)
 endif()

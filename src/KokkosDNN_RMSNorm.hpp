@@ -133,6 +133,11 @@ struct RmsNormOnePlusTeam {
   float eps;
   KOKKOS_INLINE_FUNCTION
   void operator()(const Member& team) const {
+    // Local handles: the KOKKOS_LAMBDA below captures by value, so bind
+    // members to locals to avoid an implicit `this` capture (deprecated
+    // in C++20; an error under -Werror on the nvcc path).
+    const View2 x_ = x, y_ = y;
+    const View1 w_ = w;
     const size_t t = static_cast<size_t>(team.league_rank());
     const size_t D = x.extent(1);
     float ss = 0;
@@ -150,8 +155,8 @@ struct RmsNormOnePlusTeam {
     const float inv = 1.0f / sqrtf(ss / static_cast<float>(D) + eps);
     Kokkos::parallel_for(
         Kokkos::TeamThreadRange(team, D), KOKKOS_LAMBDA(size_t d) {
-          y(t, d) = static_cast<Scalar>(static_cast<float>(x(t, d)) * inv *
-                                        (1.0f + static_cast<float>(w(d))));
+          y_(t, d) = static_cast<Scalar>(static_cast<float>(x_(t, d)) * inv *
+                                        (1.0f + static_cast<float>(w_(d))));
         });
   }
 };

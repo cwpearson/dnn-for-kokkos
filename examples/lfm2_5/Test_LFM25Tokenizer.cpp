@@ -107,8 +107,8 @@ TEST(LFM25Tokenizer, ChatRenderGolden) {
   using KokkosDNN::LFM25::render_lfm25_chatml;
 
   // System + user + open assistant header (generation prompt).
-  EXPECT_EQ(render_lfm25_chatml({{"system", "Be brief.", ""},
-                                 {"user", "Hi", ""}},
+  EXPECT_EQ(render_lfm25_chatml({{"system", "Be brief.", "", {}, ""},
+                                 {"user", "Hi", "", {}, ""}},
                                 true),
             "<|im_start|>system\nBe brief.<|im_end|>\n"
             "<|im_start|>user\nHi<|im_end|>\n"
@@ -116,19 +116,19 @@ TEST(LFM25Tokenizer, ChatRenderGolden) {
 
   // Thinking block: emitted inside an assistant turn only when that turn
   // carries non-empty thinking and preserve_thinking is true.
-  std::vector<ChatMessage> think = {{"assistant", "reply", "plan"}};
+  std::vector<ChatMessage> think = {{"assistant", "reply", "plan", {}, ""}};
   EXPECT_EQ(render_lfm25_chatml(think, false, true),
             "<|im_start|>assistant\n<think>plan</think>\nreply<|im_end|>\n");
   // preserve_thinking=false drops the trace but keeps the content.
   EXPECT_EQ(render_lfm25_chatml(think, false, false),
             "<|im_start|>assistant\nreply<|im_end|>\n");
   // Thinking on non-assistant roles is ignored.
-  EXPECT_EQ(render_lfm25_chatml({{"user", "Hi", "nope"}}, false, true),
+  EXPECT_EQ(render_lfm25_chatml({{"user", "Hi", "nope", {}, ""}}, false, true),
             "<|im_start|>user\nHi<|im_end|>\n");
   // No generation prompt on request; default-system injection when asked.
-  EXPECT_EQ(render_lfm25_chatml({{"user", "Hi", ""}}, false),
+  EXPECT_EQ(render_lfm25_chatml({{"user", "Hi", "", {}, ""}}, false),
             "<|im_start|>user\nHi<|im_end|>\n");
-  EXPECT_EQ(render_lfm25_chatml({{"user", "Hi", ""}}, false, true, "Sys."),
+  EXPECT_EQ(render_lfm25_chatml({{"user", "Hi", "", {}, ""}}, false, true, "Sys."),
             "<|im_start|>system\nSys.<|im_end|>\n"
             "<|im_start|>user\nHi<|im_end|>\n");
   // Empty default disables injection.
@@ -139,8 +139,8 @@ TEST(LFM25Tokenizer, ChatRenderGolden) {
 TEST(LFM25Tokenizer, ChatEncodeRoundtrip) {
   using KokkosDNN::LFM25::ChatMessage;
   KokkosDNN::LFM25::Tokenizer tok(write_tmp(lfm25_fixture_json()));
-  std::vector<ChatMessage> msgs = {{"system", "be bold", ""},
-                                   {"user", "hi there", ""}};
+  std::vector<ChatMessage> msgs = {{"system", "be bold", "", {}, ""},
+                                   {"user", "hi there", "", {}, ""}};
   std::vector<int> ids =
       KokkosDNN::LFM25::encode_chatml(tok, msgs, true, true);
   ASSERT_FALSE(ids.empty());
@@ -191,8 +191,8 @@ TEST(LFM25Tokenizer, ToolRenderGolden) {
   using KokkosDNN::LFM25::render_lfm25_chatml_with_tools;
 
   // No tools + plain history renders exactly like the base renderer.
-  const std::vector<ChatMessage> plain = {{"system", "Be brief.", ""},
-                                            {"user", "Hi", ""}};
+  const std::vector<ChatMessage> plain = {{"system", "Be brief.", "", {}, ""},
+                                            {"user", "Hi", "", {}, ""}};
   EXPECT_EQ(render_lfm25_chatml_with_tools(plain, "", "", true, true),
             KokkosDNN::LFM25::render_lfm25_chatml(plain, true, true));
 
@@ -200,14 +200,14 @@ TEST(LFM25Tokenizer, ToolRenderGolden) {
   const std::string tools =
       "[{\"type\":\"function\",\"function\":{\"name\":"
       "\"get_weather\"}}]";
-  EXPECT_EQ(render_lfm25_chatml_with_tools({{"user", "Hi", ""}}, tools, "",
+  EXPECT_EQ(render_lfm25_chatml_with_tools({{"user", "Hi", "", {}, ""}}, tools, "",
                                            true, true),
             "<|im_start|>system\nList of tools: " + tools +
                 "<|im_end|>\n"
                 "<|im_start|>user\nHi<|im_end|>\n"
                 "<|im_start|>assistant\n");
-  const std::vector<ChatMessage> sys_user = {{"system", "Sys.", ""},
-                                                  {"user", "Hi", ""}};
+  const std::vector<ChatMessage> sys_user = {{"system", "Sys.", "", {}, ""},
+                                                  {"user", "Hi", "", {}, ""}};
   EXPECT_EQ(render_lfm25_chatml_with_tools(sys_user, tools, "Do X.", true,
                                            true),
       "<|im_start|>system\nSys.\nList of tools: " + tools +

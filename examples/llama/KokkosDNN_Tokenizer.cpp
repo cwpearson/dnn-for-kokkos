@@ -399,8 +399,6 @@ bool is_space(uint32_t cp) {
 // Returns byte-offset pieces of the original string.
 // ---------------------------------------------------------------------------
 
-bool is_cr(uint32_t c) { return c == 0x0D; }
-bool is_lf(uint32_t c) { return c == 0x0A; }
 bool is_crlf(uint32_t c) { return c == 0x0D || c == 0x0A; }
 
 uint32_t ascii_lower(uint32_t c) {

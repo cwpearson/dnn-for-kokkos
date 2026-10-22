@@ -292,10 +292,8 @@ int main(int argc, char** argv) {
                 audio.size(), audio.size() / 24000.0, mean, std::sqrt(var),
                 (double)mn, (double)mx, secs);
     std::printf("[durations");
-    size_t fsum = 0;
     for (int d : dbg.pred_dur) {
       std::printf(" %d", d);
-      fsum += (size_t)d;
     }
     std::printf("] frames=%d audio=%zu (expect %zu)\n", dbg.frames,
                 audio.size(), (size_t)dbg.frames * 2 * 300);

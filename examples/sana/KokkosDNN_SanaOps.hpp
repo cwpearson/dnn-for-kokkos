@@ -576,7 +576,7 @@ void cross_attention_mha_bidirectional(
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& out,
     size_t num_heads = 0,
     const std::string& label = "KokkosDNN::sana_cross") {
-  const size_t T = x.extent(0), D = x.extent(1), L = cond.extent(0);
+  const size_t T = x.extent(0), D = x.extent(1);
   if (cond.extent(1) != D || out.extent(0) != T || out.extent(1) != D)
     throw std::invalid_argument("cross_attention_mha_bidirectional: dim mismatch");
   if (T == 0 || D == 0) return;
@@ -689,7 +689,6 @@ void cross_attention_mha_bidirectional(
     size_t num_heads = 0,
     const std::string& label = "KokkosDNN::sana_cross") {
   const size_t B = x.extent(0), T = x.extent(1), D = x.extent(2);
-  const size_t L = cond.extent(0);
   if (cond.extent(1) != D || out.extent(0) != B || out.extent(1) != T ||
       out.extent(2) != D)
     throw std::invalid_argument("cross_attention_mha_bidirectional: dim mismatch");

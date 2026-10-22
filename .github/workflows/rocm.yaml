@@ -106,10 +106,12 @@ jobs:
 
       - name: Build and install Kokkos (HIP + Serial)
         run: |
-          # gfx90a (MI200, Kokkos_ARCH_VEGA90A) is a sensible compile-only
-          # default: no GPU is present, so nothing queries the real device;
-          # any supported Kokkos_ARCH_* (or Kokkos_ARCH_NATIVE=ON on a GPU
-          # node) works. ROCM_PATH points find_package(hip) at /opt/rocm.
+          # gfx90a (MI200, Kokkos_ARCH_AMD_GFX90A) is a sensible
+          # compile-only default: no GPU is present, so nothing queries
+          # the real device; any supported Kokkos_ARCH_* (or
+          # Kokkos_ARCH_NATIVE=ON on a GPU node) works. (VEGA90A was the
+          # pre-4.x name and is silently ignored by Kokkos 5.)
+          # ROCM_PATH points find_package(hip) at /opt/rocm.
           # CMAKE_PREFIX_PATH is also required: FindTPLROCTHRUST locates
           # rocthrust via ROCM_PATH, but rocthrust-config.cmake itself does
           # find_dependency(rocprim) with no PATHS hint, so without /opt/rocm
@@ -123,7 +125,7 @@ jobs:
             -DROCM_PATH="${ROCM_PATH}" \
             -DKokkos_ENABLE_HIP=ON \
             -DKokkos_ENABLE_SERIAL=ON \
-            -DKokkos_ARCH_VEGA90A=ON \
+            -DKokkos_ARCH_AMD_GFX90A=ON \
             -DKokkos_ENABLE_TESTS=OFF
           cmake --build kokkos-build --parallel "$(nproc)"
           cmake --install kokkos-build
@@ -156,6 +158,7 @@ jobs:
             -DKokkosDNN_ENABLE_TEST_DISCOVERY=OFF \
             -DKokkosDNN_ENABLE_EXAMPLES=ON \
             -DKokkosDNN_ENABLE_BENCHMARKS=ON \
+            -DKokkosDNN_ENABLE_COMPILER_WARNINGS=ON \
             ${TPL_FLAGS}
 
       # Build every target (library, tests, examples). Deliberately does

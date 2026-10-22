@@ -308,7 +308,7 @@ void moe_gather_rows(
     const Kokkos::View<int*, ExecSpace>& rows,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& dst,
     const std::string& label = "KokkosDNN::moe_gather") {
-  const size_t C = src.extent(0), D = src.extent(1), N = rows.extent(0);
+  const size_t D = src.extent(1), N = rows.extent(0);
   if (dst.extent(0) != N || (N > 0 && dst.extent(1) != D) ||
       (N > 0 && src.extent(1) != D))
     throw std::invalid_argument("moe_gather_rows: dimension mismatch");

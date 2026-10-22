@@ -14,6 +14,7 @@ target_include_directories(kokkosdnn_common INTERFACE
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 target_compile_features(kokkosdnn_common INTERFACE cxx_std_20)
+kokkosdnn_enable_compiler_warnings(kokkosdnn_common)
 
 install(TARGETS kokkosdnn_common EXPORT KokkosDNNTragets)
 install(FILES KokkosDNN_Common.hpp KokkosDNN_Detokenizer.hpp KokkosDNN_Usage.hpp
