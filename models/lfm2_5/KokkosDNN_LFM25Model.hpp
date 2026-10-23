@@ -152,7 +152,8 @@ void shortconv_state_update(
 //     with the optional expert bias for selection only, top-k norm and
 //     routing scale -> sparse top-k dispatch: host groups each (token,
 //     slot) under its expert, then per routed expert a gathered SwiGLU
-//     via packed quant_gemm plus a weighted scatter-add); then residual.
+//     (chunk path: dequantize-once + dense gemm; single-row decode path:
+//     packed quant_gemm) plus a weighted scatter-add); then residual.
 // Final rmsnorm + (possibly tied) lm_head gemv.
 //
 // KV cache: dense FP per attention layer ([max_seq_len, n_kv, head_dim],
@@ -192,6 +193,19 @@ class Model {
   MatR gate_buf_, up_buf_, act_buf_;
   MatR sc_bcx_buf_, sc_bx_buf_, sc_gate_buf_, sc_conv_buf_, sc_y_buf_;
   MatR moe_logits_buf_, moe_oe_buf_;
+  // Dequantized expert staging for the chunk MoE path: gate/up [MI, dim],
+  // down [dim, MI]. Each routed expert is dequantized into these once per
+  // layer, then the existing dense gemm() runs the SwiGLU projections. This
+  // replaces per-expert on-the-fly quant_gemm, which re-dequantizes each
+  // packed weight row once per gathered output row (M times) and reloads
+  // each activation row once per output column (N times). The host loop
+  // over experts is sequential, so one staging triple is enough.
+  MatR moe_deq_gate_, moe_deq_up_, moe_deq_down_;
+  // Packed narrow GEMM I/O for the chunk MoE path: [T, MI]. The TPL gemm()
+  // dispatch calls cuBLAS/hipBLAS with packed leading dims, so the GEMM
+  // outputs must be stride-MI packed; the [T, FFNm]-carved egate/eup/eact
+  // subviews violate that when MI < FFNm.
+  MatR moe_gn_gate_, moe_gn_up_, moe_gn_act_;
   Kokkos::View<int**, Kokkos::LayoutRight, ExecSpace> moe_idx_buf_;
   Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace> moe_w_buf_;
   // Sparse top-k dispatch staging: gathered expert inputs plus the row-id /
@@ -321,7 +335,17 @@ class Model {
                     moe_row_buf_.extent(0) >= T &&
                     moe_wstage_buf_.extent(0) >= T &&
                     moe_idx_host_.extent(0) >= T &&
-                    moe_w_host_.extent(0) >= T)))
+                    moe_w_host_.extent(0) >= T &&
+                    moe_deq_gate_.extent(0) == MI &&
+                    moe_deq_gate_.extent(1) == DIM &&
+                    moe_deq_down_.extent(0) == DIM &&
+                    moe_deq_down_.extent(1) == MI &&
+                    moe_gn_gate_.extent(0) >= T &&
+                    moe_gn_gate_.extent(1) == MI &&
+                    moe_gn_up_.extent(0) >= T &&
+                    moe_gn_up_.extent(1) == MI &&
+                    moe_gn_act_.extent(0) >= T &&
+                    moe_gn_act_.extent(1) == MI)))
       return;
     h_buf_ = MatR("h", T, DIM);
     tmp_buf_ = MatR("tmp", T, DIM);
@@ -364,6 +388,14 @@ class Model {
       moe_w_host_ =
           Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::HostSpace>(
               "moe_w_host", T, TK);
+      // Dequantized expert staging (config-sized; reused across experts).
+      moe_deq_gate_ = MatR("moe_deq_gate", MI, DIM);
+      moe_deq_up_   = MatR("moe_deq_up", MI, DIM);
+      moe_deq_down_ = MatR("moe_deq_down", DIM, MI);
+      // Packed narrow GEMM I/O (stride MI == extent, cuBLAS-safe).
+      moe_gn_gate_ = MatR("moe_gn_gate", T, MI);
+      moe_gn_up_   = MatR("moe_gn_up", T, MI);
+      moe_gn_act_  = MatR("moe_gn_act", T, MI);
     }
     q3_buf_ = View3("q", T, NH, HD);
     k3_buf_ = View3("k", T, NKV, HD);
@@ -387,9 +419,10 @@ class Model {
   // Sparse top-k MoE dispatch for one chunk: group the C*K (token, slot)
   // pairs by selected expert on the host (counting sort over persistent
   // workspace), then run each routed expert's SwiGLU over its gathered
-  // rows only and scatter-add the weighted outputs into y (which must be
-  // zeroed by the caller). Only routed experts launch GEMMs; unrouted
-  // experts contribute nothing and are skipped entirely.
+  // rows only (dequantize-once into persistent staging + dense gemm) and
+  // scatter-add the weighted outputs into y (which must be zeroed by the
+  // caller). Only routed experts launch GEMMs; unrouted experts contribute
+  // nothing and are skipped entirely.
   // Only device subviews of persistent buffers are used (no View
   // allocations); host grouping reuses moe_*_ workspace (no per-layer
   // news). The two deep_copies per expert (<= C ints + floats) are the
@@ -459,20 +492,44 @@ class Model {
       Kokkos::deep_copy(ws, whost);
       auto gx = Kokkos::subview(moe_gather_buf_, std::make_pair(size_t(0), N),
                                 Kokkos::ALL);
-      auto egate =
-          Kokkos::subview(gate_buf_, std::make_pair(size_t(0), N),
-                          std::make_pair(size_t(0), MI));
-      auto eup = Kokkos::subview(up_buf_, std::make_pair(size_t(0), N),
-                                 std::make_pair(size_t(0), MI));
-      auto eact = Kokkos::subview(act_buf_, std::make_pair(size_t(0), N),
-                                  std::make_pair(size_t(0), MI));
+      // Packed narrow GEMM I/O ([N, MI] carved out of [T, MI] staging:
+      // row stride == MI, which the TPL gemm() dispatch requires).
+      auto peg = Kokkos::subview(moe_gn_gate_, std::make_pair(size_t(0), N),
+                                 Kokkos::ALL);
+      auto pup =
+          Kokkos::subview(moe_gn_up_, std::make_pair(size_t(0), N),
+                          Kokkos::ALL);
+      auto pact = Kokkos::subview(moe_gn_act_, std::make_pair(size_t(0), N),
+                                  Kokkos::ALL);
       auto eoe = Kokkos::subview(moe_oe_buf_, std::make_pair(size_t(0), N),
                                  Kokkos::ALL);
+      // Dequantize-once + dense GEMM: the on-the-fly quant_gemm
+      // re-dequantizes each packed weight row once per gathered output row
+      // and reloads each activation row once per output column, which
+      // dominates prefill (nsys: 99% of GPU kernel time on a 902-token
+      // prefill). Dequantizing the routed expert once per layer into
+      // persistent staging and running the dense gemm() dispatch (cuBLAS /
+      // native-tiled, FP32 accumulation) removes both redundancies. Values
+      // match the packed weights up to the Scalar rounding every other
+      // dense layer already carries.
+      const size_t KDIM = x.extent(1);
+      auto dgate = Kokkos::subview(moe_deq_gate_, std::make_pair(size_t(0), MI),
+                                   std::make_pair(size_t(0), KDIM));
+      auto dup = Kokkos::subview(moe_deq_up_, std::make_pair(size_t(0), MI),
+                                 std::make_pair(size_t(0), KDIM));
+      auto ddown = Kokkos::subview(moe_deq_down_, std::make_pair(size_t(0), KDIM),
+                                   std::make_pair(size_t(0), MI));
       moe_gather_rows<ExecSpace, Scalar>(x, rows, gx);
-      Gguf::quant_gemm<ExecSpace, Scalar>(handle, gx, b.gate_exps[e], egate);
-      Gguf::quant_gemm<ExecSpace, Scalar>(handle, gx, b.up_exps[e], eup);
-      swiglu<ExecSpace, Scalar>(egate, eup, eact);
-      Gguf::quant_gemm<ExecSpace, Scalar>(handle, eact, b.down_exps[e], eoe);
+      Gguf::dequant_to_dense<ExecSpace, Scalar>(b.gate_exps[e], dgate);
+      Gguf::dequant_to_dense<ExecSpace, Scalar>(b.up_exps[e], dup);
+      gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), gx, dgate,
+                              static_cast<Scalar>(0), peg);
+      gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), gx, dup,
+                              static_cast<Scalar>(0), pup);
+      swiglu<ExecSpace, Scalar>(peg, pup, pact);
+      Gguf::dequant_to_dense<ExecSpace, Scalar>(b.down_exps[e], ddown);
+      gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), pact, ddown,
+                              static_cast<Scalar>(0), eoe);
       moe_scatter_add_weighted<ExecSpace, Scalar>(eoe, rows, ws, y);
     }
   }
@@ -731,9 +788,9 @@ class Model {
           // dispatch: each (token, slot) is grouped under its selected
           // expert on the host (counting sort, persistent workspace), then
           // per expert with N > 0 rows: gather N inputs -> SwiGLU via
-          // packed quant_gemm -> weighted scatter-add. Only routed experts
-          // run GEMMs (decode: <= top_k narrow GEMMs vs n_experts full
-          // ones).
+          // dequantize-once + dense gemm -> weighted scatter-add. Only
+          // routed experts run GEMMs (decode: <= top_k narrow GEMMs vs
+          // n_experts full ones).
           auto mlogits = Kokkos::subview(moe_logits_buf_,
                                          std::make_pair(size_t(0), C),
                                          Kokkos::ALL);
