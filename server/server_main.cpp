@@ -59,6 +59,7 @@ namespace Common = KokkosDNN::Common;
 using Exec = Kokkos::DefaultExecutionSpace;
 using Scalar = DefaultScalar;
 using ServerSession = Session<Exec, Scalar>;
+using ServerSessionHost = Session<Exec, Scalar, Kokkos::HostSpace>;
 using json = nlohmann::json;
 
 // Single-sourced from the top-level project(VERSION ...): the generated
@@ -173,10 +174,12 @@ void handle_stop_signal(int) {
 struct TurnTimings {
   double lock_ms = 0.0;     // waiting for the single-flight inference mutex
   double encode_ms = 0.0;   // render + encode the full message history
-  double prefill_ms = 0.0;  // prompt prefill (no prefix cache across turns)
+  double prefill_ms = 0.0;  // suffix prefill after prefix-cache reuse
   double decode_ms = 0.0;   // sum of Session::step() (model forward + detok)
   double sse_ms = 0.0;      // SSE framing + socket writes inside the loop
   bool aborted = false;     // peer disconnected; generation stopped early
+  bool prefix_hit = false;  // a cached content prefix was reused
+  size_t prefix_reused = 0;  // reused prefix length in tokens (0 on miss)
 };
 
 double now_ms() {
@@ -193,13 +196,14 @@ void log_turn(const std::string& method, const std::string& target, int status,
               size_t completion_tokens) {
   const double tok_s =
       tm.decode_ms > 0.0 ? completion_tokens * 1000.0 / tm.decode_ms : 0.0;
-  char tail[320];
+  char tail[384];
   std::snprintf(tail, sizeof(tail),
                 " prompt_tokens=%zu completion_tokens=%zu lock_ms=%.1f"
                 " encode_ms=%.1f prefill_ms=%.1f decode_ms=%.1f sse_ms=%.1f"
-                " decode_tok_s=%.1f%s",
+                " decode_tok_s=%.1f prefix_hit=%d prefix_reused=%zu%s",
                 prompt_tokens, completion_tokens, tm.lock_ms, tm.encode_ms,
                 tm.prefill_ms, tm.decode_ms, tm.sse_ms, tok_s,
+                tm.prefix_hit ? 1 : 0, tm.prefix_reused,
                 tm.aborted ? " aborted=client-disconnect" : "");
   std::fprintf(stderr, "%s %s -> %d%s\n", method.c_str(), target.c_str(),
                status, tail);
@@ -216,6 +220,7 @@ struct CliOptions {
   std::string weights;
   std::string tokenizer;
   std::string config_path;
+  bool prefix_cache_host = false;  // keep the KV-cache entry in host memory
 };
 
 // Returns an exit code when the process should stop after parse_cli
@@ -226,6 +231,7 @@ struct CliOptions {
         "Usage: %s [--port N] [--model ID] [--weights PATH] [--tokenizer "
         "PATH]\n"
         "             [--config PATH] [--help] [--version]\n"
+        "             [--prefix-cache-host]\n"
         "\n"
         "OpenAI-compatible inference server for KokkosDNN (LFM2.5).\n"
         "\n"
@@ -236,6 +242,10 @@ struct CliOptions {
         "  --tokenizer PATH  tokenizer.json path or directory (required)\n"
         "  --config PATH     optional model config JSON overlay (base: HF\n"
         "                    lfm2_5_24b_a2b defaults)\n"
+        "  --prefix-cache-host\n"
+        "                    keep the single prefix-cache KV entry in host\n"
+        "                    memory instead of device memory (saves VRAM at\n"
+        "                    the cost of host<->device copies per turn)\n"
         "  --help            print this message and exit\n"
         "  --version         print the server version and exit\n"
         "\n"
@@ -277,6 +287,8 @@ struct CliOptions {
       if (!need_value("--tokenizer", out.tokenizer)) return 1;
     } else if (std::strcmp(a, "--config") == 0) {
       if (!need_value("--config", out.config_path)) return 1;
+    } else if (std::strcmp(a, "--prefix-cache-host") == 0) {
+      out.prefix_cache_host = true;
     } else {
       std::printf("Unknown argument: %s\n", a);
       help();
@@ -299,9 +311,14 @@ struct ServerState {
   std::atomic<unsigned long long> next_id{1};
   // Long-lived decoding session reused across requests (guarded by mu).
   // Per-request construction re-rents the full KV cache and deep-copies
-  // the tokenizer (~170ms TTFT); Session::prefill() already resets all
-  // turn state, and run_session() re-applies per-request options + seed.
-  std::unique_ptr<ServerSession> sess;
+  // the tokenizer (~170ms TTFT); Session::prefill_cached() instead keeps a
+  // single-entry prefix cache of content states across turns (exact-prefix
+  // reuse for agentic loops) while still resetting all turn state, and
+  // run_session() re-applies per-request options + seed. The concrete
+  // Session instantiation (device- vs host-resident cache entry) is picked
+  // from prefix_cache_host at construction; the interface erases it.
+  bool prefix_cache_host = false;
+  std::unique_ptr<KokkosDNN::LFM25::ISession> sess;
 };
 
 // Loads Config (HF defaults + optional JSON overlay), GGUF weights, and the
@@ -1014,42 +1031,60 @@ struct GenResult {
 // over-context prompts (caller maps to 400); other exceptions propagate to
 // the 500 path.
 //
+// full_ids is the whole prompt (history + trailing generation prompt);
+// content_ids is the cacheable history prefix (same encoding without the
+// generation prompt, expected to be an exact prefix of full_ids). The
+// single-entry prefix cache resumes from the cached content on exact
+// matches; a mismatch falls back to a full prefill internally.
+//
 // on_step may return false to stop generation early (the streaming providers
 // do this when sink.write() reports the peer is gone: the single-flight
 // inference lock makes generating for a dead client steal a whole completion
 // from the next queued request).
-GenResult run_session(ServerState& st, const std::vector<int>& prompt_ids,
-                      SessionOptions opts, bool has_seed, uint64_t seed,
-                      int req_max_tokens,
+GenResult run_session(ServerState& st, const std::vector<int>& full_ids,
+                      const std::vector<int>& content_ids, SessionOptions opts,
+                      bool has_seed, uint64_t seed, int req_max_tokens,
                       const std::function<bool(const StepOutcome&)>& on_step,
                       TurnTimings* tm) {
-  if (prompt_ids.size() >= static_cast<size_t>(st.cfg.max_seq_len))
+  if (full_ids.size() >= static_cast<size_t>(st.cfg.max_seq_len))
     throw std::invalid_argument(
         "prompt is longer than the model's context window (" +
-        std::to_string(prompt_ids.size()) + " tokens, max_seq_len=" +
+        std::to_string(full_ids.size()) + " tokens, max_seq_len=" +
         std::to_string(st.cfg.max_seq_len) + ")");
   const size_t budget =
-      static_cast<size_t>(st.cfg.max_seq_len) - prompt_ids.size();
+      static_cast<size_t>(st.cfg.max_seq_len) - full_ids.size();
   int max_new = req_max_tokens < 0 ? kDefaultMaxTokens : req_max_tokens;
   if (static_cast<size_t>(max_new) > budget)
     max_new = static_cast<int>(budget);
   opts.max_new = max_new;
 
   // Reuse one long-lived Session: avoids re-renting the KV cache and
-  // re-copying the tokenizer on every request. set_options() + prefill()
-  // reset all turn state; the forced reseed reproduces fresh-session RNG
-  // behavior exactly (construction seeds from opts.seed, an explicit
-  // request seed wins, unseeded requests deterministically restart the
-  // default stream).
-  if (!st.sess)
-    st.sess = std::make_unique<ServerSession>(st.cfg, st.weights, st.tok,
-                                              opts);
-  else
+  // re-copying the tokenizer on every request. set_options() +
+  // prefill_cached() reset all turn state; the forced reseed reproduces
+  // fresh-session RNG behavior exactly (construction seeds from opts.seed,
+  // an explicit request seed wins, unseeded requests deterministically
+  // restart the default stream). The cache-entry placement (device vs host
+  // memory) is fixed at construction from --prefix-cache-host.
+  if (!st.sess) {
+    if (st.prefix_cache_host)
+      st.sess = std::make_unique<ServerSessionHost>(
+          st.cfg, st.weights, st.tok, opts);
+    else
+      st.sess =
+          std::make_unique<ServerSession>(st.cfg, st.weights, st.tok, opts);
+  } else {
     st.sess->set_options(opts);
-  ServerSession& sess = *st.sess;
+  }
+  KokkosDNN::LFM25::ISession& sess = *st.sess;
   const double t_prefill = now_ms();
-  sess.prefill(prompt_ids, has_seed ? seed : opts.seed, /*hasSeed=*/true);
-  if (tm) tm->prefill_ms = now_ms() - t_prefill;
+  const KokkosDNN::LFM25::CachedPrefillOutcome pc =
+      sess.prefill_cached(full_ids, content_ids, has_seed ? seed : opts.seed,
+                          /*hasSeed=*/true);
+  if (tm) {
+    tm->prefill_ms = now_ms() - t_prefill;
+    tm->prefix_hit = pc.hit;
+    tm->prefix_reused = pc.reused;
+  }
   std::string text;
   while (!sess.finished()) {
     const double t_step = now_ms();
@@ -1134,10 +1169,17 @@ bool sse_done(httplib::DataSink& sink) {
     tm.lock_ms = now_ms() - t_lock;
     try {
       const double t_encode = now_ms();
-      const std::vector<int> prompt_ids =
+      const std::string sys_suffix = make_system_suffix(pr);
+      // Full prompt plus the cacheable history prefix (same encoding
+      // without the trailing generation prompt). The prefix is an exact
+      // token prefix of the full prompt, so the next turn resumes from it.
+      const std::vector<int> content_ids =
           KokkosDNN::LFM25::encode_chatml_with_tools(
-              st.tok, pr.messages, pr.tools_json, make_system_suffix(pr),
-              true, true);
+              st.tok, pr.messages, pr.tools_json, sys_suffix,
+              /*add_generation_prompt=*/false, true);
+      const std::vector<int> full_ids =
+          KokkosDNN::LFM25::encode_chatml_with_tools(
+              st.tok, pr.messages, pr.tools_json, sys_suffix, true, true);
       tm.encode_ms = now_ms() - t_encode;
       // Tools mode feeds raw per-step pieces (specials visible) through
       // the stream parser so native call blocks become `tool_calls`
@@ -1152,8 +1194,8 @@ bool sse_done(httplib::DataSink& sink) {
           return true;
         };
       }
-      GenResult r = run_session(st, prompt_ids, pr.opts, pr.has_seed, pr.seed,
-                                pr.req_max_tokens, on_step, &tm);
+      GenResult r = run_session(st, full_ids, content_ids, pr.opts, pr.has_seed,
+                                pr.seed, pr.req_max_tokens, on_step, &tm);
       std::string text = r.text;
       std::vector<ToolCall> calls;
       if (pr.tools_active) {
@@ -1216,10 +1258,14 @@ bool sse_done(httplib::DataSink& sink) {
             return true;
           }
           const double t_encode = now_ms();
-          const std::vector<int> prompt_ids =
+          const std::string sys_suffix = make_system_suffix(p);
+          const std::vector<int> content_ids =
               KokkosDNN::LFM25::encode_chatml_with_tools(
-                  st.tok, p.messages, p.tools_json, make_system_suffix(p),
-                  true, true);
+                  st.tok, p.messages, p.tools_json, sys_suffix,
+                  /*add_generation_prompt=*/false, true);
+          const std::vector<int> full_ids =
+              KokkosDNN::LFM25::encode_chatml_with_tools(
+                  st.tok, p.messages, p.tools_json, sys_suffix, true, true);
           tm.encode_ms = now_ms() - t_encode;
           bool sse_ok = true;
           auto chunk = [&](const json& delta, const json& finish) {
@@ -1238,7 +1284,8 @@ bool sse_done(httplib::DataSink& sink) {
           chunk({{"role", "assistant"}}, nullptr);
           ToolCallStreamParser tool_parser(resolved_stops(p));
           GenResult r = run_session(
-              st, prompt_ids, p.opts, p.has_seed, p.seed, p.req_max_tokens,
+              st, full_ids, content_ids, p.opts, p.has_seed, p.seed,
+              p.req_max_tokens,
               [&](const StepOutcome& s) {
                 if (!p.tools_active) {
                   if (!s.delta.empty())
@@ -1345,11 +1392,13 @@ bool sse_done(httplib::DataSink& sink) {
     tm.lock_ms = now_ms() - t_lock;
     try {
       const double t_encode = now_ms();
-      const std::vector<int> prompt_ids =
+      const std::vector<int> content_ids =
+          KokkosDNN::LFM25::encode_chatml(st.tok, pr.messages, false, true);
+      const std::vector<int> full_ids =
           KokkosDNN::LFM25::encode_chatml(st.tok, pr.messages, true, true);
       tm.encode_ms = now_ms() - t_encode;
-      GenResult r = run_session(st, prompt_ids, pr.opts, pr.has_seed, pr.seed,
-                                pr.req_max_tokens, nullptr, &tm);
+      GenResult r = run_session(st, full_ids, content_ids, pr.opts, pr.has_seed,
+                                pr.seed, pr.req_max_tokens, nullptr, &tm);
       send_json(res, 200,
                 json{{"id", id},
                      {"object", "text_completion"},
@@ -1407,12 +1456,15 @@ bool sse_done(httplib::DataSink& sink) {
           p.messages = KokkosDNN::LFM25::make_chat_messages(
               it->get<std::string>(), "", "user");
           const double t_encode = now_ms();
-          const std::vector<int> prompt_ids =
+          const std::vector<int> content_ids =
+              KokkosDNN::LFM25::encode_chatml(st.tok, p.messages, false, true);
+          const std::vector<int> full_ids =
               KokkosDNN::LFM25::encode_chatml(st.tok, p.messages, true, true);
           tm.encode_ms = now_ms() - t_encode;
           bool sse_ok = true;
           GenResult r = run_session(
-              st, prompt_ids, p.opts, p.has_seed, p.seed, p.req_max_tokens,
+              st, full_ids, content_ids, p.opts, p.has_seed, p.seed,
+              p.req_max_tokens,
               [&](const StepOutcome& s) {
                 if (s.delta.empty()) return sse_ok;
                 sse_ok = sse_send(
@@ -1487,8 +1539,12 @@ int main(int argc, char* argv[]) {
     startup_log("  config: " +
                 (opt.config_path.empty() ? std::string("(baked-in defaults)")
                                          : opt.config_path));
+    startup_log(std::string("  prefix cache: single entry in ") +
+                (opt.prefix_cache_host ? "host memory (--prefix-cache-host)"
+                                       : "device memory"));
     startup_log("loading weights...");
     ServerState st;
+    st.prefix_cache_host = opt.prefix_cache_host;
     std::string err;
     if (!load_model(opt, st, err)) {
       startup_log(std::string("kokkosdnn_server: ") + err);
