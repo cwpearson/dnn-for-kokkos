@@ -13,7 +13,7 @@ if(NOT KokkosDNN_ENABLE_MODEL_LFM25)
     " (the server serves LFM2.5).")
 endif()
 
-# HTTP + JSON front-end deps. Pins: cpp-httplib v0.15.3, nlohmann/json
+# HTTP + JSON front-end deps. Pins: cpp-httplib v0.63.0, nlohmann/json
 # v3.11.3. FetchContent touches the network at configure time; for offline
 # builds pre-seed the sources and point at them with
 # -DFETCHCONTENT_SOURCE_DIR_CPP_HTTPLIB=<path> /
@@ -22,7 +22,7 @@ include(FetchContent)
 FetchContent_Declare(
   cpp_httplib
   GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
-  GIT_TAG v0.15.3
+  GIT_TAG v0.63.0
 )
 FetchContent_Declare(
   nlohmann_json
