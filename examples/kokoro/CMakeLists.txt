@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 # Kokoro-82M TTS example: native Kokkos StyleTTS2 + ISTFTNet inference.
 # Not part of libkokkosdnn; model-specific code lives here.
 

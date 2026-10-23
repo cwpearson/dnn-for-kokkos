@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // GEMM/GEMV benchmarks: Native vs Dispatched (cuBLAS) on Llama 3.1 8B-Instruct shapes.
 //
 //   Y[M,N] = X[M,K] * W[N,K]^T  (W row-major [out_features, in_features])

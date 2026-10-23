@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Kokoro golden test: full-config forward with real weights vs the torch
 // reference (examples/kokoro/generate_kokoro_golden.py). Env-gated:
 //   KOKKOSDNN_KOKORO_WEIGHTS=kokoro-v1_0.pth

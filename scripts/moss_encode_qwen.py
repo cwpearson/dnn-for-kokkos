@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 """Qwen3.5 prompt-frontend reference for the MOSS-Image staged split.
 
 Reference implementation of the host-side frontend (tokenizer/BPE +

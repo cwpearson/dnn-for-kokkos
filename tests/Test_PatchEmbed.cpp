@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // patchembed_forward (ViT patch embed, im2col + gemm_bias) vs naive host
 // conv reference: non-overlapping stride path, overlapping K/S, bias add,
 // unbiased empty-bias path, and argument validation.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // GEMM: Y = X * W^T vs host reference (float + bfloat16).
 #include <gtest/gtest.h>
 

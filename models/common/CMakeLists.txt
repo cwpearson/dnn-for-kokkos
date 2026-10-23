@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 # models/common: shared model-support utilities (INTERFACE, header-only).
 # KokkosDNN_Common.hpp umbrella + KokkosDNN_Detokenizer.hpp (streaming
 # detokenizer with stop-string handling) + KokkosDNN_Usage.hpp (usage

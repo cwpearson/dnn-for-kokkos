@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Two-layer MLP for XOR, built only from KokkosDNN training ops.
 //
 // Architecture: X[B,2] -> dense(W1[H,2],b1) -> tanh -> dense(W2[1,H],b2)

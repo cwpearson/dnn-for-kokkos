@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // TRUE MOSS-Image DiT: scheduler goldens, safetensors loader roundtrip,
 // forward smoke, skip-layer identity, bhalf smoke.
 #include <gtest/gtest.h>

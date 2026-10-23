@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // gemm_bias / gemv_bias vs host reference (float + half + bfloat16):
 // Y = X * W^T + b with row-broadcast bias and an empty-bias unbiased path.
 #include <gtest/gtest.h>

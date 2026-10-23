@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Persistent Session tests: tiny random weights + a synthetic tokenizer
 // fixture (no downloads). Covers: prefill+step loop termination, stop-id
 // handling, max_new/max_seq_len Length caps, usage counts, reseed

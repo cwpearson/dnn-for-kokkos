@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // MIOpen SDPA stub implementation for KokkosDNN attention.
 //
 // Single translation unit mirroring tpl/cudnn/KokkosDNN_CuDNN_SDPA.cpp.

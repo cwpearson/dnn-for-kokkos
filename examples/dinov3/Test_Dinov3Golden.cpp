@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Golden real-weight validation for the DINOv3 example.
 //
 // README TODO "Golden test vs HF": CLS + patch-token check against HF

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Tests for Common::Usage / Common::FinishReason / to_string().
 #include <gtest/gtest.h>
 

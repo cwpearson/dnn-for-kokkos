@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Gemma4 core ops vs host references (float + bfloat16):
 // scaled embedding gather, gated-GeLU multiply, scaleless RMSNorm,
 // proportional partial-RoPE table (+ tail passthrough), sliding-window
