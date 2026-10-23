@@ -200,24 +200,28 @@ TEST(Attention, FloatLongKeys) {
   auto got = Kokkos::create_mirror_view(out);
   Kokkos::deep_copy(got, out);
   for (int hh = 0; hh < Hq; ++hh) {
-    float m = -1e30f;
+    // FP64 reference: over 8192 keys a float accumulator is itself ~1.3e-4
+    // off the exact value, i.e. worse than the 1e-4 tolerance below, so it
+    // cannot adjudicate a kernel whose own error is ~5e-6.
+    double m = -1e30;
     for (int kk = 0; kk < Ktot; ++kk) {
-      float s = 0;
-      for (int d = 0; d < D; ++d) s += hq(0, hh, d) * hk(kk, 0, d);
-      m = std::max(m, s * scale);
+      double s = 0;
+      for (int d = 0; d < D; ++d) s += (double)hq(0, hh, d) * hk(kk, 0, d);
+      m = std::max(m, s * (double)scale);
     }
-    float denom = 0;
+    double denom = 0;
     for (int kk = 0; kk < Ktot; ++kk) {
-      float s = 0;
-      for (int d = 0; d < D; ++d) s += hq(0, hh, d) * hk(kk, 0, d);
-      denom += std::exp(s * scale - m);
+      double s = 0;
+      for (int d = 0; d < D; ++d) s += (double)hq(0, hh, d) * hk(kk, 0, d);
+      denom += std::exp(s * (double)scale - m);
     }
     for (int d = 0; d < D; ++d) {
-      float acc = 0;
+      double acc = 0;
       for (int kk = 0; kk < Ktot; ++kk) {
-        float s = 0;
-        for (int dd = 0; dd < D; ++dd) s += hq(0, hh, dd) * hk(kk, 0, dd);
-        acc += std::exp(s * scale - m) * hv(kk, 0, d);
+        double s = 0;
+        for (int dd = 0; dd < D; ++dd)
+          s += (double)hq(0, hh, dd) * hk(kk, 0, dd);
+        acc += std::exp(s * (double)scale - m) * (double)hv(kk, 0, d);
       }
       EXPECT_NEAR(got(0, hh, d), acc / denom, 1e-4f)
           << "long-key mismatch at (" << hh << "," << d << ")";
