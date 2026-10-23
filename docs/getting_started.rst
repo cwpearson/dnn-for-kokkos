@@ -44,13 +44,46 @@ Configure options
      - build ``benchmarks/kokkosdnn_bench`` (Google Benchmark, fetched if needed)
    * - ``KokkosDNN_ENABLE_CUBLAS``
      - OFF
-     - GEMM via cuBLAS on CUDA spaces
+     - GEMM via cuBLAS on CUDA spaces (incl. fused GEMM+bias via cublasLt)
    * - ``KokkosDNN_ENABLE_CUDNN``
      - OFF
-     - attention via cuDNN SDPA (with automatic native fallback)
+     - attention + convolutions via cuDNN (with automatic native fallback;
+       needs ``<cudnn.h>`` + ``cudnn-frontend``, fetched automatically)
+   * - ``KokkosDNN_ENABLE_HIPBLAS``
+     - OFF
+     - GEMM via hipBLAS on HIP spaces
+   * - ``KokkosDNN_ENABLE_MIOPEN``
+     - OFF
+     - convolutions via MIOpen on HIP spaces (attention path falls back to
+       native; no fused SDPA in MIOpen)
+   * - ``KokkosDNN_ENABLE_ACCELERATE``
+     - OFF
+     - GEMM/GEMV via Apple Accelerate ``cblas_sgemm`` on host spaces
+       (float only; native fallback otherwise)
+   * - ``KokkosDNN_ENABLE_TEST_DISCOVERY``
+     - ON
+     - register gtest tests via ``gtest_discover_tests`` (set OFF for
+       GPU-less build-only CI, where test binaries cannot run at build time)
    * - ``KokkosDNN_ENABLE_IMAGE``
      - OFF
-     - optional image component (``KokkosDNN::Image``, stb-backed I/O + preprocessing)
+     - optional image component (``KokkosDNN::image``, stb-backed I/O + preprocessing)
+   * - ``KokkosDNN_ENABLE_MODEL_LFM25``
+     - ON
+     - build LFM2.5 model component (``KokkosDNN::lfm25``)
+   * - ``KokkosDNN_ENABLE_MODEL_MOSS``
+     - ON
+     - build MOSS-Image model component (``KokkosDNN::moss``)
+   * - ``KokkosDNN_ENABLE_SERVER``
+     - OFF
+     - build OpenAI-compatible HTTP server (``kokkosdnn_server``; requires
+       ``KokkosDNN_ENABLE_MODEL_LFM25=ON``)
+   * - ``KokkosDNN_ENABLE_COMPILER_WARNINGS``
+     - OFF
+     - enable compiler warnings as errors (mirroring
+       ``Kokkos_ENABLE_COMPILER_WARNINGS``)
+   * - ``BUILD_SHARED_LIBS``
+     - OFF
+     - build shared libraries (Linux/macOS only; Windows is untested)
 
 Building these docs
 -------------------

@@ -54,3 +54,36 @@ LayerScale — header: ``src/KokkosDNN_LayerScale.hpp``.
    Uniform ``out = scalar * x`` (e.g. Gemma4 per-layer ``layer_scalar``);
    distinct from LayerScale's per-channel ``[D]`` multiply. Rank-1
    ``[D]`` overload also exists.
+
+GroupNorm — header: ``src/KokkosDNN_GroupNorm.hpp``. NCHW GroupNorm
+(diffusers ResNet/attention norm, e.g. the FLUX.2-small VAE decoder:
+32 groups, eps 1e-6, affine). Scalar-agnostic (FP32 accumulation),
+native portable team-parallel kernel (no TPL), in-place safe (``x``
+may alias ``y``).
+
+.. cpp:function:: template <typename ExecSpace, typename Scalar> void groupnorm_forward(const Kokkos::View<Scalar****, Kokkos::LayoutRight, ExecSpace>& x, const Kokkos::View<Scalar*, ExecSpace>& weight, const Kokkos::View<Scalar*, ExecSpace>& bias, size_t num_groups, float eps, const Kokkos::View<Scalar****, Kokkos::LayoutRight, ExecSpace>& y, const std::string& label)
+
+   ``y[n,c,h,w] = (x[n,c,h,w] - mean[n,g]) / sqrt(var[n,g] + eps) *
+   weight[c] + bias[c]`` over ``x/y [N, C, H, W]`` with ``weight/bias
+   [C]``; ``num_groups`` must be positive and divide ``C``.
+
+Adaptive norms — header: ``src/KokkosDNN_AdaptiveNorm.hpp``.
+Channel-wise normalization for time-major ``[T, C]`` activations
+(StyleTTS2/Kokoro style conditioning). Scalar-agnostic (FP32
+accumulation), portable kernels, in-place safe.
+
+.. cpp:function:: template <typename ExecSpace, typename Scalar> void instance_norm1d(const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x, float eps, const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& y, const std::string& label)
+
+   Affine-free instance norm: per-channel mean/var over the ``T``
+   steps (matches ``nn.InstanceNorm1d(affine=False)``).
+
+.. cpp:function:: template <typename ExecSpace, typename Scalar> void adain1d_forward(const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x, const Kokkos::View<float*, ExecSpace>& style, const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& fc_w, const Kokkos::View<float*, ExecSpace>& fc_b, float eps, const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& y, const std::string& label)
+
+   AdaIN1d: instance-norm ``x [T, C]``, then style modulation
+   ``y = (1 + gamma) * n + beta`` with ``[gamma;beta] = fc(s)`` split
+   in halves (``fc_w [2C, S]``, ``fc_b [2C]``).
+
+.. cpp:function:: template <typename ExecSpace, typename Scalar> void adaln_forward(const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x, const Kokkos::View<float*, ExecSpace>& style, const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& fc_w, const Kokkos::View<float*, ExecSpace>& fc_b, float eps, const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& y, const std::string& label)
+
+   AdaLayerNorm: per-step layer-norm over channels (``eps``), then the
+   same ``fc(s)`` style modulation as :cpp:func:`adain1d_forward`.
