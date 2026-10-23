@@ -20,7 +20,7 @@ Scope is deliberately narrow: **bfloat16 storage/compute by default** (`--fp32` 
 ## Requirements
 
 - CMake ≥ 3.22, C++20 compiler
-- An installed Kokkos (Serial is enough for tests; CUDA backend for GPU)
+- An installed Kokkos >= 5.2.1 (Serial is enough for tests; CUDA backend for GPU)
 - Optional: CUDA Toolkit (for `KokkosDNN_ENABLE_CUBLAS`), cuDNN (for `KokkosDNN_ENABLE_CUDNN`)
 - Optional: ROCm (for `KokkosDNN_ENABLE_HIPBLAS` / `KokkosDNN_ENABLE_MIOPEN`)
 - Optional: Apple Accelerate (for `KokkosDNN_ENABLE_ACCELERATE`, macOS only, no install needed)

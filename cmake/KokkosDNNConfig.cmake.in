@@ -4,8 +4,8 @@
 
 include(CMakeFindDependencyMacro)
 
-# Core dependency: Kokkos 5.x (see CMakeLists.txt find_package(Kokkos)).
-find_dependency(Kokkos 5)
+# Core dependency: Kokkos >= 5.2.1 (see CMakeLists.txt find_package(Kokkos)).
+find_dependency(Kokkos 5.2.1)
 
 # TPLs linked PUBLICly by KokkosDNN::kokkosdnn must resolve in the
 # consumer. Each guard is baked in at build time: only TPLs enabled when

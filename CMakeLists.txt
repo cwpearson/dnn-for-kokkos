@@ -81,7 +81,10 @@ endif()
 # ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
-find_package(Kokkos REQUIRED)
+# Minimum Kokkos version is the CI-pinned release (5.2.1); keep in sync
+# with .github/workflows/*.yaml KOKKOS_VERSION and
+# cmake/KokkosDNNConfig.cmake.in find_dependency(Kokkos ...).
+find_package(Kokkos 5.2.1 REQUIRED)
 if(Kokkos_COMPILE_LANGUAGE)
   enable_language(${Kokkos_COMPILE_LANGUAGE})
   if(Kokkos_COMPILE_LANGUAGE STREQUAL CUDA)
