@@ -291,4 +291,138 @@ TEST(LFM25Session, LogprobsEmptyWhenOffFloat) {
   EXPECT_TRUE(st.top_ids.empty());
 }
 
+// Greedy decode of the current turn (up to `max_steps` steps).
+template <class S>
+std::vector<int> greedy_run(S& s, int max_steps = 6) {
+  std::vector<int> ids;
+  for (int i = 0; i < max_steps && !s.finished(); ++i)
+    ids.push_back(s.step().id);
+  return ids;
+}
+
+// Cached prefill matches a full prefill bit-for-bit: a cold
+// prefill_cached(full, content) decodes exactly like prefill(full).
+template <class Scalar>
+void check_cache_cold_exactness() {
+  using namespace KokkosDNN::LFM25;
+  Env e = make_env();
+  const std::vector<int> content{1, 2, 3, 4};
+  const std::vector<int> full{1, 2, 3, 4, 5, 6};
+  auto ref = make_session<Scalar>(e, no_stop_opts(6));
+  ref.prefill(full);
+  const std::vector<int> expect = greedy_run(ref);
+  auto s = make_session<Scalar>(e, no_stop_opts(6));
+  const CachedPrefillOutcome o = s.prefill_cached(full, content);
+  EXPECT_FALSE(o.hit);
+  EXPECT_EQ(o.reused, 0u);
+  EXPECT_EQ(s.prefix_cache_size(), 1u);
+  EXPECT_EQ(greedy_run(s), expect);
+}
+
+TEST(LFM25Session, CacheColdExactnessFloat) { check_cache_cold_exactness<float>(); }
+
+TEST(LFM25Session, CacheColdExactnessBHalf) {
+  check_cache_cold_exactness<Kokkos::Experimental::bhalf_t>();
+}
+
+// Agentic-loop shape: the second turn extends the first turn's content.
+// The hit reuses the cached content prefix and still decodes exactly like
+// a fresh full prefill; the single entry then holds the newest content.
+template <class Scalar>
+void check_cache_hit_reuse() {
+  using namespace KokkosDNN::LFM25;
+  Env e = make_env();
+  const std::vector<int> content1{1, 2, 3, 4};
+  const std::vector<int> full1{1, 2, 3, 4, 5};
+  const std::vector<int> content2{1, 2, 3, 4, 5, 6};
+  const std::vector<int> full2{1, 2, 3, 4, 5, 6, 7};
+  auto s = make_session<Scalar>(e, no_stop_opts(6));
+  EXPECT_FALSE(s.prefill_cached(full1, content1).hit);
+  (void)greedy_run(s);
+  const CachedPrefillOutcome o = s.prefill_cached(full2, content2);
+  EXPECT_TRUE(o.hit);
+  EXPECT_EQ(o.reused, content1.size());
+  EXPECT_EQ(s.prefix_cache_size(), 1u);
+  auto ref = make_session<Scalar>(e, no_stop_opts(6));
+  ref.prefill(full2);
+  EXPECT_EQ(greedy_run(s), greedy_run(ref));
+}
+
+TEST(LFM25Session, CacheHitReuseFloat) { check_cache_hit_reuse<float>(); }
+
+TEST(LFM25Session, CacheHitReuseBHalf) {
+  check_cache_hit_reuse<Kokkos::Experimental::bhalf_t>();
+}
+
+// Capacity is one: an unrelated prompt evicts the entry, so the earlier
+// content misses on return.
+TEST(LFM25Session, CacheEvictsSingleEntry) {
+  using namespace KokkosDNN::LFM25;
+  Env e = make_env();
+  auto s = make_session<float>(e, no_stop_opts(6));
+  EXPECT_FALSE(s.prefill_cached({1, 2, 3, 4, 5}, {1, 2, 3, 4}).hit);
+  EXPECT_FALSE(s.prefill_cached({9, 9, 9, 9, 9}, {9, 9, 9, 9}).hit);
+  EXPECT_EQ(s.prefix_cache_size(), 1u);
+  const CachedPrefillOutcome o =
+      s.prefill_cached({1, 2, 3, 4, 5}, {1, 2, 3, 4});
+  EXPECT_FALSE(o.hit);
+  EXPECT_EQ(o.reused, 0u);
+}
+
+// A content vector that is not a prefix of the full prompt falls back to
+// an uncached full prefill (miss, no cache insertion) without failing.
+TEST(LFM25Session, CacheFallbackOnNonPrefix) {
+  using namespace KokkosDNN::LFM25;
+  Env e = make_env();
+  auto s = make_session<float>(e, no_stop_opts(6));
+  const std::vector<int> full{1, 2, 3, 4, 5};
+  const std::vector<int> bad_content{1, 2, 8, 8};
+  const CachedPrefillOutcome o = s.prefill_cached(full, bad_content);
+  EXPECT_FALSE(o.hit);
+  EXPECT_EQ(s.prefix_cache_size(), 0u);
+  auto ref = make_session<float>(e, no_stop_opts(6));
+  ref.prefill(full);
+  EXPECT_EQ(greedy_run(s), greedy_run(ref));
+}
+
+// Repeated identical prompts hit with an empty suffix and decode like a
+// fresh prefill.
+TEST(LFM25Session, CacheRepeatIdentical) {
+  using namespace KokkosDNN::LFM25;
+  Env e = make_env();
+  auto s = make_session<float>(e, no_stop_opts(6));
+  EXPECT_FALSE(s.prefill_cached({1, 2, 3, 4}, {1, 2, 3}).hit);
+  (void)greedy_run(s);
+  const CachedPrefillOutcome o = s.prefill_cached({1, 2, 3, 4}, {1, 2, 3});
+  EXPECT_TRUE(o.hit);
+  EXPECT_EQ(o.reused, 3u);
+  auto ref = make_session<float>(e, no_stop_opts(6));
+  ref.prefill({1, 2, 3, 4});
+  EXPECT_EQ(greedy_run(s), greedy_run(ref));
+}
+
+// Host-resident entries (the --prefix-cache-host path) decode exactly
+// like device-resident ones.
+TEST(LFM25Session, CacheHostResidentExactness) {
+  using namespace KokkosDNN::LFM25;
+  using HostSession =
+      Session<Exec, float, Kokkos::HostSpace>;
+  Env e = make_env();
+  KokkosDNN::LFM25::Weights<Exec, float> w;
+  KokkosDNN::LFM25::random_init(e.cfg, w, 1234);
+  const std::vector<int> content1{1, 2, 3, 4};
+  const std::vector<int> full1{1, 2, 3, 4, 5};
+  const std::vector<int> content2{1, 2, 3, 4, 5, 6};
+  const std::vector<int> full2{1, 2, 3, 4, 5, 6, 7};
+  HostSession s(e.cfg, w, e.tok, no_stop_opts(6));
+  EXPECT_FALSE(s.prefill_cached(full1, content1).hit);
+  (void)greedy_run(s);
+  const CachedPrefillOutcome o = s.prefill_cached(full2, content2);
+  EXPECT_TRUE(o.hit);
+  EXPECT_EQ(o.reused, content1.size());
+  auto ref = make_session<float>(e, no_stop_opts(6));
+  ref.prefill(full2);
+  EXPECT_EQ(greedy_run(s), greedy_run(ref));
+}
+
 }  // namespace

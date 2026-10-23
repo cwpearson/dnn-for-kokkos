@@ -16,12 +16,14 @@ cmake -B build -DKokkosDNN_ENABLE_SERVER=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target kokkosdnn_server
 ./build/server/kokkosdnn_server --weights lfm2_5.gguf \
     --tokenizer /path/to/tokenizer.json [--config overlay.json] \
-    [--model lfm2_5] [--port 8000]
+    [--model lfm2_5] [--port 8000] [--prefix-cache-host]
 ```
 
 `--help` / `--version` work without Kokkos weights. `--weights` and
 `--tokenizer` are required to serve; `--config` is an optional model-config
 JSON overlay on top of the baked-in `lfm2_5_24b_a2b` defaults.
+`--prefix-cache-host` keeps the prefix-cache entry in host memory instead
+of device memory (saves VRAM at the cost of host<->device copies per turn).
 
 ## Docker
 
@@ -119,12 +121,21 @@ Limits to know:
 - The server owns `Kokkos::initialize/finalize` for the serving process.
 - Single-user, blocking: one global mutex guards all inference. A second
   concurrent request blocks until the in-flight request finishes (no 409;
-  keep this in mind for multi-client use). A fresh `Session` is built per
-  request under that lock so per-request sampling/stop/seed options apply.
-- No prefix cache: every turn re-prefills the whole message history, so an
-  agent loop pays `history / prefill_rate` on each turn in addition to
-  decoding. The per-turn log line reports both halves (`prefill_ms`,
-  `decode_ms`, `decode_tok_s`) so this is measurable from the server logs.
+  keep this in mind for multi-client use). One long-lived `Session` is
+  reused across requests under that lock; per-request sampling/stop/seed
+  options apply via `set_options()`, and a single-entry prefix cache of
+  content states carries over across turns (see below).
+- Prefix cache: each turn encodes the history twice — the full prompt and
+  the cacheable content prefix (same encoding without the trailing
+  generation prompt). When the new prompt starts with the cached content
+  (the common agentic-loop shape: history plus new assistant/tool
+  messages), only the suffix is prefilled; the turn is bit-identical to a
+  full prefill. A miss replaces the entry. The per-turn log line reports
+  `prefix_hit`/`prefix_reused`, and `prefill_ms` covers only the suffix
+  forward, so the saving is measurable from the server logs. The entry
+  lives in device memory by default; `--prefix-cache-host` keeps it in
+  host memory instead (H2D/D2H copies per turn, ~20 KB per token for
+  LFM2.5-24B at 128k context ≈ 2.5 GiB per full-window entry).
 - A streaming client that disconnects stops the turn at the next token
   (detected from `sink.write()`); the abandoned turn is logged with
   `aborted=client-disconnect` instead of holding the inference lock for the
@@ -137,12 +148,14 @@ Every completed turn logs one line to stderr:
 ```
 POST /v1/chat/completions -> 200 prompt_tokens=17 completion_tokens=64
   lock_ms=0.0 encode_ms=0.2 prefill_ms=261.4 decode_ms=1576.9 sse_ms=1.9
-  decode_tok_s=40.6
+  decode_tok_s=40.6 prefix_hit=1 prefix_reused=12
 ```
 
 `lock_ms` is time waiting for the inference mutex (non-zero means the
-request queued behind another), `prefill_ms` is prompt processing,
-`decode_ms` is the sum of model steps, `sse_ms` is SSE framing plus socket
-writes, and `decode_tok_s` is the rate a streaming client observes. A GPU
+request queued behind another), `prefill_ms` is prompt processing (only
+the uncached suffix when `prefix_hit=1`), `decode_ms` is the sum of model
+steps, `sse_ms` is SSE framing plus socket writes, and `decode_tok_s` is
+the rate a streaming client observes. `prefix_reused` is the reused
+prefix length in tokens (0 on a miss). A GPU
 that looks 100% busy in `nvidia-smi` while `decode_tok_s` is low means the
 model step, not the transport, is the bottleneck.
