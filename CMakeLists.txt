@@ -338,7 +338,7 @@ install(EXPORT KokkosDNNTargets
 include(CMakePackageConfigHelpers)
 write_basic_package_version_file(
   ${CMAKE_CURRENT_BINARY_DIR}/KokkosDNNConfigVersion.cmake
-  VERSION ${PROJECT_VERSION} COMPATIBILITY SameMajorVersion)
+  VERSION ${PROJECT_VERSION} COMPATIBILITY SameMinorVersion)
 configure_file(cmake/KokkosDNNConfig.cmake.in
   ${CMAKE_CURRENT_BINARY_DIR}/KokkosDNNConfig.cmake @ONLY)
 install(FILES
