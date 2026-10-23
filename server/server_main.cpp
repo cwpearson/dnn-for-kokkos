@@ -87,9 +87,74 @@ void handle_stop_signal(int) {
 
 // Startup progress goes to stderr (unbuffered enough for `podman logs` to
 // show it while weights load) with an explicit flush per line. Per-request
-// traffic stays silent by design.
+// traffic is logged to stderr too (method + endpoint + body size + status;
+// the server `error.message` for non-2xx) via the httplib logger installed
+// in main() plus explicit SSE error lines from the streaming providers.
 [[maybe_unused]] void startup_log(const std::string& msg) {
   std::fprintf(stderr, "%s\n", msg.c_str());
+  std::fflush(stderr);
+}
+
+// Single-line stderr logging: control chars that would split lines are
+// blanked and long details truncated so one request stays one line.
+[[maybe_unused]] std::string log_sanitize(std::string s,
+                                          size_t max_len = 300) {
+  for (char& c : s) {
+    if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+  }
+  if (s.size() > max_len) s = s.substr(0, max_len) + "...";
+  return s;
+}
+
+// Extracts the `error.message` carried by send_bad_request/send_server_error
+// (and the 404 error_handler) so request logs name the failure cause.
+// Falls back to the raw body snippet when it is not the expected JSON.
+[[maybe_unused]] std::string request_error_detail(
+    const httplib::Response& res) {
+  if (res.body.empty()) return "";
+  try {
+    const json j = json::parse(res.body);
+    const auto it = j.find("error");
+    if (it != j.end() && it->is_object()) {
+      const auto mit = it->find("message");
+      if (mit != it->end() && mit->is_string())
+        return mit->get<std::string>();
+    }
+  } catch (...) {
+  }
+  return res.body;
+}
+
+// httplib logger: every request (including unmatched routes via the 404
+// error_handler) logs `METHOD target body_bytes=N -> STATUS` with
+// `error="..."` appended for non-2xx. Single fprintf per line; httplib
+// serializes logger calls and fprintf itself is thread-safe.
+[[maybe_unused]] void log_request(const httplib::Request& req,
+                                  const httplib::Response& res) {
+  const std::string target = req.target.empty() ? req.path : req.target;
+  std::string line = req.method + " " + target +
+                     " body_bytes=" + std::to_string(req.body.size()) +
+                     " -> " + std::to_string(res.status);
+  if (res.status < 200 || res.status >= 300) {
+    const std::string detail = log_sanitize(request_error_detail(res));
+    if (!detail.empty()) line += " error=\"" + detail + "\"";
+  }
+  std::fprintf(stderr, "%s\n", line.c_str());
+  std::fflush(stderr);
+}
+
+// Streaming providers answer 200 before generation runs, so mid-stream
+// failures travel as SSE `data: {"error":...}` events the logger (which runs
+// before the streamed body) cannot see. Each SSE error site logs its own
+// line with the same endpoint/body-size prefix.
+[[maybe_unused]] void log_stream_error(const std::string& method,
+                                       const std::string& target,
+                                       size_t body_bytes,
+                                       const std::string& err) {
+  std::string line = method + " " + target +
+                     " body_bytes=" + std::to_string(body_bytes) +
+                     " -> sse-error error=\"" + log_sanitize(err) + "\"";
+  std::fprintf(stderr, "%s\n", line.c_str());
   std::fflush(stderr);
 }
 
@@ -1055,8 +1120,10 @@ void sse_done(httplib::DataSink& sink) {
   res.set_header("X-Accel-Buffering", "no");
   res.set_chunked_content_provider(
       "text/event-stream",
-      [&st, body = req.body, id, created](size_t /*offset*/,
-                                          httplib::DataSink& sink) -> bool {
+      [&st, method = req.method,
+       target = req.target.empty() ? req.path : req.target,
+       body = req.body, id, created](size_t /*offset*/,
+                                     httplib::DataSink& sink) -> bool {
         std::lock_guard<std::mutex> lk(st.mu);
         try {
           const json b = json::parse(body);  // re-parse: already validated
@@ -1065,6 +1132,7 @@ void sse_done(httplib::DataSink& sink) {
           if (!parse_common(b, st.cfg, st.model_id, p, e) ||
               !parse_messages(b, p.messages, e)) {
             sse_send(sink, openai_error(e));
+            log_stream_error(method, target, body.size(), e);
             sink.done();
             return true;
           }
@@ -1130,6 +1198,7 @@ void sse_done(httplib::DataSink& sink) {
           sse_done(sink);
         } catch (const std::exception& ex) {
           sse_send(sink, openai_error(ex.what(), "server_error"));
+          log_stream_error(method, target, body.size(), ex.what());
         }
         // Terminate the chunked body cleanly: sink.done() emits the
         // trailing 0-length chunk; returning true reports success. Returning
@@ -1212,8 +1281,10 @@ void sse_done(httplib::DataSink& sink) {
   res.set_header("X-Accel-Buffering", "no");
   res.set_chunked_content_provider(
       "text/event-stream",
-      [&st, body = req.body, id, created](size_t /*offset*/,
-                                          httplib::DataSink& sink) -> bool {
+      [&st, method = req.method,
+       target = req.target.empty() ? req.path : req.target,
+       body = req.body, id, created](size_t /*offset*/,
+                                     httplib::DataSink& sink) -> bool {
         std::lock_guard<std::mutex> lk(st.mu);
         try {
           const json b = json::parse(body);
@@ -1221,12 +1292,15 @@ void sse_done(httplib::DataSink& sink) {
           std::string e;
           if (!parse_common(b, st.cfg, st.model_id, p, e)) {
             sse_send(sink, openai_error(e));
+            log_stream_error(method, target, body.size(), e);
             sink.done();
             return true;
           }
           auto it = b.find("prompt");
           if (it == b.end() || !it->is_string()) {
             sse_send(sink, openai_error("'prompt' must be a string"));
+            log_stream_error(method, target, body.size(),
+                             "'prompt' must be a string");
             sink.done();
             return true;
           }
@@ -1265,6 +1339,7 @@ void sse_done(httplib::DataSink& sink) {
           sse_done(sink);
         } catch (const std::exception& ex) {
           sse_send(sink, openai_error(ex.what(), "server_error"));
+          log_stream_error(method, target, body.size(), ex.what());
         }
         // See chat_handler: sink.done() + true terminates the chunked body
         // cleanly; returning false would truncate it (curl error 18).
@@ -1318,6 +1393,22 @@ int main(int argc, char* argv[]) {
       startup_log("listening on 0.0.0.0:" + std::to_string(opt.port) +
                   " — ready to serve");
       httplib::Server svr;
+      // Log every request: METHOD target body_bytes=N -> STATUS plus
+      // error="..." for non-2xx (extracted from the JSON error body).
+      svr.set_logger([](const httplib::Request& req,
+                        const httplib::Response& res) { log_request(req, res); });
+      // Unmatched routes would otherwise reply with httplib's plain-text
+      // 404; return the OpenAI error shape instead so the logger above can
+      // report the cause. Handler-set error bodies are left untouched.
+      svr.set_error_handler([](const httplib::Request& req,
+                               httplib::Response& res) {
+        if (!res.body.empty())
+          return httplib::Server::HandlerResponse::Unhandled;
+        const std::string target = req.target.empty() ? req.path : req.target;
+        send_json(res, 404,
+                  openai_error("unknown endpoint '" + target + "'"));
+        return httplib::Server::HandlerResponse::Handled;
+      });
       svr.Get("/v1/models", [&](const httplib::Request&,
                                 httplib::Response& res) {
         models_handler(st, res);
