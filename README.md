@@ -24,6 +24,7 @@ Scope is deliberately narrow: **bfloat16 storage/compute by default** (`--fp32` 
 - Optional: CUDA Toolkit (for `KokkosDNN_ENABLE_CUBLAS`), cuDNN (for `KokkosDNN_ENABLE_CUDNN`)
 - Optional: ROCm (for `KokkosDNN_ENABLE_HIPBLAS` / `KokkosDNN_ENABLE_MIOPEN`)
 - Optional: Apple Accelerate (for `KokkosDNN_ENABLE_ACCELERATE`, macOS only, no install needed)
+- Supported platforms: Linux and macOS (tested in CI on `ubuntu-latest` / `ubuntu-24.04` and `macos-latest`). Windows is untested and there are no shared-library export macros, so `BUILD_SHARED_LIBS` targets Linux/macOS.
 
 ## Build
 
