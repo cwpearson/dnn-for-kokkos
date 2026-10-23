@@ -49,7 +49,12 @@ Options:
 | `KokkosDNN_ENABLE_MIOPEN` | OFF | convolutions via MIOpen on HIP spaces (attention path falls back to native; no fused SDPA in MIOpen) |
 | `KokkosDNN_ENABLE_ACCELERATE` | OFF | GEMM/GEMV via Apple Accelerate `cblas_sgemm` on host spaces (float only; native fallback otherwise) |
 | `KokkosDNN_ENABLE_TEST_DISCOVERY` | ON | register gtest tests via `gtest_discover_tests` (set OFF for GPU-less build-only CI, where test binaries cannot run at build time) |
-| `KokkosDNN_ENABLE_IMAGE` | OFF | optional image component (`KokkosDNN::Image`, stb-backed I/O + preprocessing) |
+| `KokkosDNN_ENABLE_IMAGE` | OFF | optional image component (`KokkosDNN::image`, stb-backed I/O + preprocessing) |
+| `KokkosDNN_ENABLE_MODEL_LFM25` | ON | build LFM2.5 model component (`KokkosDNN::lfm25`) |
+| `KokkosDNN_ENABLE_MODEL_MOSS` | ON | build MOSS-Image model component (`KokkosDNN::moss`) |
+| `KokkosDNN_ENABLE_SERVER` | OFF | build OpenAI-compatible HTTP server (`kokkosdnn_server`; requires `KokkosDNN_ENABLE_MODEL_LFM25=ON`) |
+| `KokkosDNN_ENABLE_COMPILER_WARNINGS` | OFF | enable compiler warnings as errors (mirroring `Kokkos_ENABLE_COMPILER_WARNINGS`) |
+| `BUILD_SHARED_LIBS` | OFF | build shared libraries (Linux/macOS only; Windows is untested) |
 
 ## Examples
 
