@@ -198,7 +198,10 @@ int main(int argc, char** argv) {
   int steps = 18;
   float guidance = 5.0f, flow_shift = 4.0f;
   uint64_t seed = 42;
-  bool tiny = false, fp32 = false;
+  bool tiny = false;
+  // --fp32 is accepted for forward compatibility; float is the only (and
+  // checkpoint-native) dtype, so the flag is currently a no-op.
+  [[maybe_unused]] bool fp32 = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -250,7 +253,6 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "warning: ignoring unknown arg '%s'\n", a.c_str());
     }
   }
-  (void)fp32;  // float is the only (and checkpoint-native) dtype.
 
   Kokkos::initialize(argc, argv);
   int rc = 0;

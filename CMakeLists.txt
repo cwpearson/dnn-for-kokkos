@@ -285,9 +285,20 @@ if(KokkosDNN_ENABLE_TESTS)
     set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(googletest)
   endif()
-  # Third-party policy: gtest builds warning-free (its own -w) and its
-  # headers reach our test TUs as SYSTEM, so they can never trip -Werror.
+  # Third-party policy: gtest builds warning-free (its own -w on every
+  # compiled target) and its headers reach our test TUs as SYSTEM, so they
+  # can never trip -Werror. Suppress all spellings/siblings: FetchContent
+  # defines gtest+gtest_main (plus gmock+gmock_main when enabled), system
+  # packages define GTest::gtest+GTest::gtest_main as IMPORTED (headers
+  # still need SYSTEM treatment). Missing targets are a no-op.
   kokkosdnn_suppress_third_party_warnings(gtest)
+  kokkosdnn_suppress_third_party_warnings(gtest_main)
+  kokkosdnn_suppress_third_party_warnings(gmock)
+  kokkosdnn_suppress_third_party_warnings(gmock_main)
+  kokkosdnn_suppress_third_party_warnings(GTest::gtest)
+  kokkosdnn_suppress_third_party_warnings(GTest::gtest_main)
+  kokkosdnn_suppress_third_party_warnings(GTest::gmock)
+  kokkosdnn_suppress_third_party_warnings(GTest::gmock_main)
   include(GoogleTest)
   # Shared GoogleTest main that initializes/finalizes Kokkos.
   add_library(kokkosdnn_gtest_main STATIC tests/GTestMain.cpp)

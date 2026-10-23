@@ -316,19 +316,18 @@ struct ShardFile {
   }
   ShardFile& operator=(ShardFile&&) = delete;
 
-  // Read n raw bytes at data-section offset `off` into dst. mmap path is a
-  // memcpy from the window; fallback path does a bounded ifstream read.
+  // Read n raw bytes at data-section offset `off` into dst. Only used by
+  // the non-mmap fallback streaming paths below; the mmap path uses
+  // data_ptr() instead.
+#if !KOKKOSDNN_HAS_MMAP
   void read_bytes(size_t off, char* dst, size_t n) const {
-#if KOKKOSDNN_HAS_MMAP
-    std::memcpy(dst, map + data_start + off, n);
-#else
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("cannot open " + path);
     f.seekg((std::streamoff)(data_start + off));
     f.read(dst, (std::streamsize)n);
     if (!f) throw std::runtime_error("safetensors: truncated tensor data");
-#endif
   }
+#endif
 
 #if KOKKOSDNN_HAS_MMAP
   // Direct pointer into the mapped window (bounds-checked by caller).

@@ -1384,7 +1384,9 @@ int main(int argc, char** argv) {
     Kokkos::fence();
     MO::print_phase_memory("dit-released", 0, 0);
     size_t oH = 0, oW = 0;
-    int oCh = 1;
+    // Only consumed by the PNG path (KOKKOSDNN_ENABLE_IMAGE); the PPM
+    // fallback below ignores it.
+    [[maybe_unused]] int oCh = 1;
     std::vector<unsigned char> pix;
     bool decoded = false;
     if (vae_decode) {
@@ -1481,7 +1483,6 @@ int main(int argc, char** argv) {
         save_ppm(ppm, pix, oH, oW);
       }
       // oCh is only consumed by the PNG path above.
-      (void)oCh;
       std::printf("[wrote %s] %zux%zu %s (PPM)\n", ppm.c_str(), oH, oW,
                   decoded ? "VAE RGB" : "grayscale preview");
     }

@@ -709,7 +709,7 @@ class Tokenizer {
     cur.ws();
     if (cur.peek() != '{') cur.fail("top level must be an object");
     ++cur.p;
-    bool have_vocab = false, have_merges = false;
+    bool have_vocab = false;
     while (true) {
       cur.ws();
       if (cur.peek() == '}') {
@@ -722,7 +722,7 @@ class Tokenizer {
       ++cur.p;
       if (key == "model") {
         parse_model(cur);
-        have_vocab = have_merges = true;
+        have_vocab = true;
       } else if (key == "added_tokens") {
         parse_added(cur);
       } else {
