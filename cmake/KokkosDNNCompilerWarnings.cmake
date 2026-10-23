@@ -9,7 +9,9 @@
 #
 # KokkosDNN_ENABLE_COMPILER_WARNINGS (OFF by default) enables a warning set
 # mirroring Kokkos's COMMON_WARNINGS/GNU_WARNINGS lists, plus -Werror (MSVC
-# /WX), so a clean build here means warnings-clean under the same bar
+# /WX) on the host compiler and -Werror=all-warnings on nvcc (CUDA backend)
+# for nvcc's own diagnostics (#550-D etc., which host -Werror does not
+# touch), so a clean build here means warnings-clean under the same bar
 # Kokkos itself uses. Each flag is probed with check_cxx_compiler_flag so
 # nvcc_wrapper/hipcc/AppleClang only receive flags they accept.
 #
@@ -62,6 +64,19 @@ if(Kokkos_ENABLE_CUDA)
   list(REMOVE_ITEM KOKKOSDNN_SUPPORTED_WARNING_FLAGS "-Wextra-semi")
 endif()
 
+# nvcc has its own diagnostic channel (#550-D unused variable, #177-D
+# unreferenced function, ...) that host -Werror does not promote: -Werror
+# is routed to the host compiler by nvcc_wrapper, while nvcc diagnostics
+# need -Werror=all-warnings (routed to nvcc). Probe it so plain host
+# compilers (which reject the kind) simply skip it.
+set(KOKKOSDNN_NVCC_WERROR_FLAG "")
+if(Kokkos_ENABLE_CUDA AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+  check_cxx_compiler_flag("-Werror=all-warnings" KOKKOSDNN_HAS_WERROR_ALL_WARNINGS)
+  if(KOKKOSDNN_HAS_WERROR_ALL_WARNINGS)
+    set(KOKKOSDNN_NVCC_WERROR_FLAG "-Werror=all-warnings")
+  endif()
+endif()
+
 function(kokkosdnn_enable_compiler_warnings target)
   if(NOT KokkosDNN_ENABLE_COMPILER_WARNINGS)
     return()
@@ -80,7 +95,7 @@ function(kokkosdnn_enable_compiler_warnings target)
     target_compile_options(${target} ${_scope} /W4 /WX)
   else()
     target_compile_options(${target} ${_scope}
-      ${KOKKOSDNN_SUPPORTED_WARNING_FLAGS} -Werror)
+      ${KOKKOSDNN_SUPPORTED_WARNING_FLAGS} -Werror ${KOKKOSDNN_NVCC_WERROR_FLAG})
   endif()
   unset(_type)
   unset(_scope)
@@ -88,15 +103,26 @@ endfunction()
 
 # Project policy: warnings are enforced on first-party code only.
 # Silence a third-party target completely (ALWAYS, independent of
-# KokkosDNN_ENABLE_COMPILER_WARNINGS):
+# KokkosDNN_ENABLE_COMPILER_WARNINGS) — disable warnings entirely with -w,
+# not just -Werror, since TPLs carry their own warning flags (e.g. gtest's
+# -Wundef, benchmark's -Wold-style-cast) that would otherwise fire on
+# system/CUDA headers in their own TUs:
 #   - compiled libraries get -w (/w on MSVC) privately, so their own
-#     build cannot fail on warnings (e.g. googlebenchmark's own -Werror
+#     build is warning-free (e.g. googlebenchmark's own -Werror
 #     plus unconditional -pedantic-errors, which hipcc trips over);
 #   - their headers get SYSTEM treatment, so including them from our
 #     warning-clean TUs cannot fail either (e.g. benchmark.h's
 #     __COUNTER__ use under hipcc -pedantic).
 # Pass the REAL target name (not an :: alias): ALIAS targets reject
-# set_target_properties/target_compile_options.
+# set_target_properties/target_compile_options (aliases are resolved
+# below, so either spelling works). Missing targets are a no-op, so call
+# with every spelling/sibling (gtest+gtest_main, benchmark+benchmark_main,
+# GTest::/benchmark:: namespaces for system packages) and let the helper
+# sort it out.
+# NOTE: googletest defines gtest AND gtest_main (likewise gmock/gmock_main
+# when enabled); googlebenchmark defines benchmark AND benchmark_main. All
+# compiled TPL targets must be suppressed — suppressing only the base lib
+# leaves the *_main TU warning (and failing under its own flags).
 function(kokkosdnn_suppress_third_party_warnings target)
   if(NOT TARGET ${target})
     return()

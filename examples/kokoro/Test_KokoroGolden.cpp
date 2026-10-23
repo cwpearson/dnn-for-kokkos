@@ -135,14 +135,6 @@ struct Golden {
     size_t p = find_key(key);
     return number_at(p);
   }
-  std::string str(const std::string& key) const {
-    size_t p = find_key(key);
-    skip_ws(text, p);
-    if (text[p] != '"') throw std::runtime_error("golden: expected string");
-    ++p;
-    size_t q = text.find('"', p);
-    return text.substr(p, q - p);
-  }
 };
 
 Golden load_golden(const std::string& path) {
