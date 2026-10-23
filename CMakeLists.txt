@@ -322,7 +322,7 @@ endif()
 # ---------------------------------------------------------------------------
 # Install
 # ---------------------------------------------------------------------------
-install(TARGETS kokkosdnn EXPORT KokkosDNNTragets
+install(TARGETS kokkosdnn EXPORT KokkosDNNTargets
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
@@ -332,7 +332,7 @@ install(DIRECTORY src/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/KokkosDNN_config.h
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
-install(EXPORT KokkosDNNTragets
+install(EXPORT KokkosDNNTargets
   NAMESPACE KokkosDNN::
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/KokkosDNN)
 include(CMakePackageConfigHelpers)

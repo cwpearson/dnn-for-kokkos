@@ -13,10 +13,10 @@ target_include_directories(kokkosdnn_lfm25 PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
-set_target_properties(kokkosdnn_lfm25 PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+set_target_properties(kokkosdnn_lfm25 PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON EXPORT_NAME lfm25)
 kokkosdnn_enable_compiler_warnings(kokkosdnn_lfm25)
 
-install(TARGETS kokkosdnn_lfm25 EXPORT KokkosDNNTragets
+install(TARGETS kokkosdnn_lfm25 EXPORT KokkosDNNTargets
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
