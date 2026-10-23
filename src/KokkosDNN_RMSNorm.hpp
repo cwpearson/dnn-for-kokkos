@@ -8,6 +8,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "KokkosDNN_Occupancy.hpp"
+
 namespace KokkosDNN {
 namespace Impl {
 
@@ -59,9 +61,11 @@ template <class ExecSpace, class Functor>
 void rmsnorm_team_launch(Functor f, size_t rows, size_t D,
                          const std::string& label) {
   if (rows == 0 || D == 0) return;
-  Kokkos::TeamPolicy<ExecSpace> probe(1, 1);
   int ts = static_cast<int>(D < 256 ? D : 256);
-  const int mx = probe.team_size_max(f, Kokkos::ParallelForTag{});
+  // Occupancy probe cached per (ExecSpace instance, functor type, scratch):
+  // decode calls this kernel once per layer norm and twice per attention
+  // layer, i.e. the same probe was re-run ~100x per token.
+  const int mx = cached_team_size_max<ExecSpace>(f);
   if (mx < ts) ts = mx;
   if (ts < 1) ts = 1;
   Kokkos::TeamPolicy<ExecSpace> policy(static_cast<int>(rows), ts);
@@ -323,9 +327,8 @@ void rmsnorm_one_plus(
   Impl::RmsNormOnePlusTeam<ExecSpace, Scalar> f{
       x, w, y, eps,
   };
-  Kokkos::TeamPolicy<ExecSpace> probe(1, 1);
+  const int mx = Impl::cached_team_size_max<ExecSpace>(f);
   int ts = static_cast<int>(D < 256 ? D : 256);
-  const int mx = probe.team_size_max(f, Kokkos::ParallelForTag{});
   if (mx < ts) ts = mx;
   if (ts < 1) ts = 1;
   Kokkos::TeamPolicy<ExecSpace> policy(static_cast<int>(T), ts);

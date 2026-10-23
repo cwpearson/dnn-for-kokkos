@@ -299,31 +299,13 @@ class Session : public ISession {
       lg = model_.forward(one_);
     }
     ::KokkosDNN::SampleResult r;
-    // Same routing as sample_token_result(): the neutral greedy path stays
-    // on device (parallel_reduce argmax, no host mirror); everything else
-    // mirrors once into persistent session scratch (no per-token
-    // create_mirror_view/host-vector mallocs) and runs the shared host
-    // pipeline. Bit-identical to sample_token_result() by construction:
-    // same device argmax, same host entry point, same predicates over the
-    // same public SampleOptions fields.
+    // Sampled decode runs entirely on device (KokkosDNN_Sampler.hpp): the
+    // V-sized buffers live in the session-owned sampler, the 128k-entry
+    // logits row is never mirrored, and only the sampled id (4 bytes) comes
+    // back. The neutral greedy path is still the device argmax with an
+    // 8-byte result and no scratch.
     const auto& so = opts_.sampling;
-    const bool need_host =
-        !so.is_greedy() || so.repetition_penalty != 1.0f ||
-        so.frequency_penalty != 0.0f || so.presence_penalty != 0.0f ||
-        !so.logit_bias.empty() || so.logprobs > 0;
-    if (!need_host && so.logprobs <= 0) {
-      r.id = ::KokkosDNN::device_argmax<ExecSpace, Scalar>(lg);
-    } else {
-      const size_t V = lg.extent(0);
-      if (V == 0)
-        throw std::invalid_argument("sample_token_result: empty logits");
-      ensure_samp(V);
-      Kokkos::deep_copy(samp_host_, lg);
-      for (size_t i = 0; i < V; ++i)
-        samp_f_[i] = static_cast<float>(samp_host_(i));
-      r = ::KokkosDNN::sample_host_logits_result(samp_f_.data(), V, so, ids_,
-                                                rng_);
-    }
+    r = sampler_.sample(lg, so, ids_, rng_);
     ids_.push_back(r.id);
     prev_ = r.id;
     usage_.completion_tokens++;
@@ -461,17 +443,6 @@ class Session : public ISession {
     prefix_cache_.restore_logits(idx, pend_);
   }
 
-  // Grow-once host staging for the sampled (non-greedy) path: the logits
-  // mirror and its float conversion buffer persist across steps so sampled
-  // tokens cost one deep_copy plus O(V) compute, with no per-token host
-  // allocations.
-  void ensure_samp(size_t n) {
-    if (samp_host_.extent(0) < n)
-      samp_host_ = typename View1::host_mirror_type(
-          "KokkosDNN::LFM25::Session::samp_host", n);
-    if (samp_f_.size() < n) samp_f_.resize(n);
-  }
-
   Model<ExecSpace, Scalar> model_;
   Tokenizer tok_;
   SessionOptions opts_;
@@ -494,8 +465,10 @@ class Session : public ISession {
   int prev_ = -1;
   std::vector<int> ids_;  // prompt + sampled ids (sampler prior)
   std::vector<int> idbuf_{0};  // single-id decode staging (no per-token alloc)
-  typename View1::host_mirror_type samp_host_;  // persistent logits mirror
-  std::vector<float> samp_f_;  // persistent mirror-to-float conversion buffer
+  // Sampling scratch (V-sized device buffers + host penalty scratch), owned
+  // here so a request never reallocates per token. Sampling itself runs on
+  // device (see KokkosDNN_Sampler.hpp).
+  ::KokkosDNN::Impl::DeviceSampler<ExecSpace> sampler_;
   ::KokkosDNN::Common::Usage usage_;
   bool finished_ = false;
   ::KokkosDNN::Common::FinishReason finish_ =
