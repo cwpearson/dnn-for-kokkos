@@ -112,13 +112,23 @@ class Session {
         detok_(resolve_stop_strings(opts_)),
         one_("KokkosDNN::LFM25::Session::one", 1) {}
 
-  // Start (or restart) a turn: reset state, forward the prompt with the
-  // model's chunked prefill, stash the last-prompt-token logits for the
-  // first step(). Reseeds the RNG from opts.seed iff opts.seedProvided.
+  // Replace the request-local sampling/stop/seed policy (e.g. when a
+  // long-lived Session is reused across requests with different options).
+  // Re-derives the stop policy; the next prefill() resets all turn state.
+  void set_options(SessionOptions opts) {
+    opts_ = std::move(opts);
+    stop_ids_ = resolve_stop_ids(opts_, model_.cfg);
+    detok_ = ::KokkosDNN::Common::IncrementalDetokenizer(
+        resolve_stop_strings(opts_));
+  }
+
   void prefill(const std::vector<int>& ids) {
     prefill(ids, opts_.seed, opts_.seedProvided);
   }
 
+  // Start (or restart) a turn: reset state, forward the prompt with the
+  // model's chunked prefill, stash the last-prompt-token logits for the
+  // first step(). Reseeds the RNG from opts.seed iff opts.seedProvided.
   // prefill() with an explicit reseed (hasSeed=true) or a continued RNG
   // stream (hasSeed=false).
   void prefill(const std::vector<int>& ids, uint64_t seed, bool hasSeed) {
@@ -188,9 +198,32 @@ class Session {
           });
       lg = model_.forward(one_);
     }
-    ::KokkosDNN::SampleResult r =
-        ::KokkosDNN::sample_token_result<ExecSpace, Scalar>(
-            lg, opts_.sampling, ids_, rng_);
+    ::KokkosDNN::SampleResult r;
+    // Same routing as sample_token_result(): the neutral greedy path stays
+    // on device (parallel_reduce argmax, no host mirror); everything else
+    // mirrors once into persistent session scratch (no per-token
+    // create_mirror_view/host-vector mallocs) and runs the shared host
+    // pipeline. Bit-identical to sample_token_result() by construction:
+    // same device argmax, same host entry point, same predicates over the
+    // same public SampleOptions fields.
+    const auto& so = opts_.sampling;
+    const bool need_host =
+        !so.is_greedy() || so.repetition_penalty != 1.0f ||
+        so.frequency_penalty != 0.0f || so.presence_penalty != 0.0f ||
+        !so.logit_bias.empty() || so.logprobs > 0;
+    if (!need_host && so.logprobs <= 0) {
+      r.id = ::KokkosDNN::device_argmax<ExecSpace, Scalar>(lg);
+    } else {
+      const size_t V = lg.extent(0);
+      if (V == 0)
+        throw std::invalid_argument("sample_token_result: empty logits");
+      ensure_samp(V);
+      Kokkos::deep_copy(samp_host_, lg);
+      for (size_t i = 0; i < V; ++i)
+        samp_f_[i] = static_cast<float>(samp_host_(i));
+      r = ::KokkosDNN::sample_host_logits_result(samp_f_.data(), V, so, ids_,
+                                                rng_);
+    }
     ids_.push_back(r.id);
     prev_ = r.id;
     usage_.completion_tokens++;
@@ -201,7 +234,8 @@ class Session {
     }
     std::string piece;
     try {
-      piece = tok_.decode(std::vector<int>{r.id});
+      idbuf_[0] = r.id;  // persistent 1-elem staging: no vector alloc/token
+      piece = tok_.decode(idbuf_);
     } catch (...) {
       piece.clear();  // undecodable id: stream "" rather than throw
     }
@@ -277,6 +311,17 @@ class Session {
     prompt_cap_ = n;
   }
 
+  // Grow-once host staging for the sampled (non-greedy) path: the logits
+  // mirror and its float conversion buffer persist across steps so sampled
+  // tokens cost one deep_copy plus O(V) compute, with no per-token host
+  // allocations.
+  void ensure_samp(size_t n) {
+    if (samp_host_.extent(0) < n)
+      samp_host_ = typename View1::host_mirror_type(
+          "KokkosDNN::LFM25::Session::samp_host", n);
+    if (samp_f_.size() < n) samp_f_.resize(n);
+  }
+
   Model<ExecSpace, Scalar> model_;
   Tokenizer tok_;
   SessionOptions opts_;
@@ -291,6 +336,9 @@ class Session {
   bool has_pending_ = false;
   int prev_ = -1;
   std::vector<int> ids_;  // prompt + sampled ids (sampler prior)
+  std::vector<int> idbuf_{0};  // single-id decode staging (no per-token alloc)
+  typename View1::host_mirror_type samp_host_;  // persistent logits mirror
+  std::vector<float> samp_f_;  // persistent mirror-to-float conversion buffer
   ::KokkosDNN::Common::Usage usage_;
   bool finished_ = false;
   ::KokkosDNN::Common::FinishReason finish_ =

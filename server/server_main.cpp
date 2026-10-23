@@ -30,6 +30,7 @@
 #include <cstring>
 #include <ctime>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -177,6 +178,11 @@ struct ServerState {
   Tokenizer tok;
   std::mutex mu;  // single in-flight request; others block
   std::atomic<unsigned long long> next_id{1};
+  // Long-lived decoding session reused across requests (guarded by mu).
+  // Per-request construction re-rents the full KV cache and deep-copies
+  // the tokenizer (~170ms TTFT); Session::prefill() already resets all
+  // turn state, and run_session() re-applies per-request options + seed.
+  std::unique_ptr<ServerSession> sess;
 };
 
 // Loads Config (HF defaults + optional JSON overlay), GGUF weights, and the
@@ -861,7 +867,11 @@ std::string tool_feed(ServerState& st, ToolCallStreamParser& parser,
                       const StepOutcome& s) {
   std::string raw_piece;
   try {
-    raw_piece = st.tok.decode(std::vector<int>{s.id}, false);
+    // Persistent 1-elem staging: tools-mode decode already costs a map
+    // lookup + string build per token; no need for a vector malloc too.
+    thread_local std::vector<int> idbuf{0};
+    idbuf[0] = s.id;
+    raw_piece = st.tok.decode(idbuf, false);
   } catch (...) {
     raw_piece.clear();
   }
@@ -900,11 +910,19 @@ GenResult run_session(ServerState& st, const std::vector<int>& prompt_ids,
     max_new = static_cast<int>(budget);
   opts.max_new = max_new;
 
-  ServerSession sess(st.cfg, st.weights, st.tok, opts);
-  if (has_seed)
-    sess.prefill(prompt_ids, seed, /*hasSeed=*/true);
+  // Reuse one long-lived Session: avoids re-renting the KV cache and
+  // re-copying the tokenizer on every request. set_options() + prefill()
+  // reset all turn state; the forced reseed reproduces fresh-session RNG
+  // behavior exactly (construction seeds from opts.seed, an explicit
+  // request seed wins, unseeded requests deterministically restart the
+  // default stream).
+  if (!st.sess)
+    st.sess = std::make_unique<ServerSession>(st.cfg, st.weights, st.tok,
+                                              opts);
   else
-    sess.prefill(prompt_ids);
+    st.sess->set_options(opts);
+  ServerSession& sess = *st.sess;
+  sess.prefill(prompt_ids, has_seed ? seed : opts.seed, /*hasSeed=*/true);
   std::string text;
   while (!sess.finished()) {
     StepOutcome s = sess.step();
