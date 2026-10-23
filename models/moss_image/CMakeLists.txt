@@ -18,8 +18,9 @@ if(KokkosDNN_ENABLE_IMAGE)
 endif()
 target_compile_features(kokkosdnn_moss INTERFACE cxx_std_20)
 kokkosdnn_enable_compiler_warnings(kokkosdnn_moss)
+set_target_properties(kokkosdnn_moss PROPERTIES EXPORT_NAME moss)
 
-install(TARGETS kokkosdnn_moss EXPORT KokkosDNNTragets)
+install(TARGETS kokkosdnn_moss EXPORT KokkosDNNTargets)
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
   FILES_MATCHING PATTERN "*.hpp" PATTERN "*.inc"

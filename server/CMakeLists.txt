@@ -57,5 +57,5 @@ if(KokkosDNN_ENABLE_TESTS)
     COMMAND kokkosdnn_server_parsing_tests)
 endif()
 
-install(TARGETS kokkosdnn_server EXPORT KokkosDNNTragets
+install(TARGETS kokkosdnn_server EXPORT KokkosDNNTargets
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
