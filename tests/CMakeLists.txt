@@ -33,16 +33,21 @@ kokkosdnn_add_test(test_conv1dgeneral Test_Conv1DGeneral.cpp)
 kokkosdnn_add_test(test_lstm Test_LSTM.cpp)
 kokkosdnn_add_test(test_adaptivenorm Test_AdaptiveNorm.cpp)
 kokkosdnn_add_test(test_audiodsp Test_AudioDSP.cpp)
-kokkosdnn_add_test(test_mossimage Test_MossImageOps.cpp)
-kokkosdnn_add_test(test_mossimageddit Test_MossImageDit.cpp)
-kokkosdnn_add_test(test_mossimage_encoder Test_MossImageEncoder.cpp)
-kokkosdnn_add_test(test_qwen_tokenizer Test_QwenTokenizer.cpp)
-kokkosdnn_add_test(test_mossimagevae Test_MossImageVae.cpp)
-# Model-specific headers moved out of src/ to models/moss_image/; only the
-# MOSS/Qwen tests get that directory on their include path.
-foreach(t test_mossimage test_mossimageddit test_mossimage_encoder test_qwen_tokenizer test_mossimagevae)
-  target_include_directories(${t} PRIVATE ${CMAKE_SOURCE_DIR}/models/moss_image)
-endforeach()
+# MOSS-Image unit tests build only when the MOSS model component is enabled,
+# mirroring models/CMakeLists.txt and examples/CMakeLists.txt (both guard
+# their MOSS subdirectories on KokkosDNN_ENABLE_MODEL_MOSS).
+if(KokkosDNN_ENABLE_MODEL_MOSS)
+  kokkosdnn_add_test(test_mossimage Test_MossImageOps.cpp)
+  kokkosdnn_add_test(test_mossimageddit Test_MossImageDit.cpp)
+  kokkosdnn_add_test(test_mossimage_encoder Test_MossImageEncoder.cpp)
+  kokkosdnn_add_test(test_qwen_tokenizer Test_QwenTokenizer.cpp)
+  kokkosdnn_add_test(test_mossimagevae Test_MossImageVae.cpp)
+  # Model-specific headers moved out of src/ to models/moss_image/; only the
+  # MOSS/Qwen tests get that directory on their include path.
+  foreach(t test_mossimage test_mossimageddit test_mossimage_encoder test_qwen_tokenizer test_mossimagevae)
+    target_include_directories(${t} PRIVATE ${CMAKE_SOURCE_DIR}/models/moss_image)
+  endforeach()
+endif()
 
 if(KokkosDNN_ENABLE_IMAGE)
   kokkosdnn_add_test(test_image Test_Image.cpp)
