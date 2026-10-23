@@ -1,1 +1,35 @@
-include(KokkosDNN::kokkosdnn)
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# Core dependency: Kokkos 5.x (see CMakeLists.txt find_package(Kokkos)).
+find_dependency(Kokkos 5)
+
+# TPLs linked PUBLICly by KokkosDNN::kokkosdnn must resolve in the
+# consumer. Each guard is baked in at build time: only TPLs enabled when
+# this package was configured trigger a find_dependency in the consumer.
+if(@KokkosDNN_ENABLE_CUBLAS@ OR @KokkosDNN_ENABLE_CUDNN@)
+  find_dependency(CUDAToolkit)
+endif()
+
+if(@KokkosDNN_USE_CUDNN_CONFIG@)
+  # Build linked CUDNN::cudnn from a CUDNN package config; re-find it here.
+  # (When the build fell back to manual CUDNN_LIBRARY paths, absolute paths
+  # are baked into the targets file and no find is needed.)
+  find_dependency(CUDNN)
+endif()
+
+if(@KokkosDNN_ENABLE_HIPBLAS@)
+  find_dependency(hipblas)
+endif()
+
+if(@KokkosDNN_USE_MIOPEN_CONFIG@)
+  # Same split as CUDNN above: config target vs. manual absolute paths.
+  find_dependency(miopen)
+endif()
+
+# NOTE: KokkosDNN_ENABLE_ACCELERATE needs no find: Accelerate is an Apple
+# system framework linked by absolute path baked into the targets file.
+
+include("${CMAKE_CURRENT_LIST_DIR}/KokkosDNNTargets.cmake")
+check_required_components(KokkosDNN)
