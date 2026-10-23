@@ -134,6 +134,32 @@ constexpr int GemmMidTK = 32;
 constexpr int GemmMidRT = 4;
 constexpr int GemmMidCT = 4;
 
+// cuBLAS NT layout guard: the cublasSgemm/cublasGemmEx calls below pass the
+// extents as leading dims (lda == K for X/W, N for Y), which is exact only
+// for row-pitch == extent views. Any padded/strided view (stride(0) !=
+// extent) or > INT_MAX extent must decline TPL and run the native kernel --
+// cuBLAS would otherwise silently read/write the wrong elements. All LFM
+// call sites pass contiguous views (scratch subviews slice only the row
+// axis of LayoutRight buffers, whose row pitch still equals K), so this
+// guard never fires there; it protects future/strided callers.
+// (LayoutRight guarantees stride(1) == 1, so checking stride(0) fully
+// characterizes the leading dim.)
+inline bool gemm_nt_cublas_layout_ok(size_t M, size_t N, size_t K, size_t sx0,
+                                      size_t sw0, size_t sy0) {
+  constexpr size_t kMax =
+      static_cast<size_t>((std::numeric_limits<int>::max)());
+  return M > 0 && N > 0 && K > 0 && M <= kMax && N <= kMax && K <= kMax &&
+         sx0 == K && sw0 == K && sy0 == N;
+}
+
+// Rank-1 (M == 1) variant of the guard: x/y are contiguous by construction,
+// only the weight row pitch and the int range need checking.
+inline bool gemv_nt_cublas_layout_ok(size_t N, size_t K, size_t sw0) {
+  constexpr size_t kMax =
+      static_cast<size_t>((std::numeric_limits<int>::max)());
+  return N > 0 && K > 0 && N <= kMax && K <= kMax && sw0 == K;
+}
+
 // Portable 4-wide vector element for coalesced global loads: 4 consecutive
 // Scalars at natural alignment (16 B for float, 8 B for bhalf_t). Replaces
 // the old CUDA-only float4, which did not compile on host backends.
@@ -707,7 +733,9 @@ void gemm(const DNNHandle<ExecSpace>& handle, Scalar alpha,
   if constexpr (is_cuda) {
     if (handle.use_cublas) {
       void* raw = handle.cublas_raw();
-      if (raw != nullptr) {
+      if (raw != nullptr &&
+          Impl::gemm_nt_cublas_layout_ok(M, N, K, X.stride(0), W.stride(0),
+                                         Y.stride(0))) {
         // No fence here: cublas_*_with_handle() re-selects the Kokkos CUDA
         // stream on the cached handle every call, so cuBLAS work is ordered
         // with surrounding Kokkos kernels on that stream.
@@ -726,7 +754,10 @@ void gemm(const DNNHandle<ExecSpace>& handle, Scalar alpha,
               static_cast<int>(K), static_cast<float>(alpha), X.data(),
               W.data(), static_cast<float>(beta), Y.data());
         }
-        if (ok) return;
+        if (ok) {
+          Impl::tpl_note_gemm(true);
+          return;
+        }
         // else fall through to native (unsupported scalar or cuBLAS failure,
         // e.g. no BF16 tensor support on the arch)
       }
@@ -743,7 +774,9 @@ void gemm(const DNNHandle<ExecSpace>& handle, Scalar alpha,
   if constexpr (is_hip) {
     if (handle.use_hipblas) {
       void* raw = handle.hipblas_raw();
-      if (raw != nullptr) {
+      if (raw != nullptr &&
+          Impl::gemm_nt_cublas_layout_ok(M, N, K, X.stride(0), W.stride(0),
+                                         Y.stride(0))) {
         // No fence here: hipblas_*_with_handle() re-selects the Kokkos HIP
         // stream on the cached handle every call, so hipBLAS work is ordered
         // with surrounding Kokkos kernels on that stream.
@@ -762,7 +795,10 @@ void gemm(const DNNHandle<ExecSpace>& handle, Scalar alpha,
               static_cast<int>(K), static_cast<float>(alpha), X.data(),
               W.data(), static_cast<float>(beta), Y.data());
         }
-        if (ok) return;
+        if (ok) {
+          Impl::tpl_note_gemm(true);
+          return;
+        }
         // else fall through to native (unsupported scalar or hipBLAS failure,
         // e.g. no BF16 support on the arch)
       }
@@ -787,8 +823,10 @@ void gemm(const DNNHandle<ExecSpace>& handle, Scalar alpha,
           if (Impl::accelerate_gemm_nt_float(
                   static_cast<int>(M), static_cast<int>(N),
                   static_cast<int>(K), alpha, X.data(), X.stride(0), W.data(),
-                  W.stride(0), beta, Y.data(), Y.stride(0)))
+                  W.stride(0), beta, Y.data(), Y.stride(0))) {
+            Impl::tpl_note_gemm(true);
             return;
+          }
         }
       }
     }
@@ -798,6 +836,7 @@ void gemm(const DNNHandle<ExecSpace>& handle, Scalar alpha,
   // row), so it reuses the team-per-row GEMV kernel with alpha/beta (one
   // team per N-row, vector-parallel K) instead of the tiled GEMM; M > 1
   // uses the portable shared-memory tiled kernel (Impl notes).
+  Impl::tpl_note_gemm(false);
   const float alpha_f = static_cast<float>(alpha);
   const float beta_f  = static_cast<float>(beta);
   if (M == 1 && K > 0 && N > 0) {
@@ -829,7 +868,7 @@ void gemv(const DNNHandle<ExecSpace>& handle,
   // Backend named deliberately: cuBLAS dispatch genuinely requires CUDA.
   constexpr bool is_cuda = std::is_same_v<ExecSpace, Kokkos::Cuda>;
   if constexpr (is_cuda) {
-    if (handle.use_cublas && N > 0 && K > 0) {
+    if (handle.use_cublas && Impl::gemv_nt_cublas_layout_ok(N, K, W.stride(0))) {
       void* raw = handle.cublas_raw();
       if (raw != nullptr) {
         // No fence here: cublas_*_with_handle() re-selects the Kokkos CUDA
@@ -848,7 +887,10 @@ void gemv(const DNNHandle<ExecSpace>& handle,
               h, 1, static_cast<int>(N), static_cast<int>(K), 1.0f, x.data(),
               W.data(), 0.0f, y.data());
         }
-        if (ok) return;
+        if (ok) {
+          Impl::tpl_note_gemv(true);
+          return;
+        }
         // else fall through to native (unsupported scalar or cuBLAS failure)
       }
     }
@@ -861,7 +903,7 @@ void gemv(const DNNHandle<ExecSpace>& handle,
   // Mirror of the cuBLAS block above (M=1 path).
   constexpr bool is_hip = std::is_same_v<ExecSpace, Kokkos::HIP>;
   if constexpr (is_hip) {
-    if (handle.use_hipblas && N > 0 && K > 0) {
+    if (handle.use_hipblas && Impl::gemv_nt_cublas_layout_ok(N, K, W.stride(0))) {
       void* raw = handle.hipblas_raw();
       if (raw != nullptr) {
         // No fence here: hipblas_*_with_handle() re-selects the Kokkos HIP
@@ -880,7 +922,10 @@ void gemv(const DNNHandle<ExecSpace>& handle,
               h, 1, static_cast<int>(N), static_cast<int>(K), 1.0f, x.data(),
               W.data(), 0.0f, y.data());
         }
-        if (ok) return;
+        if (ok) {
+          Impl::tpl_note_gemv(true);
+          return;
+        }
         // else fall through to native (unsupported scalar or hipBLAS failure)
       }
     }
@@ -892,7 +937,8 @@ void gemv(const DNNHandle<ExecSpace>& handle,
   constexpr bool is_host_mem_gemv =
       std::is_same_v<typename ExecSpace::memory_space, Kokkos::HostSpace>;
   if constexpr (is_host_mem_gemv) {
-    if (handle.use_accelerate && N > 0 && K > 0) {
+    if (handle.use_accelerate && N > 0 && K > 0 && x.stride(0) == 1 &&
+        y.stride(0) == 1) {
       if constexpr (std::is_same_v<Scalar, float>) {
         constexpr size_t kMaxV = static_cast<size_t>(
             (std::numeric_limits<int>::max)());
@@ -900,8 +946,10 @@ void gemv(const DNNHandle<ExecSpace>& handle,
           Kokkos::fence();
           if (Impl::accelerate_gemm_nt_float(
                   1, static_cast<int>(N), static_cast<int>(K), 1.0f, x.data(),
-                  K, W.data(), W.stride(0), 0.0f, y.data(), N))
+                  K, W.data(), W.stride(0), 0.0f, y.data(), N)) {
+            Impl::tpl_note_gemv(true);
             return;
+          }
         }
       }
     }
@@ -910,6 +958,7 @@ void gemv(const DNNHandle<ExecSpace>& handle,
   if (N == 0 || K == 0) return;
   // Native: team-per-row GEMV (one team per N-row, vector-parallel K over
   // scratch-staged x slabs; Impl notes). FP32 accumulation.
+  Impl::tpl_note_gemv(false);
   Impl::gemv_native<ExecSpace, Scalar>(x, W, 1.0f, 0.0f, y, label);
 }
 

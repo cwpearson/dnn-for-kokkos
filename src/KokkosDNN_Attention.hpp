@@ -554,12 +554,16 @@ void attention_gqa_streaming(const DNNHandle<ExecSpace>& handle, const QView& q,
     // false falls back to the native kernel below.
     if (handle.use_cudnn) {
       if (sliding_window == 0) {
-        if (try_cudnn_sdpa_gqa<Scalar>(handle, q, k, v, q_off, out, scale))
+        if (try_cudnn_sdpa_gqa<Scalar>(handle, q, k, v, q_off, out, scale)) {
+          tpl_note_attn(true);
           return;
+        }
       } else {
         if (try_cudnn_sdpa_gqa_sliding<Scalar>(handle, q, k, v, q_off, out,
-                                               scale, sliding_window))
+                                               scale, sliding_window)) {
+          tpl_note_attn(true);
           return;
+        }
       }
     }
   } else {
@@ -603,6 +607,7 @@ void attention_gqa_streaming(const DNNHandle<ExecSpace>& handle, const QView& q,
   // materialized; extra memory is O(D) scratch per resident team plus O(1)
   // per (t, h) beyond the outputs, so 128k contexts stay feasible.
   using DummyMask = Kokkos::View<int*, ExecSpace>;
+  tpl_note_attn(false);
   launch_gqa_streaming_auto<ExecSpace, Scalar, QView, KView, VView, DummyMask,
                             OView, false, false>(
       q, k, v, DummyMask(), out, T, Hq, D, Hkv, Ktot, q_off, scale, 0.0f,
