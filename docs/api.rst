@@ -32,6 +32,8 @@ Conventions
    api/normalization
    api/convolution
    api/attention
+   api/moe
+   api/sequence
    api/diffusion
    api/embeddings
    api/activations
