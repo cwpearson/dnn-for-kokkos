@@ -1186,6 +1186,21 @@ bool sse_done(httplib::DataSink& sink) {
   return sink.write(kDone, sizeof(kDone) - 1);
 }
 
+// Peer liveness for a streaming response. A write only reports an error once
+// the transport gives up (RST); a half-closed peer (FIN) can absorb many
+// small SSE frames first, so a long generation can keep running for a client
+// that is already gone. is_writable() is httplib's non-destructive
+// select()+MSG_PEEK on the socket, which notices the FIN immediately.
+//
+// Polled every kLivenessPollSteps decoded tokens: one syscall per 16 tokens
+// is negligible next to a forward pass, and polling per token would add one
+// to every step. The single-flight inference lock means a dead client that is
+// not detected costs the *next* queued request the whole completion, which is
+// exactly the multi-second queueing seen in deployed agentic loops.
+constexpr size_t kLivenessPollSteps = 16;
+
+bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
+
 // ---------------------------------------------------------------------------
 // Route handlers
 // ---------------------------------------------------------------------------
@@ -1327,6 +1342,7 @@ bool sse_done(httplib::DataSink& sink) {
                   st.tok, p.messages, p.tools_json, sys_suffix, true, true);
           tm.encode_ms = now_ms() - t_encode;
           bool sse_ok = true;
+          size_t steps_since_poll = 0;
           auto chunk = [&](const json& delta, const json& finish) {
             if (!sse_ok) return;
             json c{{"id", id},
@@ -1341,11 +1357,27 @@ bool sse_done(httplib::DataSink& sink) {
             sse_ok = sse_send(sink, c);
           };
           chunk({{"role", "assistant"}}, nullptr);
+          // Nothing has been generated yet: if the peer is already gone, do
+          // not pay for this turn's prefill (seconds at long context) under
+          // the single-flight lock.
+          if (!sse_ok || !sse_peer_alive(sink)) {
+            tm.aborted = true;
+            log_turn(method, target, 200, tm, 0, 0);
+            sink.done();
+            return true;
+          }
           ToolCallStreamParser tool_parser(resolved_stops(p));
           GenResult r = run_session(
               st, full_ids, content_ids, p.opts, p.has_seed, p.seed,
               p.req_max_tokens,
               [&](const StepOutcome& s) {
+                // Cheap periodic liveness check: picks up a client that
+                // disconnected without the socket write failing yet.
+                if (++steps_since_poll >= kLivenessPollSteps) {
+                  steps_since_poll = 0;
+                  if (!sse_peer_alive(sink)) sse_ok = false;
+                }
+                if (!sse_ok) return false;
                 if (!p.tools_active) {
                   if (!s.delta.empty())
                     chunk({{"content", s.delta}}, nullptr);
@@ -1514,6 +1546,15 @@ bool sse_done(httplib::DataSink& sink) {
           }
           p.messages = KokkosDNN::LFM25::make_chat_messages(
               it->get<std::string>(), "", "user");
+          // This endpoint has no opening chunk, so this is the last chance to
+          // notice a peer that left before paying for the prefill.
+          if (!sse_peer_alive(sink)) {
+            tm.aborted = true;
+            log_turn(method, target, 200, tm, 0, 0);
+            sink.done();
+            return true;
+          }
+          size_t steps_since_poll = 0;
           const double t_encode = now_ms();
           const std::vector<int> content_ids =
               KokkosDNN::LFM25::encode_chatml(st.tok, p.messages, false, true);
@@ -1525,6 +1566,11 @@ bool sse_done(httplib::DataSink& sink) {
               st, full_ids, content_ids, p.opts, p.has_seed, p.seed,
               p.req_max_tokens,
               [&](const StepOutcome& s) {
+                if (++steps_since_poll >= kLivenessPollSteps) {
+                  steps_since_poll = 0;
+                  if (!sse_peer_alive(sink)) sse_ok = false;
+                }
+                if (!sse_ok) return false;
                 if (s.delta.empty()) return sse_ok;
                 sse_ok = sse_send(
                     sink, json{{"id", id},
@@ -1631,6 +1677,11 @@ int main(int argc, char* argv[]) {
       // ACK can hold a frame back ~40 ms. Nagle costs nothing to disable and
       // the stream is latency-, not bandwidth-bound.
       svr.set_tcp_nodelay(true);
+      // Bound one SSE/proxy write. cpp-httplib defaults to 5 s; a stalled
+      // reader otherwise holds the single-flight inference lock for up to
+      // that long per frame. SSE frames are ~100 B, so 2 s is already
+      // generous for a healthy client and bounds a dead-but-not-reset peer.
+      svr.set_write_timeout(2, 0);
       // Log every request: METHOD target body_bytes=N -> STATUS plus
       // error="..." for non-2xx (extracted from the JSON error body).
       svr.set_logger([](const httplib::Request& req,
