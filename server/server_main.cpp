@@ -16,6 +16,7 @@
 
 #include <Kokkos_Core.hpp>
 
+#include "KokkosDNN_config.h"
 #include "KokkosDNN_LFM25Config.hpp"
 #include "KokkosDNN_LFM25Session.hpp"
 #include "KokkosDNN_LFM25Tokenizer.hpp"
@@ -57,7 +58,10 @@ using Scalar = DefaultScalar;
 using ServerSession = Session<Exec, Scalar>;
 using json = nlohmann::json;
 
-constexpr const char* kVersion = "0.1.0";
+// Single-sourced from the top-level project(VERSION ...): the generated
+// KokkosDNN_config.h carries KOKKOSDNN_VERSION, so bumps only touch
+// CMakeLists.txt.
+constexpr const char* kVersion = KOKKOSDNN_VERSION;
 constexpr int kDefaultPort = 8000;
 constexpr const char* kDefaultModel = "lfm2_5";
 constexpr int kDefaultMaxTokens = 256;
