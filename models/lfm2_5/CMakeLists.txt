@@ -25,5 +25,10 @@ install(TARGETS kokkosdnn_lfm25 EXPORT KokkosDNNTargets
 )
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-  FILES_MATCHING PATTERN "*.hpp" PATTERN "*.json"
+  FILES_MATCHING PATTERN "*.hpp"
+)
+# Runtime data (not a compiler header): install the model config alongside
+# other share/ payloads so <prefix>/include stays header-only.
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/config-lfm2_5-24b-a2b.json
+  DESTINATION ${CMAKE_INSTALL_DATADIR}/KokkosDNN
 )
