@@ -546,40 +546,10 @@ void launch_gqa_streaming_auto(const QView& q, const KView& k, const VView& v,
 }
 
 // ---------------------------------------------------------------------------
-// Single-token (T == 1) decode attention: one team per query head.
-//
-// Why a separate kernel: at T == 1 the streaming functor above hands each of
-// the HC heads of a team its own query row, and that row walks the whole key
-// axis serially on one thread. With Hq == 32, HC == 4 only 4 of 256 team
-// threads do the key loop, so decode attention (a memory-bound GEMV per head:
-// ~2 x Ktot x D x sizeof(Scalar) bytes) ran at ~0.1 GB/s -- measured 1.9 ms
-// per call at Ktot = 900, D = 64, Hq = 32, i.e. ~19 ms of the ~27 ms
-// native-build decode step, and growing with context. Decode is exactly this
-// shape, once per layer per token, so it dominated batch-1 decode in both
-// builds (the TPL build additionally rebuilt its cuDNN SDPA plan per token;
-// see the dispatch note in attention_gqa_streaming).
-//
-// Structure (league = Hq teams, team = one thread per head dim where the
-// backend allows it; every loop strides on the runtime team size, so Serial
-// and clamped teams are correct by construction):
-//   * keys stream through in tiles of `ktile`; K and V tile rows are staged
-//     in team scratch by the whole team, coalesced along D;
-//   * scores: thread r owns keys r, r + team, ... of the tile and does the
-//     full-D dot (8 interleaved accumulators, same as the streaming kernel)
-//     from the staged K row;
-//   * one team max per tile folds into the running max m (the same deferred
-//     normalization the streaming kernel uses): the shared accumulator row
-//     and each thread's partial denominator are rescaled by exp(m - m_new);
-//   * the accumulator row is updated by thread d for dim d, so the V
-//     multiply is D-way parallel over consecutive addresses (and the staged
-//     rows are padded to an odd stride so the score phase's row access is
-//     bank-conflict-free);
-//   * per-thread partial denominators are combined once, at the end.
-// The result equals softmax(Q K^T * scale) V with FP32 accumulation and the
-// same per-key rescaling as the streaming kernel, up to FP32 rounding of a
-// different summation order (tile-blocked instead of strictly sequential).
-// The tile-pair (K + V) plus state is sized by the launcher to stay within
-// the portable kMaxTeamScratchBytes budget, so this runs on every backend.
+// Pre-split-K single-token decode kernel, kept only as launch_gqa_decode's
+// last-resort fallback for head dims too large for the split-K footprint
+// (see launch_gqa_decode_small_scratch). One team per query head, K/V staged
+// in float team scratch at a 32-key tile:
 
 // Team-scratch footprint (in floats) of GqaDecodeFunctor: scaled query row
 // and accumulator row, this tile's scores/weights, per-slot partial
@@ -758,14 +728,22 @@ struct GqaDecodeFunctor {
   }
 };
 
-// Single-token decode launcher: team size one thread per head dim (rounded
-// up to a warp, clamped to what the backend can field, e.g. Serial -> 1) and
-// a key-tile width that keeps the scratch within kMaxTeamScratchBytes.
+// Fallback decode launcher for the one case the split-K kernel cannot field:
+// a per-team scratch budget (kMaxTeamScratchBytes on Serial, the device's
+// shared-memory limit elsewhere) too small even for its D-sized query and
+// accumulator rows, i.e. head dims in the thousands. Unchanged from before
+// the split-K kernel and kept only so extreme head dims keep working; the
+// split-K path handles every geometry that fits (see launch_gqa_decode).
+// Team size one thread per head dim (rounded up to a warp, clamped to what
+// the backend can field, e.g. Serial -> 1) and a key-tile width that keeps
+// the scratch within kMaxTeamScratchBytes.
 template <class ExecSpace, class Scalar, class QView, class KView, class VView,
           class OView>
-void launch_gqa_decode(const QView& q, const KView& k, const VView& v,
-                       size_t q_off, const OView& out, float scale,
-                       size_t sliding_window, const std::string& label) {
+void launch_gqa_decode_small_scratch(const QView& q, const KView& k,
+                                     const VView& v, size_t q_off,
+                                     const OView& out, float scale,
+                                     size_t sliding_window,
+                                     const std::string& label) {
   const size_t Hq = q.extent(1), D = q.extent(2);
   const size_t Hkv = k.extent(1), Ktot = k.extent(0);
   if (Hq == 0 || D == 0 || Ktot == 0) return;
@@ -798,6 +776,570 @@ void launch_gqa_decode(const QView& q, const KView& k, const VView& v,
       static_cast<int>(Hq), team_size, 1);
   policy.set_scratch_size(0, Kokkos::PerTeam(bytes(ktile)));
   Kokkos::parallel_for(label, policy, f);
+}
+
+// ---------------------------------------------------------------------------
+// Single-token (T == 1) decode attention: flash decoding (split-K over the
+// key axis, one block per (KV-head group, key range)).
+//
+// Why a dedicated kernel: at T == 1 attention is a memory-bound GEMV per
+// query head -- it streams 2 x Ktot x D x sizeof(Scalar) bytes per head for
+// 4 x Ktot x D FLOPs, once per layer per decoded token, so at 10-15k context
+// it dominates batch-1 decode. The first version of this kernel (one team per
+// query head, Hq teams of 64 threads) could not scale: only Hq blocks per
+// launch (39% of an RTX 3090's SMs, 24% of an H100's) at 2 warps each, a
+// 32-key tile forced by the portable 32 KiB scratch cap (~469 tiles and
+// ~1878 team barriers per call at Ktot = 15000), and all four query heads of
+// a GQA group re-streaming the same KV head, for 122.9 MB read per layer at
+// Ktot = 15000 (measured ~59 GB/s effective, 2.26 ms per call, 16384 keys).
+//
+// Structure of the split-K kernel:
+//   * The query row's key window [klo, khi) (gqa_key_window: causal, plus the
+//     sliding-window lower clamp) is cut into `nsplit` contiguous key ranges.
+//     Grid = (Hq / NG) * nsplit blocks of 128 threads, nsplit chosen from the
+//     backend's concurrency estimate (~4 blocks per SM, at least half a tile
+//     per split), so the grid scales with the device instead of with Hq and
+//     the key axis is walked in parallel by many blocks.
+//   * NG is the GQA group size Hq / Hkv -- 4 for LFM2.5-24B-A2B (32 / 8): one
+//     block covers every query head that shares a KV head, so a key's K and V
+//     rows are read once and reused NG times (4x less KV traffic: 30.7 MB per
+//     layer at Ktot = 15000). Geometries whose group is not 1/2/4/8 query
+//     heads wide (Hq % Hkv != 0, or a wider MQA group) run this same kernel
+//     with NG == 1 and the h * Hkv / Hq mapping, so every geometry is exact
+//     and grouping is purely a traffic optimization.
+//   * Keys stream through a block's range in tiles of `ktile` (<= 256, chosen
+//     from the backend's actual per-team scratch budget). Per tile there are
+//     three phases and three team barriers (three per ktile keys instead of
+//     the old two per 32):
+//       - scores: thread r owns keys r, r + team, ... of the tile and
+//         computes all NG full-D dots from the K row (raw row pointer plus d
+//         stride, so plain views and cache subviews behave identically);
+//       - max/weights: one team max per head folds into the running max m
+//         (the same deferred normalization the streaming kernel uses),
+//         aa = exp(m_old - m_new), and each key's owner rewrites its scores
+//         as exp(s - m_new) while accumulating its own rescaled denominator;
+//       - accumulate: thread r owns dims r, r + team, ... and keeps the NG
+//         FP32 accumulators of its dims in registers across the tile's keys;
+//         one V element per key feeds all NG heads.
+//   * Each block writes one partial per (query head, split) -- (m, l, acc[D])
+//     -- into a persistent workspace, and a second kernel (grid = Hq, one
+//     small team each) merges the splits with the usual log-sum-exp combine:
+//         M = max_i m_i, O = sum_i acc_i exp(m_i - M) / sum_i l_i exp(m_i - M)
+//     so a decode call is two kernel launches.
+//   * The workspace lives on the DNNHandle (mutable, grow-only, fenced only
+//     when it grows): a decode step calls attention ~10 times per token, so a
+//     per-call cudaMalloc would dominate. Being a handle member, it never
+//     crosses ExecSpace instances.
+//
+// Numerics keep the previous contract: FP32 accumulation throughout, per-key
+// rescaling against a tile maximum, and a single final Scalar rounding (the
+// combine's exp-weighted merge is algebraically identical). The result equals
+// softmax(Q K^T * scale) V up to FP32 reassociation of a different summation
+// order (tile-blocked and split-blocked instead of strictly sequential), the
+// same guarantee the streaming kernel gives. A query row with no contributing
+// key (l == 0) keeps zeros.
+//
+// Every per-key loop strides on the runtime team size and every reduction is
+// a team collective, so Serial (team size 1), HIP and SYCL run this kernel
+// unchanged -- no warp intrinsics and no backend-specific code.
+
+// Scratch footprint (in floats) of GqaDecodeSplitFunctor: the scaled query
+// rows and the FP32 accumulators ([NG x SS] each, SS padded against bank
+// conflicts), this tile's per-head weights ([NG x ktile]), and the per-thread
+// partial denominators ([NG x slots], slots >= the launcher's team size).
+// Device-callable so the functor and the launcher cannot drift apart.
+KOKKOS_INLINE_FUNCTION
+size_t gqa_decode_split_scratch_floats(size_t D, int ng, int ktile, int slots) {
+  size_t ss = D + 1;
+  if (ss % 32 == 0) ++ss;
+  return static_cast<size_t>(2 * ng) * ss +
+         static_cast<size_t>(ng) * static_cast<size_t>(ktile) +
+         static_cast<size_t>(ng) * static_cast<size_t>(slots);
+}
+
+// Partial-buffer footprint (in floats) for a decode call: one (m, l, acc[D])
+// record per (query head, split), laid out [head][split][record] so the
+// combine kernel for one head reads one contiguous span.
+inline size_t gqa_decode_partial_floats(size_t Hq, size_t nsplit, size_t D) {
+  return Hq * nsplit * (D + 2);
+}
+
+// Split count for a decode call of `len` keys over `ngroups` head groups.
+// Aim at ~4 blocks per resident SM (concurrency / 2048 approximates the SM
+// count: CUDA reports SMs x maxThreadsPerSM, Serial 1) with each split
+// covering at least half a nominal tile, so the per-split prologue and
+// epilogue stay amortized and no split is empty. Capped at 64 splits: past
+// that the combine reads more partials than the extra parallelism is worth.
+inline int gqa_decode_nsplit(size_t len, size_t ngroups, int conc) {
+  if (conc <= 1 || ngroups == 0) return 1;  // single-threaded backend
+  const size_t sm = static_cast<size_t>(conc + 2047) / 2048;  // >= 1
+  const size_t blocks = 4 * (sm > 0 ? sm : 1);
+  size_t target = (blocks + ngroups - 1) / ngroups;
+  const size_t by_len = len / 128;  // at least half a 256-key tile
+  if (target > by_len) target = by_len;
+  if (target > 64) target = 64;
+  if (target < 1) target = 1;
+  return static_cast<int>(target);
+}
+
+template <class ExecSpace, class Scalar, class QView, class KView, class VView,
+          class PView, int NG>
+struct GqaDecodeSplitFunctor {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  using ScratchView =
+      Kokkos::View<float*, typename ExecSpace::scratch_memory_space,
+                   Kokkos::MemoryUnmanaged>;
+  using KVT = std::remove_const_t<typename KView::value_type>;
+  using VVT = std::remove_const_t<typename VView::value_type>;
+  QView q;
+  KView k;
+  VView v;
+  PView partial;
+  size_t Hq, D, Hkv, klo, khi, nsplit, ksplit;
+  int ktile;   // keys per tile
+  int tslots;  // team slots the launcher reserved in scratch (>= team size)
+  float scale;
+
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& member) const {
+    // Local handles: inner lambdas capture by value without an implicit
+    // `this` capture (quiets -Wdeprecated under C++20).
+    const auto Q = q;
+    const auto K = k;
+    const auto V = v;
+    const auto P = partial;
+    const size_t Dloc = D;
+    const size_t Hqloc = Hq;
+    const size_t Kvloc = Hkv;
+    const size_t NS = nsplit;
+    const int KT = ktile;
+    const int slots = tslots;
+    const float scl = scale;
+    const int rank = static_cast<int>(member.team_rank());
+    const int team_n = static_cast<int>(member.team_size());
+
+    // Block (g, sp): head group g (kv head g * NG / ... see below) and key
+    // split sp.
+    const size_t block = static_cast<size_t>(member.league_rank());
+    const size_t grp = block / NS;
+    const size_t sp = block % NS;
+    const size_t hbase = grp * static_cast<size_t>(NG);
+    const size_t kvh = (hbase * Kvloc) / Hqloc;
+    const size_t k0 = klo + sp * ksplit;
+    const size_t k1 = (k0 + ksplit < khi) ? (k0 + ksplit) : khi;
+
+    // Scratch layout mirrors gqa_decode_split_scratch_floats.
+    size_t SS = Dloc + 1;
+    if (SS % 32 == 0) ++SS;
+    ScratchView buf(member.team_scratch(0),
+                    gqa_decode_split_scratch_floats(Dloc, NG, KT, slots));
+    float* base = buf.data();
+    const size_t qo = 0;                                // [NG][SS] scaled Q
+    const size_t ao = static_cast<size_t>(NG) * SS;     // [NG][SS] FP32 acc
+    const size_t wo = 2 * static_cast<size_t>(NG) * SS;  // [NG][KT] weights
+    const size_t lo = wo + static_cast<size_t>(NG) * static_cast<size_t>(KT);
+
+    // Scaled query rows (one per head of the group) and zeroed accumulators.
+    // The pad columns past D are zeroed too, so nothing uninitialized is ever
+    // read back.
+    Kokkos::parallel_for(
+        Kokkos::TeamVectorRange(member, static_cast<size_t>(NG) * SS),
+        KOKKOS_LAMBDA(size_t i) {
+          const size_t hh = i / SS;
+          const size_t dd = i % SS;
+          base[qo + i] = (dd < Dloc)
+                             ? static_cast<float>(Q(0, hbase + hh, dd)) * scl
+                             : 0.0f;
+          base[ao + i] = 0.0f;
+        });
+    member.team_barrier();
+
+    // Row/kv-head/d strides of the caller's views (plain views and subviews
+    // with arbitrary row strides both work; only D-contiguity is a fast path).
+    const size_t ks0 = K.stride(0), ks1 = K.stride(1), ksd = K.stride(2);
+    const size_t vs0 = V.stride(0), vs1 = V.stride(1), vsd = V.stride(2);
+    const KVT* kbase = K.data();
+    const VVT* vbase = V.data();
+    // Dims per thread in the accumulator phase (D <= team size => one).
+    const size_t dpt = (Dloc + static_cast<size_t>(team_n) - 1) /
+                       static_cast<size_t>(team_n);
+
+    // Streaming state: every thread keeps an identical copy of (m, aa) -- the
+    // team reductions broadcast them -- and its own partial denominator.
+    float m[NG], lpart[NG], aa[NG];
+    for (int h = 0; h < NG; ++h) {
+      m[h] = -1e30f;
+      lpart[h] = 0.0f;
+    }
+
+    for (size_t t0 = k0; t0 < k1; t0 += static_cast<size_t>(KT)) {
+      const int kw = (t0 + static_cast<size_t>(KT) <= k1)
+                         ? KT
+                         : static_cast<int>(k1 - t0);
+      // Scores: thread r owns keys r, r + team, ... of this tile; the full-D
+      // dot is done once per (key, group head) from one K row. Two keys are
+      // in flight per iteration so each staged Q element read from scratch
+      // feeds two dots (halving the broadcast traffic) and two independent K
+      // rows are outstanding (hiding the row's cache-miss latency).
+      int kki = rank;
+      for (; kki + team_n < kw; kki += 2 * team_n) {
+        const KVT* __restrict__ krow0 =
+            kbase + (t0 + static_cast<size_t>(kki)) * ks0 + kvh * ks1;
+        const KVT* __restrict__ krow1 =
+            krow0 + static_cast<size_t>(team_n) * ks0;
+        float s0[NG], s1[NG];
+        for (int h = 0; h < NG; ++h) {
+          s0[h] = 0.0f;
+          s1[h] = 0.0f;
+        }
+        for (size_t d = 0; d < Dloc; ++d) {
+          const float kv0 = static_cast<float>(krow0[d * ksd]);
+          const float kv1 = static_cast<float>(krow1[d * ksd]);
+          for (int h = 0; h < NG; ++h) {
+            const float qs = base[qo + h * SS + d];
+            s0[h] += qs * kv0;
+            s1[h] += qs * kv1;
+          }
+        }
+        for (int h = 0; h < NG; ++h) {
+          base[wo + h * KT + kki] = s0[h];
+          base[wo + h * KT + kki + team_n] = s1[h];
+        }
+      }
+      for (; kki < kw; kki += team_n) {
+        const size_t kk = t0 + static_cast<size_t>(kki);
+        const KVT* __restrict__ krow = kbase + kk * ks0 + kvh * ks1;
+        float s[NG];
+        for (int h = 0; h < NG; ++h) s[h] = 0.0f;
+        for (size_t d = 0; d < Dloc; ++d) {
+          const float kv = static_cast<float>(krow[d * ksd]);
+          for (int h = 0; h < NG; ++h) s[h] += base[qo + h * SS + d] * kv;
+        }
+        for (int h = 0; h < NG; ++h) base[wo + h * KT + kki] = s[h];
+      }
+      member.team_barrier();
+      // Per-head tile maximum folded into the running max (the -1e30 sentinel
+      // makes the first tile's rescale exp(-1e30 - m_new) == 0).
+      for (int h = 0; h < NG; ++h) {
+        float tmax = -1e30f;
+        Kokkos::parallel_reduce(
+            Kokkos::TeamThreadRange(member, static_cast<size_t>(kw)),
+            KOKKOS_LAMBDA(size_t i, float& vmax) {
+              const float sv = base[wo + static_cast<size_t>(h) * KT + i];
+              if (sv > vmax) vmax = sv;
+            },
+            Kokkos::Max<float>(tmax));
+        const float mnew = (tmax > m[h]) ? tmax : m[h];
+        aa[h] = expf(m[h] - mnew);
+        m[h] = mnew;
+      }
+      // Weights for the owner's keys, plus its own rescaled denominator.
+      for (int h = 0; h < NG; ++h) lpart[h] *= aa[h];
+      for (int kw_i = rank; kw_i < kw; kw_i += team_n) {
+        for (int h = 0; h < NG; ++h) {
+          const float wt = expf(base[wo + h * KT + kw_i] - m[h]);
+          base[wo + h * KT + kw_i] = wt;
+          lpart[h] += wt;
+        }
+      }
+      member.team_barrier();
+      // Accumulate: thread r owns dims r, r + team, ...; its NG accumulators
+      // live in registers across the tile, and each V element read feeds all
+      // NG heads (the V stream is read exactly once per key). Four keys are
+      // in flight per iteration with one register accumulator set each, so
+      // four independent V loads are outstanding (the loop is otherwise a
+      // single dependent load per key) and the FP32 sums are four interleaved
+      // chains instead of one tile-long one.
+      for (size_t u = 0; u < dpt; ++u) {
+        const size_t d = static_cast<size_t>(rank) + u * static_cast<size_t>(team_n);
+        if (d >= Dloc) break;
+        float a[NG];
+        for (int h = 0; h < NG; ++h) a[h] = base[ao + h * SS + d] * aa[h];
+        const VVT* __restrict__ vcol = vbase + kvh * vs1 + d * vsd;
+        float a0[NG], a1[NG], a2[NG], a3[NG];
+        for (int h = 0; h < NG; ++h) {
+          a0[h] = 0.0f;
+          a1[h] = 0.0f;
+          a2[h] = 0.0f;
+          a3[h] = 0.0f;
+        }
+        int kkj = 0;
+        for (; kkj + 4 <= kw; kkj += 4) {
+          const size_t kk0 = t0 + static_cast<size_t>(kkj);
+          const float v0 = static_cast<float>(vcol[kk0 * vs0]);
+          const float v1 = static_cast<float>(vcol[(kk0 + 1) * vs0]);
+          const float v2 = static_cast<float>(vcol[(kk0 + 2) * vs0]);
+          const float v3 = static_cast<float>(vcol[(kk0 + 3) * vs0]);
+          for (int h = 0; h < NG; ++h) {
+            const float* __restrict__ wp = base + wo + h * KT + kkj;
+            a0[h] += wp[0] * v0;
+            a1[h] += wp[1] * v1;
+            a2[h] += wp[2] * v2;
+            a3[h] += wp[3] * v3;
+          }
+        }
+        for (; kkj < kw; ++kkj) {
+          const float vv =
+              static_cast<float>(vcol[(t0 + static_cast<size_t>(kkj)) * vs0]);
+          for (int h = 0; h < NG; ++h) a0[h] += base[wo + h * KT + kkj] * vv;
+        }
+        for (int h = 0; h < NG; ++h)
+          base[ao + h * SS + d] =
+              a[h] + ((a0[h] + a1[h]) + (a2[h] + a3[h]));
+      }
+      member.team_barrier();  // tile buffer reusable by the next iteration
+    }
+
+    // One team sum per head: each thread's partial denominator (already
+    // rescaled tile by tile) covers exactly its own keys.
+    for (int h = 0; h < NG; ++h) base[lo + h * slots + rank] = lpart[h];
+    member.team_barrier();
+    float ltot[NG];
+    for (int h = 0; h < NG; ++h) {
+      float ls = 0.0f;
+      Kokkos::parallel_reduce(
+          Kokkos::TeamThreadRange(member, static_cast<size_t>(team_n)),
+          KOKKOS_LAMBDA(int r, float& sum) {
+            sum += base[lo + static_cast<size_t>(h) * slots + r];
+          },
+          ls);
+      ltot[h] = ls;
+    }
+    // Write this split's partial record(s). Un-normalized acc + (m, l) keep
+    // the combine's log-sum-exp merge exact; a block with no key writes the
+    // -1e30 / 0 sentinel pair, which the combine weights to zero.
+    const size_t rec = Dloc + 2;
+    if (rank == 0) {
+      for (int h = 0; h < NG; ++h) {
+        float* pr = P.data() + ((hbase + static_cast<size_t>(h)) * NS + sp) * rec;
+        pr[0] = m[h];
+        pr[1] = ltot[h];
+      }
+    }
+    for (size_t u = 0; u < dpt; ++u) {
+      const size_t d = static_cast<size_t>(rank) + u * static_cast<size_t>(team_n);
+      if (d >= Dloc) break;
+      for (int h = 0; h < NG; ++h)
+        P.data()[((hbase + static_cast<size_t>(h)) * NS + sp) * rec + 2 + d] =
+            base[ao + h * SS + d];
+    }
+  }
+};
+
+// Combine kernel: one team per query head merges that head's `nsplit`
+// partials (see the kernel comment above) and writes the normalized row.
+template <class ExecSpace, class Scalar, class OView, class PView>
+struct GqaDecodeCombineFunctor {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  using ScratchView =
+      Kokkos::View<float*, typename ExecSpace::scratch_memory_space,
+                   Kokkos::MemoryUnmanaged>;
+  OView out;
+  PView partial;
+  size_t D, nsplit;
+  int slots;  // team slots the launcher reserved in scratch (>= team size)
+
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& member) const {
+    const auto O = out;
+    const auto P = partial;
+    const size_t Dloc = D;
+    const size_t NS = nsplit;
+    const int slots_l = slots;
+    const int rank = static_cast<int>(member.team_rank());
+    const int team_n = static_cast<int>(member.team_size());
+    const size_t h = static_cast<size_t>(member.league_rank());
+    const size_t rec = Dloc + 2;
+    const float* __restrict__ pb = P.data() + h * NS * rec;
+    ScratchView buf(member.team_scratch(0),
+                    static_cast<size_t>(slots_l) + NS);
+    float* mx = buf.data();
+    float* wt = mx + static_cast<size_t>(slots_l);
+
+    // Global maximum of the splits' running maxima.
+    float lm = -1e30f;
+    for (size_t s = static_cast<size_t>(rank); s < NS;
+         s += static_cast<size_t>(team_n)) {
+      const float mv = pb[s * rec];
+      if (mv > lm) lm = mv;
+    }
+    mx[rank] = lm;
+    member.team_barrier();
+    float M = -1e30f;
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(member, static_cast<size_t>(team_n)),
+        KOKKOS_LAMBDA(int r, float& vmax) {
+          if (mx[r] > vmax) vmax = mx[r];
+        },
+        Kokkos::Max<float>(M));
+    // Merge weights per split (nsplit is at most 64, so one smem plane).
+    for (size_t s = static_cast<size_t>(rank); s < NS;
+         s += static_cast<size_t>(team_n))
+      wt[s] = expf(pb[s * rec] - M);
+    member.team_barrier();
+    // Merged denominator: every thread sums the same few terms, so this needs
+    // no reduction. l == 0 (no contributing key anywhere) keeps zeros.
+    float ltot = 0.0f;
+    for (size_t s = 0; s < NS; ++s) ltot += pb[s * rec + 1] * wt[s];
+    const float inv = (ltot > 0.0f) ? (1.0f / ltot) : 0.0f;
+    for (size_t d = static_cast<size_t>(rank); d < Dloc;
+         d += static_cast<size_t>(team_n)) {
+      float a = 0.0f;
+      for (size_t s = 0; s < NS; ++s) a += wt[s] * pb[s * rec + 2 + d];
+      O(0, h, d) = static_cast<Scalar>(a * inv);
+    }
+  }
+};
+
+// Split-K decode launcher for a fixed group width NG (compile-time so the
+// per-head arrays stay in registers). `nsplit`/`ksplit`/`ktile`/`team_size`
+// are chosen by launch_gqa_decode below.
+template <class ExecSpace, class Scalar, class QView, class KView, class VView,
+          class OView, int NG>
+void launch_gqa_decode_split(const DNNHandle<ExecSpace>& handle,
+                             const QView& q, const KView& k, const VView& v,
+                             size_t klo, size_t khi, size_t nsplit,
+                             size_t ksplit, int ktile, int team_size,
+                             const OView& out, float scale,
+                             const std::string& label) {
+  const size_t Hq = q.extent(1), D = q.extent(2), Hkv = k.extent(1);
+  const size_t ngroups = Hq / static_cast<size_t>(NG);
+  Kokkos::View<float*, ExecSpace> partial = handle.attn_decode_scratch(
+      gqa_decode_partial_floats(Hq, nsplit, D));
+
+  GqaDecodeSplitFunctor<ExecSpace, Scalar, QView, KView, VView,
+                        Kokkos::View<float*, ExecSpace>, NG>
+      f{q, k, v, partial, Hq, D, Hkv, klo, khi, nsplit, ksplit,
+        ktile, team_size, scale};
+  Kokkos::TeamPolicy<ExecSpace> policy(static_cast<int>(ngroups * nsplit),
+                                       team_size, 1);
+  policy.set_scratch_size(
+      0, Kokkos::PerTeam(gqa_decode_split_scratch_floats(D, NG, ktile,
+                                                        team_size) *
+                         sizeof(float)));
+  Kokkos::parallel_for(label, policy, f);
+
+  GqaDecodeCombineFunctor<ExecSpace, Scalar, OView,
+                          Kokkos::View<float*, ExecSpace>>
+      cf{out, partial, D, nsplit, team_size};
+  Kokkos::TeamPolicy<ExecSpace> cpolicy(static_cast<int>(Hq), team_size, 1);
+  cpolicy.set_scratch_size(
+      0, Kokkos::PerTeam((static_cast<size_t>(team_size) + nsplit) *
+                         sizeof(float)));
+  Kokkos::parallel_for(label + "_combine", cpolicy, cf);
+}
+
+// Single-token decode launcher. Picks the GQA group width, split count, tile
+// width and team size from the geometry and the backend's actual scratch
+// budget, then runs the split-K partial kernel plus the combine kernel.
+template <class ExecSpace, class Scalar, class QView, class KView, class VView,
+          class OView>
+void launch_gqa_decode(const DNNHandle<ExecSpace>& handle, const QView& q,
+                       const KView& k, const VView& v, size_t q_off,
+                       const OView& out, float scale, size_t sliding_window,
+                       const std::string& label) {
+  const size_t Hq = q.extent(1), D = q.extent(2);
+  const size_t Hkv = k.extent(1), Ktot = k.extent(0);
+  if (Hq == 0 || D == 0 || Hkv == 0 || Ktot == 0) return;
+
+  // Causal (plus sliding-window) key window of the single query row.
+  size_t klo = 0, khi = 0;
+  gqa_key_window(q_off, Ktot, sliding_window, 0, klo, khi);
+  if (khi > Ktot) khi = Ktot;
+  const size_t len = (khi > klo) ? (khi - klo) : 0;
+
+  // Group width: all query heads sharing one KV head, when that is 1/2/4/8.
+  // Anything else (Hq % Hkv != 0, or an MQA group wider than 8) runs one head
+  // per block with the plain h * Hkv / Hq mapping.
+  size_t ng = 1;
+  if (Hq % Hkv == 0) {
+    const size_t g = Hq / Hkv;
+    if (g == 2 || g == 4 || g == 8) ng = g;
+  }
+  const int ngroups = static_cast<int>(Hq / ng);
+  const int team_req = 128;
+  const size_t budget =
+      static_cast<size_t>(Kokkos::TeamPolicy<ExecSpace>::scratch_size_max(0));
+
+  // Extreme head dims can exceed even a minimal split-K footprint (two
+  // NG x D float planes): drop to one head per block, and if that still does
+  // not fit keep the pre-split-K kernel as the last-resort fallback.
+  if (gqa_decode_split_scratch_floats(D, static_cast<int>(ng), 8, team_req) *
+          sizeof(float) >
+      budget)
+    ng = 1;
+  if (gqa_decode_split_scratch_floats(D, 1, 8, team_req) * sizeof(float) >
+      budget) {
+    launch_gqa_decode_small_scratch<ExecSpace, Scalar, QView, KView, VView,
+                                    OView>(q, k, v, q_off, out, scale,
+                                           sliding_window, label);
+    return;
+  }
+
+  int conc = 1;
+  {
+    // Threads the backend can run at once (1 on Serial/Threads with one
+    // thread); only used as an SM-count proxy, never for correctness.
+    const int c = ExecSpace().concurrency();
+    if (c > 1) conc = c;
+  }
+  const int nsplit_i = gqa_decode_nsplit(len, static_cast<size_t>(ngroups),
+                                         conc);
+  const size_t nsplit = static_cast<size_t>(nsplit_i);
+  const size_t ksplit = (len + nsplit - 1) / nsplit;  // ceil, >= 1 when len > 0
+
+  // Team size: a requested warp count clamped to what the backend and the
+  // kernel's scratch allow (Serial -> 1). Probe with the largest tile so the
+  // answer is conservative for whatever tile width is chosen below.
+  auto scratch_bytes = [&](int kt, int ts) {
+    return gqa_decode_split_scratch_floats(D, static_cast<int>(ng), kt, ts) *
+           sizeof(float);
+  };
+  int team_size = team_req;
+  {
+    Kokkos::View<float*, ExecSpace> probe_ws =
+        handle.attn_decode_scratch(gqa_decode_partial_floats(Hq, nsplit, D));
+    GqaDecodeSplitFunctor<ExecSpace, Scalar, QView, KView, VView,
+                          Kokkos::View<float*, ExecSpace>, 1>
+        probe_f{q, k, v, probe_ws, Hq, D, Hkv, klo, khi, nsplit, ksplit,
+                512, team_req, scale};
+    Kokkos::TeamPolicy<ExecSpace> probe(1, 1);
+    const size_t req = scratch_bytes(512, team_req);
+    probe.set_scratch_size(0, Kokkos::PerTeam(req < budget ? req : budget));
+    const int mx = probe.team_size_max(probe_f, Kokkos::ParallelForTag{});
+    if (mx < team_size) team_size = mx;
+    if (team_size < 1) team_size = 1;
+  }
+
+  // Tile width: 512 keys (four keys per thread at a 128-thread team, which
+  // is what the score and accumulator loops are unrolled for; a split shorter
+  // than a tile simply runs one partial tile), shrunk until the per-team
+  // scratch fits the backend's budget.
+  int ktile = 512;
+  while (ktile > 8 && scratch_bytes(ktile, team_size) > budget) ktile /= 2;
+
+  switch (ng) {
+    case 8:
+      launch_gqa_decode_split<ExecSpace, Scalar, QView, KView, VView, OView, 8>(
+          handle, q, k, v, klo, khi, nsplit, ksplit, ktile, team_size, out,
+          scale, label);
+      break;
+    case 4:
+      launch_gqa_decode_split<ExecSpace, Scalar, QView, KView, VView, OView, 4>(
+          handle, q, k, v, klo, khi, nsplit, ksplit, ktile, team_size, out,
+          scale, label);
+      break;
+    case 2:
+      launch_gqa_decode_split<ExecSpace, Scalar, QView, KView, VView, OView, 2>(
+          handle, q, k, v, klo, khi, nsplit, ksplit, ktile, team_size, out,
+          scale, label);
+      break;
+    default:
+      launch_gqa_decode_split<ExecSpace, Scalar, QView, KView, VView, OView, 1>(
+          handle, q, k, v, klo, khi, nsplit, ksplit, ktile, team_size, out,
+          scale, label);
+      break;
+  }
 }
 
 // Streaming online-softmax GQA core shared by both public overloads below.
@@ -834,15 +1376,18 @@ void attention_gqa_streaming(const DNNHandle<ExecSpace>& handle, const QView& q,
   //   * the multi-row streaming kernel gives a T == 1 team one query row per
   //     thread and walks the whole key axis serially on 4 of 256 threads
   //     (~1.9 ms per layer at Ktot = 900).
-  // GqaDecodeFunctor above is the T == 1 kernel for every backend: one team
-  // per head with the key axis spread across the team, measured 81 us per
-  // layer at the same shape (vs 1.9 ms) and 4.6 us at Ktot = 8, so a decode
-  // token's whole attention drops from ~19 ms to ~0.8 ms at ctx 900.
-  // Prefill (T > 1) keeps the cuDNN SDPA dispatch below.
+  // The split-K decode kernel above is the T == 1 path for every backend:
+  // its grid is (Hq / NG) * nsplit blocks of 128 threads (one block covers
+  // all the query heads of a GQA group, and nsplit splits of the key axis
+  // scale with the device), with K/V streamed once per group and a tiny
+  // log-sum-exp combine kernel. Measured on the RTX 3090 at Hq=32/Hkv=8/D=64
+  // bf16, 0.145 ms per layer at Ktot = 16384 vs 2.26 ms before (see
+  // benchmarks/Bench_DecodeAttention.cpp). Prefill (T > 1) keeps the cuDNN
+  // SDPA dispatch below.
   if (T == 1) {
     tpl_note_attn(false);
     launch_gqa_decode<ExecSpace, Scalar, QView, KView, VView, OView>(
-        q, k, v, q_off, out, scale, sliding_window, label);
+        handle, q, k, v, q_off, out, scale, sliding_window, label);
     return;
   }
 #if defined(KOKKOSDNN_ENABLE_CUDNN) && defined(KOKKOS_ENABLE_CUDA)

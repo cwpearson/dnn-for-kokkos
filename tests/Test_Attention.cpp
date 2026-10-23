@@ -229,6 +229,100 @@ TEST(Attention, FloatLongKeys) {
   }
 }
 
+// Split-K decode kernel (flash-decoding form) vs an FP64 host reference.
+// Covers every geometry class the launcher specialises: a GQA group of 4
+// (the LFM2.5 shape, where one block covers all query heads of a KV head),
+// MHA (no sharing), MQA (group of 8), a geometry whose Hq % Hkv != 0 (group
+// width 1 fallback), an odd head dim, and a sliding-window decode. The
+// kernel is reached through the public entry point, so the test also covers
+// the launcher's split/tile/team choice and the combine pass.
+template <class Scalar>
+void check_decode_split_reference(float tol, int Hq, int Hkv, int D, int Ktot,
+                                  size_t window) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  KokkosDNN::DNNHandle<Exec> h;
+  const size_t ktot = static_cast<size_t>(Ktot);
+  const size_t q_off = ktot - 1;  // single-token decode at the cache end
+  const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+  Kokkos::View<Scalar***, Exec> q("q", 1, Hq, D), k("k", ktot, Hkv, D),
+      v("v", ktot, Hkv, D), out("out", 1, Hq, D);
+  auto hq = Kokkos::create_mirror_view(q);
+  auto hk = Kokkos::create_mirror_view(k);
+  auto hv = Kokkos::create_mirror_view(v);
+  for (int hh = 0; hh < Hq; ++hh)
+    for (int d = 0; d < D; ++d)
+      hq(0, hh, d) = static_cast<Scalar>(0.02f * ((hh * 5 + d) % 11) - 0.1f);
+  for (size_t n = 0; n < ktot; ++n)
+    for (int hh = 0; hh < Hkv; ++hh)
+      for (int d = 0; d < D; ++d) {
+        hk(n, hh, d) =
+            static_cast<Scalar>(0.02f * ((n * 3 + hh * 7 + d) % 13) - 0.1f);
+        hv(n, hh, d) =
+            static_cast<Scalar>(0.01f * ((n * 5 + hh * 3 + d) % 17) - 0.1f);
+      }
+  Kokkos::deep_copy(q, hq);
+  Kokkos::deep_copy(k, hk);
+  Kokkos::deep_copy(v, hv);
+  if (window == 0)
+    KokkosDNN::attention_gqa_single<Exec, Scalar>(h, q, k, v, q_off, out, scale);
+  else
+    KokkosDNN::attention_gqa_single_sliding<Exec, Scalar>(h, q, k, v, q_off,
+                                                         out, scale, window);
+  Kokkos::fence();
+  auto got = Kokkos::create_mirror_view(out);
+  Kokkos::deep_copy(got, out);
+
+  // Reference over the exact stored (bf16-rounded) inputs, in double.
+  auto mq = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, q);
+  auto mk = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, k);
+  auto mv = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace{}, v);
+  size_t klo = 0, khi = 0;
+  KokkosDNN::Impl::gqa_key_window(q_off, ktot, window, 0, klo, khi);
+  for (int hh = 0; hh < Hq; ++hh) {
+    const int kvh = (hh * Hkv) / Hq;
+    double m = -1e300;
+    for (size_t kk = klo; kk < khi; ++kk) {
+      double s = 0.0;
+      for (int d = 0; d < D; ++d)
+        s += (double)mq(0, hh, d) * (double)mk(kk, kvh, d);
+      m = std::max(m, s * (double)scale);
+    }
+    double den = 0.0;
+    for (size_t kk = klo; kk < khi; ++kk) {
+      double s = 0.0;
+      for (int d = 0; d < D; ++d)
+        s += (double)mq(0, hh, d) * (double)mk(kk, kvh, d);
+      den += std::exp(s * (double)scale - m);
+    }
+    for (int d = 0; d < D; ++d) {
+      double acc = 0.0;
+      for (size_t kk = klo; kk < khi; ++kk) {
+        double s = 0.0;
+        for (int dd = 0; dd < D; ++dd)
+          s += (double)mq(0, hh, dd) * (double)mk(kk, kvh, dd);
+        acc += std::exp(s * (double)scale - m) * (double)mv(kk, kvh, d);
+      }
+      const double ref = den > 0.0 ? acc / den : 0.0;
+      EXPECT_NEAR(static_cast<double>(got(0, hh, d)), ref, tol)
+          << "split-K mismatch at Hq=" << Hq << " Hkv=" << Hkv << " D=" << D
+          << " Ktot=" << Ktot << " win=" << window << " (" << hh << "," << d
+          << ")";
+    }
+  }
+}
+
+TEST(Attention, SplitKVDecodeReference) {
+  check_decode_split_reference<float>(1e-5f, 32, 8, 64, 1024, 0);
+  check_decode_split_reference<Kokkos::Experimental::bhalf_t>(5e-2f, 32, 8, 64,
+                                                              1024, 0);
+  check_decode_split_reference<float>(1e-5f, 8, 8, 64, 512, 0);   // MHA
+  check_decode_split_reference<float>(1e-5f, 8, 1, 64, 512, 0);   // MQA
+  check_decode_split_reference<float>(1e-5f, 3, 2, 8, 256, 0);    // uneven
+  check_decode_split_reference<float>(1e-5f, 4, 2, 7, 256, 0);    // odd D
+  check_decode_split_reference<float>(1e-5f, 32, 8, 64, 512, 256);   // window
+  check_decode_split_reference<float>(1e-5f, 3, 2, 8, 33, 0);     // ragged
+}
+
 // Causal GQA with tanh logit softcapping and a per-key validity mask vs a
 // host reference. Covers softcap on (large + small cap), cap <= 0 disabling,
 // interior pad keys, and a nonzero prefill offset (generalized q_off/Ktot
