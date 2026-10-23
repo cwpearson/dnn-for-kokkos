@@ -101,9 +101,10 @@ so subset with `--benchmark_filter` or lower `--benchmark_min_time` there.
   build for anything beyond smoke tests.
 - LFM2.5 scope: hybrid MoE (40 blocks, 64-expert top-4, sigmoid gating) with
   GGUF loading (F32/F16/BF16, Q8_0, Q4_K, Q6_K; other dtypes throw), MoE
-  experts stay packed via `quant_gemm` with no TPL dispatch on the
-  gather-GEMM path yet, dense-FP KV cache only, and no full-weights golden
-  test (needs a real checkpoint + tokenizer).
+  experts dequantized once per routed expert per layer into persistent
+  staging for the dense `gemm()` dispatch (chunk path; single-row decode
+  keeps on-the-fly `quant_gemm`), dense-FP KV cache only, and no
+  full-weights golden test (needs a real checkpoint + tokenizer).
 - MOSS-Image scope: ~27 GB checkpoint (10.2 GB DiT + 16.8 GB Qwen3.5 text
   encoder + VAE); `--staged` keeps encoder and DiT resident one at a time
   for 24 GB GPUs. Serial-CPU full runs are slow and the text encoder needs
