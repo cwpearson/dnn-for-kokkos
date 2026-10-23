@@ -26,6 +26,28 @@ namespace KokkosDNN {
 namespace LFM25 {
 namespace Impl {
 
+// Decode (single-row) MoE combine: y(0,d) += a * x(0,d), FP32 accumulation.
+// Lets the C==1 path below accumulate each routed expert straight into the
+// output without the gather/scatter staging (and its per-expert row/weight
+// deep_copies) of the chunk path.
+template <class ExecSpace, class Scalar>
+void moe_axpy_row(
+    float a,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& y,
+    const std::string& label = "KokkosDNN::LFM25::moe_axpy") {
+  if (x.extent(0) != 1 || y.extent(0) != 1 || y.extent(1) != x.extent(1))
+    throw std::invalid_argument("moe_axpy_row: expected single-row [1, D]");
+  const size_t D = x.extent(1);
+  if (D == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::RangePolicy<ExecSpace>(0, D),
+      KOKKOS_LAMBDA(size_t d) {
+        y(0, d) = static_cast<Scalar>(static_cast<float>(y(0, d)) +
+                                     a * static_cast<float>(x(0, d)));
+      });
+}
+
 // Short-conv split of the in_proj output: in_proj maps [dim] -> 3 stacked
 // [B, C, X] projections (llama.cpp `shortconv.in_proj`, {n_embd, 3*n_embd}).
 //   bx[t,d]   = B[t,d] * X[t,d]   (the depthwise-conv input)
@@ -455,6 +477,54 @@ class Model {
     }
   }
 
+  // Single-row (decode) MoE dispatch: the chunk path above groups (token,
+  // slot) pairs on the host, which costs 2 + 2*experts device-host
+  // synchronizations per layer per token. With one row the grouping is
+  // trivial -- the input row IS each expert's input (no gather) and each
+  // expert accumulates straight into y (no scatter) -- so only the single
+  // idx/weight row crosses to the host (2 tiny fences per layer). Per slot:
+  // packed quant_gemm gate/up, SwiGLU, packed quant_gemm down, weighted add.
+  void moe_forward_decode(
+      const BlockWeights<ExecSpace, Scalar>& b, const MatR& x,
+      const Kokkos::View<int**, Kokkos::LayoutRight, ExecSpace>& idx,
+      const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& w,
+      const MatR& y, size_t MI) {
+    const size_t NE = b.gate_exps.size();
+    const size_t KK = idx.extent(1);
+    if (NE == 0 || KK == 0) return;
+    if (x.extent(0) != 1 || y.extent(0) != 1)
+      throw std::invalid_argument("moe_forward_decode: expected one row");
+    auto h_idx = Kokkos::subview(moe_idx_host_, size_t(0), Kokkos::ALL);
+    auto h_w   = Kokkos::subview(moe_w_host_, size_t(0), Kokkos::ALL);
+    auto d_idx = Kokkos::subview(idx, size_t(0), Kokkos::ALL);
+    auto d_w   = Kokkos::subview(w, size_t(0), Kokkos::ALL);
+    Kokkos::deep_copy(h_idx, d_idx);
+    Kokkos::deep_copy(h_w, d_w);
+    auto egate =
+        Kokkos::subview(gate_buf_, std::make_pair(size_t(0), size_t(1)),
+                        std::make_pair(size_t(0), MI));
+    auto eup = Kokkos::subview(up_buf_, std::make_pair(size_t(0), size_t(1)),
+                               std::make_pair(size_t(0), MI));
+    auto eact = Kokkos::subview(act_buf_, std::make_pair(size_t(0), size_t(1)),
+                                std::make_pair(size_t(0), MI));
+    auto eoe = Kokkos::subview(moe_oe_buf_,
+                               std::make_pair(size_t(0), size_t(1)), Kokkos::ALL);
+    for (size_t k = 0; k < KK; ++k) {
+      const int e = h_idx(k);
+      if (e < 0 || (size_t)e >= NE)
+        throw std::runtime_error(
+            "moe_forward_decode: expert id out of range");
+      const float a = h_w(k);
+      if (a == 0.0f) continue;
+      const size_t ee = (size_t)e;
+      Gguf::quant_gemm<ExecSpace, Scalar>(handle, x, b.gate_exps[ee], egate);
+      Gguf::quant_gemm<ExecSpace, Scalar>(handle, x, b.up_exps[ee], eup);
+      swiglu<ExecSpace, Scalar>(egate, eup, eact);
+      Gguf::quant_gemm<ExecSpace, Scalar>(handle, eact, b.down_exps[ee], eoe);
+      Impl::moe_axpy_row<ExecSpace, Scalar>(a, eoe, y);
+    }
+  }
+
  public:
   // Forward T prompt tokens starting at absolute position seq_len.
   // Returns logits [vocab] for the LAST token. Updates KV caches and conv
@@ -678,7 +748,12 @@ class Model {
                                                 ROT_NORM_TOPK, ROUTED_SCALE,
                                                 midx, mw);
           Kokkos::deep_copy(down, static_cast<Scalar>(0));
-          moe_forward_sparse(b, tmp2, midx, mw, down, C, MI);
+          // Decode (one row) skips the host-grouped sparse dispatch: no
+          // gather/scatter and only one idx/weight row crosses to the host.
+          if (C == 1)
+            moe_forward_decode(b, tmp2, midx, mw, down, MI);
+          else
+            moe_forward_sparse(b, tmp2, midx, mw, down, C, MI);
           (void)FFN;
         }
         Kokkos::parallel_for(
