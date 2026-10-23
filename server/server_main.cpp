@@ -12,7 +12,9 @@
 // request; a second concurrent request blocks until the first finishes). A
 // fresh Session is built per request under that lock so per-request
 // sampling/stop/seed options apply without mutating shared state; weights
-// and the tokenizer are shared read-only.
+// and the tokenizer are shared read-only. A streaming client that goes away
+// mid-response is detected from sink.write() and its turn stops at the next
+// token instead of burning the remaining max_new tokens under that lock.
 
 #include <Kokkos_Core.hpp>
 
@@ -28,6 +30,7 @@
 
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
@@ -89,7 +92,9 @@ void handle_stop_signal(int) {
 // show it while weights load) with an explicit flush per line. Per-request
 // traffic is logged to stderr too (method + endpoint + body size + status;
 // the server `error.message` for non-2xx) via the httplib logger installed
-// in main() plus explicit SSE error lines from the streaming providers.
+// in main() plus explicit SSE error lines from the streaming providers, and
+// one timings line per completed turn (lock/encode/prefill/decode/SSE ms +
+// decode tok/s) from log_turn().
 [[maybe_unused]] void startup_log(const std::string& msg) {
   std::fprintf(stderr, "%s\n", msg.c_str());
   std::fflush(stderr);
@@ -155,6 +160,49 @@ void handle_stop_signal(int) {
                      " body_bytes=" + std::to_string(body_bytes) +
                      " -> sse-error error=\"" + log_sanitize(err) + "\"";
   std::fprintf(stderr, "%s\n", line.c_str());
+  std::fflush(stderr);
+}
+
+// ---------------------------------------------------------------------------
+// Per-turn timing
+// ---------------------------------------------------------------------------
+// Where a request's wall time goes, filled in by run_session()/the handlers.
+// Reported as one stderr line per completed turn (log_turn) so an operator can
+// tell model time (prefill_ms + decode_ms) from server time (lock_ms +
+// encode_ms + sse_ms) and read the decode rate the client actually sees.
+struct TurnTimings {
+  double lock_ms = 0.0;     // waiting for the single-flight inference mutex
+  double encode_ms = 0.0;   // render + encode the full message history
+  double prefill_ms = 0.0;  // prompt prefill (no prefix cache across turns)
+  double decode_ms = 0.0;   // sum of Session::step() (model forward + detok)
+  double sse_ms = 0.0;      // SSE framing + socket writes inside the loop
+  bool aborted = false;     // peer disconnected; generation stopped early
+};
+
+double now_ms() {
+  using namespace std::chrono;
+  return duration<double, std::milli>(steady_clock::now().time_since_epoch())
+      .count();
+}
+
+// One line per completed turn: prompt/completion counts, the split above, and
+// decode tok/s (completion tokens over decode time — the rate a streaming
+// client observes, prefill excluded).
+void log_turn(const std::string& method, const std::string& target, int status,
+              const TurnTimings& tm, size_t prompt_tokens,
+              size_t completion_tokens) {
+  const double tok_s =
+      tm.decode_ms > 0.0 ? completion_tokens * 1000.0 / tm.decode_ms : 0.0;
+  char tail[320];
+  std::snprintf(tail, sizeof(tail),
+                " prompt_tokens=%zu completion_tokens=%zu lock_ms=%.1f"
+                " encode_ms=%.1f prefill_ms=%.1f decode_ms=%.1f sse_ms=%.1f"
+                " decode_tok_s=%.1f%s",
+                prompt_tokens, completion_tokens, tm.lock_ms, tm.encode_ms,
+                tm.prefill_ms, tm.decode_ms, tm.sse_ms, tok_s,
+                tm.aborted ? " aborted=client-disconnect" : "");
+  std::fprintf(stderr, "%s %s -> %d%s\n", method.c_str(), target.c_str(),
+               status, tail);
   std::fflush(stderr);
 }
 
@@ -965,10 +1013,16 @@ struct GenResult {
 // prefill + one-token steps to completion. Throws std::invalid_argument on
 // over-context prompts (caller maps to 400); other exceptions propagate to
 // the 500 path.
+//
+// on_step may return false to stop generation early (the streaming providers
+// do this when sink.write() reports the peer is gone: the single-flight
+// inference lock makes generating for a dead client steal a whole completion
+// from the next queued request).
 GenResult run_session(ServerState& st, const std::vector<int>& prompt_ids,
                       SessionOptions opts, bool has_seed, uint64_t seed,
                       int req_max_tokens,
-                      const std::function<void(const StepOutcome&)>& on_step) {
+                      const std::function<bool(const StepOutcome&)>& on_step,
+                      TurnTimings* tm) {
   if (prompt_ids.size() >= static_cast<size_t>(st.cfg.max_seq_len))
     throw std::invalid_argument(
         "prompt is longer than the model's context window (" +
@@ -993,12 +1047,22 @@ GenResult run_session(ServerState& st, const std::vector<int>& prompt_ids,
   else
     st.sess->set_options(opts);
   ServerSession& sess = *st.sess;
+  const double t_prefill = now_ms();
   sess.prefill(prompt_ids, has_seed ? seed : opts.seed, /*hasSeed=*/true);
+  if (tm) tm->prefill_ms = now_ms() - t_prefill;
   std::string text;
   while (!sess.finished()) {
+    const double t_step = now_ms();
     StepOutcome s = sess.step();
+    const double t_step_done = now_ms();
     if (!s.delta.empty()) text += s.delta;
-    if (on_step) on_step(s);
+    const bool keep_going = on_step ? on_step(s) : true;
+    if (tm) {
+      tm->decode_ms += t_step_done - t_step;
+      tm->sse_ms += now_ms() - t_step_done;
+      if (!keep_going) tm->aborted = true;
+    }
+    if (!keep_going) break;
   }
   text += sess.flush();
   const auto u = sess.usage();
@@ -1013,15 +1077,19 @@ GenResult run_session(ServerState& st, const std::vector<int>& prompt_ids,
 // ---------------------------------------------------------------------------
 // SSE helpers
 // ---------------------------------------------------------------------------
-
-void sse_send(httplib::DataSink& sink, const json& payload) {
+// cpp-httplib v0.63.0 does not buffer a chunked provider's writes: each
+// sink.write() emits one chunk header + payload + CRLF and sends it on the
+// socket immediately (plus a poll() for writability), so these calls are the
+// only transport hop between a decoded token and the client. The return value
+// is the liveness signal — false once the peer is gone.
+bool sse_send(httplib::DataSink& sink, const json& payload) {
   const std::string frame = "data: " + payload.dump() + "\n\n";
-  sink.write(frame.c_str(), frame.size());
+  return sink.write(frame.data(), frame.size());
 }
 
-void sse_done(httplib::DataSink& sink) {
+bool sse_done(httplib::DataSink& sink) {
   static const char kDone[] = "data: [DONE]\n\n";
-  sink.write(kDone, sizeof(kDone) - 1);
+  return sink.write(kDone, sizeof(kDone) - 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1060,26 +1128,32 @@ void sse_done(httplib::DataSink& sink) {
   const std::time_t created = std::time(nullptr);
 
   if (!pr.stream) {
+    const double t_lock = now_ms();
     std::lock_guard<std::mutex> lk(st.mu);
+    TurnTimings tm;
+    tm.lock_ms = now_ms() - t_lock;
     try {
+      const double t_encode = now_ms();
       const std::vector<int> prompt_ids =
           KokkosDNN::LFM25::encode_chatml_with_tools(
               st.tok, pr.messages, pr.tools_json, make_system_suffix(pr),
               true, true);
+      tm.encode_ms = now_ms() - t_encode;
       // Tools mode feeds raw per-step pieces (specials visible) through
       // the stream parser so native call blocks become `tool_calls`
       // instead of leaking into content; plain mode keeps Session's
       // detokenized text byte-for-byte.
       ToolCallStreamParser tool_parser(resolved_stops(pr));
       std::string tool_text;
-      std::function<void(const StepOutcome&)> on_step;
+      std::function<bool(const StepOutcome&)> on_step;
       if (pr.tools_active) {
         on_step = [&](const StepOutcome& s) {
           tool_text += tool_feed(st, tool_parser, s);
+          return true;
         };
       }
       GenResult r = run_session(st, prompt_ids, pr.opts, pr.has_seed, pr.seed,
-                                pr.req_max_tokens, on_step);
+                                pr.req_max_tokens, on_step, &tm);
       std::string text = r.text;
       std::vector<ToolCall> calls;
       if (pr.tools_active) {
@@ -1105,6 +1179,8 @@ void sse_done(httplib::DataSink& sink) {
                        {"completion_tokens", r.completion_tokens},
                        {"total_tokens",
                         r.prompt_tokens + r.completion_tokens}}}});
+      log_turn(req.method, req.target.empty() ? req.path : req.target, 200, tm,
+               r.prompt_tokens, r.completion_tokens);
     } catch (const std::invalid_argument& e) {
       send_bad_request(res, e.what());  // over-context prompts
     } catch (const std::exception& e) {
@@ -1124,7 +1200,10 @@ void sse_done(httplib::DataSink& sink) {
        target = req.target.empty() ? req.path : req.target,
        body = req.body, id, created](size_t /*offset*/,
                                      httplib::DataSink& sink) -> bool {
+        const double t_lock = now_ms();
         std::lock_guard<std::mutex> lk(st.mu);
+        TurnTimings tm;
+        tm.lock_ms = now_ms() - t_lock;
         try {
           const json b = json::parse(body);  // re-parse: already validated
           ParsedRequest p;
@@ -1136,11 +1215,15 @@ void sse_done(httplib::DataSink& sink) {
             sink.done();
             return true;
           }
+          const double t_encode = now_ms();
           const std::vector<int> prompt_ids =
               KokkosDNN::LFM25::encode_chatml_with_tools(
                   st.tok, p.messages, p.tools_json, make_system_suffix(p),
                   true, true);
+          tm.encode_ms = now_ms() - t_encode;
+          bool sse_ok = true;
           auto chunk = [&](const json& delta, const json& finish) {
+            if (!sse_ok) return;
             json c{{"id", id},
                    {"object", "chat.completion.chunk"},
                    {"created", created},
@@ -1150,7 +1233,7 @@ void sse_done(httplib::DataSink& sink) {
                         {{{"index", 0},
                           {"delta", delta},
                           {"finish_reason", finish}}})}};
-            sse_send(sink, c);
+            sse_ok = sse_send(sink, c);
           };
           chunk({{"role", "assistant"}}, nullptr);
           ToolCallStreamParser tool_parser(resolved_stops(p));
@@ -1160,14 +1243,16 @@ void sse_done(httplib::DataSink& sink) {
                 if (!p.tools_active) {
                   if (!s.delta.empty())
                     chunk({{"content", s.delta}}, nullptr);
-                  return;
+                  return sse_ok;
                 }
                 std::string d = tool_feed(st, tool_parser, s);
                 if (!d.empty()) chunk({{"content", d}}, nullptr);
-              });
+                return sse_ok;
+              },
+              &tm);
           // (display text was already streamed piece-wise via on_step.)
           std::string finish = r.finish;
-          if (p.tools_active) {
+          if (sse_ok && p.tools_active) {
             // (json_mode fence stripping is a non-streaming affordance;
             // streamed deltas arrive unmodified.)
             ToolParseResult tp = tool_parser.finish();
@@ -1181,21 +1266,26 @@ void sse_done(httplib::DataSink& sink) {
               finish = Common::to_string(Common::FinishReason::ToolCalls);
             }
           }
-          json final = json{{"id", id},
-                            {"object", "chat.completion.chunk"},
-                            {"created", created},
-                            {"model", st.model_id},
-                            {"choices",
-                             json::array({{{"index", 0},
-                                           {"delta", json::object()},
-                                           {"finish_reason", finish}}})},
-                            {"usage",
-                             {{"prompt_tokens", r.prompt_tokens},
-                              {"completion_tokens", r.completion_tokens},
-                              {"total_tokens",
-                               r.prompt_tokens + r.completion_tokens}}}};
-          sse_send(sink, final);
-          sse_done(sink);
+          if (sse_ok) {
+            json final =
+                json{{"id", id},
+                     {"object", "chat.completion.chunk"},
+                     {"created", created},
+                     {"model", st.model_id},
+                     {"choices",
+                      json::array({{{"index", 0},
+                                    {"delta", json::object()},
+                                    {"finish_reason", finish}}})},
+                     {"usage",
+                      {{"prompt_tokens", r.prompt_tokens},
+                       {"completion_tokens", r.completion_tokens},
+                       {"total_tokens",
+                        r.prompt_tokens + r.completion_tokens}}}};
+            sse_send(sink, final);
+            sse_done(sink);
+          }
+          log_turn(method, target, 200, tm, r.prompt_tokens,
+                   r.completion_tokens);
         } catch (const std::exception& ex) {
           sse_send(sink, openai_error(ex.what(), "server_error"));
           log_stream_error(method, target, body.size(), ex.what());
@@ -1249,12 +1339,17 @@ void sse_done(httplib::DataSink& sink) {
   const std::time_t created = std::time(nullptr);
 
   if (!pr.stream) {
+    const double t_lock = now_ms();
     std::lock_guard<std::mutex> lk(st.mu);
+    TurnTimings tm;
+    tm.lock_ms = now_ms() - t_lock;
     try {
+      const double t_encode = now_ms();
       const std::vector<int> prompt_ids =
           KokkosDNN::LFM25::encode_chatml(st.tok, pr.messages, true, true);
+      tm.encode_ms = now_ms() - t_encode;
       GenResult r = run_session(st, prompt_ids, pr.opts, pr.has_seed, pr.seed,
-                                pr.req_max_tokens, nullptr);
+                                pr.req_max_tokens, nullptr, &tm);
       send_json(res, 200,
                 json{{"id", id},
                      {"object", "text_completion"},
@@ -1269,6 +1364,8 @@ void sse_done(httplib::DataSink& sink) {
                        {"completion_tokens", r.completion_tokens},
                        {"total_tokens",
                         r.prompt_tokens + r.completion_tokens}}}});
+      log_turn(req.method, req.target.empty() ? req.path : req.target, 200, tm,
+               r.prompt_tokens, r.completion_tokens);
     } catch (const std::invalid_argument& e) {
       send_bad_request(res, e.what());
     } catch (const std::exception& e) {
@@ -1285,7 +1382,10 @@ void sse_done(httplib::DataSink& sink) {
        target = req.target.empty() ? req.path : req.target,
        body = req.body, id, created](size_t /*offset*/,
                                      httplib::DataSink& sink) -> bool {
+        const double t_lock = now_ms();
         std::lock_guard<std::mutex> lk(st.mu);
+        TurnTimings tm;
+        tm.lock_ms = now_ms() - t_lock;
         try {
           const json b = json::parse(body);
           ParsedRequest p;
@@ -1306,37 +1406,46 @@ void sse_done(httplib::DataSink& sink) {
           }
           p.messages = KokkosDNN::LFM25::make_chat_messages(
               it->get<std::string>(), "", "user");
+          const double t_encode = now_ms();
           const std::vector<int> prompt_ids =
               KokkosDNN::LFM25::encode_chatml(st.tok, p.messages, true, true);
+          tm.encode_ms = now_ms() - t_encode;
+          bool sse_ok = true;
           GenResult r = run_session(
               st, prompt_ids, p.opts, p.has_seed, p.seed, p.req_max_tokens,
               [&](const StepOutcome& s) {
-                if (s.delta.empty()) return;
-                sse_send(sink,
-                         json{{"id", id},
-                              {"object", "text_completion.chunk"},
-                              {"created", created},
-                              {"model", st.model_id},
-                              {"choices",
-                               json::array({{{"text", s.delta},
-                                             {"index", 0},
-                                             {"finish_reason", nullptr}}})}});
-              });
-          sse_send(sink,
-                   json{{"id", id},
-                        {"object", "text_completion.chunk"},
-                        {"created", created},
-                        {"model", st.model_id},
-                        {"choices",
-                         json::array({{{"text", ""},
-                                       {"index", 0},
-                                       {"finish_reason", r.finish}}})},
-                        {"usage",
-                         {{"prompt_tokens", r.prompt_tokens},
-                          {"completion_tokens", r.completion_tokens},
-                          {"total_tokens",
-                           r.prompt_tokens + r.completion_tokens}}}});
-          sse_done(sink);
+                if (s.delta.empty()) return sse_ok;
+                sse_ok = sse_send(
+                    sink, json{{"id", id},
+                               {"object", "text_completion.chunk"},
+                               {"created", created},
+                               {"model", st.model_id},
+                               {"choices",
+                                json::array({{{"text", s.delta},
+                                              {"index", 0},
+                                              {"finish_reason", nullptr}}})}});
+                return sse_ok;
+              },
+              &tm);
+          if (sse_ok) {
+            sse_send(sink,
+                     json{{"id", id},
+                          {"object", "text_completion.chunk"},
+                          {"created", created},
+                          {"model", st.model_id},
+                          {"choices",
+                           json::array({{{"text", ""},
+                                         {"index", 0},
+                                         {"finish_reason", r.finish}}})},
+                          {"usage",
+                           {{"prompt_tokens", r.prompt_tokens},
+                            {"completion_tokens", r.completion_tokens},
+                            {"total_tokens",
+                             r.prompt_tokens + r.completion_tokens}}}});
+            sse_done(sink);
+          }
+          log_turn(method, target, 200, tm, r.prompt_tokens,
+                   r.completion_tokens);
         } catch (const std::exception& ex) {
           sse_send(sink, openai_error(ex.what(), "server_error"));
           log_stream_error(method, target, body.size(), ex.what());
@@ -1393,6 +1502,12 @@ int main(int argc, char* argv[]) {
       startup_log("listening on 0.0.0.0:" + std::to_string(opt.port) +
                   " — ready to serve");
       httplib::Server svr;
+      // SSE is one small write per token. cpp-httplib defaults to
+      // CPPHTTPLIB_TCP_NODELAY=false, i.e. Nagle stays enabled on accepted
+      // sockets; on a non-loopback path (proxy, WAN client) Nagle + delayed
+      // ACK can hold a frame back ~40 ms. Nagle costs nothing to disable and
+      // the stream is latency-, not bandwidth-bound.
+      svr.set_tcp_nodelay(true);
       // Log every request: METHOD target body_bytes=N -> STATUS plus
       // error="..." for non-2xx (extracted from the JSON error body).
       svr.set_logger([](const httplib::Request& req,
