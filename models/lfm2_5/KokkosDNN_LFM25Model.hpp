@@ -870,7 +870,10 @@ public:
       Kokkos::deep_copy(toks, h);
     }
     auto logits = forward(toks);
-    int nxt     = sample_token<ExecSpace, Scalar>(logits, opt, out, r);
+    // One sampler for the whole run: the V-sized sampling scratch is
+    // allocated once instead of per token.
+    ::KokkosDNN::Impl::DeviceSampler<ExecSpace> sampler(logits.extent(0));
+    int nxt = sampler.sample(logits, opt, out, r).id;
     if ((int)out.size() < max_seq) out.push_back(nxt);
     if (on_token) on_token(nxt);
     if (one_buf_.extent(0) != 1) {
@@ -890,7 +893,7 @@ public:
             one(0) = tok;
           });
       logits = forward(one_buf_);
-      nxt    = sample_token<ExecSpace, Scalar>(logits, opt, out, r);
+      nxt    = sampler.sample(logits, opt, out, r).id;
       out.push_back(nxt);
       if (on_token) on_token(nxt);
     }
