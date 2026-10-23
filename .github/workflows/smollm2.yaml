@@ -59,12 +59,15 @@ jobs:
         run: |
           # TESTS=OFF + BENCHMARKS=OFF: this workflow only needs the
           # example drivers (and runs just the SmolLM2 one below).
+          # SERVER=ON also builds kokkosdnn_server (binary only; the parsing
+          # test needs TESTS=ON so it is not registered here).
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DKokkos_ROOT="${KOKKOS_INSTALL}" \
             -DKokkosDNN_ENABLE_TESTS=OFF \
             -DKokkosDNN_ENABLE_EXAMPLES=ON \
             -DKokkosDNN_ENABLE_BENCHMARKS=OFF \
+            -DKokkosDNN_ENABLE_SERVER=ON \
             -DKokkosDNN_ENABLE_COMPILER_WARNINGS=ON
 
       - name: Build examples

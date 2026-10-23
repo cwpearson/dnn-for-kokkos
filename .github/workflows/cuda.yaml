@@ -106,6 +106,8 @@ jobs:
           # at build time, but the runner has no GPU (libcuda.so.1 is
           # absent), so every test binary fails to start. This workflow is
           # compile coverage only.
+          # SERVER=ON also builds kokkosdnn_server (compile coverage only;
+          # its parsing test is registered but not run here).
           KOKKOS_INSTALL="$GITHUB_WORKSPACE/kokkos-install"
           NVCC_WRAPPER="$GITHUB_WORKSPACE/kokkos-src/bin/nvcc_wrapper"
           if [ "${{ matrix.tpl }}" = "ON" ]; then
@@ -121,6 +123,7 @@ jobs:
             -DKokkosDNN_ENABLE_TEST_DISCOVERY=OFF \
             -DKokkosDNN_ENABLE_EXAMPLES=ON \
             -DKokkosDNN_ENABLE_BENCHMARKS=ON \
+            -DKokkosDNN_ENABLE_SERVER=ON \
             -DKokkosDNN_ENABLE_COMPILER_WARNINGS=ON \
             ${TPL_FLAGS}
 

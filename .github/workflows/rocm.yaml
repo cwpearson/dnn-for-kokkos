@@ -144,6 +144,8 @@ jobs:
           # at build time, but the runner has no GPU, so every test binary
           # aborts inside Kokkos::initialize. This workflow is compile
           # coverage only.
+          # SERVER=ON also builds kokkosdnn_server (compile coverage only;
+          # its parsing test is registered but not run here).
           if [ "${{ matrix.tpl }}" = "ON" ]; then
             TPL_FLAGS="-DKokkosDNN_ENABLE_HIPBLAS=ON -DKokkosDNN_ENABLE_MIOPEN=ON"
           else
@@ -158,6 +160,7 @@ jobs:
             -DKokkosDNN_ENABLE_TEST_DISCOVERY=OFF \
             -DKokkosDNN_ENABLE_EXAMPLES=ON \
             -DKokkosDNN_ENABLE_BENCHMARKS=ON \
+            -DKokkosDNN_ENABLE_SERVER=ON \
             -DKokkosDNN_ENABLE_COMPILER_WARNINGS=ON \
             ${TPL_FLAGS}
 
