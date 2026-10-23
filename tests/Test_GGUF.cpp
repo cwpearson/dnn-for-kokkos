@@ -588,6 +588,32 @@ void check_quant_gemm(GgmlType dtype, size_t K, float tol) {
   Kokkos::fence();
 }
 
+// ---------------------------------------------------------------------------
+// (e) dequant_to_dense vs host-dequantized reference.
+// ---------------------------------------------------------------------------
+template <class Scalar>
+void check_dequant_to_dense(GgmlType dtype, size_t K, float tol) {
+  const size_t N = 4;
+  std::vector<float> ref;
+  std::vector<uint8_t> raw;
+  build_case(dtype, N, K, ref, raw);
+  std::vector<float> wdq;
+  host_dequant(dtype, raw.data(), N * K, wdq);
+
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> Y("Y", N, K);
+  QuantWeight<Exec> w = make_qw<Exec>(dtype, N, K, raw);
+  dequant_to_dense(w, Y);
+  Kokkos::fence();
+  auto got = Kokkos::create_mirror_view(Y);
+  Kokkos::deep_copy(got, Y);
+
+  for (size_t j = 0; j < N; ++j)
+    for (size_t k = 0; k < K; ++k)
+      EXPECT_NEAR((float)got(j, k), wdq[j * K + k], tol)
+          << "dequant mismatch dtype=" << ggml_type_name(dtype) << " (" << j
+          << "," << k << ")";
+}
+
 }  // namespace
 
 TEST(GgufQuantGemm, GemvFloat) {
@@ -614,6 +640,50 @@ TEST(GgufQuantGemm, GemmFloat) {
   check_quant_gemm<float>(GgmlType::Q8_0, 64, 1e-4f);
   check_quant_gemm<float>(GgmlType::Q4_K, 256, 1e-4f);
   check_quant_gemm<float>(GgmlType::Q6_K, 256, 1e-4f);
+}
+
+TEST(GgufDequantToDense, Float) {
+  check_dequant_to_dense<float>(GgmlType::F32, 64, 1e-5f);
+  check_dequant_to_dense<float>(GgmlType::F16, 64, 1e-4f);
+  check_dequant_to_dense<float>(GgmlType::BF16, 64, 1e-4f);
+  check_dequant_to_dense<float>(GgmlType::Q8_0, 64, 1e-4f);
+  check_dequant_to_dense<float>(GgmlType::Q4_K, 256, 1e-4f);
+  check_dequant_to_dense<float>(GgmlType::Q6_K, 256, 1e-4f);
+}
+
+TEST(GgufDequantToDense, BHalf) {
+  using bhalf_t = Kokkos::Experimental::bhalf_t;
+  check_dequant_to_dense<bhalf_t>(GgmlType::F32, 64, 5e-2f);
+  check_dequant_to_dense<bhalf_t>(GgmlType::F16, 64, 5e-2f);
+  check_dequant_to_dense<bhalf_t>(GgmlType::BF16, 64, 5e-2f);
+  check_dequant_to_dense<bhalf_t>(GgmlType::Q8_0, 64, 5e-2f);
+}
+
+TEST(GgufDequantToDense, Errors) {
+  // Unsupported dtype is rejected before any kernel launch.
+  {
+    std::vector<uint8_t> bytes(18, 0);
+    auto w = make_qw<Exec>(GgmlType::Q4_0, 1, 32, bytes);
+    Kokkos::View<float**, Kokkos::LayoutRight, Exec> Y("Y", 1, 32);
+    EXPECT_THROW(dequant_to_dense(w, Y), std::invalid_argument);
+  }
+  // Dimension mismatches are rejected.
+  {
+    std::vector<uint8_t> bytes(2 * 34, 0);
+    auto w = make_qw<Exec>(GgmlType::Q8_0, 1, 64, bytes);
+    Kokkos::View<float**, Kokkos::LayoutRight, Exec> Y("Y", 2, 64);
+    EXPECT_THROW(dequant_to_dense(w, Y), std::invalid_argument);
+  }
+  // K-quants require a block-multiple column count.
+  {
+    QuantWeight<Exec> w;
+    w.dtype = GgmlType::Q4_K;
+    w.rows  = 1;
+    w.cols  = 64;
+    w.data  = Kokkos::View<uint8_t*, Exec>("qw", 144);
+    Kokkos::View<float**, Kokkos::LayoutRight, Exec> Y("Y", 1, 64);
+    EXPECT_THROW(dequant_to_dense(w, Y), std::invalid_argument);
+  }
 }
 
 TEST(GgufQuant, Errors) {
