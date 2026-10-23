@@ -8,6 +8,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "KokkosDNN_Occupancy.hpp"
+
 // Sparse Mixture-of-Experts routing (gating) ops.
 //
 // Two routing activations are supported because different model families
@@ -201,14 +203,16 @@ struct MoeRouteFunctor {
 // Host backends allow team_size 1 only, and constructing a TeamPolicy with a
 // larger team throws there, so probe `team_size_max` from a team_size-1 policy
 // (valid everywhere) and clamp; every loop strides on the runtime team size,
-// so a clamped team stays correct.
+// so a clamped team stays correct. The probe is cached (see
+// KokkosDNN_Occupancy.hpp): decode runs one router per MoE layer, and the
+// answer only depends on the exec-space instance, the functor type and the
+// per-team scratch, which are all fixed for a given model/layer width.
 template <class ExecSpace, class Functor>
 void moe_route_launch(const std::string& label, size_t T, size_t E,
                       const Functor& f) {
   const int shbytes = static_cast<int>(E * sizeof(float));
-  Kokkos::TeamPolicy<ExecSpace> probe(1, 1);
-  probe.set_scratch_size(0, Kokkos::PerTeam(shbytes));
-  const int tmax = probe.team_size_max(f, Kokkos::ParallelForTag{});
+  const int tmax = cached_team_size_max<ExecSpace>(
+      f, static_cast<std::size_t>(shbytes));
   int ts         = Impl::moe_route_team_size(E);
   if (ts > tmax) ts = tmax;
   if (ts < 1) ts = 1;
