@@ -17,8 +17,10 @@
 #
 # Usage: include this module once (top-level CMakeLists does so), then call
 #   kokkosdnn_enable_compiler_warnings(<target>)
-# for every first-party target. INTERFACE libraries get INTERFACE scope so
-# the flags propagate to consumers; anything else gets PRIVATE scope so
+# for every first-party target. INTERFACE libraries get INTERFACE scope
+# guarded by $<BUILD_INTERFACE:...> so the flags propagate to in-tree
+# consumers but never leak into the installed export set (installed
+# consumers must not inherit -Werror); anything else gets PRIVATE scope so
 # third-party targets pulled in via FetchContent are unaffected.
 include_guard(GLOBAL)
 
@@ -87,18 +89,35 @@ function(kokkosdnn_enable_compiler_warnings target)
   endif()
   get_target_property(_type ${target} TYPE)
   if(_type STREQUAL "INTERFACE_LIBRARY")
-    set(_scope INTERFACE)
+    # INTERFACE options are exported to the install set, so guard every
+    # flag with $<BUILD_INTERFACE:...>: in-tree consumers still compile
+    # warnings-clean, but installed (imported) consumers see an empty
+    # interface instead of our -Werror. One target_compile_options call per
+    # flag because a single $<BUILD_INTERFACE:a;b;c> would carry the list
+    # separators into the generator expression.
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+      target_compile_options(${target} INTERFACE
+        $<BUILD_INTERFACE:/W4> $<BUILD_INTERFACE:/WX>)
+    else()
+      foreach(_flag IN LISTS KOKKOSDNN_SUPPORTED_WARNING_FLAGS)
+        target_compile_options(${target} INTERFACE $<BUILD_INTERFACE:${_flag}>)
+      endforeach()
+      target_compile_options(${target} INTERFACE $<BUILD_INTERFACE:-Werror>)
+      if(KOKKOSDNN_NVCC_WERROR_FLAG)
+        target_compile_options(${target} INTERFACE
+          $<BUILD_INTERFACE:${KOKKOSDNN_NVCC_WERROR_FLAG}>)
+      endif()
+      unset(_flag)
+    endif()
   else()
-    set(_scope PRIVATE)
-  endif()
-  if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-    target_compile_options(${target} ${_scope} /W4 /WX)
-  else()
-    target_compile_options(${target} ${_scope}
-      ${KOKKOSDNN_SUPPORTED_WARNING_FLAGS} -Werror ${KOKKOSDNN_NVCC_WERROR_FLAG})
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+      target_compile_options(${target} PRIVATE /W4 /WX)
+    else()
+      target_compile_options(${target} PRIVATE
+        ${KOKKOSDNN_SUPPORTED_WARNING_FLAGS} -Werror ${KOKKOSDNN_NVCC_WERROR_FLAG})
+    endif()
   endif()
   unset(_type)
-  unset(_scope)
 endfunction()
 
 # Project policy: warnings are enforced on first-party code only.
