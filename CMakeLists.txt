@@ -339,8 +339,22 @@ include(CMakePackageConfigHelpers)
 write_basic_package_version_file(
   ${CMAKE_CURRENT_BINARY_DIR}/KokkosDNNConfigVersion.cmake
   VERSION ${PROJECT_VERSION} COMPATIBILITY SameMinorVersion)
-configure_file(cmake/KokkosDNNConfig.cmake.in
-  ${CMAKE_CURRENT_BINARY_DIR}/KokkosDNNConfig.cmake @ONLY)
+# Baked into KokkosDNNConfig.cmake: whether the build linked the
+# config-package targets (needing a consumer-side find_dependency) or manual
+# absolute paths (needing none).
+if(KokkosDNN_ENABLE_CUDNN AND TARGET CUDNN::cudnn)
+  set(KokkosDNN_USE_CUDNN_CONFIG TRUE)
+else()
+  set(KokkosDNN_USE_CUDNN_CONFIG FALSE)
+endif()
+if(KokkosDNN_ENABLE_MIOPEN AND TARGET MIOpen)
+  set(KokkosDNN_USE_MIOPEN_CONFIG TRUE)
+else()
+  set(KokkosDNN_USE_MIOPEN_CONFIG FALSE)
+endif()
+configure_package_config_file(cmake/KokkosDNNConfig.cmake.in
+  ${CMAKE_CURRENT_BINARY_DIR}/KokkosDNNConfig.cmake
+  INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/KokkosDNN)
 install(FILES
   ${CMAKE_CURRENT_BINARY_DIR}/KokkosDNNConfig.cmake
   ${CMAKE_CURRENT_BINARY_DIR}/KokkosDNNConfigVersion.cmake
