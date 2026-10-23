@@ -121,3 +121,28 @@ Limits to know:
   concurrent request blocks until the in-flight request finishes (no 409;
   keep this in mind for multi-client use). A fresh `Session` is built per
   request under that lock so per-request sampling/stop/seed options apply.
+- No prefix cache: every turn re-prefills the whole message history, so an
+  agent loop pays `history / prefill_rate` on each turn in addition to
+  decoding. The per-turn log line reports both halves (`prefill_ms`,
+  `decode_ms`, `decode_tok_s`) so this is measurable from the server logs.
+- A streaming client that disconnects stops the turn at the next token
+  (detected from `sink.write()`); the abandoned turn is logged with
+  `aborted=client-disconnect` instead of holding the inference lock for the
+  remaining `max_tokens`.
+
+## Observability
+
+Every completed turn logs one line to stderr:
+
+```
+POST /v1/chat/completions -> 200 prompt_tokens=17 completion_tokens=64
+  lock_ms=0.0 encode_ms=0.2 prefill_ms=261.4 decode_ms=1576.9 sse_ms=1.9
+  decode_tok_s=40.6
+```
+
+`lock_ms` is time waiting for the inference mutex (non-zero means the
+request queued behind another), `prefill_ms` is prompt processing,
+`decode_ms` is the sum of model steps, `sse_ms` is SSE framing plus socket
+writes, and `decode_tok_s` is the rate a streaming client observes. A GPU
+that looks 100% busy in `nvidia-smi` while `decode_tok_s` is low means the
+model step, not the transport, is the bottleneck.
