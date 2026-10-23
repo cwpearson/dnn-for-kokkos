@@ -84,14 +84,12 @@ TEST(MossDitScheduler, InTestRecomputeAndMonotone) {
     size_t u = 0;
     while (u + 1 < tr.size() && tr[u + 1] < sg) ++u;  // linear lower_bound
     if (u >= tr.size()) u = tr.size() - 1;
-    size_t l = (u > 0) ? u - 1 : 0;
     // Snap: linear scan for the true nearest (ties -> lower index).
     size_t best = 0;
     for (size_t k = 0; k < tr.size(); ++k) {
       double db = std::fabs(sg - tr[k]), dn = std::fabs(sg - tr[best]);
       if (db < dn || (db == dn && k < best)) best = k;
     }
-    (void)l;
     (void)u;
     if (want.empty() || tr[best] != want.back()) want.push_back(tr[best]);
   }

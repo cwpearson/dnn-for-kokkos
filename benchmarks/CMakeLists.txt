@@ -31,9 +31,14 @@ if(NOT benchmark_FOUND)
   set(BENCHMARK_ENABLE_WERROR OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(googlebenchmark)
 endif()
-# Third-party policy: benchmark builds warning-free (its own -w) and its
-# headers reach kokkosdnn_bench as SYSTEM, so they can never trip -Werror.
+# Third-party policy: benchmark builds warning-free (its own -w on every
+# compiled target) and its headers reach kokkosdnn_bench as SYSTEM, so they
+# can never trip -Werror. Suppress both libs (benchmark+benchmark_main) in
+# both spellings (system packages provide benchmark::benchmark as IMPORTED).
 kokkosdnn_suppress_third_party_warnings(benchmark)
+kokkosdnn_suppress_third_party_warnings(benchmark_main)
+kokkosdnn_suppress_third_party_warnings(benchmark::benchmark)
+kokkosdnn_suppress_third_party_warnings(benchmark::benchmark_main)
 
 add_executable(kokkosdnn_bench
   BenchmarkMain.cpp

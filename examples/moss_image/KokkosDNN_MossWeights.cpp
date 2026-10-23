@@ -45,10 +45,8 @@ uint32_t ld32(const char* p) {
          ((uint32_t)b[3] << 24);
 }
 uint64_t ld64(const char* p) {
-  const auto* b = reinterpret_cast<const unsigned char*>(p);
   uint64_t lo = (uint64_t)ld32(p);
   uint64_t hi = (uint64_t)ld32(p + 4);
-  (void)b;
   return lo | (hi << 32);
 }
 
