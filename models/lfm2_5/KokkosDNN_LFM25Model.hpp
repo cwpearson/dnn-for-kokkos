@@ -28,28 +28,6 @@ namespace KokkosDNN {
 namespace LFM25 {
 namespace Impl {
 
-// Decode (single-row) MoE combine: y(0,d) += a * x(0,d), FP32 accumulation.
-// Lets the C==1 path below accumulate each routed expert straight into the
-// output without the gather/scatter staging (and its per-expert row/weight
-// deep_copies) of the chunk path.
-template <class ExecSpace, class Scalar>
-void moe_axpy_row(
-    float a,
-    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
-    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& y,
-    const std::string& label = "KokkosDNN::LFM25::moe_axpy") {
-  if (x.extent(0) != 1 || y.extent(0) != 1 || y.extent(1) != x.extent(1))
-    throw std::invalid_argument("moe_axpy_row: expected single-row [1, D]");
-  const size_t D = x.extent(1);
-  if (D == 0) return;
-  Kokkos::parallel_for(
-      label, Kokkos::RangePolicy<ExecSpace>(0, D),
-      KOKKOS_LAMBDA(size_t d) {
-        y(0, d) = static_cast<Scalar>(static_cast<float>(y(0, d)) +
-                                     a * static_cast<float>(x(0, d)));
-      });
-}
-
 // Short-conv split of the in_proj output: in_proj maps [dim] -> 3 stacked
 // [B, C, X] projections (llama.cpp `shortconv.in_proj`, {n_embd, 3*n_embd}).
 //   bx[t,d]   = B[t,d] * X[t,d]   (the depthwise-conv input)
@@ -210,6 +188,12 @@ class Model {
   MatR moe_gn_gate_, moe_gn_up_, moe_gn_act_;
   Kokkos::View<int**, Kokkos::LayoutRight, ExecSpace> moe_idx_buf_;
   Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace> moe_w_buf_;
+  // Decode MoE path: device-indexable per-expert pointer tables (built once
+  // by ensure_moe_tables; empty for non-MoE layers) and the per-slot SwiGLU
+  // staging ([top_k, moe_intermediate], one row per routed slot).
+  std::vector<Gguf::QuantWeightTable<ExecSpace>> moe_tab_gate_, moe_tab_up_,
+      moe_tab_down_;
+  MatR moe_dec_act_;
   // Sparse top-k dispatch staging: gathered expert inputs plus the row-id /
   // weight vectors for the expert currently being processed. Sized by chunk
   // capacity (one expert's rows N <= C always fit); carved via subview so
@@ -398,6 +382,8 @@ class Model {
       moe_gn_gate_ = MatR("moe_gn_gate", T, MI);
       moe_gn_up_   = MatR("moe_gn_up", T, MI);
       moe_gn_act_  = MatR("moe_gn_act", T, MI);
+      // Decode-path SwiGLU staging: one row per routed slot.
+      moe_dec_act_ = MatR("moe_dec_act", TK, MI);
     }
     q3_buf_ = View3("q", T, NH, HD);
     k3_buf_ = View3("k", T, NKV, HD);
@@ -408,6 +394,28 @@ class Model {
     scratch_ffn_ = FFNm;
     scratch_E_   = E;
     scratch_K_   = TK;
+  }
+
+  // Build the decode MoE path's device tables once. `weights` is fixed at
+  // construction (packed payloads are allocated by load_gguf / random_init and
+  // never reallocated), so the host vectors are walked once into device
+  // pointer tables and the gemv kernels can index the routed expert directly.
+  void ensure_moe_tables() {
+    const size_t NL = weights.blocks.size();
+    if (moe_tab_gate_.size() == NL) return;
+    moe_tab_gate_.assign(NL, Gguf::QuantWeightTable<ExecSpace>());
+    moe_tab_up_.assign(NL, Gguf::QuantWeightTable<ExecSpace>());
+    moe_tab_down_.assign(NL, Gguf::QuantWeightTable<ExecSpace>());
+    for (size_t l = 0; l < NL; ++l) {
+      const auto& b = weights.blocks[l];
+      if (b.gate_exps.empty()) continue;
+      moe_tab_gate_[l] = Gguf::make_quant_weight_table<ExecSpace>(
+          b.gate_exps, "LFM25::moe_gate_exps");
+      moe_tab_up_[l] = Gguf::make_quant_weight_table<ExecSpace>(
+          b.up_exps, "LFM25::moe_up_exps");
+      moe_tab_down_[l] = Gguf::make_quant_weight_table<ExecSpace>(
+          b.down_exps, "LFM25::moe_down_exps");
+    }
   }
 
   void ensure_tok(size_t n) {
@@ -519,7 +527,8 @@ class Model {
                                    std::make_pair(size_t(0), KDIM));
       auto dup = Kokkos::subview(moe_deq_up_, std::make_pair(size_t(0), MI),
                                  std::make_pair(size_t(0), KDIM));
-      auto ddown = Kokkos::subview(moe_deq_down_, std::make_pair(size_t(0), KDIM),
+      auto ddown = Kokkos::subview(moe_deq_down_,
+                                   std::make_pair(size_t(0), KDIM),
                                    std::make_pair(size_t(0), MI));
       moe_gather_rows<ExecSpace, Scalar>(x, rows, gx);
       Gguf::dequant_to_dense<ExecSpace, Scalar>(b.gate_exps[e], dgate);
@@ -536,55 +545,37 @@ class Model {
     }
   }
 
-  // Single-row (decode) MoE dispatch: the chunk path above groups (token,
-  // slot) pairs on the host, which costs 2 + 2*experts device-host
-  // synchronizations per layer per token. With one row the grouping is
-  // trivial -- the input row IS each expert's input (no gather) and each
-  // expert accumulates straight into y (no scatter) -- so only the single
-  // idx/weight row crosses to the host (2 tiny fences per layer). Per slot:
-  // packed quant_gemm gate/up, SwiGLU, packed quant_gemm down, weighted add.
+  // Single-row (decode) MoE dispatch. The routing slot ids/weights are read
+  // on device, so this path performs no host fence at all, and the two fused
+  // kernels of Gguf::quant_moe_decode (gate+up+SwiGLU, down+weighted combine)
+  // replace the 2 + 3*top_k launches of the per-slot dispatch. Both matter at
+  // batch 1: nsys on the native build showed 455 expert-GEMV launches
+  // (~16 ms/token) and 74 blocking D2H copies per token, i.e. the expert GEMV
+  // alone was ~60% of the GPU time.
+  //
+  // The per-expert packed weights are a std::vector on the host, so the
+  // device-indexable pointer tables are built once (ensure_moe_tables) and
+  // reused for the life of the model: the packed payloads are allocated at
+  // load time and never move.
   void moe_forward_decode(
       const BlockWeights<ExecSpace, Scalar>& b, const MatR& x,
       const Kokkos::View<int**, Kokkos::LayoutRight, ExecSpace>& idx,
       const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& w,
-      const MatR& y, size_t MI) {
+      const MatR& y, size_t MI, int layer) {
     const size_t NE = b.gate_exps.size();
     const size_t KK = idx.extent(1);
     if (NE == 0 || KK == 0) return;
     if (x.extent(0) != 1 || y.extent(0) != 1)
       throw std::invalid_argument("moe_forward_decode: expected one row");
-    auto h_idx = Kokkos::subview(moe_idx_host_, size_t(0), Kokkos::ALL);
-    auto h_w   = Kokkos::subview(moe_w_host_, size_t(0), Kokkos::ALL);
-    auto d_idx = Kokkos::subview(idx, size_t(0), Kokkos::ALL);
-    auto d_w   = Kokkos::subview(w, size_t(0), Kokkos::ALL);
-    Kokkos::deep_copy(h_idx, d_idx);
-    Kokkos::deep_copy(h_w, d_w);
-    auto egate =
-        Kokkos::subview(gate_buf_, std::make_pair(size_t(0), size_t(1)),
-                        std::make_pair(size_t(0), MI));
-    auto eup = Kokkos::subview(up_buf_, std::make_pair(size_t(0), size_t(1)),
+    ensure_moe_tables();
+    auto act = Kokkos::subview(moe_dec_act_, std::make_pair(size_t(0), KK),
                                std::make_pair(size_t(0), MI));
-    auto eact = Kokkos::subview(act_buf_, std::make_pair(size_t(0), size_t(1)),
-                                std::make_pair(size_t(0), MI));
-    auto eoe = Kokkos::subview(moe_oe_buf_,
-                               std::make_pair(size_t(0), size_t(1)), Kokkos::ALL);
-    for (size_t k = 0; k < KK; ++k) {
-      const int e = h_idx(k);
-      if (e < 0 || (size_t)e >= NE)
-        throw std::runtime_error(
-            "moe_forward_decode: expert id out of range");
-      const float a = h_w(k);
-      if (a == 0.0f) continue;
-      const size_t ee = (size_t)e;
-      Gguf::quant_gemm<ExecSpace, Scalar>(handle, x, b.gate_exps[ee], egate);
-      Gguf::quant_gemm<ExecSpace, Scalar>(handle, x, b.up_exps[ee], eup);
-      swiglu<ExecSpace, Scalar>(egate, eup, eact);
-      Gguf::quant_gemm<ExecSpace, Scalar>(handle, eact, b.down_exps[ee], eoe);
-      Impl::moe_axpy_row<ExecSpace, Scalar>(a, eoe, y);
-    }
+    Gguf::quant_moe_decode<ExecSpace, Scalar>(
+        handle, x, moe_tab_gate_[(size_t)layer], moe_tab_up_[(size_t)layer],
+        moe_tab_down_[(size_t)layer], idx, w, act, y);
   }
 
- public:
+public:
   // Forward T prompt tokens starting at absolute position seq_len.
   // Returns logits [vocab] for the LAST token. Updates KV caches and conv
   // states, and advances seq_len by T.
@@ -804,15 +795,17 @@ class Model {
           gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), tmp2,
                                   b.gate_inp, static_cast<Scalar>(0), mlogits);
           moe_route_sigmoid<ExecSpace, Scalar>(mlogits, b.exp_bias, TOP_K,
-                                                ROT_NORM_TOPK, ROUTED_SCALE,
-                                                midx, mw);
-          Kokkos::deep_copy(down, static_cast<Scalar>(0));
-          // Decode (one row) skips the host-grouped sparse dispatch: no
-          // gather/scatter and only one idx/weight row crosses to the host.
-          if (C == 1)
-            moe_forward_decode(b, tmp2, midx, mw, down, MI);
-          else
+                                               ROT_NORM_TOPK, ROUTED_SCALE,
+                                               midx, mw);
+          // Decode (one row) skips the host-grouped sparse dispatch: its two
+          // fused kernels read the routing slots on device and assign `down`
+          // (no gather/scatter, no zero fill, no host fence).
+          if (C == 1) {
+            moe_forward_decode(b, tmp2, midx, mw, down, MI, l);
+          } else {
+            Kokkos::deep_copy(down, static_cast<Scalar>(0));
             moe_forward_sparse(b, tmp2, midx, mw, down, C, MI);
+          }
           (void)FFN;
         }
         Kokkos::parallel_for(
