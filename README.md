@@ -70,6 +70,13 @@ Options:
 
 See each directory's README for flags, run commands, and design notes.
 
+## Server
+
+`server/kokkosdnn_server` (opt-in via `-DKokkosDNN_ENABLE_SERVER=ON`) is an
+OpenAI-compatible HTTP front-end for LFM2.5 (`GET /v1/models`,
+`POST /v1/chat/completions` with SSE streaming, `POST /v1/completions` alias).
+See [server](server/README.md) for flags, routes, and request params.
+
 ## Benchmarks
 
 `benchmarks/kokkosdnn_bench` (Google Benchmark, opt-in via
