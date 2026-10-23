@@ -22,7 +22,7 @@
 
 // stb declarations only (implementation is in KokkosDNN_Image.cpp).
 // stb warning suppression is handled at the build-system level: the stb
-// include dir is exposed as SYSTEM (-isystem) via stb::stb (see
+// include dir is exposed as SYSTEM (-isystem) via KokkosDNN::stb (see
 // src/images/CMakeLists.txt), which silences third-party warnings
 // portably on GCC/Clang without enumerating warning names here.
 #include "stb_image.h"

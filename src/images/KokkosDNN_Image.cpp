@@ -4,7 +4,7 @@
 //
 // Headers under src/images/ (KokkosDNN_ImageIO.hpp) include stb_image.h /
 // stb_image_write.h for declarations only. The IMPLEMENTATION macros are
-// defined exactly once, here. "stb_image.h" resolves via the stb::stb
+// defined exactly once, here. "stb_image.h" resolves via the KokkosDNN::stb
 // interface include dir (see src/images/CMakeLists.txt): that dir is the
 // folder actually containing stb_image.h, whether the headers live at the
 // top level of the stb repo or under a stb/ subdir, so no path tweaks here.
