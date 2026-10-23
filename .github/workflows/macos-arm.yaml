@@ -86,6 +86,9 @@ jobs:
         run: |
           # KokkosDNN_ENABLE_IMAGE=ON builds src/images (KokkosDNN::Image,
           # stb-backed I/O) and registers its unit tests (Test_Image).
+          # KokkosDNN_ENABLE_SERVER=ON builds server/kokkosdnn_server plus
+          # its parsing unit test (kokkosdnn_server_parsing, no weights
+          # needed); FetchContent fetches cpp-httplib + nlohmann/json.
           # Missing system stb headers are fetched automatically.
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
@@ -94,6 +97,7 @@ jobs:
             -DKokkosDNN_ENABLE_EXAMPLES=ON \
             -DKokkosDNN_ENABLE_BENCHMARKS=ON \
             -DKokkosDNN_ENABLE_IMAGE=ON \
+            -DKokkosDNN_ENABLE_SERVER=ON \
             -DKokkosDNN_ENABLE_COMPILER_WARNINGS=ON \
             -DKokkosDNN_ENABLE_ACCELERATE=${{ matrix.accelerate }}
 
