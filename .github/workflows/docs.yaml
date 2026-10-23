@@ -1,17 +1,20 @@
 name: Docs
 
 # Build the Sphinx docs on every PR (build only); build + deploy to
-# GitHub Pages on pushes to main. Only runs when the docs (or this
-# workflow) change; build workflows ignore docs-only changes in return.
+# GitHub Pages on pushes to main. Only runs when the docs, the root
+# README (included by docs/index.rst), or this workflow change; build
+# workflows ignore docs-only changes in return.
 on:
   push:
     branches: [main]
     paths:
       - "docs/**"
+      - "README.md"
       - ".github/workflows/docs.yaml"
   pull_request:
     paths:
       - "docs/**"
+      - "README.md"
       - ".github/workflows/docs.yaml"
 
 permissions:
