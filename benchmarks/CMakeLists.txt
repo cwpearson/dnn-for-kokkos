@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 # Google Benchmark-based microbenchmarks for core KokkosDNN operators.
 #
 # Produces a single `kokkosdnn_bench` binary. GEMM, biased-linear, and

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // End-to-end tiny LFM2.5: random weights, forward + greedy decode.
 // Exercises both bfloat16 (default) and fp32 scalar paths. No weight
 // downloads; tiny_test() dims keep runtime to seconds.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // 2D axial RoPE (DINOv3 ViT): host-reference match, prefix skip,
 // identity at zero coord, dynamic H/W, out-of-place parity.
 #include <gtest/gtest.h>

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 #ifndef KOKKOSDNN_MOSS_WEIGHTS_HPP
 #define KOKKOSDNN_MOSS_WEIGHTS_HPP
 

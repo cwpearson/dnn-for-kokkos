@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Single-layer bidirectional LSTM: device vs host reference, lengths
 // handling (pad rows zero, states freeze), forward/backward equivalence,
 // argument validation.

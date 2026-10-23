@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // kokkosdnn_server: OpenAI-compatible HTTP front-end for KokkosDNN (LFM2.5).
 //
 // Translation only: HTTP/JSON <-> LFM25 Session calls. No sampling, chat

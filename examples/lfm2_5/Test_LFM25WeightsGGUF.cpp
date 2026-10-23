@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // LFM25 GGUF loader regression test: llama.cpp tensor naming.
 //
 // The real LFM2.5-24B-A2B-Q4_K_M checkpoint names the final norm

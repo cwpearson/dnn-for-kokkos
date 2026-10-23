@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // GGUF + K-quant (Q4_K_M family) tests. No real weights are used: every file
 // is synthesized into /tmp by write_synthetic_gguf and removed afterwards.
 #include <gtest/gtest.h>

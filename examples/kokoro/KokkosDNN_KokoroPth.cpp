@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Kokoro torch.save reader: ZIP index + protocol-2 pickle VM.
 // See KokkosDNN_KokoroPth.hpp for the format contract.
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // 114 entries from hexgrad/Kokoro-82M config.json
     {";", 1},
     {":", 2},

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Memory-bound elementwise benchmarks (native Kokkos only, no TPL path):
 // RMSNorm, row softmax, SwiGLU, RoPE at Llama 3.1 8B-Instruct dims (dim=4096,
 // ffn_dim=14336, head_dim=128, n_heads=32/n_kv=8). Throughput is reported as

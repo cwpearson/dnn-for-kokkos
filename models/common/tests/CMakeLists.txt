@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 # models/common/tests: unit tests for the header-only common utilities.
 # Mirrors the examples/*/test pattern: link KokkosDNN::gtest_main (Kokkos
 # init/finalize + GTest main) and register via kokkosdnn_discover_tests.

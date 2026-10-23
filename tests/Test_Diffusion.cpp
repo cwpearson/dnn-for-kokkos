@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Generic DiT diffusion ops vs host reference: AdaLN modulation
 // (rank-2 + rank-3) and sinusoidal timestep embeddings.
 #include <gtest/gtest.h>

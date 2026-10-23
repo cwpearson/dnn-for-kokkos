@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // MoE routing (top-k select + softmax/sigmoid weights), expert weighted-sum
 // helper, and fused per-head QK RMSNorm vs host references.
 #include <gtest/gtest.h>

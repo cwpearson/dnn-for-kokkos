@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Paged + int8-quantized KV cache: parity, accuracy, config, and growth.
 // Always-on, tiny config, no weight downloads.
 #include <gtest/gtest.h>

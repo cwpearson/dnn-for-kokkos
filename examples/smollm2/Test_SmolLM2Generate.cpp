@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // End-to-end SmolLM2: presets, fixtures, and tiny/full generate smoke.
 // No weight downloads: random weights + checked-in config fixtures.
 #include <gtest/gtest.h>

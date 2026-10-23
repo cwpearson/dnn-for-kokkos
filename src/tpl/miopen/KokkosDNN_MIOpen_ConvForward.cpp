@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // MIOpen convolution forwards declared in
 // tpl/miopen/KokkosDNN_MIOpen_ConvForward.hpp.
 //

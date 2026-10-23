@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Image component tests (requires -DKokkosDNN_ENABLE_IMAGE=ON).
 #include "KokkosDNN_config.h"
 #ifndef KOKKOSDNN_ENABLE_IMAGE

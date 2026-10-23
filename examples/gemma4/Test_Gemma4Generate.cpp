@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // End-to-end Gemma4 text: presets, fixtures, tiny/full generate smoke,
 // and a gated real-weight check (skips without files, never downloads).
 // No weight downloads: random weights + checked-in config fixture.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Bidirectional (non-causal) MHA: host-reference agreement (float +
 // bfloat16, MHA + GQA mappings), and the
 // non-causal property (early outputs depend on future tokens, unlike the

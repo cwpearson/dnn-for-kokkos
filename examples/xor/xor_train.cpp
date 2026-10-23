@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Trains the XOR MLP (2 -> hidden tanh -> 1) with full-batch Adam and
 // prints the final truth table. Usage:
 //   xor_train [--hidden N] [--epochs N] [--lr X] [--seed N]

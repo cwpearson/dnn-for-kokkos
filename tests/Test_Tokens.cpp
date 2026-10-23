@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // tokens_assemble (ViT token assembly, cat[cls,registers,patches]): batched
 // vs host reference, shared-prefix broadcast ([D] and [1,D] CLS forms),
 // single-sequence path, and argument validation.

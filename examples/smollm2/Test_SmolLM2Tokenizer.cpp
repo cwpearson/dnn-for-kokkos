@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // SmolLM2 tokenizer regression tests (synthetic GPT-2 fixtures only, no
 // model downloads). Covers: base/instruct BOS-EOS conventions, Digits
 // individual-digits splitting, GPT-2 ByteLevel space handling, specials +

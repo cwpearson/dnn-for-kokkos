@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 # Gemma4 E2B-it text example: model-specific inference built on top of the
 # core library. Not part of libkokkosdnn; kept here as example/support code.
 # Separate family from examples/llama and examples/smollm2 (config/weights/

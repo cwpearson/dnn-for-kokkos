@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // layerscale_residual_forward (out = x + gamma*branch, gamma [D] broadcast)
 // and layerscale_forward (out = gamma*branch): batched [B,T,D] vs host
 // reference, single-sequence [T,D], rank-1 [D], gamma=1/0 degenerates,

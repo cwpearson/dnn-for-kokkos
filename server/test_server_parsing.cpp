@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Parsing unit tests for kokkosdnn_server: exercise the pure OpenAI/JSON
 // translation helpers (parse_common, parse_messages, openai_error) by
 // including server_main.cpp with KOKKOSDNN_SERVER_NO_MAIN. No weights, no

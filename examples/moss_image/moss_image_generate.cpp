@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // MOSS-Image-SFT text-to-image driver: true-pipeline phase order
 // (encode -> release+fence -> DiT sample -> release+fence -> VAE decode)
 // with FlowEuler sampling, CFG, and positive-branch SLG.

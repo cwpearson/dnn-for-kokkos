@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Sampler unit tests: temperature / top-k / top-p / min-p, repetition
 // penalty, seeded RNG determinism, greedy equivalence. No weight downloads;
 // fixed logits + fixed seeds only (device tests use tiny views).

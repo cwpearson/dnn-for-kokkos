@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 """Reference Gemma-2-2B-IT caption features for the Sana example golden test.
 
 Loads google/gemma-2-2b-it (or a local snapshot) with HF transformers on CPU,

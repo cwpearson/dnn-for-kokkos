@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Shared GoogleTest main: initializes Kokkos around RUN_ALL_TESTS.
 #include <gtest/gtest.h>
 

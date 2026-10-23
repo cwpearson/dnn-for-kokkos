@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // torch.save (.pth) reader for the Sana example: stored-entry ZIP parsing,
 // protocol-2 pickle VM (closed opcode set), and fp32 storage streaming.
 // See KokkosDNN_SanaPth.hpp for the format contract.

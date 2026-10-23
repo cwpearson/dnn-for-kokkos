@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // DC-AE VAE decoder tests (example-scoped, never download weights).
 //
 // - ConfigValidate: factories validate; bad configs throw.

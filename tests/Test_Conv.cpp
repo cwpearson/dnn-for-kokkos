@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Promoted spatial convolutions: dense 3x3, depthwise KxK, grouped 1x1.
 // Native correctness vs host references (biased/unbiased, argument
 // validation). The dense 3x3 runs the im2col + gemm_bias lowering (so on

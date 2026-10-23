@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Kokoro tiny smoke test: random weights, no files. Verifies the full
 // synthesize() path runs, honors the length contract (audio == 300 * 2F
 // samples), produces finite output, and is deterministic given the seed.

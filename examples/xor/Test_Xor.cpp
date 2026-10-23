@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // End-to-end XOR test: a tiny 2->8(tanh)->1 MLP trained with full-batch
 // Adam must learn the truth table. Runs on DefaultExecutionSpace (Serial
 // in CPU CI) in well under a second of kernel time plus Kokkos launch

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 # LFM2.5 model library: installable component (KokkosDNN::lfm25).
 # Mechanical promotion of the former examples/lfm2_5 library sources; no
 # behavior change. Driver (lfm2_5_generate) and Test_*.cpp stay in
