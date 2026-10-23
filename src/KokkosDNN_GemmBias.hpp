@@ -2,6 +2,7 @@
 #define KOKKOSDNN_GEMMBIAS_HPP
 
 #include <Kokkos_Core.hpp>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -10,6 +11,20 @@
 
 namespace KokkosDNN {
 namespace Impl {
+
+// cublasLt BIAS-epilogue layout guard: the Lt matrix layouts below are
+// created with leading dims K/K/N, which is exact only for row-pitch ==
+// extent views (plus a unit-stride bias). Anything else must decline the
+// fused path and take the split/natural fallback -- the epilogue would
+// otherwise add the bias to the wrong elements. Same rationale as
+// gemm_nt_cublas_layout_ok in KokkosDNN_Gemm.hpp.
+inline bool gemm_bias_lt_layout_ok(size_t M, size_t N, size_t K, size_t sx0,
+                                   size_t sw0, size_t sb0, size_t sy0) {
+  constexpr size_t kMax =
+      static_cast<size_t>((std::numeric_limits<int>::max)());
+  return M > 0 && N > 0 && K > 0 && M <= kMax && N <= kMax && K <= kMax &&
+         sx0 == K && sw0 == K && sb0 == 1 && sy0 == N;
+}
 
 // Broadcast-bias add for the rank-2 path: Y(i,j) += b(j) in FP32.
 // Separate efficient device kernel (one element per thread), not a host
@@ -110,7 +125,9 @@ void gemm_bias(
   if constexpr (is_cuda) {
     if (handle.use_cublas) {
       void* lt = handle.cublaslt_bias_state();
-      if (lt != nullptr) {
+      if (lt != nullptr &&
+          Impl::gemm_bias_lt_layout_ok(M, N, K, X.stride(0), W.stride(0),
+                                       b.stride(0), Y.stride(0))) {
         // No fence here: the Lt call re-selects the Kokkos CUDA stream on
         // every invocation, so it stays ordered with Kokkos kernels.
         bool ok = false;
@@ -126,7 +143,10 @@ void gemm_bias(
               static_cast<int>(K), 1.0f, X.data(), W.data(), b.data(),
               Y.data());
         }
-        if (ok) return;
+        if (ok) {
+          Impl::tpl_note_bias(true);
+          return;
+        }
         // else fall through to the split TPL path below (keeps cuBLAS
         // GEMM speed; the bias kernel is today's behavior there).
       }
@@ -139,6 +159,7 @@ void gemm_bias(
           gemm(handle, static_cast<Scalar>(1), X, W, static_cast<Scalar>(0),
                Y, label);
           Impl::add_bias_2d<ExecSpace, Scalar>(Y, b, label + "_bias");
+          Impl::tpl_note_bias(true);
           return;
         }
       }
@@ -157,6 +178,7 @@ void gemm_bias(
       gemm(handle, static_cast<Scalar>(1), X, W, static_cast<Scalar>(0), Y,
            label);
       Impl::add_bias_2d<ExecSpace, Scalar>(Y, b, label + "_bias");
+      Impl::tpl_note_bias(true);
       return;
     }
   }
@@ -173,6 +195,7 @@ void gemm_bias(
       gemm(handle, static_cast<Scalar>(1), X, W, static_cast<Scalar>(0), Y,
            label);
       Impl::add_bias_2d<ExecSpace, Scalar>(Y, b, label + "_bias");
+      Impl::tpl_note_bias(true);
       return;
     }
   }
@@ -180,6 +203,7 @@ void gemm_bias(
   // Native fused single pass: rank-2 M == 1 reuses the team-per-row GEMV
   // kernel with fused bias (same working set), M > 1 uses the tiled GEMM
   // with bias folded into write-back.
+  Impl::tpl_note_bias(false);
   if (M == 1) {
     Kokkos::View<Scalar*, ExecSpace,
                  Kokkos::MemoryTraits<Kokkos::Unmanaged>>
@@ -218,7 +242,9 @@ void gemv_bias(
   if constexpr (is_cuda_gv) {
     if (handle.use_cublas) {
       void* lt = handle.cublaslt_bias_state();
-      if (lt != nullptr) {
+      if (lt != nullptr && x.stride(0) == 1 && y.stride(0) == 1 &&
+          Impl::gemm_bias_lt_layout_ok(1, N, K, K, W.stride(0), b.stride(0),
+                                       N)) {
         bool ok = false;
         if constexpr (std::is_same_v<Scalar, float>) {
           ok = Impl::cublaslt_gemm_bias_nt_f32_with_state(
@@ -230,13 +256,17 @@ void gemv_bias(
               lt, 1, static_cast<int>(N), static_cast<int>(K), 1.0f, x.data(),
               W.data(), b.data(), y.data());
         }
-        if (ok) return;
+        if (ok) {
+          Impl::tpl_note_bias(true);
+          return;
+        }
       }
       if constexpr (std::is_same_v<Scalar, float> ||
                     std::is_same_v<Scalar, Kokkos::Experimental::bhalf_t>) {
         if (handle.cublas_raw() != nullptr) {
           gemv(handle, x, W, y, label);
           Impl::add_bias_1d<ExecSpace, Scalar>(y, b, label + "_bias");
+          Impl::tpl_note_bias(true);
           return;
         }
       }
@@ -254,6 +284,7 @@ void gemv_bias(
         handle.hipblas_raw() != nullptr) {
       gemv(handle, x, W, y, label);
       Impl::add_bias_1d<ExecSpace, Scalar>(y, b, label + "_bias");
+      Impl::tpl_note_bias(true);
       return;
     }
   }
@@ -266,11 +297,13 @@ void gemv_bias(
     if (handle.use_accelerate && std::is_same_v<Scalar, float>) {
       gemv(handle, x, W, y, label);
       Impl::add_bias_1d<ExecSpace, Scalar>(y, b, label + "_bias");
+      Impl::tpl_note_bias(true);
       return;
     }
   }
 #endif
   // Native fused single pass (bias folded into the GEMV write-back).
+  Impl::tpl_note_bias(false);
   Impl::gemv_native<ExecSpace, Scalar>(x, W, 1.0f, 0.0f, y, label, b.data());
 }
 
