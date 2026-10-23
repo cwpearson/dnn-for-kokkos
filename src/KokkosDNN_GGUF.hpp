@@ -704,6 +704,182 @@ KOKKOS_INLINE_FUNCTION float quant_elem(GgmlType dtype, const uint8_t* row,
   }
 }
 
+// Sub-block grouped dot: GS consecutive packed-row elements starting at k0
+// sharing one scale set (Q4_K: 32 sharing one (d*scale, dmin*min) pair;
+// Q6_K: 16 sharing one (d, scale); Q8_0: 32 sharing one d). Groups never
+// straddle a block (256 % GS == 0 for Q4_K/Q6_K, 32 % 32 == 0 for Q8_0), so
+// the block pointer needs one division per group instead of per element.
+// Hoists the fp16->float scale converts and the scale/min unpacking that
+// quant_elem() repeats per element (32x/16x fewer), leaving one nibble
+// extract + FMA per element. Same values up to FP32 reassociation (the
+// callers reduce over groups instead of elements). xd/xs cover strided
+// activation rows: element k reads xd[k * xs]. Q4_K/Q6_K/Q8_0 only; other
+// dtypes stay on quant_elem().
+template <class Scalar>
+KOKKOS_INLINE_FUNCTION float quant_group_dot(GgmlType dtype,
+                                             const uint8_t* row,
+                                             const Scalar* xd, size_t xs,
+                                             size_t k0) {
+  switch (dtype) {
+    case GgmlType::Q4_K: {
+      const BlockQ4K* b = reinterpret_cast<const BlockQ4K*>(
+          row + (k0 / 256) * sizeof(BlockQ4K));
+      const size_t sub  = (k0 / 32) % 8;  // 2*iter + (high ? 1 : 0)
+      const size_t iter = sub / 2;
+      uint8_t sc, mn;
+      get_scale_min_k4((int)(2 * iter + (sub % 2)), b->scales, &sc, &mn);
+      const float dm = fp16_to_float(b->d) * (float)sc;
+      const float mm = -fp16_to_float(b->dmin) * (float)mn;
+      const uint8_t* q = b->qs + iter * 32;
+      float s          = 0;
+      if ((sub % 2) == 0) {
+        for (size_t l = 0; l < 32; ++l)
+          s += (dm * (float)(q[l] & 0xF) + mm) *
+               static_cast<float>(xd[(k0 + l) * xs]);
+      } else {
+        for (size_t l = 0; l < 32; ++l)
+          s += (dm * (float)(q[l] >> 4) + mm) *
+               static_cast<float>(xd[(k0 + l) * xs]);
+      }
+      return s;
+    }
+    case GgmlType::Q6_K: {
+      const BlockQ6K* b = reinterpret_cast<const BlockQ6K*>(
+          row + (k0 / 256) * sizeof(BlockQ6K));
+      const size_t r     = k0 % 256;
+      const size_t chunk = r / 128;
+      const size_t rr    = r % 128;
+      const size_t sub   = rr / 32;
+      const size_t ll    = rr % 32;  // 0 or 16: (ll + l) / 16 is constant
+      const uint8_t* ql  = b->ql + chunk * 64;
+      const uint8_t* qh  = b->qh + chunk * 32;
+      const float ds =
+          fp16_to_float(b->d) * (float)b->scales[chunk * 8 + sub * 2 + ll / 16];
+      float s = 0;
+      if (sub == 0) {
+        for (size_t l = 0; l < 16; ++l) {
+          const size_t a = ll + l;
+          const int qv =
+              (int)(int8_t)((ql[a] & 0xF) | (((qh[a] >> 0) & 3) << 4)) - 32;
+          s += ds * (float)qv * static_cast<float>(xd[(k0 + l) * xs]);
+        }
+      } else if (sub == 1) {
+        for (size_t l = 0; l < 16; ++l) {
+          const size_t a = ll + l;
+          const int qv = (int)(int8_t)((ql[a + 32] & 0xF) |
+                                       (((qh[a] >> 2) & 3) << 4)) -
+                         32;
+          s += ds * (float)qv * static_cast<float>(xd[(k0 + l) * xs]);
+        }
+      } else if (sub == 2) {
+        for (size_t l = 0; l < 16; ++l) {
+          const size_t a = ll + l;
+          const int qv =
+              (int)(int8_t)((ql[a] >> 4) | (((qh[a] >> 4) & 3) << 4)) - 32;
+          s += ds * (float)qv * static_cast<float>(xd[(k0 + l) * xs]);
+        }
+      } else {
+        for (size_t l = 0; l < 16; ++l) {
+          const size_t a = ll + l;
+          const int qv = (int)(int8_t)((ql[a + 32] >> 4) |
+                                       (((qh[a] >> 6) & 3) << 4)) -
+                         32;
+          s += ds * (float)qv * static_cast<float>(xd[(k0 + l) * xs]);
+        }
+      }
+      return s;
+    }
+    case GgmlType::Q8_0: {
+      const BlockQ80* b = reinterpret_cast<const BlockQ80*>(
+          row + (k0 / 32) * sizeof(BlockQ80));
+      const float d = fp16_to_float(b->d);
+      float s       = 0;
+      for (size_t l = 0; l < 32; ++l)
+        s += d * (float)b->qs[l] * static_cast<float>(xd[(k0 + l) * xs]);
+      return s;
+    }
+    default: return 0.0f;  // unreachable: grouped path is Q4_K/Q6_K/Q8_0 only
+  }
+}
+
+// Grouped-path eligibility: the sub-block size GS divides K (groups are
+// block-aligned, so they never straddle a block). F32/F16/BF16 stay on the
+// per-element path (already one cheap convert or less per element).
+inline bool quant_can_group(GgmlType dtype, size_t K, size_t& gs) {
+  switch (dtype) {
+    case GgmlType::Q4_K: gs = 32; return K % 32 == 0;
+    case GgmlType::Q6_K: gs = 16; return K % 16 == 0;
+    case GgmlType::Q8_0: gs = 32; return K % 32 == 0;
+    default: return false;
+  }
+}
+
+// Grouped GEMV/GEMM functors: same contracts as QuantGemvFunctor /
+// QuantGemmFunctor below, but the TeamThreadRange runs over ngroups = K/GS
+// sub-blocks (GS = 32 for Q4_K/Q8_0, 16 for Q6_K) with one quant_group_dot
+// per group instead of K quant_elem calls.
+template <class ExecSpace, class Scalar>
+struct QuantGemvGroupedFunctor {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  Kokkos::View<Scalar*, ExecSpace> x, y;
+  const uint8_t* wdata;
+  GgmlType dtype;
+  size_t ngroups;
+  size_t group;
+  size_t row_bytes;
+
+  KOKKOS_INLINE_FUNCTION void operator()(const Member& team) const {
+    const size_t j   = (size_t)team.league_rank();
+    const uint8_t* r = wdata + j * row_bytes;
+    const auto xx    = x;
+    const GgmlType dt = dtype;
+    const size_t ng   = ngroups;
+    const size_t gs   = group;
+    const Scalar* xd  = xx.data();
+    const size_t xs   = xx.stride(0);
+    float team_sum    = 0;
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(team, ng),
+        KOKKOS_LAMBDA(size_t g, float& s) {
+          s += quant_group_dot(dt, r, xd, xs, g * gs);
+        },
+        team_sum);
+    if (team.team_rank() == 0) y(j) = static_cast<Scalar>(team_sum);
+  }
+};
+
+template <class ExecSpace, class Scalar>
+struct QuantGemmGroupedFunctor {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> X, Y;
+  const uint8_t* wdata;
+  GgmlType dtype;
+  size_t N;
+  size_t ngroups;
+  size_t group;
+  size_t row_bytes;
+
+  KOKKOS_INLINE_FUNCTION void operator()(const Member& team) const {
+    const size_t id  = (size_t)team.league_rank();
+    const size_t i   = id / N;
+    const size_t j   = id % N;
+    const uint8_t* r = wdata + j * row_bytes;
+    const auto XX     = X;
+    const GgmlType dt = dtype;
+    const size_t ng   = ngroups;
+    const size_t gs   = group;
+    const Scalar* xb  = XX.data() + i * XX.stride(0);
+    float team_sum    = 0;
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(team, ng),
+        KOKKOS_LAMBDA(size_t g, float& s) {
+          s += quant_group_dot(dt, r, xb, size_t(1), g * gs);
+        },
+        team_sum);
+    if (team.team_rank() == 0) Y(i, j) = static_cast<Scalar>(team_sum);
+  }
+};
+
 template <class ExecSpace, class Scalar>
 struct QuantGemvFunctor {
   using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
@@ -785,6 +961,16 @@ void quant_gemv(
     throw std::invalid_argument("quant_gemv: dimension mismatch");
   Impl::quant_check(w.dtype, w.rows, w.cols, w.data.extent(0), "quant_gemv");
   if (w.rows == 0 || w.cols == 0) return;
+  // Grouped sub-block path (one scale set per 32/16 elems) when K aligns;
+  // otherwise the per-element path below.
+  size_t gs = 0;
+  if (Impl::quant_can_group(w.dtype, w.cols, gs)) {
+    Impl::QuantGemvGroupedFunctor<ExecSpace, Scalar> f{
+        x, y, w.data.data(), w.dtype, w.cols / gs, gs, w.row_bytes()};
+    Kokkos::TeamPolicy<ExecSpace> policy((int)w.rows, Kokkos::AUTO);
+    Kokkos::parallel_for(label, policy, f);
+    return;
+  }
   Impl::QuantGemvFunctor<ExecSpace, Scalar> f{x, y, w.data.data(), w.dtype,
                                               w.cols, w.row_bytes()};
   Kokkos::TeamPolicy<ExecSpace> policy((int)w.rows, Kokkos::AUTO);
@@ -816,6 +1002,16 @@ void quant_gemm(
   if (M == 0 || N == 0 || K == 0) return;
   if (M * N > (size_t)INT_MAX)
     throw std::invalid_argument("quant_gemm: M*N too large");
+  // Grouped sub-block path (one scale set per 32/16 elems) when K aligns;
+  // otherwise the per-element path below.
+  size_t gs = 0;
+  if (Impl::quant_can_group(w.dtype, w.cols, gs)) {
+    Impl::QuantGemmGroupedFunctor<ExecSpace, Scalar> fg{
+        X, Y, w.data.data(), w.dtype, N, K / gs, gs, w.row_bytes()};
+    Kokkos::TeamPolicy<ExecSpace> policy((int)(M * N), Kokkos::AUTO);
+    Kokkos::parallel_for(label, policy, fg);
+    return;
+  }
   Impl::QuantGemmFunctor<ExecSpace, Scalar> f{X, Y, w.data.data(), w.dtype, K,
                                               N, w.row_bytes()};
   Kokkos::TeamPolicy<ExecSpace> policy((int)(M * N), Kokkos::AUTO);

@@ -7,28 +7,164 @@
 #include <string>
 
 namespace KokkosDNN {
+namespace Impl {
+
+// Team-parallel RMSNorm row worker: one team per row. The sum-of-squares is
+// a team-parallel reduce (FP32 reassociation vs a serial loop is ~1 ulp,
+// inside test tolerances), then the scale fans out over the team. The old
+// RangePolicy-over-rows left decode (T=1) to a single thread running the
+// whole D loop serially; this exposes T*D-way parallelism on every backend.
+// Team size clamps to team_size_max (Serial -> 1; strided TeamThreadRange
+// stays correct). In-place safe: the reduce completes before any write.
+template <class ExecSpace, class Scalar>
+struct RmsNormTeam {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  using View2 = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
+  using View1 = Kokkos::View<Scalar*, ExecSpace>;
+  View2 x;
+  View1 w;
+  View2 y;
+  float eps;
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& team) const {
+    // Locals: the lambdas below capture by value, so bind members to
+    // locals to avoid an implicit `this` capture (deprecated in C++20).
+    const View2 x_ = x, y_ = y;
+    const View1 w_ = w;
+    const float eps_ = eps;
+    const size_t t = static_cast<size_t>(team.league_rank());
+    const size_t D = x_.extent(1);
+    float ss = 0;
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(team, D),
+        KOKKOS_LAMBDA(size_t d, float& acc) {
+          const float v = static_cast<float>(x_(t, d));
+          acc += v * v;
+        },
+        ss);
+    const float inv = 1.0f / sqrtf(ss / static_cast<float>(D) + eps_);
+    Kokkos::parallel_for(
+        Kokkos::TeamThreadRange(team, D), KOKKOS_LAMBDA(size_t d) {
+          y_(t, d) = static_cast<Scalar>(static_cast<float>(x_(t, d)) * inv *
+                                        static_cast<float>(w_(d)));
+        });
+  }
+};
+
+// Launcher shared by rmsnorm and the per-head qk variants below: one team
+// per row, team size min(D, 256) clamped to team_size_max.
+template <class ExecSpace, class Functor>
+void rmsnorm_team_launch(Functor f, size_t rows, size_t D,
+                         const std::string& label) {
+  if (rows == 0 || D == 0) return;
+  Kokkos::TeamPolicy<ExecSpace> probe(1, 1);
+  int ts = static_cast<int>(D < 256 ? D : 256);
+  const int mx = probe.team_size_max(f, Kokkos::ParallelForTag{});
+  if (mx < ts) ts = mx;
+  if (ts < 1) ts = 1;
+  Kokkos::TeamPolicy<ExecSpace> policy(static_cast<int>(rows), ts);
+  Kokkos::parallel_for(label, policy, f);
+}
+
+// Per-head QK worker: one team per (token, head) row of D. Same reduce-then
+// -scale structure as RmsNormTeam; the flat [T, H*D] input is indexed at
+// h*D+d. Fixes the same single-threaded-decode issue for head_dim-wide
+// rows (decode ran H threads serial over D).
+template <class ExecSpace, class Scalar>
+struct QkRmsNormTeam {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  using View2 = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
+  using View1 = Kokkos::View<Scalar*, ExecSpace>;
+  using View3 = Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>;
+  View2 flat;
+  View1 w;
+  View3 out;
+  size_t H;
+  size_t D;
+  float eps;
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& team) const {
+    const View2 flat_ = flat;
+    const View1 w_    = w;
+    const View3 out_  = out;
+    const float eps_  = eps;
+    const size_t H_ = H, D_ = D;
+    const size_t id = static_cast<size_t>(team.league_rank());
+    const size_t t  = id / H_;
+    const size_t h  = id % H_;
+    const size_t base = h * D_;
+    float ss = 0;
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(team, D_),
+        KOKKOS_LAMBDA(size_t d, float& acc) {
+          const float v = static_cast<float>(flat_(t, base + d));
+          acc += v * v;
+        },
+        ss);
+    const float inv = 1.0f / sqrtf(ss / static_cast<float>(D_) + eps_);
+    Kokkos::parallel_for(
+        Kokkos::TeamThreadRange(team, D_), KOKKOS_LAMBDA(size_t d) {
+          out_(t, h, d) = static_cast<Scalar>(
+              static_cast<float>(flat_(t, base + d)) * inv *
+              static_cast<float>(w_(d)));
+        });
+  }
+};
+
+// Rank-3 variant: q/out are [T, H, D] (in-place safe: reduce completes
+// before any write, same as above).
+template <class ExecSpace, class Scalar>
+struct QkRmsNorm3dTeam {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  using View1 = Kokkos::View<Scalar*, ExecSpace>;
+  using View3 = Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>;
+  View3 q;
+  View1 w;
+  View3 out;
+  size_t H;
+  size_t D;
+  float eps;
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& team) const {
+    const View3 q_ = q, out_ = out;
+    const View1 w_ = w;
+    const float eps_ = eps;
+    const size_t H_ = H, D_ = D;
+    const size_t id = static_cast<size_t>(team.league_rank());
+    const size_t t  = id / H_;
+    const size_t h  = id % H_;
+    float ss = 0;
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(team, D_),
+        KOKKOS_LAMBDA(size_t d, float& acc) {
+          const float v = static_cast<float>(q_(t, h, d));
+          acc += v * v;
+        },
+        ss);
+    const float inv = 1.0f / sqrtf(ss / static_cast<float>(D_) + eps_);
+    Kokkos::parallel_for(
+        Kokkos::TeamThreadRange(team, D_), KOKKOS_LAMBDA(size_t d) {
+          out_(t, h, d) = static_cast<Scalar>(
+              static_cast<float>(q_(t, h, d)) * inv *
+              static_cast<float>(w_(d)));
+        });
+  }
+};
+
+}  // namespace Impl
 
 // RMSNorm (Llama variant, no mean-centering, no bias):
 //   y[i,:] = x[i,:] / sqrt(mean(x[i,:]^2) + eps) * w[:]
 // x, y: [tokens, dim], w: [dim]. Scalar-agnostic; norm accumulated in FP32.
+// Team-parallel over rows and dim (Impl::RmsNormTeam); in-place safe.
 template <class ExecSpace, class Scalar>
 void rmsnorm(const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
              const Kokkos::View<Scalar*, ExecSpace>& w, float eps,
              const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& y,
              const std::string& label = "KokkosDNN::rmsnorm") {
   const size_t T = x.extent(0), D = x.extent(1);
-  Kokkos::parallel_for(
-      label, Kokkos::RangePolicy<ExecSpace>(0, T), KOKKOS_LAMBDA(size_t t) {
-        float ss = 0;
-        for (size_t d = 0; d < D; ++d) {
-          float v = static_cast<float>(x(t, d));
-          ss += v * v;
-        }
-        float inv = 1.0f / sqrt(ss / (float)D + eps);
-        for (size_t d = 0; d < D; ++d)
-          y(t, d) = static_cast<Scalar>(static_cast<float>(x(t, d)) * inv *
-                                        static_cast<float>(w(d)));
-      });
+  Impl::rmsnorm_team_launch<ExecSpace>(
+      Impl::RmsNormTeam<ExecSpace, Scalar>{x, w, y, eps}, T, D, label);
 }
 
 // Batched variant: x, y: [batch, tokens, dim], w: [dim].
@@ -223,8 +359,9 @@ void rmsnorm_row_noscale(
 // Gemma4 example-local qk_reshape_norm: the plain rmsnorm op works on
 // [tokens, dim] rows, while q/k norms run per attention head):
 //   out[t,h,d] = flat[t,h*D+d] / rms(flat[t,h*D:(h+1)*D]) * w[d]
-// Same FP32 formula as rmsnorm above, applied independently per (t, h).
-// Scalar-agnostic; backend-portable MDRange kernel.
+// Same per-row math as rmsnorm above, applied independently to each (t, h).
+// Scalar-agnostic; backend-portable team-parallel kernel (one team per
+// (token, head) row, D-way parallel within the team).
 template <class ExecSpace, class Scalar>
 void qk_rmsnorm(
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& flat,
@@ -234,21 +371,9 @@ void qk_rmsnorm(
   const size_t T = out.extent(0), H = out.extent(1), D = out.extent(2);
   if (flat.extent(0) != T || flat.extent(1) != H * D || w.extent(0) != D)
     throw std::invalid_argument("qk_rmsnorm: dimension mismatch");
-  if (T == 0 || H == 0 || D == 0) return;
-  Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, H}),
-      KOKKOS_LAMBDA(size_t t, size_t h) {
-        float ss = 0;
-        for (size_t d = 0; d < D; ++d) {
-          float v = static_cast<float>(flat(t, h * D + d));
-          ss += v * v;
-        }
-        float inv = 1.0f / sqrt(ss / (float)D + eps);
-        for (size_t d = 0; d < D; ++d)
-          out(t, h, d) = static_cast<Scalar>(
-              static_cast<float>(flat(t, h * D + d)) * inv *
-              static_cast<float>(w(d)));
-      });
+  Impl::rmsnorm_team_launch<ExecSpace>(
+      Impl::QkRmsNormTeam<ExecSpace, Scalar>{flat, w, out, H, D, eps}, T * H,
+      D, label);
 }
 
 // Rank-3 overload for already-shaped q/k: q/out [T, H, D], w [D].
@@ -263,20 +388,9 @@ void qk_rmsnorm3d(
   if (out.extent(0) != T || out.extent(1) != H || out.extent(2) != D ||
       w.extent(0) != D)
     throw std::invalid_argument("qk_rmsnorm3d: dimension mismatch");
-  if (T == 0 || H == 0 || D == 0) return;
-  Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, H}),
-      KOKKOS_LAMBDA(size_t t, size_t h) {
-        float ss = 0;
-        for (size_t d = 0; d < D; ++d) {
-          float v = static_cast<float>(q(t, h, d));
-          ss += v * v;
-        }
-        float inv = 1.0f / sqrt(ss / (float)D + eps);
-        for (size_t d = 0; d < D; ++d)
-          out(t, h, d) = static_cast<Scalar>(
-              static_cast<float>(q(t, h, d)) * inv * static_cast<float>(w(d)));
-      });
+  Impl::rmsnorm_team_launch<ExecSpace>(
+      Impl::QkRmsNorm3dTeam<ExecSpace, Scalar>{q, w, out, H, D, eps}, T * H,
+      D, label);
 }
 
 }  // namespace KokkosDNN
