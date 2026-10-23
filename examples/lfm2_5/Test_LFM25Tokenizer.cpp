@@ -299,8 +299,70 @@ TEST(LFM25Tokenizer, ToolRenderGolden) {
       "<|im_start|>tool\n{\"temp\": 72}<|im_end|>\n");
 }
 
-TEST(LFM25Tokenizer, ToolParse) {
-  using KokkosDNN::LFM25::kEosToken;
+// The server's prefix cache keys on the history encoding without the
+// trailing generation prompt and requires it to be an exact token prefix
+// of the full encoding (specials split first, so the appended generation
+// header never merges with history bytes). The same holds across an
+// appended agentic turn: the earlier full prompt's history part stays a
+// prefix of the extended prompt.
+TEST(LFM25Tokenizer, ContentIsExactPrefixOfFull) {
+  using KokkosDNN::LFM25::ChatMessage;
+  KokkosDNN::LFM25::Tokenizer tok(write_tmp(lfm25_fixture_json()));
+  auto is_prefix = [](const std::vector<int>& pre,
+                      const std::vector<int>& full) {
+    if (pre.size() > full.size()) return false;
+    for (size_t i = 0; i < pre.size(); ++i)
+      if (pre[i] != full[i]) return false;
+    return true;
+  };
+  // Fixture-safe text only (the fixture vocab is lowercase fragments).
+  const std::vector<ChatMessage> msgs = {{"system", "be bold", "", {}, ""},
+                                         {"user", "hi there", "", {}, ""}};
+  const std::vector<int> content =
+      KokkosDNN::LFM25::encode_chatml(tok, msgs, false, true);
+  const std::vector<int> full =
+      KokkosDNN::LFM25::encode_chatml(tok, msgs, true, true);
+  EXPECT_LT(content.size(), full.size());
+  EXPECT_TRUE(is_prefix(content, full));
+
+  // Agentic growth: an assistant turn plus a follow-up user turn appended.
+  // The first turn's content stays an exact prefix of the extended prompt.
+  const std::vector<ChatMessage> grown = {
+      {"system", "be bold", "", {}, ""},
+      {"user", "hi there", "", {}, ""},
+      {"assistant", "hi", "", {}, ""},
+      {"user", "the", "", {}, ""}};
+  const std::vector<int> grown_full =
+      KokkosDNN::LFM25::encode_chatml(tok, grown, true, true);
+  EXPECT_LT(full.size(), grown_full.size());
+  EXPECT_TRUE(is_prefix(content, grown_full));
+
+  // Tool-bearing growth holds at the render level (tool names/JSON are
+  // outside the fixture vocab, so this half stays string-level): history
+  // renders identically up to the appended turns.
+  using KokkosDNN::LFM25::ToolCall;
+  ToolCall c;
+  c.name = "get_weather";
+  c.arguments = "{\"location\":\"SF\"}";
+  ChatMessage a;
+  a.role = "assistant";
+  a.content = "Checking.";
+  a.tool_calls.push_back(c);
+  ChatMessage tool_msg;
+  tool_msg.role = "tool";
+  tool_msg.content = "{\"temp\": 72}";
+  const std::vector<ChatMessage> tool_grown = {
+      {"system", "be bold", "", {}, ""},
+      {"user", "hi there", "", {}, ""}, a, tool_msg};
+  const std::string base =
+      KokkosDNN::LFM25::render_lfm25_chatml(msgs, false, true);
+  const std::string grown_render =
+      KokkosDNN::LFM25::render_lfm25_chatml_with_tools(tool_grown, "", "",
+                                                       true, true);
+  EXPECT_EQ(grown_render.substr(0, base.size()), base);
+}
+
+TEST(LFM25Tokenizer, ToolParse) {  using KokkosDNN::LFM25::kEosToken;
   using KokkosDNN::LFM25::kToolCallEndToken;
   using KokkosDNN::LFM25::kToolCallStartToken;
   using KokkosDNN::LFM25::parse_tool_call_block;

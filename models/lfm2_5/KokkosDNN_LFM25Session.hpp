@@ -23,8 +23,11 @@
 // Multi-turn: calling prefill() again after a turn finished starts a new
 // turn reusing the same weights and rented state. The new prefill rewrites
 // KV/conv state from position 0 (model.reset() + forward), so turns are
-// exact but share no prefix cache: keeping the old prefix resident across
-// turns (prefix-reuse / prompt-cache) is future work.
+// exact but share no prefix cache. For agentic loops where each turn
+// extends the previous history, use prefill_cached(full, content): a
+// single-entry exact-prefix cache (see KokkosDNN_LFM25PrefixCache.hpp) resumes
+// from the longest cached content prefix and forwards only the suffix,
+// bit-identical to a full prefill.
 //
 // Determinism: the session owns one HostRNG. Construction seeds it from
 // SessionOptions::seed; prefill(ids) reseeds from opts.seed iff
@@ -69,6 +72,7 @@
 
 #include "KokkosDNN_Detokenizer.hpp"
 #include "KokkosDNN_LFM25Model.hpp"
+#include "KokkosDNN_LFM25PrefixCache.hpp"
 #include "KokkosDNN_LFM25Tokenizer.hpp"
 #include "KokkosDNN_Sampler.hpp"
 #include "KokkosDNN_Usage.hpp"
@@ -97,8 +101,43 @@ struct StepOutcome {
   bool finished = false;  // turn is over; step() goes sticky past this
 };
 
-template <class ExecSpace, class Scalar = DefaultScalar>
-class Session {
+// Per-turn prefix-cache outcome for logging/observability.
+struct CachedPrefillOutcome {
+  bool hit = false;   // a cached prefix was reused
+  size_t reused = 0;  // reused prefix length in tokens (0 on miss)
+};
+
+// Runtime-polymorphic Session front-end. The cache storage space (device
+// vs host memory) is a compile-time Session template parameter, but the
+// server picks it from a CLI flag at startup; this interface lets the
+// server hold either instantiation behind one pointer. All cross-cutting
+// types are non-templated, so no templated virtuals are needed. The
+// per-step virtual dispatch is negligible next to a model forward.
+struct ISession {
+  virtual ~ISession() = default;
+  virtual void set_options(SessionOptions opts) = 0;
+  virtual void prefill(const std::vector<int>& ids) = 0;
+  virtual void prefill(const std::vector<int>& ids, uint64_t seed,
+                       bool hasSeed) = 0;
+  virtual CachedPrefillOutcome prefill_cached(
+      const std::vector<int>& full, const std::vector<int>& content) = 0;
+  virtual CachedPrefillOutcome prefill_cached(const std::vector<int>& full,
+                                             const std::vector<int>& content,
+                                             uint64_t seed, bool hasSeed) = 0;
+  virtual StepOutcome step() = 0;
+  virtual std::string flush() = 0;
+  virtual void reset() = 0;
+  virtual void clear_prefix_cache() = 0;
+  virtual ::KokkosDNN::Common::Usage usage() const = 0;
+  virtual ::KokkosDNN::Common::FinishReason finish() const = 0;
+  virtual bool finished() const = 0;
+  virtual size_t generated() const = 0;
+  virtual size_t prefix_cache_size() const = 0;
+};
+
+template <class ExecSpace, class Scalar = DefaultScalar,
+          class StoreSpace = typename ExecSpace::memory_space>
+class Session : public ISession {
  public:
   using ViewInt = Kokkos::View<int*, ExecSpace>;
   using HostInt = typename ViewInt::host_mirror_type;
@@ -117,14 +156,14 @@ class Session {
   // Replace the request-local sampling/stop/seed policy (e.g. when a
   // long-lived Session is reused across requests with different options).
   // Re-derives the stop policy; the next prefill() resets all turn state.
-  void set_options(SessionOptions opts) {
+  void set_options(SessionOptions opts) override {
     opts_ = std::move(opts);
     stop_ids_ = resolve_stop_ids(opts_, model_.cfg);
     detok_ = ::KokkosDNN::Common::IncrementalDetokenizer(
         resolve_stop_strings(opts_));
   }
 
-  void prefill(const std::vector<int>& ids) {
+  void prefill(const std::vector<int>& ids) override {
     prefill(ids, opts_.seed, opts_.seedProvided);
   }
 
@@ -133,26 +172,13 @@ class Session {
   // first step(). Reseeds the RNG from opts.seed iff opts.seedProvided.
   // prefill() with an explicit reseed (hasSeed=true) or a continued RNG
   // stream (hasSeed=false).
-  void prefill(const std::vector<int>& ids, uint64_t seed, bool hasSeed) {
+  void prefill(const std::vector<int>& ids, uint64_t seed,
+               bool hasSeed) override {
     if (ids.empty())
       throw std::invalid_argument("Session::prefill: empty prompt");
     if (hasSeed) rng_.seed(seed);
     model_.reset();
-    ensure_prompt(ids.size());
-    auto toks =
-        Kokkos::subview(prompt_buf_, std::make_pair(size_t(0), ids.size()));
-    {
-      auto h =
-          Kokkos::subview(prompt_host_, std::make_pair(size_t(0), ids.size()));
-      for (size_t i = 0; i < ids.size(); ++i) h(i) = ids[i];
-      Kokkos::deep_copy(toks, h);
-    }
-    auto lg = model_.forward(toks);
-    // The returned view aliases model scratch (overwritten by the next
-    // forward), so keep a private device copy for the first step().
-    if (pend_.extent(0) != lg.extent(0))
-      pend_ = View1("KokkosDNN::LFM25::Session::pending", lg.extent(0));
-    Kokkos::deep_copy(pend_, lg);
+    forward_full(ids);
     has_pending_ = true;
     prev_ = -1;
     ids_ = ids;
@@ -164,11 +190,83 @@ class Session {
     last_ = StepOutcome{};
   }
 
+  // Single-entry prefix-cache capacity (see KokkosDNN_LFM25PrefixCache.hpp).
+  static constexpr size_t kPrefixCacheCapacity = 1;
+
+  CachedPrefillOutcome prefill_cached(const std::vector<int>& full,
+                                     const std::vector<int>& content) override {
+    return prefill_cached(full, content, opts_.seed, opts_.seedProvided);
+  }
+
+  // Cached prefill for history-growing callers (e.g. the server's agentic
+  // loop): `full` is the whole prompt to generate from (including the
+  // trailing generation prompt), `content` is the cacheable history prefix
+  // (everything before that prompt, expected to be an exact prefix of
+  // `full`). Resumes from the longest cached content prefix that `full`
+  // starts with and forwards only the suffix; bit-identical to
+  // prefill(full). New content states are snapshotted for future turns
+  // (a miss replaces the single cached entry). When `content` is not an exact prefix of `full`
+  // (e.g. tokenizer boundary drift), falls back to an uncached full
+  // prefill without touching the cache.
+  CachedPrefillOutcome prefill_cached(const std::vector<int>& full,
+                                     const std::vector<int>& content,
+                                     uint64_t seed, bool hasSeed) override {
+    if (full.empty())
+      throw std::invalid_argument("Session::prefill_cached: empty prompt");
+    if (content.size() > full.size() || !is_prefix_of(content, full)) {
+      prefill(full, seed, hasSeed);
+      return CachedPrefillOutcome{};
+    }
+    if (hasSeed) rng_.seed(seed);
+    size_t hit_len = 0;
+    const int hit =
+        prefix_cache_.find(full, content.size(), hit_len);
+    if (hit >= 0) {
+      prefix_cache_.restore(static_cast<size_t>(hit), model_);
+      prefix_cache_.promote(static_cast<size_t>(hit));
+    } else {
+      model_.reset();
+    }
+    if (hit_len < content.size()) {
+      // Forward the uncached content tail, then snapshot the content state
+      // for future turns before forwarding the generation-prompt suffix.
+      View1 lg = forward_range(full, hit_len, content.size());
+      std::vector<int> key(full.begin(),
+                           full.begin() + static_cast<long>(content.size()));
+      prefix_cache_.save(key, model_, lg);
+      if (content.size() < full.size())
+        forward_full_from(content.size(), full);
+      else
+        stash_logits(lg);
+    } else if (content.size() < full.size()) {
+      // Exact content hit: the content state is already resident.
+      forward_full_from(content.size(), full);
+    } else {
+      // Repeated identical prompt (full == content == cached): no suffix
+      // to forward; reuse the stashed last-token logits directly.
+      stash_entry_logits(static_cast<size_t>(hit));
+    }
+    has_pending_ = true;
+    prev_ = -1;
+    ids_ = full;
+    usage_ = ::KokkosDNN::Common::Usage{};
+    usage_.prompt_tokens = full.size();
+    detok_.reset();
+    finished_ = false;
+    finish_ = ::KokkosDNN::Common::FinishReason::Stop;
+    last_ = StepOutcome{};
+    return CachedPrefillOutcome{hit >= 0, hit_len};
+  }
+
+  // Drop all cached prefixes (e.g. after weights/config changes).
+  void clear_prefix_cache() override { prefix_cache_.clear(); }
+  size_t prefix_cache_size() const override { return prefix_cache_.size(); }
+
   // Sample exactly one token. The first step after prefill() samples from
   // the stashed prefill logits (no forward); later steps forward the
   // previously sampled token, then sample. Never forwards past
   // cfg.max_seq_len: at the cap it returns a terminal Length outcome.
-  StepOutcome step() {
+  StepOutcome step() override {
     if (finished_) return last_;
     StepOutcome out;
     const int max_seq = model_.cfg.max_seq_len;
@@ -266,11 +364,11 @@ class Session {
   // End-of-stream: release whatever the detokenizer still holds back
   // (a stop-prefix tail or partial UTF-8). After a stop-string hit the
   // buffer was discarded, so this returns "" until the next prefill().
-  std::string flush() { return detok_.flush(); }
+  std::string flush() override { return detok_.flush(); }
 
   // Back to the fresh-constructed state (keeps weights, options, RNG
   // stream position). Call prefill() to start a turn afterwards.
-  void reset() {
+  void reset() override {
     model_.reset();
     detok_.reset();
     usage_ = ::KokkosDNN::Common::Usage{};
@@ -282,10 +380,10 @@ class Session {
     last_ = StepOutcome{};
   }
 
-  ::KokkosDNN::Common::Usage usage() const { return usage_; }
-  ::KokkosDNN::Common::FinishReason finish() const { return finish_; }
-  bool finished() const { return finished_; }
-  size_t generated() const { return usage_.completion_tokens; }
+  ::KokkosDNN::Common::Usage usage() const override { return usage_; }
+  ::KokkosDNN::Common::FinishReason finish() const override { return finish_; }
+  bool finished() const override { return finished_; }
+  size_t generated() const override { return usage_.completion_tokens; }
   const Config& config() const { return model_.cfg; }
 
  private:
@@ -313,6 +411,56 @@ class Session {
     prompt_cap_ = n;
   }
 
+  // True when `pre` is an exact prefix of `full`.
+  static bool is_prefix_of(const std::vector<int>& pre,
+                           const std::vector<int>& full) {
+    if (pre.size() > full.size()) return false;
+    for (size_t i = 0; i < pre.size(); ++i) {
+      if (pre[i] != full[i]) return false;
+    }
+    return true;
+  }
+
+  // Forward full[a:b) (model.seq_len must equal a). Returns the last-token
+  // logits view (aliases model scratch: the caller must copy before the
+  // next forward).
+  View1 forward_range(const std::vector<int>& full, size_t a, size_t b) {
+    ensure_prompt(b - a);
+    auto toks = Kokkos::subview(prompt_buf_, std::make_pair(size_t(0), b - a));
+    {
+      auto h = Kokkos::subview(prompt_host_, std::make_pair(size_t(0), b - a));
+      for (size_t i = a; i < b; ++i) h(i - a) = full[i];
+      Kokkos::deep_copy(toks, h);
+    }
+    return model_.forward(toks);
+  }
+
+  // Keep a private device copy of last-token logits for the first step()
+  // (the returned view aliases model scratch, overwritten by next forward).
+  void stash_logits(const View1& lg) {
+    if (pend_.extent(0) != lg.extent(0))
+      pend_ = View1("KokkosDNN::LFM25::Session::pending", lg.extent(0));
+    Kokkos::deep_copy(pend_, lg);
+  }
+
+  // Uncached full forward + stash.
+  void forward_full(const std::vector<int>& ids) {
+    stash_logits(forward_range(ids, 0, ids.size()));
+  }
+
+  // Forward the suffix full[from:) and stash its logits.
+  void forward_full_from(size_t from, const std::vector<int>& full) {
+    stash_logits(forward_range(full, from, full.size()));
+  }
+
+  // Exact-hit path with an empty suffix: reuse the entry's stashed logits.
+  void stash_entry_logits(size_t idx) {
+    const size_t v = prefix_cache_.entry_logits_size(idx);
+    if (pend_.extent(0) != v)
+      pend_ = View1("KokkosDNN::LFM25::Session::pending", v);
+    prefix_cache_.restore_logits(idx, pend_);
+  }
+
   // Grow-once host staging for the sampled (non-greedy) path: the logits
   // mirror and its float conversion buffer persist across steps so sampled
   // tokens cost one deep_copy plus O(V) compute, with no per-token host
@@ -330,6 +478,13 @@ class Session {
   ::KokkosDNN::HostRNG rng_;
   std::vector<int> stop_ids_;  // sorted, deduped
   ::KokkosDNN::Common::IncrementalDetokenizer detok_;
+  // Exact-prefix KV cache across turns (single entry). Plain prefill()
+  // leaves it untouched; prefill_cached() resumes from it and snapshots new
+  // content states into it. Entry storage lives in StoreSpace (device
+  // memory by default; HostSpace when the server is started with
+  // --prefix-cache-host).
+  PrefixCache<ExecSpace, Scalar, StoreSpace> prefix_cache_{
+      kPrefixCacheCapacity};
   ViewInt prompt_buf_;
   HostInt prompt_host_;
   size_t prompt_cap_ = 0;
