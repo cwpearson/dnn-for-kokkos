@@ -2,6 +2,11 @@
 #define KOKKOSDNN_HANDLE_HPP
 
 #include <Kokkos_Core.hpp>
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
 #include <type_traits>
 #include <utility>
 #include "KokkosDNN_config.h"
@@ -24,6 +29,99 @@
 #endif
 
 namespace KokkosDNN {
+namespace Impl {
+
+// ---------------------------------------------------------------------------
+// Env-gated TPL dispatch counters (observability for the dispatch audit).
+//
+// Every public GEMM/attention entry point records exactly one outcome per
+// call (TPL-served vs native fallback) via tpl_note_gemm/gemv/bias/attn().
+// Counting is active only when KOKKOSDNN_DEBUG_DISPATCH is set in the
+// environment (read once, cached); otherwise each helper is a single
+// never-taken branch. An atexit hook prints the table to stderr, so a short
+// run (e.g. a few generated tokens) proves which ops reached cuBLAS/cuDNN:
+//   KOKKOSDNN_DEBUG_DISPATCH=1 ./lfm2_5_generate ...
+// Numerics-neutral: relaxed host-side atomics on the dispatch path only,
+// never in device code. A gemm_bias split fallback (cuBLAS GEMM + bias
+// kernel) counts once under bias and once under gemm (the inner gemm truly
+// ran on the TPL); the LFM2.5 forward never calls gemm_bias, so its gemm
+// row stays pure there.
+// ---------------------------------------------------------------------------
+struct TplDispatchCounters {
+  std::atomic<uint64_t> tpl_gemm{0};
+  std::atomic<uint64_t> native_gemm{0};
+  std::atomic<uint64_t> tpl_gemv{0};
+  std::atomic<uint64_t> native_gemv{0};
+  std::atomic<uint64_t> tpl_bias{0};
+  std::atomic<uint64_t> native_bias{0};
+  std::atomic<uint64_t> tpl_attn{0};
+  std::atomic<uint64_t> native_attn{0};
+};
+
+inline TplDispatchCounters& tpl_dispatch_counters() {
+  static TplDispatchCounters c;
+  return c;
+}
+
+inline bool tpl_dispatch_debug() {
+  static const bool enabled =
+      (std::getenv("KOKKOSDNN_DEBUG_DISPATCH") != nullptr);
+  return enabled;
+}
+
+inline void tpl_dump_counters() {
+  TplDispatchCounters& c = tpl_dispatch_counters();
+  std::fprintf(stderr,
+               "[KokkosDNN dispatch] gemm: tpl=%llu native=%llu | "
+               "gemv: tpl=%llu native=%llu | gemm_bias: tpl=%llu native=%llu | "
+               "attn: tpl=%llu native=%llu\n",
+               (unsigned long long)c.tpl_gemm.load(std::memory_order_relaxed),
+               (unsigned long long)c.native_gemm.load(std::memory_order_relaxed),
+               (unsigned long long)c.tpl_gemv.load(std::memory_order_relaxed),
+               (unsigned long long)c.native_gemv.load(std::memory_order_relaxed),
+               (unsigned long long)c.tpl_bias.load(std::memory_order_relaxed),
+               (unsigned long long)c.native_bias.load(std::memory_order_relaxed),
+               (unsigned long long)c.tpl_attn.load(std::memory_order_relaxed),
+               (unsigned long long)c.native_attn.load(
+                   std::memory_order_relaxed));
+}
+
+inline void tpl_arm_dump_once() {
+  static std::once_flag arm;
+  std::call_once(arm, [] { std::atexit(tpl_dump_counters); });
+}
+
+inline void tpl_note(std::atomic<uint64_t>& took_tpl,
+                     std::atomic<uint64_t>& took_native, bool tpl) {
+  if (!tpl_dispatch_debug()) return;
+  tpl_arm_dump_once();
+  if (tpl)
+    took_tpl.fetch_add(1, std::memory_order_relaxed);
+  else
+    took_native.fetch_add(1, std::memory_order_relaxed);
+}
+
+inline void tpl_note_gemm(bool took_tpl) {
+  TplDispatchCounters& c = tpl_dispatch_counters();
+  tpl_note(c.tpl_gemm, c.native_gemm, took_tpl);
+}
+
+inline void tpl_note_gemv(bool took_tpl) {
+  TplDispatchCounters& c = tpl_dispatch_counters();
+  tpl_note(c.tpl_gemv, c.native_gemv, took_tpl);
+}
+
+inline void tpl_note_bias(bool took_tpl) {
+  TplDispatchCounters& c = tpl_dispatch_counters();
+  tpl_note(c.tpl_bias, c.native_bias, took_tpl);
+}
+
+inline void tpl_note_attn(bool took_tpl) {
+  TplDispatchCounters& c = tpl_dispatch_counters();
+  tpl_note(c.tpl_attn, c.native_attn, took_tpl);
+}
+
+}  // namespace Impl
 
 // Lightweight handle that records which third-party dispatches are active.
 // Native Kokkos paths ignore it; call sites stay free of #ifdefs.
