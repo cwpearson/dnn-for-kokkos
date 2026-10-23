@@ -46,6 +46,7 @@
 
 #include "KokkosDNN_Handle.hpp"
 #include "KokkosDNN_Macros.hpp"
+#include "KokkosDNN_Occupancy.hpp"
 #include "KokkosDNN_SwiGLU.hpp"
 
 namespace KokkosDNN {
@@ -1321,8 +1322,10 @@ void quant_moe_decode(
         nu, gate.row_bytes, up.row_bytes, MI, gate.size()};
     const size_t nc  = ng > nu ? ng : nu;
     const int want   = Impl::quant_chunk_team_size(nc);
-    Kokkos::TeamPolicy<ExecSpace> probe(1, 1);
-    const int tmax   = probe.team_size_max(f, Kokkos::ParallelForTag{});
+    // Cached occupancy probe (KokkosDNN_Occupancy.hpp): decode runs this
+    // twice per MoE layer; the answer depends only on the functor type and
+    // the exec-space instance (no scratch here).
+    const int tmax   = ::KokkosDNN::Impl::cached_team_size_max<ExecSpace>(f);
     const int ts     = want < tmax ? want : (tmax > 1 ? tmax : 1);
     Kokkos::parallel_for(label + "::gate_up",
                          Kokkos::TeamPolicy<ExecSpace>(
@@ -1334,8 +1337,7 @@ void quant_moe_decode(
         act, Y, down.base, idx, wts, down.dtype, avec, nd, down.row_bytes,
         gate.size(), S};
     const int want = Impl::quant_chunk_team_size(S * nd);
-    Kokkos::TeamPolicy<ExecSpace> probe(1, 1);
-    const int tmax = probe.team_size_max(f, Kokkos::ParallelForTag{});
+    const int tmax = ::KokkosDNN::Impl::cached_team_size_max<ExecSpace>(f);
     const int ts   = want < tmax ? want : (tmax > 1 ? tmax : 1);
     Kokkos::parallel_for(label + "::down",
                          Kokkos::TeamPolicy<ExecSpace>(static_cast<int>(K),
