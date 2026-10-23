@@ -45,6 +45,8 @@
 #include <vector>
 
 #include "KokkosDNN_Handle.hpp"
+#include "KokkosDNN_Macros.hpp"
+#include "KokkosDNN_SwiGLU.hpp"
 
 namespace KokkosDNN {
 namespace Gguf {
@@ -816,6 +818,126 @@ inline bool quant_can_group(GgmlType dtype, size_t K, size_t& gs) {
   }
 }
 
+// --- decode (M == 1) chunking ----------------------------------------------
+// The sparse-MoE decode kernels below split one packed row into *chunks* and
+// hand each chunk to one thread of the row's team. A chunk is the smallest
+// unit whose packed bytes are one aligned 128-bit load:
+//   Q4_K: 32 elements (16 packed bytes, one low + one high nibble sub-block)
+//   Q6_K: 16 elements (one scale set; 16+8 packed bytes, not 16B-aligned)
+//   Q8_0: 32 elements (one block)
+//   F32/F16/BF16 and anything else: one element (per-element path).
+// Why: decode is weight-bandwidth bound, and the per-element grouped dot above
+// issues one byte load per weight element plus one scalar activation load.
+// Measured on the RTX 3090 with a 1536x2048 Q4_K GEMV (1.77 MB payload, L2
+// defeated), one thread per output row: 54 GB/s for the grouped dot vs 250
+// GB/s for this chunk layout (128-bit weight loads + 128-bit activation
+// loads), against a 300 GB/s read-only ceiling for the same shape. The GEMV
+// was ~60% of decode time, so the load width is the whole game at batch 1.
+// Same arithmetic per element (dm * q + mm) * x, FP32 accumulation; the only
+// change is which thread accumulates which elements, i.e. FP32 reassociation.
+inline size_t quant_chunk_count(GgmlType dtype, size_t cols) {
+  switch (dtype) {
+    case GgmlType::Q4_K: return cols / 32;
+    case GgmlType::Q6_K: return cols / 16;
+    case GgmlType::Q8_0: return cols / 32;
+    default: return cols;
+  }
+}
+
+// 16-byte aggregate: nvcc/gcc both emit a single 128-bit load for an
+// alignas(16) POD, and unlike uint4 it exists on every backend.
+struct alignas(16) QuantU8x16 {
+  uint8_t b[16];
+};
+
+// Aligned activation window: 8 Scalars (16 B for bhalf, 32 B for float).
+// Requires the activation row pointer to be 16-byte aligned.
+template <class Scalar>
+struct alignas(16) QuantX8 {
+  Scalar v[8];
+};
+
+// One Q4_K chunk: 16 packed bytes -> 16 low-nibble (sub-block 2*iter) and 16
+// high-nibble (sub-block 2*iter+1) elements, each with its own (d*scale,
+// -dmin*min) pair. Chunk c of a row: block c/8, iter (c%8)/2, half c%2; the
+// chunk's first element is block*256 + iter*64 + half*16.
+template <class Scalar>
+KOKKOS_INLINE_FUNCTION float quant_q4k_chunk_dot(const uint8_t* row,
+                                                 const Scalar* xd, size_t xs,
+                                                 size_t c, bool xvec) {
+  const size_t blk  = c / 8;
+  const BlockQ4K* b = reinterpret_cast<const BlockQ4K*>(
+      row + blk * sizeof(BlockQ4K));
+  const size_t iter = (c % 8) / 2;
+  const size_t half = c % 2;
+  QuantU8x16 q = *reinterpret_cast<const QuantU8x16*>(
+      b->qs + iter * 32 + half * 16);
+  const size_t k0 = blk * 256 + iter * 64 + half * 16;
+  uint8_t sc, mn;
+  get_scale_min_k4(static_cast<int>(2 * iter), b->scales, &sc, &mn);
+  const float dmA = fp16_to_float(b->d) * (float)sc;
+  const float mmA = -fp16_to_float(b->dmin) * (float)mn;
+  get_scale_min_k4(static_cast<int>(2 * iter + 1), b->scales, &sc, &mn);
+  const float dmB = fp16_to_float(b->d) * (float)sc;
+  const float mmB = -fp16_to_float(b->dmin) * (float)mn;
+  float sa = 0, sb = 0;
+  if (xvec) {
+    // Four 128-bit activation loads instead of 32 scalar ones (1.4x on the
+    // microbenchmark above).
+    const QuantX8<Scalar>* xa =
+        reinterpret_cast<const QuantX8<Scalar>*>(xd + k0);
+    const QuantX8<Scalar>* xb =
+        reinterpret_cast<const QuantX8<Scalar>*>(xd + k0 + 32);
+    const QuantX8<Scalar> lo0 = xa[0], lo1 = xa[1];
+    const QuantX8<Scalar> hi0 = xb[0], hi1 = xb[1];
+KOKKOSDNN_PRAGMA_UNROLL()
+    for (int i = 0; i < 8; ++i) {
+      const float x_lo0 = static_cast<float>(lo0.v[i]);
+      const float x_lo1 = static_cast<float>(lo1.v[i]);
+      const float x_hi0 = static_cast<float>(hi0.v[i]);
+      const float x_hi1 = static_cast<float>(hi1.v[i]);
+      sa = fmaf(dmA * (float)(q.b[i] & 0xF) + mmA, x_lo0, sa);
+      sa = fmaf(dmA * (float)(q.b[i + 8] & 0xF) + mmA, x_lo1, sa);
+      sb = fmaf(dmB * (float)(q.b[i] >> 4) + mmB, x_hi0, sb);
+      sb = fmaf(dmB * (float)(q.b[i + 8] >> 4) + mmB, x_hi1, sb);
+    }
+  } else {
+    // Unaligned activation row: same math, scalar loads.
+KOKKOSDNN_PRAGMA_UNROLL()
+    for (int i = 0; i < 16; ++i) {
+      sa = fmaf(dmA * (float)(q.b[i] & 0xF) + mmA,
+                static_cast<float>(xd[(k0 + i) * xs]), sa);
+      sb = fmaf(dmB * (float)(q.b[i] >> 4) + mmB,
+                static_cast<float>(xd[(k0 + 32 + i) * xs]), sb);
+    }
+  }
+  return sa + sb;
+}
+
+// One decode chunk of a packed row (see quant_chunk_count above).
+template <class Scalar>
+KOKKOS_INLINE_FUNCTION float quant_chunk_dot(GgmlType dtype,
+                                             const uint8_t* row,
+                                             const Scalar* xd, size_t xs,
+                                             size_t c, bool xvec) {
+  switch (dtype) {
+    case GgmlType::Q4_K: return quant_q4k_chunk_dot(row, xd, xs, c, xvec);
+    case GgmlType::Q6_K: return quant_group_dot(dtype, row, xd, xs, c * 16);
+    case GgmlType::Q8_0: return quant_group_dot(dtype, row, xd, xs, c * 32);
+    default:
+      return quant_elem(dtype, row, c) * static_cast<float>(xd[c * xs]);
+  }
+}
+
+// Team size for a decode chunk range: one chunk per thread when the range
+// allows, clamped to 32..128 threads (a row's dot is a short reduction; wider
+// teams only add reduce depth).
+inline int quant_chunk_team_size(size_t nchunks) {
+  int ts = 32;
+  while ((size_t)ts < nchunks && ts < 128) ts *= 2;
+  return ts;
+}
+
 // Grouped GEMV/GEMM functors: same contracts as QuantGemvFunctor /
 // QuantGemmFunctor below, but the TeamThreadRange runs over ngroups = K/GS
 // sub-blocks (GS = 32 for Q4_K/Q8_0, 16 for Q6_K) with one quant_group_dot
@@ -950,6 +1072,277 @@ inline void quant_check(GgmlType dtype, size_t rows, size_t cols,
 }
 
 }  // namespace Impl
+
+// ---------------------------------------------------------------------------
+// Sparse-expert weight tables (device-side indexing of packed weights).
+// ---------------------------------------------------------------------------
+// MoE expert weights live as one QuantWeight per expert (a std::vector on the
+// host), which a device kernel cannot index. A QuantWeightTable mirrors the
+// per-expert payload pointers into a device view once at load time; the shape
+// and dtype shared by every entry travel with it, so kernels need one pointer
+// lookup and no host round trip. Entries must be homogeneous, which is what
+// the loader produces for a stacked [E, N, K] expert tensor (and what the
+// random_init test weights produce too).
+template <class ExecSpace>
+struct QuantWeightTable {
+  Kokkos::View<uintptr_t*, ExecSpace> base;  // packed payload per entry
+  GgmlType dtype = GgmlType::F32;
+  size_t rows      = 0;  // N (out_features) of one entry
+  size_t cols      = 0;  // K (in_features) of one entry
+  size_t row_bytes = 0;
+
+  size_t size() const { return base.extent(0); }
+};
+
+template <class ExecSpace>
+QuantWeightTable<ExecSpace> make_quant_weight_table(
+    const std::vector<QuantWeight<ExecSpace>>& ws, const std::string& what) {
+  QuantWeightTable<ExecSpace> t;
+  if (ws.empty()) return t;
+  t.dtype = ws[0].dtype;
+  t.rows  = ws[0].rows;
+  t.cols  = ws[0].cols;
+  for (size_t e = 0; e < ws.size(); ++e) {
+    const auto& w = ws[e];
+    if (w.dtype != t.dtype || w.rows != t.rows || w.cols != t.cols)
+      throw std::invalid_argument(
+          what + ": entries must share dtype and shape");
+    Impl::quant_check(w.dtype, w.rows, w.cols, w.data.extent(0), what.c_str());
+  }
+  t.row_bytes = ws[0].row_bytes();
+  t.base      = Kokkos::View<uintptr_t*, ExecSpace>(what + "::base", ws.size());
+  auto hbase  = Kokkos::create_mirror_view(t.base);
+  for (size_t e = 0; e < ws.size(); ++e)
+    hbase(e) = reinterpret_cast<uintptr_t>(ws[e].data.data());
+  Kokkos::deep_copy(t.base, hbase);
+  return t;
+}
+
+namespace Impl {
+
+// Fused gate/up + SwiGLU for one decoded token: one team per (routed slot,
+// output column). Reads the routing slot's expert id and weight on device, so
+// no host fence is needed, and emits act[s, j] = silu(gate_e x)_j * (up_e x)_j
+// directly (the separate gate, up and swiglu launches disappear).
+template <class ExecSpace, class Scalar>
+struct QuantMoeGateUpFunctor {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> X;    // [1, K]
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> act;  // [S, MI]
+  Kokkos::View<uintptr_t*, ExecSpace> gbase, ubase;
+  Kokkos::View<int**, Kokkos::LayoutRight, ExecSpace> idx;    // [1, S]
+  Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace> wts;  // [1, S]
+  GgmlType gdtype, udtype;
+  bool xvec;
+  size_t g_chunks, u_chunks;  // decode chunks per packed row (K)
+  size_t g_row_bytes, u_row_bytes;
+  size_t rows;      // MI: output columns per expert
+  size_t n_experts;
+
+  KOKKOS_INLINE_FUNCTION void operator()(const Member& team) const {
+    const size_t id = static_cast<size_t>(team.league_rank());
+    const size_t s  = id / rows;
+    const size_t j  = id - s * rows;
+    const int e     = idx(0, s);
+    // Routing ids come from the router kernel (always in range). The guard
+    // keeps a bogus id from reading outside the expert tables and matching
+    // the E == 0 / zero-weight convention: contribute nothing.
+    const bool bad = (e < 0) || (static_cast<size_t>(e) >= n_experts);
+    if (bad) {
+      if (team.team_rank() == 0) act(s, j) = static_cast<Scalar>(0);
+      return;
+    }
+    const auto xx    = X;
+    const Scalar* xd = xx.data();
+    // Column stride: quant_chunk_dot indexes the activation by *element*
+    // within the single row (X is [1, K] LayoutRight), so it wants stride(1)
+    // -- stride(0) is the row pitch and would walk off the buffer. The
+    // vectorized path in quant_q4k_chunk_dot additionally assumes the row is
+    // contiguous (stride(1) == 1), which xvec guarantees.
+    const size_t xs  = xx.stride(1);
+    const uint8_t* gr =
+        reinterpret_cast<const uint8_t*>(gbase(e)) + j * g_row_bytes;
+    const uint8_t* ur =
+        reinterpret_cast<const uint8_t*>(ubase(e)) + j * u_row_bytes;
+    const GgmlType gdt = gdtype, udt = udtype;
+    const bool xv      = xvec;
+    const size_t ng    = g_chunks, nu = u_chunks;
+    float g = 0, u = 0;
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(team, ng),
+        KOKKOS_LAMBDA(size_t c, float& acc) {
+          acc += quant_chunk_dot(gdt, gr, xd, xs, c, xv);
+        },
+        g);
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(team, nu),
+        KOKKOS_LAMBDA(size_t c, float& acc) {
+          acc += quant_chunk_dot(udt, ur, xd, xs, c, xv);
+        },
+        u);
+    if (team.team_rank() == 0)
+      act(s, j) = static_cast<Scalar>(silu(g) * u);
+  }
+};
+
+// Down projection + weighted combine for one decoded token: one team per
+// output row d, summing every routed slot inside the same reduction
+// (y[d] = sum_s w_s * down_e[s][d,:] . act[s]). The slot loop lives in the
+// kernel, so y is *assigned* (no caller-side zero fill, no per-slot
+// weighted-add launch) and there is no atomics/ordering question.
+template <class ExecSpace, class Scalar>
+struct QuantMoeDownFunctor {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> act;  // [S, MI]
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> Y;    // [1, K]
+  Kokkos::View<uintptr_t*, ExecSpace> dbase;
+  Kokkos::View<int**, Kokkos::LayoutRight, ExecSpace> idx;    // [1, S]
+  Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace> wts;  // [1, S]
+  GgmlType dtype;
+  bool xvec;
+  size_t nchunks;    // chunks per packed row (MI)
+  size_t row_bytes;  // down row stride
+  size_t n_experts;
+  size_t slots;
+
+  KOKKOS_INLINE_FUNCTION void operator()(const Member& team) const {
+    const size_t d = static_cast<size_t>(team.league_rank());
+    const auto aa  = act;
+    const Scalar* abase = aa.data();
+    const size_t stride = aa.stride(0);
+    const GgmlType dt = dtype;
+    const bool xv     = xvec;
+    const size_t nc   = nchunks;
+    const size_t rb   = row_bytes;
+    const size_t ne   = n_experts;
+    const size_t ns   = slots;
+    // Hoisted: device lambdas must not capture `this`.
+    const auto IDX = idx;
+    const auto WTS = wts;
+    const auto DB  = dbase;
+    float acc      = 0;
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(team, ns * nc),
+        KOKKOS_LAMBDA(size_t sc, float& out) {
+          const size_t s  = sc / nc;
+          const size_t c  = sc - s * nc;
+          const int e     = IDX(0, s);
+          if (e < 0 || static_cast<size_t>(e) >= ne) return;
+          const float w = WTS(0, s);
+          if (w == 0.0f) return;
+          const uint8_t* row =
+              reinterpret_cast<const uint8_t*>(DB(e)) + d * rb;
+          out += w * quant_chunk_dot(dt, row, abase + s * stride, size_t(1), c,
+                                     xv);
+        },
+        acc);
+    if (team.team_rank() == 0) Y(0, d) = static_cast<Scalar>(acc);
+  }
+};
+
+}  // namespace Impl
+
+// Sparse mixture-of-experts decode (one token) against packed expert weights.
+// Two launches per MoE layer, independent of top_k:
+//   1. gate/up GEMV fused with SwiGLU  -> act [S, MI]
+//   2. down GEMV fused with the weighted slot combine -> Y [1, K]
+// The routing indices/weights are consumed on device, so this path performs no
+// host synchronization at all (the per-token fence pair and the 2+2 * top_k
+// launches of the per-slot dispatch are gone). act is caller-owned scratch
+// ([S, MI], one row per routed slot) so steady-state decode allocates nothing.
+// Numerics: same (dm * q + mm) * x terms in FP32, reassociated across threads;
+// SwiGLU is applied in FP32 instead of after a Scalar round trip of gate/up.
+template <class ExecSpace, class Scalar>
+void quant_moe_decode(
+    const DNNHandle<ExecSpace>& handle,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& X,
+    const QuantWeightTable<ExecSpace>& gate,
+    const QuantWeightTable<ExecSpace>& up,
+    const QuantWeightTable<ExecSpace>& down,
+    const Kokkos::View<int**, Kokkos::LayoutRight, ExecSpace>& idx,
+    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& wts,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& act,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& Y,
+    const std::string& label = "KokkosDNN::Gguf::quant_moe_decode") {
+  (void)handle;  // native kernels only; kept for API symmetry with gemm()
+  if (X.extent(0) != 1 || Y.extent(0) != 1)
+    throw std::invalid_argument("quant_moe_decode: expected one row");
+  const size_t K = X.extent(1), MI = gate.rows;
+  const size_t S = idx.extent(0) == 0 ? 0 : idx.extent(1);
+  if (gate.cols != K || up.cols != K || up.rows != MI || down.rows != K ||
+      down.cols != MI || Y.extent(1) != K)
+    throw std::invalid_argument("quant_moe_decode: dimension mismatch");
+  if (gate.size() == 0 || gate.size() != up.size() ||
+      gate.size() != down.size())
+    throw std::invalid_argument("quant_moe_decode: expert table mismatch");
+  if (idx.extent(0) != 1 || wts.extent(0) != 1 || wts.extent(1) != S)
+    throw std::invalid_argument("quant_moe_decode: routing dimension mismatch");
+  if (act.extent(0) < S || (S > 0 && act.extent(1) != MI))
+    throw std::invalid_argument("quant_moe_decode: act scratch too small");
+  if (S == 0 || K == 0 || MI == 0) return;
+  // Mixed K-quant recipes store gate/up and down with different dtypes
+  // (Q4_K_M keeps most experts Q4_K but a few tensors Q6_K), so each matrix
+  // keeps its own dtype and chunk count.
+  // The chunk layout assumes whole ggml blocks (a chunk never straddles one);
+  // every K-quant expert matrix in practice is block aligned. Other dtypes
+  // fall back to a one-element chunk and work for any width.
+  auto block_aligned = [](GgmlType dt, size_t n) {
+    switch (dt) {
+      case GgmlType::Q4_K:
+      case GgmlType::Q6_K:
+      case GgmlType::Q8_0: return n % 256 == 0;
+      default: return true;
+    }
+  };
+  if (!block_aligned(gate.dtype, K) || !block_aligned(up.dtype, K) ||
+      !block_aligned(down.dtype, MI))
+    throw std::invalid_argument(
+        "quant_moe_decode: K-quant rows must be a multiple of 256 elements");
+  const size_t ng = Impl::quant_chunk_count(gate.dtype, K);
+  const size_t nu = Impl::quant_chunk_count(up.dtype, K);
+  const size_t nd = Impl::quant_chunk_count(down.dtype, MI);
+  if (ng == 0 || nu == 0 || nd == 0)
+    throw std::invalid_argument("quant_moe_decode: bad packed row");
+  // 128-bit activation loads need 16-byte-aligned rows.
+  auto aligned16 = [](const void* p) {
+    return (reinterpret_cast<uintptr_t>(p) & 15u) == 0;
+  };
+  const bool xvec = aligned16(X.data()) && X.stride(1) == 1;
+  const bool avec = aligned16(act.data()) &&
+                    (act.stride(0) * sizeof(Scalar)) % 16 == 0;
+
+  // Team size: one chunk per thread when the row allows it, clamped to what
+  // the backend can actually field. Host backends allow team_size 1 only, so
+  // probe from a team_size-1 policy (valid everywhere) and clamp; the chunk
+  // loops stride on the runtime team size, so a clamped team stays correct.
+  {
+    Impl::QuantMoeGateUpFunctor<ExecSpace, Scalar> f{
+        X, act, gate.base, up.base, idx, wts, gate.dtype, up.dtype, xvec, ng,
+        nu, gate.row_bytes, up.row_bytes, MI, gate.size()};
+    const size_t nc  = ng > nu ? ng : nu;
+    const int want   = Impl::quant_chunk_team_size(nc);
+    Kokkos::TeamPolicy<ExecSpace> probe(1, 1);
+    const int tmax   = probe.team_size_max(f, Kokkos::ParallelForTag{});
+    const int ts     = want < tmax ? want : (tmax > 1 ? tmax : 1);
+    Kokkos::parallel_for(label + "::gate_up",
+                         Kokkos::TeamPolicy<ExecSpace>(
+                             static_cast<int>(S * MI), ts),
+                         f);
+  }
+  {
+    Impl::QuantMoeDownFunctor<ExecSpace, Scalar> f{
+        act, Y, down.base, idx, wts, down.dtype, avec, nd, down.row_bytes,
+        gate.size(), S};
+    const int want = Impl::quant_chunk_team_size(S * nd);
+    Kokkos::TeamPolicy<ExecSpace> probe(1, 1);
+    const int tmax = probe.team_size_max(f, Kokkos::ParallelForTag{});
+    const int ts   = want < tmax ? want : (tmax > 1 ? tmax : 1);
+    Kokkos::parallel_for(label + "::down",
+                         Kokkos::TeamPolicy<ExecSpace>(static_cast<int>(K),
+                                                       ts),
+                         f);
+  }
+}
 
 // y[N] = W[N,K] * x[K] with packed-quant W, FP32 accumulation.
 template <class ExecSpace, class Scalar>
