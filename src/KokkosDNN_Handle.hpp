@@ -175,6 +175,30 @@ struct DNNHandle {
   // contract as the handles above; only used by gemm_bias/gemv_bias.
   mutable void* cublaslt_bias_ptr_ = nullptr;
 
+  // Persistent workspace for the split-K single-token decode attention
+  // partials (see KokkosDNN_Attention.hpp). Batch-1 decode calls attention
+  // once per layer per token (~10 times per token for LFM2.5), so a per-call
+  // device allocation would show up in the step time; this buffer is
+  // allocated on first use and only grown afterwards. Mutable because the
+  // attention entry points take the handle by const reference, and per
+  // handle (not static) so it can never be shared across ExecSpace
+  // instances; the existing usage is one handle per session/thread.
+  mutable Kokkos::View<float*, ExecSpace> attn_decode_partials;
+
+  // Returns a workspace of at least `floats` floats, growing (never
+  // shrinking) the cached buffer. The fence on growth retires kernels that
+  // may still be reading the old buffer before it is released.
+  Kokkos::View<float*, ExecSpace> attn_decode_scratch(size_t floats) const {
+    if (static_cast<size_t>(attn_decode_partials.extent(0)) < floats) {
+      ExecSpace().fence();
+      const size_t cap = floats + floats / 2 + 1024;
+      attn_decode_partials =
+          Kokkos::View<float*, ExecSpace>("KokkosDNN::attn_decode_partials",
+                                          cap);
+    }
+    return attn_decode_partials;
+  }
+
   DNNHandle() {
 #if (defined(KOKKOSDNN_ENABLE_CUBLAS) || defined(KOKKOSDNN_ENABLE_CUDNN)) && \
     defined(KOKKOS_ENABLE_CUDA)
@@ -232,7 +256,8 @@ struct DNNHandle {
         cudnn_ptr_(other.cudnn_ptr_),
         hipblas_ptr_(other.hipblas_ptr_),
         miopen_ptr_(other.miopen_ptr_),
-        cublaslt_bias_ptr_(other.cublaslt_bias_ptr_) {
+        cublaslt_bias_ptr_(other.cublaslt_bias_ptr_),
+        attn_decode_partials(std::move(other.attn_decode_partials)) {
     other.use_cublas   = false;
     other.use_cudnn    = false;
     other.use_hipblas  = false;
@@ -258,6 +283,7 @@ struct DNNHandle {
       hipblas_ptr_ = other.hipblas_ptr_;
       miopen_ptr_  = other.miopen_ptr_;
       cublaslt_bias_ptr_ = other.cublaslt_bias_ptr_;
+      attn_decode_partials = std::move(other.attn_decode_partials);
       other.use_cublas   = false;
       other.use_cudnn    = false;
       other.use_hipblas  = false;

@@ -49,6 +49,7 @@ add_executable(kokkosdnn_bench
   Bench_Attention.cpp
   Bench_AttentionSliding.cpp
   Bench_AttentionBidirectional.cpp
+  Bench_DecodeAttention.cpp
   Bench_Elementwise.cpp
 )
 target_link_libraries(kokkosdnn_bench PRIVATE KokkosDNN::kokkosdnn benchmark::benchmark)
