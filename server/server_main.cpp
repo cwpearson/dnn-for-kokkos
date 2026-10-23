@@ -1065,7 +1065,8 @@ void sse_done(httplib::DataSink& sink) {
           if (!parse_common(b, st.cfg, st.model_id, p, e) ||
               !parse_messages(b, p.messages, e)) {
             sse_send(sink, openai_error(e));
-            return false;
+            sink.done();
+            return true;
           }
           const std::vector<int> prompt_ids =
               KokkosDNN::LFM25::encode_chatml_with_tools(
@@ -1130,7 +1131,12 @@ void sse_done(httplib::DataSink& sink) {
         } catch (const std::exception& ex) {
           sse_send(sink, openai_error(ex.what(), "server_error"));
         }
-        return false;  // single-shot provider: done after one pass
+        // Terminate the chunked body cleanly: sink.done() emits the
+        // trailing 0-length chunk; returning true reports success. Returning
+        // false here would abort without the terminator and clients see
+        // "curl: (18) transfer closed with outstanding read data remaining".
+        sink.done();
+        return true;
       });
 }
 
@@ -1215,12 +1221,14 @@ void sse_done(httplib::DataSink& sink) {
           std::string e;
           if (!parse_common(b, st.cfg, st.model_id, p, e)) {
             sse_send(sink, openai_error(e));
-            return false;
+            sink.done();
+            return true;
           }
           auto it = b.find("prompt");
           if (it == b.end() || !it->is_string()) {
             sse_send(sink, openai_error("'prompt' must be a string"));
-            return false;
+            sink.done();
+            return true;
           }
           p.messages = KokkosDNN::LFM25::make_chat_messages(
               it->get<std::string>(), "", "user");
@@ -1258,7 +1266,10 @@ void sse_done(httplib::DataSink& sink) {
         } catch (const std::exception& ex) {
           sse_send(sink, openai_error(ex.what(), "server_error"));
         }
-        return false;
+        // See chat_handler: sink.done() + true terminates the chunked body
+        // cleanly; returning false would truncate it (curl error 18).
+        sink.done();
+        return true;
       });
 }
 
