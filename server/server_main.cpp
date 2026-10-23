@@ -18,6 +18,8 @@
 
 #include <Kokkos_Core.hpp>
 
+#include <KokkosDNN.hpp>
+
 #include "KokkosDNN_config.h"
 #include "KokkosDNN_LFM25Config.hpp"
 #include "KokkosDNN_LFM25Session.hpp"
@@ -38,6 +40,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -99,6 +102,46 @@ void handle_stop_signal(int) {
 [[maybe_unused]] void startup_log(const std::string& msg) {
   std::fprintf(stderr, "%s\n", msg.c_str());
   std::fflush(stderr);
+}
+
+// Startup hardware/dispatch report. Without it a mis-provisioned deployment
+// (a MIG slice instead of the full device, a lower-arch build JIT-ed forward,
+// TPL dispatch compiled out) is indistinguishable from a slow kernel in the
+// per-turn timings line. The dispatch list comes from the library's
+// print_configuration(); the device block is CUDA-only because SM count and
+// clocks have no portable Kokkos query.
+[[maybe_unused]] void log_device_info() {
+  const std::string es_name = Exec::name();
+  startup_log(std::string("  execution space: ") + es_name +
+              " (concurrency=" + std::to_string(Exec().concurrency()) + ")");
+#ifdef KOKKOS_ENABLE_CUDA
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) return;
+  cudaDeviceProp p{};
+  if (cudaGetDeviceProperties(&p, dev) != cudaSuccess) return;
+  // CUDA 13 dropped clockRate/memoryClockRate from cudaDeviceProp; the
+  // attributes are still queryable and tell an operator whether the device
+  // is clocked/limited as expected.
+  int sm_clock_khz = 0, mem_clock_khz = 0;
+  cudaDeviceGetAttribute(&sm_clock_khz, cudaDevAttrClockRate, dev);
+  cudaDeviceGetAttribute(&mem_clock_khz, cudaDevAttrMemoryClockRate, dev);
+  char line[512];
+  std::snprintf(
+      line, sizeof(line),
+      "  device %d: %s (compute %d.%d, %d SMs, %.1f GiB, SM clock %d MHz, "
+      "memory %d MHz x %d-bit)",
+      dev, p.name, p.major, p.minor, p.multiProcessorCount,
+      static_cast<double>(p.totalGlobalMem) / (1024.0 * 1024.0 * 1024.0),
+      sm_clock_khz / 1000, mem_clock_khz / 1000, p.memoryBusWidth);
+  startup_log(line);
+  // A MIG slice presents fewer SMs and a proportional share of bandwidth;
+  // batch-1 decode scales with both (grids are small at T == 1), so this is
+  // the first thing to check when tok/s lands far below the GPU's class.
+  if (p.multiProcessorCount < 64)
+    startup_log(
+        "  note: <64 SMs visible; if this is not the whole GPU (MIG slice or "
+        "device busy), decode throughput will be a fraction of full-device");
+#endif
 }
 
 // Single-line stderr logging: control chars that would split lines are
@@ -220,6 +263,7 @@ struct CliOptions {
   std::string weights;
   std::string tokenizer;
   std::string config_path;
+  int max_seq_len = 0;  // 0 => keep the config file / preset value
   bool prefix_cache_host = false;  // keep the KV-cache entry in host memory
 };
 
@@ -230,7 +274,8 @@ struct CliOptions {
     std::printf(
         "Usage: %s [--port N] [--model ID] [--weights PATH] [--tokenizer "
         "PATH]\n"
-        "             [--config PATH] [--help] [--version]\n"
+        "             [--config PATH] [--max-seq-len N] [--help] "
+        "[--version]\n"
         "             [--prefix-cache-host]\n"
         "\n"
         "OpenAI-compatible inference server for KokkosDNN (LFM2.5).\n"
@@ -242,6 +287,8 @@ struct CliOptions {
         "  --tokenizer PATH  tokenizer.json path or directory (required)\n"
         "  --config PATH     optional model config JSON overlay (base: HF\n"
         "                    lfm2_5_24b_a2b defaults)\n"
+        "  --max-seq-len N   context window to serve (overrides the config;\n"
+        "                    the KV cache is allocated for N tokens)\n"
         "  --prefix-cache-host\n"
         "                    keep the single prefix-cache KV entry in host\n"
         "                    memory instead of device memory (saves VRAM at\n"
@@ -287,6 +334,16 @@ struct CliOptions {
       if (!need_value("--tokenizer", out.tokenizer)) return 1;
     } else if (std::strcmp(a, "--config") == 0) {
       if (!need_value("--config", out.config_path)) return 1;
+    } else if (std::strcmp(a, "--max-seq-len") == 0) {
+      if (i + 1 >= argc) {
+        std::printf("Missing value for --max-seq-len\n");
+        return 1;
+      }
+      out.max_seq_len = std::atoi(argv[++i]);
+      if (out.max_seq_len <= 0) {
+        std::printf("--max-seq-len must be a positive integer\n");
+        return 1;
+      }
     } else if (std::strcmp(a, "--prefix-cache-host") == 0) {
       out.prefix_cache_host = true;
     } else {
@@ -338,6 +395,8 @@ struct ServerState {
     st.cfg = o.config_path.empty()
                  ? Config::lfm2_5_24b_a2b()
                  : Config::from_json_file(o.config_path);
+    if (o.max_seq_len > 0) st.cfg.max_seq_len = o.max_seq_len;
+    st.cfg.validate();
     st.weights.allocate(st.cfg);
     KokkosDNN::LFM25::load_gguf(st.cfg, o.weights, st.weights);
     st.tok = Tokenizer(o.tokenizer);
@@ -1542,6 +1601,14 @@ int main(int argc, char* argv[]) {
     startup_log(std::string("  prefix cache: single entry in ") +
                 (opt.prefix_cache_host ? "host memory (--prefix-cache-host)"
                                        : "device memory"));
+    log_device_info();
+    {
+      std::ostringstream os;
+      KokkosDNN::print_configuration(os);
+      std::istringstream lines(os.str());
+      std::string line;
+      while (std::getline(lines, line)) startup_log("  " + line);
+    }
     startup_log("loading weights...");
     ServerState st;
     st.prefix_cache_host = opt.prefix_cache_host;
