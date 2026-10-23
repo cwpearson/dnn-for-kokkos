@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 # LFM2.5-24B-A2B example driver: model implementation lives in
 # models/lfm2_5 (KokkosDNN::lfm25); this directory only builds the
 # lfm2_5_generate driver plus its tests.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // FlowEuler sampler tests for the Sana example (no weights, no downloads).
 //
 // Covers the Sana scheduler math against its torch reference

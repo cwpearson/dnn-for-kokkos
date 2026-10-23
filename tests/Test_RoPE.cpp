@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // RoPE preserves per-head norm (rotation is orthogonal, float + bfloat16).
 #include <gtest/gtest.h>
 

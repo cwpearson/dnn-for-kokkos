@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 cmake_minimum_required(VERSION 3.22 FATAL_ERROR)
 project(KokkosDNN VERSION 0.1.0 LANGUAGES CXX)
 

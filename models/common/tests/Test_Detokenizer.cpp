@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Tests for Common::IncrementalDetokenizer (streaming detokenizer with
 // stop-string handling). All pieces are fed as raw byte strings, exactly
 // as Tokenizer::decode({id}) would produce them.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // LFM2.5 tokenizer regression tests (synthetic GPT-2-style fixture only,
 // no model downloads). Covers: LFM2.5 special-token conventions, BPE
 // roundtrip, special-token atomicity (<|im_start|> is never split by BPE),

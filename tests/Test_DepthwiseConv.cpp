@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Depthwise 3x3 convolution (stride 1, pad 1, groups=Cin) vs naive host
 // reference: rank-2 biased/unbiased, rank-3 batched, argument validation.
 #include <gtest/gtest.h>

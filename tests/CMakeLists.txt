@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 function(kokkosdnn_add_test NAME SRC)
   add_executable(${NAME} ${SRC})
   target_link_libraries(${NAME} PRIVATE KokkosDNN::kokkosdnn KokkosDNN::gtest_main)

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 """Torch reference for the KokkosDNN Sana example (Test_SanaGolden).
 
 Runs a single SanaMS_600M_P1_D28 forward on CPU with fixed-seed latents and

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // LFM2.5 config tests (no weight downloads).
 //
 // Covers: the lfm2_5_24b_a2b() preset values, tiny_test() validation, and

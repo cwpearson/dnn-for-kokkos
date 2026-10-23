@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 """Generate a golden token file for KokkosDNN's DINOv3 real-weight validation.
 
 Compares against Hugging Face `transformers` on the ViT-B/16 encoder

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // End-to-end tiny Llama: random weights, prefill + greedy decode.
 // Exercises both bfloat16 (default) and fp32 scalar paths.
 #include <gtest/gtest.h>

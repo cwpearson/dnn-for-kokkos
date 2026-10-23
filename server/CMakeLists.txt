@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 # kokkosdnn_server: OpenAI-compatible HTTP front-end.
 # Thin binary: owns Kokkos::initialize/finalize, parses CLI flags, loads the
 # LFM2.5 model (config + GGUF weights + tokenizer), and serves OpenAI routes

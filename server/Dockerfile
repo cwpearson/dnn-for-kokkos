@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 # kokkosdnn_server: CUDA-enabled inference server image (multi-stage).
 #
 # Stage 1 (builder) compiles Kokkos (CUDA backend) + kokkosdnn_server in an

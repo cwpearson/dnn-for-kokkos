@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // cuDNN SDPA implementation for KokkosDNN grouped-query causal attention.
 //
 // Single translation unit that includes <cudnn_frontend.h> so the rest of

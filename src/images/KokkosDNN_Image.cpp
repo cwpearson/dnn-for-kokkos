@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Single stb implementation translation unit for libkokkosdnn_image.a.
 //
 // Headers under src/images/ (KokkosDNN_ImageIO.hpp) include stb_image.h /

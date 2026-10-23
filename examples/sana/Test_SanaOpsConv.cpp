@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Sana fused GLUMBConv MixFFN vs composed host pipeline (rank-2,
 // unbiased-depthwise variant, batched ratio config, argument validation).
 // Model-specific stitching; lives with the Sana example (see

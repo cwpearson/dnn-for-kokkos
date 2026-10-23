@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Audio DSP toolkit: Hann window, STFT vs torch goldens (hexgrad-style
 // center/reflect convention), ISTFT roundtrip + torch parity, 1D resample
 // vs torch interpolate semantics, reflect index checks.

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 # Model components: installable per-model libraries plus shared support.
 # models/common is unconditional (every model lib links KokkosDNN::common);
 # per-model subdirectories are guarded so

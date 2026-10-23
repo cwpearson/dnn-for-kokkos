@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Causal depthwise 1D conv: prefill vs host reference, stepwise decode
 // equivalence with the streaming cache, argument validation.
 #include <gtest/gtest.h>

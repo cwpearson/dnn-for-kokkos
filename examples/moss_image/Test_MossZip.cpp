@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Synthetic-ZIP unit test for the MOSS torch.save (.pth) central-directory
 // reader (KokkosDNN_MossZip.hpp). No real checkpoint needed: the test builds
 // a minimal stored-entries ZIP in memory, writes it to a temp file, and

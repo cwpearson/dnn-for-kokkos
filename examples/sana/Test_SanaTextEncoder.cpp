@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Tests for the native Gemma-2-2B-IT text encoder (examples/sana).
 //
 // Fast path (no downloads): Config defaults/validate/JSON parsing,

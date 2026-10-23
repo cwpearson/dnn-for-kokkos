@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Performance-TODO regression tests (always-on, tiny config, no downloads).
 //
 // Covers the "Performance" README item (minus weight quantization, out of

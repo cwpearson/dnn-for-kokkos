@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Kokoro .pth inventory test: missing files throw; with
 // KOKKOSDNN_KOKORO_WEIGHTS set, the real checkpoint parses to the expected
 // tensor inventory (names/shapes/counts vs the released kokoro-v1_0.pth).

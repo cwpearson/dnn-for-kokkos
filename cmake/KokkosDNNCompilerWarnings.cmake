@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 # KokkosDNN compiler warnings helper.
 #
 # Kokkos exposes Kokkos_ENABLE_COMPILER_WARNINGS, but those flags are

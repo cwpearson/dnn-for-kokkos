@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Qwen3.5 text-encoder tests: config/layer-type pattern, (1+w) QK-norm
 // golden, partial-rotary golden, gated-delta-rule golden, gated-RMSNorm
 // golden, and a tiny-config full-model forward vs a host double reference.

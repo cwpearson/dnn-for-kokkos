@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Tiny-random smoke test for the Sana example (no weights, no downloads).
 //
 // Covers: Config::tiny_test()/validate()/sana600m_1024() geometry, and a

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 """Torch reference for the Sana DC-AE VAE decoder golden test.
 
 Loads the diffusers DC-AE checkpoint, decodes small fixed-seed latents, and

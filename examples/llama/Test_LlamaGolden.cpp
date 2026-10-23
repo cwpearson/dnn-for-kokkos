@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Golden real-weight validation for the Llama example.
 //
 // README TODO "Real-weight validation": golden logits/perplexity check

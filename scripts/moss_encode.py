@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 """Stage-A prompt encoder for the MOSS-Image staged split.
 
 Produces the caption-embedding file consumed by the C++ driver

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // GroupNorm op + FLUX.2-small (MOSS-Image) VAE decoder tests.
 // GroupNorm is checked against a host reference (float + bhalf); the
 // BN-stat denormalize + depth-to-space glue is already covered by

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 #ifndef KOKKOSDNN_SANA_CONFIG_HPP
 #define KOKKOSDNN_SANA_CONFIG_HPP
 

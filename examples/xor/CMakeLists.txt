@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 # XOR example: tiny 2-layer MLP trained with the KokkosDNN training ops.
 # Header-only MLP (KokkosDNN_XorMLP.hpp) + training driver + gtest.
 

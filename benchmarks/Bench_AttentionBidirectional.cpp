@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Bidirectional (non-causal) MHA benchmarks: Native vs Dispatched (cuDNN SDPA).
 //
 // Single config Hq=12, Hkv=12, D=64 for all token counts, matching DINOv3

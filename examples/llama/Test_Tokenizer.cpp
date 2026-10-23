@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Tokenizer regression tests: synthetic fixture (always runs) + real-file
 // oracle vectors (runs when KOKKOSDNN_TOKENIZER_JSON points at a Llama 3
 // tokenizer.json; expected ids generated with Hugging Face `tokenizers`).

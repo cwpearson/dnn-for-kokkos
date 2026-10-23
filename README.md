@@ -118,3 +118,11 @@ so subset with `--benchmark_filter` or lower `--benchmark_min_time` there.
   differs from the torch reference by RNG (deterministic given `--seed`);
   durations, F0/N, and ASR features match the reference and are golden
   tested. Long paragraphs scale linearly (audio = 300·F₂ samples).
+
+## License
+
+Apache-2.0 WITH LLVM-exception (see [LICENSE](LICENSE)).
+Every source file carries an `SPDX-License-Identifier` /
+`SPDX-FileCopyrightText` header. The generated Unicode tables in
+`models/moss_image/KokkosDNN_QwenTokenizerTables.inc` additionally fall
+under the Unicode License v3 (attribution in `LICENSE`).

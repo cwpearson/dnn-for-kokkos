@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 # MOSS-Image-SFT example driver: model pipeline headers live in
 # models/moss_image (KokkosDNN::moss, header-only); this directory only
 # builds the moss_image_generate driver. Example-local support code

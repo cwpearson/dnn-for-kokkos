@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 # MOSS-Image model library: installable component (KokkosDNN::moss).
 # Header-only pipeline (KokkosDNN_MossImage{,Dit,Encoder,Vae}.hpp,
 # KokkosDNN_QwenTokenizer.hpp + tables .inc live here); there are no .cpp

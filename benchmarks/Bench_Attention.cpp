@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Grouped-query attention benchmarks: Native vs Dispatched (cuDNN SDPA).
 //
 // Shapes mirror Llama 3.1 8B-Instruct: Hq=32 query heads, Hkv=8 KV heads, D=128.

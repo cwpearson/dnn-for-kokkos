@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Kokoro-TTS driver: phonemes (or naive text) in, 24 kHz WAV out.
 //
 //   kokoro_tts [--weights kokoro-v1_0.pth] [--voice af_heart.pt]

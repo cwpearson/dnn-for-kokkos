@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Sana fused attention ops vs naive triple-loop host references (float + bhalf):
 // Model-specific stitching; lives with the Sana example (see
 // KokkosDNN_SanaOps.hpp), not the core library.

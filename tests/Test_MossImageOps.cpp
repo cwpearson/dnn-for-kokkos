@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // MOSS-Image ops vs host reference: shift-aware timestep embedding,
 // fused RMSNorm+AdaLN-zero modulation, gated residuals, batched QK RMSNorm,
 // 4-coordinate RoPE build/apply, joint attention wrapper, CFG/SLG

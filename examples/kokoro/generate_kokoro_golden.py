@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 """Generate Kokoro golden reference JSON via the torch KModel.
 
 Runs the reference pipeline (kokoro pip model.py, v0.7.x) on fixed phoneme

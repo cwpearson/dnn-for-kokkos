@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Safetensors round-trip: write a tiny F32/BF16 checkpoint, load it back
 // into both fp32 and bfloat16 weights.
 #include <gtest/gtest.h>
