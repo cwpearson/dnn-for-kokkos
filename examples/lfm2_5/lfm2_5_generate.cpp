@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 // SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 #include <Kokkos_Core.hpp>
+#include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <iostream>
 #include <string>
@@ -16,7 +18,7 @@
 //   lfm2_5_generate [--tiny] [--weights model.gguf]
 //                   [--tokenizer tok.json] [--prompt "text"] [--max-new N]
 //                   [--stop <id> ...] [--stop-string "str" ...]
-//                   [--fp32] [--prefill-chunk N]
+//                   [--fp32] [--timings] [--prefill-chunk N]
 //                   [--config config.json] [--max-seq-len N]
 //                   [--chat] [--system "text"] [--role user]
 //                   [--add-bos | --no-add-bos]
@@ -58,7 +60,7 @@ int run_model(KokkosDNN::LFM25::Config cfg, const std::string& wpath,
               int prefill_chunk_override, bool chat_mode,
               const std::string& system_prompt, const std::string& role,
               bool want_bos, const std::vector<std::string>& stop_strings,
-              KokkosDNN::SampleOptions samp_opt) {
+              KokkosDNN::SampleOptions samp_opt, bool want_timings) {
   using Exec = Kokkos::DefaultExecutionSpace;
   KokkosDNN::LFM25::Weights<Exec, Scalar> w;
   if (tiny || wpath.empty()) {
@@ -146,11 +148,36 @@ int run_model(KokkosDNN::LFM25::Config cfg, const std::string& wpath,
               samp_opt.is_greedy() ? " [greedy]" : "");
   KokkosDNN::HostRNG rng(samp_opt.seed);
   std::vector<int> out;
+  // Per-phase timings (--timings): the driver otherwise prints none, so
+  // throughput work ends up measuring whole-process wall time and
+  // subtracting out the weight load. Captured at the sampling callback,
+  // which fires once per generated token right after sampling: the gap from
+  // generate() start to the first callback is prefill + first-token TTFT,
+  // and the rest are decode steps.
+  using Clock = std::chrono::steady_clock;
+  const auto t_gen0 = Clock::now();
+  auto since = [](Clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
+  };
+  bool got_first = false;
+  double t_first = 0.0, t_last = 0.0;
+  std::vector<double> step_ms;
+  auto mark_token = [&](int /*id*/) {
+    const double t = since(t_gen0);
+    if (!got_first) {
+      got_first = true;
+      t_first = t;
+    } else {
+      step_ms.push_back(t - t_last);
+    }
+    t_last = t;
+  };
   if (!tok_path.empty()) {
     KokkosDNN::LFM25::Tokenizer stok(tok_path);
     std::printf("decoded (streaming): ");
     std::fflush(stdout);
     auto on_token = [&](int id) {
+      mark_token(id);
       std::string piece = stok.decode(std::vector<int>{id});
       std::fputs(piece.c_str(), stdout);
       std::fflush(stdout);
@@ -162,6 +189,7 @@ int run_model(KokkosDNN::LFM25::Config cfg, const std::string& wpath,
     std::printf("generated (streaming):");
     std::fflush(stdout);
     auto on_token = [&](int id) {
+      mark_token(id);
       std::printf(" %d", id);
       std::fflush(stdout);
     };
@@ -171,6 +199,30 @@ int run_model(KokkosDNN::LFM25::Config cfg, const std::string& wpath,
   std::printf("generated %zu ids:", out.size());
   for (auto id : out) std::printf(" %d", id);
   std::printf("\n");
+  if (want_timings) {
+    // Prompt tokens are forwarded by generate()'s prefill; every other id
+    // is one decode step. The first sampled token is produced at the end of
+    // prefill, so t_first is prefill + TTFT for that token.
+    const size_t n_prompt = prompt_ids.size();
+    const size_t n_new = out.size() > n_prompt ? out.size() - n_prompt : 0;
+    double med = 0.0;
+    if (!step_ms.empty()) {
+      std::vector<double> s = step_ms;
+      std::sort(s.begin(), s.end());
+      med = s[s.size() / 2];
+    }
+    const double prefill_tok_s =
+        t_first > 0.0 ? (double)n_prompt * 1e3 / t_first : 0.0;
+    const double decode_ms = got_first ? (t_last - t_first) : 0.0;
+    const double decode_tok_s =
+        decode_ms > 0.0 ? (double)step_ms.size() * 1e3 / decode_ms : 0.0;
+    std::fprintf(
+        stderr,
+        "[timings] prefill %zu tok in %.1f ms (%.1f tok/s) | decode %zu tok "
+        "in %.1f ms (%.1f tok/s) | median step %.2f ms | total %.1f ms\n",
+        n_prompt, t_first, prefill_tok_s, n_new, decode_ms, decode_tok_s, med,
+        got_first ? t_last : since(t_gen0));
+  }
   if (!tok_path.empty()) {
     KokkosDNN::LFM25::Tokenizer tok(tok_path);
     std::printf("decoded: %s\n", tok.decode(out).c_str());
@@ -216,6 +268,7 @@ int main(int argc, char** argv) {
     std::string system_prompt;
     std::string role = "user";
     bool want_bos    = true;
+    bool want_timings = false;
     std::vector<std::string> stop_strings;
     // LFM2.5 driver sampling defaults.
     KokkosDNN::SampleOptions samp_opt;
@@ -260,6 +313,8 @@ int main(int argc, char** argv) {
         max_seq_len_override = std::stoi(argv[++i]);
       } else if (a == "--fp32") {
         fp32 = true;
+      } else if (a == "--timings") {
+        want_timings = true;
       } else if (a == "--temperature" && i + 1 < argc) {
         samp_opt.temperature = std::stof(argv[++i]);
       } else if (a == "--top-k" && i + 1 < argc) {
@@ -314,13 +369,13 @@ int main(int argc, char** argv) {
       rc = run_model<float>(cfg, wpath, tiny, tok_path, prompt, max_new,
                             extra_stops, prefill_chunk_override, chat_mode,
                             system_prompt, role, want_bos, stop_strings,
-                            samp_opt);
+                            samp_opt, want_timings);
     } else {
       std::printf("[dtype bfloat16]\n");
       rc = run_model<KokkosDNN::LFM25::DefaultScalar>(
           cfg, wpath, tiny, tok_path, prompt, max_new, extra_stops,
           prefill_chunk_override, chat_mode, system_prompt, role, want_bos,
-          stop_strings, samp_opt);
+          stop_strings, samp_opt, want_timings);
     }
     Kokkos::finalize();
     return rc;

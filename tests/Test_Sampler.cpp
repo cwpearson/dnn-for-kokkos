@@ -284,6 +284,32 @@ TEST(Sampler, LogitBiasForcesChosenId) {
   EXPECT_EQ(KokkosDNN::sample_host_logits(lg, sampled, {}, rng3), 4);
 }
 
+TEST(Sampler, UntruncatedPathRespectsModifiers) {
+  // No top-k / top-p / min-p filtering takes the index-order short-circuit;
+  // the logit adjustments applied before it must still decide the draw.
+  auto lg = fixture_logits();
+  SampleOptions opt;
+  opt.temperature = 0.7f;  // top_k 0, top_p 1, min_p 0 -> untruncated
+  opt.logit_bias = {{5, 1e30f}};
+  HostRNG rng(11);
+  EXPECT_EQ(KokkosDNN::sample_host_logits(lg, opt, {}, rng), 5);
+  // Repetition penalty steers the same path away from the argmax when the
+  // penalty is large enough to flip it (id 2 is the argmax of the fixture).
+  SampleOptions rep;
+  rep.temperature = 0.7f;
+  rep.repetition_penalty = 100.0f;
+  HostRNG rng2(3);
+  EXPECT_NE(KokkosDNN::sample_host_logits(lg, rep, {2}, rng2), 2);
+  // One uniform draw per token, exactly like the filtered path (the RNG
+  // stream stays aligned whichever branch runs).
+  HostRNG a(9), b(9);
+  (void)KokkosDNN::sample_host_logits(lg, opt, {}, a);
+  SampleOptions filtered = opt;
+  filtered.top_p = 0.9f;
+  (void)KokkosDNN::sample_host_logits(lg, filtered, {}, b);
+  EXPECT_EQ(a.next_u64(), b.next_u64());
+}
+
 TEST(Sampler, LogprobsTopNMatchesGreedy) {
   auto lg = fixture_logits();  // argmax is 2
   SampleOptions opt;
