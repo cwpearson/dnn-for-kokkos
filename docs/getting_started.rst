@@ -8,6 +8,10 @@ Requirements
 - An installed Kokkos >= 5.2.1 (Serial is enough for tests; CUDA backend for GPU)
 - Optional: CUDA Toolkit (for ``KokkosDNN_ENABLE_CUBLAS``), cuDNN (for
   ``KokkosDNN_ENABLE_CUDNN``)
+- Supported platforms: Linux and macOS (tested in CI on ``ubuntu-latest`` /
+  ``ubuntu-24.04`` and ``macos-latest``). Windows is untested and there are
+  no shared-library export macros, so ``BUILD_SHARED_LIBS`` targets
+  Linux/macOS.
 
 Build
 -----
