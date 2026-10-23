@@ -51,6 +51,7 @@ add_executable(kokkosdnn_bench
   Bench_AttentionBidirectional.cpp
   Bench_DecodeAttention.cpp
   Bench_Elementwise.cpp
+  Bench_Sampler.cpp
 )
 target_link_libraries(kokkosdnn_bench PRIVATE KokkosDNN::kokkosdnn benchmark::benchmark)
 set_target_properties(kokkosdnn_bench PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
