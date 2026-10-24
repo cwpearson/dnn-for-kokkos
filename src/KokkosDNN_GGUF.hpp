@@ -819,27 +819,40 @@ inline bool quant_can_group(GgmlType dtype, size_t K, size_t& gs) {
   }
 }
 
-// --- decode (M == 1) chunking ----------------------------------------------
-// The sparse-MoE decode kernels below split one packed row into *chunks* and
-// hand each chunk to one thread of the row's team. A chunk is the smallest
-// unit whose packed bytes are one aligned 128-bit load:
-//   Q4_K: 32 elements (16 packed bytes, one low + one high nibble sub-block)
-//   Q6_K: 16 elements (one scale set; 16+8 packed bytes, not 16B-aligned)
-//   Q8_0: 32 elements (one block)
+// --- decode (M == 1) work units --------------------------------------------
+// The sparse-MoE decode kernels below split one packed row into *units* and
+// hand each unit to one thread of the row's team, so a team is a reduction
+// over a packed row. A unit is 32 elements of one packed row -- the smallest
+// span that covers whole quant sub-blocks and can be fetched with wide loads:
+//   Q4_K: 16 packed bytes, one aligned 128-bit load (low-nibble sub-block 2i
+//         at +0, high-nibble sub-block 2i+1 at +32 elements)
+//   Q6_K: 32 packed bytes, 16 low + 16 high bytes covering the 32-element span
+//         at +0 and +64 elements (2-byte loads; see below)
+//   Q8_0: one 34-byte block, 2-byte loads (same alignment reason)
 //   F32/F16/BF16 and anything else: one element (per-element path).
-// Why: decode is weight-bandwidth bound, and the per-element grouped dot above
-// issues one byte load per weight element plus one scalar activation load.
-// Measured on the RTX 3090 with a 1536x2048 Q4_K GEMV (1.77 MB payload, L2
-// defeated), one thread per output row: 54 GB/s for the grouped dot vs 250
-// GB/s for this chunk layout (128-bit weight loads + 128-bit activation
-// loads), against a 300 GB/s read-only ceiling for the same shape. The GEMV
-// was ~60% of decode time, so the load width is the whole game at batch 1.
+// Why units and not elements: decode is weight-bandwidth bound, and the
+// per-element grouped dot above issues one byte load per weight element plus
+// one scalar activation load. Measured on the RTX 3090 with a 1536x2048 Q4_K
+// GEMV (1.77 MB payload, L2 defeated), one thread per output row: 54 GB/s for
+// the grouped dot vs 250 GB/s for this unit layout (128-bit weight loads +
+// 128-bit activation loads), against a 300 GB/s read-only ceiling for the same
+// shape. The GEMV was ~60% of decode time, so the load width is the whole game
+// at batch 1.
 // Same arithmetic per element (dm * q + mm) * x, FP32 accumulation; the only
 // change is which thread accumulates which elements, i.e. FP32 reassociation.
-inline size_t quant_chunk_count(GgmlType dtype, size_t cols) {
+//
+// Q6_K/Q8_0 blocks are 210/34 bytes, so the packed payload is only 2-byte
+// aligned per block (210 and 34 are 2 mod 4, and a row of them inherits that):
+// 16-byte vector loads on those weights would fault on odd block indices and
+// even 4-byte loads are safe only at the row start. They are fetched as eight
+// 2-byte loads instead. That still beats one load per element by 8x on the
+// packed side; the bigger win is that the activation side (2 bytes/element
+// against ~0.8 packed bytes for Q6_K) becomes 128-bit loads, which is where
+// most of the load instructions were.
+inline size_t quant_unit_count(GgmlType dtype, size_t cols) {
   switch (dtype) {
-    case GgmlType::Q4_K: return cols / 32;
-    case GgmlType::Q6_K: return cols / 16;
+    case GgmlType::Q4_K:
+    case GgmlType::Q6_K:
     case GgmlType::Q8_0: return cols / 32;
     default: return cols;
   }
@@ -851,6 +864,25 @@ struct alignas(16) QuantU8x16 {
   uint8_t b[16];
 };
 
+// 16 packed bytes behind 8 x 2-byte loads, for the 2-byte-aligned payloads
+// (Q6_K/Q8_0 blocks). Natural alignment keeps every backend happy: no backend
+// gating and no unaligned 32/128-bit loads.
+struct QuantU16x8 {
+  uint16_t w[8];
+};
+
+KOKKOS_INLINE_FUNCTION QuantU16x8 quant_load_u16x8(const uint8_t* p) {
+  const uint16_t* q = reinterpret_cast<const uint16_t*>(p);
+  QuantU16x8 r;
+KOKKOSDNN_PRAGMA_UNROLL()
+  for (int i = 0; i < 8; ++i) r.w[i] = q[i];
+  return r;
+}
+
+KOKKOS_INLINE_FUNCTION uint8_t quant_u16x8_byte(const QuantU16x8& v, int i) {
+  return static_cast<uint8_t>((v.w[i >> 1] >> ((i & 1) * 8)) & 0xFFu);
+}
+
 // Aligned activation window: 8 Scalars (16 B for bhalf, 32 B for float).
 // Requires the activation row pointer to be 16-byte aligned.
 template <class Scalar>
@@ -858,10 +890,10 @@ struct alignas(16) QuantX8 {
   Scalar v[8];
 };
 
-// One Q4_K chunk: 16 packed bytes -> 16 low-nibble (sub-block 2*iter) and 16
+// One Q4_K unit: 16 packed bytes -> 16 low-nibble (sub-block 2*iter) and 16
 // high-nibble (sub-block 2*iter+1) elements, each with its own (d*scale,
-// -dmin*min) pair. Chunk c of a row: block c/8, iter (c%8)/2, half c%2; the
-// chunk's first element is block*256 + iter*64 + half*16.
+// -dmin*min) pair. Unit c of a row: block c/8, iter (c%8)/2, half c%2; the
+// unit's first element is block*256 + iter*64 + half*16.
 template <class Scalar>
 KOKKOS_INLINE_FUNCTION float quant_q4k_chunk_dot(const uint8_t* row,
                                                  const Scalar* xd, size_t xs,
@@ -915,28 +947,144 @@ KOKKOSDNN_PRAGMA_UNROLL()
   return sa + sb;
 }
 
-// One decode chunk of a packed row (see quant_chunk_count above).
+// One Q6_K unit: 32 elements of a 128-element block half. The low/high nibble
+// bytes for the two sub-blocks sit at ql[chunk*64 + pair*32 + half*16] and the
+// 2-bit highs at qh[chunk*32 + half*16]; the sub-blocks' scale indices are
+// (2*pair + half) and (2*pair + half + 4) of the block's 8 scales. `pair`
+// selects sub-blocks {0,2} or {1,3}, i.e. element offsets +0 and +64 from the
+// unit base; `half` selects the 16-element half. Both windows are 16 elements,
+// so all 32 elements of the unit are covered exactly once.
 template <class Scalar>
-KOKKOS_INLINE_FUNCTION float quant_chunk_dot(GgmlType dtype,
-                                             const uint8_t* row,
-                                             const Scalar* xd, size_t xs,
-                                             size_t c, bool xvec) {
+KOKKOS_INLINE_FUNCTION float quant_q6k_chunk_dot(const uint8_t* row,
+                                                 const Scalar* xd, size_t xs,
+                                                 size_t c, bool xvec) {
+  const size_t blk  = c / 8;
+  const BlockQ6K* b = reinterpret_cast<const BlockQ6K*>(
+      row + blk * sizeof(BlockQ6K));
+  const size_t chunk = (c % 8) / 4;
+  const size_t pair  = (c % 4) / 2;
+  const size_t half  = c % 2;
+  const size_t k0    = blk * 256 + chunk * 128 + pair * 32 + half * 16;
+  const QuantU16x8 ql =
+      quant_load_u16x8(b->ql + chunk * 64 + pair * 32 + half * 16);
+  const QuantU16x8 qh = quant_load_u16x8(b->qh + chunk * 32 + half * 16);
+  const float dd      = fp16_to_float(b->d);
+  const float ds0     = dd * (float)b->scales[chunk * 8 + 2 * pair + half];
+  const float ds1 = dd * (float)b->scales[chunk * 8 + 2 * pair + half + 4];
+  const int shf   = pair ? 2 : 0;
+  float sa = 0, sb = 0;
+  if (xvec) {
+    const QuantX8<Scalar>* xa =
+        reinterpret_cast<const QuantX8<Scalar>*>(xd + k0);
+    const QuantX8<Scalar>* xb =
+        reinterpret_cast<const QuantX8<Scalar>*>(xd + k0 + 64);
+    const QuantX8<Scalar> a0 = xa[0], a1 = xa[1];
+    const QuantX8<Scalar> b0 = xb[0], b1 = xb[1];
+    float xa8[16], xb8[16];
+KOKKOSDNN_PRAGMA_UNROLL()
+    for (int i = 0; i < 8; ++i) {
+      xa8[i]     = static_cast<float>(a0.v[i]);
+      xa8[i + 8] = static_cast<float>(a1.v[i]);
+      xb8[i]     = static_cast<float>(b0.v[i]);
+      xb8[i + 8] = static_cast<float>(b1.v[i]);
+    }
+KOKKOSDNN_PRAGMA_UNROLL()
+    for (int i = 0; i < 16; ++i) {
+      const int qa = (int)((quant_u16x8_byte(ql, i) & 0xF) |
+                           (((quant_u16x8_byte(qh, i) >> shf) & 3) << 4));
+      const int qb = (int)((quant_u16x8_byte(ql, i) >> 4) |
+                           (((quant_u16x8_byte(qh, i) >> (shf + 4)) & 3) << 4));
+      sa = fmaf(ds0 * (float)(qa - 32), xa8[i], sa);
+      sb = fmaf(ds1 * (float)(qb - 32), xb8[i], sb);
+    }
+  } else {
+KOKKOSDNN_PRAGMA_UNROLL()
+    for (int i = 0; i < 16; ++i) {
+      const int qa = (int)((quant_u16x8_byte(ql, i) & 0xF) |
+                           (((quant_u16x8_byte(qh, i) >> shf) & 3) << 4));
+      const int qb = (int)((quant_u16x8_byte(ql, i) >> 4) |
+                           (((quant_u16x8_byte(qh, i) >> (shf + 4)) & 3) << 4));
+      sa = fmaf(ds0 * (float)(qa - 32),
+                static_cast<float>(xd[(k0 + i) * xs]), sa);
+      sb = fmaf(ds1 * (float)(qb - 32),
+                static_cast<float>(xd[(k0 + 64 + i) * xs]), sb);
+    }
+  }
+  return sa + sb;
+}
+
+// One Q8_0 unit: a whole 34-byte block (32 elements, one scale).
+template <class Scalar>
+KOKKOS_INLINE_FUNCTION float quant_q80_chunk_dot(const uint8_t* row,
+                                                 const Scalar* xd, size_t xs,
+                                                 size_t c, bool xvec) {
+  const BlockQ80* b = reinterpret_cast<const BlockQ80*>(
+      row + c * sizeof(BlockQ80));
+  const size_t k0 = c * 32;
+  const float d   = fp16_to_float(b->d);
+  // BlockQ80 is 34 bytes: 2-byte loads (qs follows a 2-byte header).
+  const QuantU16x8 lo =
+      quant_load_u16x8(reinterpret_cast<const uint8_t*>(b->qs));
+  const QuantU16x8 hi =
+      quant_load_u16x8(reinterpret_cast<const uint8_t*>(b->qs + 16));
+  float s = 0;
+  if (xvec) {
+    const QuantX8<Scalar>* xa =
+        reinterpret_cast<const QuantX8<Scalar>*>(xd + k0);
+    const QuantX8<Scalar> a0 = xa[0], a1 = xa[1];
+    const QuantX8<Scalar> a2 = xa[2], a3 = xa[3];
+    float xf[32];
+KOKKOSDNN_PRAGMA_UNROLL()
+    for (int i = 0; i < 8; ++i) {
+      xf[i]      = static_cast<float>(a0.v[i]);
+      xf[i + 8]  = static_cast<float>(a1.v[i]);
+      xf[i + 16] = static_cast<float>(a2.v[i]);
+      xf[i + 24] = static_cast<float>(a3.v[i]);
+    }
+KOKKOSDNN_PRAGMA_UNROLL()
+    for (int i = 0; i < 16; ++i) {
+      const float qa = static_cast<float>(
+          static_cast<int8_t>(quant_u16x8_byte(lo, i)));
+      const float qb = static_cast<float>(
+          static_cast<int8_t>(quant_u16x8_byte(hi, i)));
+      s = fmaf(d * qa, xf[i], s);
+      s = fmaf(d * qb, xf[i + 16], s);
+    }
+  } else {
+KOKKOSDNN_PRAGMA_UNROLL()
+    for (int i = 0; i < 32; ++i) {
+      const uint8_t byte = i < 16 ? quant_u16x8_byte(lo, i)
+                                  : quant_u16x8_byte(hi, i - 16);
+      s = fmaf(d * static_cast<float>(static_cast<int8_t>(byte)),
+               static_cast<float>(xd[(k0 + i) * xs]), s);
+    }
+  }
+  return s;
+}
+
+// One decode unit of a packed row (see quant_unit_count above).
+template <class Scalar>
+KOKKOS_INLINE_FUNCTION float quant_unit_dot(GgmlType dtype,
+                                            const uint8_t* row,
+                                            const Scalar* xd, size_t xs,
+                                            size_t c, bool xvec) {
   switch (dtype) {
     case GgmlType::Q4_K: return quant_q4k_chunk_dot(row, xd, xs, c, xvec);
-    case GgmlType::Q6_K: return quant_group_dot(dtype, row, xd, xs, c * 16);
-    case GgmlType::Q8_0: return quant_group_dot(dtype, row, xd, xs, c * 32);
+    case GgmlType::Q6_K: return quant_q6k_chunk_dot(row, xd, xs, c, xvec);
+    case GgmlType::Q8_0: return quant_q80_chunk_dot(row, xd, xs, c, xvec);
     default:
       return quant_elem(dtype, row, c) * static_cast<float>(xd[c * xs]);
   }
 }
 
-// Team size for a decode chunk range: one chunk per thread when the range
-// allows, clamped to 32..128 threads (a row's dot is a short reduction; wider
-// teams only add reduce depth).
-inline int quant_chunk_team_size(size_t nchunks) {
-  int ts = 32;
-  while ((size_t)ts < nchunks && ts < 128) ts *= 2;
-  return ts;
+// Threads per output row in a decode team: 32 keeps a row's reduction inside
+// one warp (a shuffle reduction, no shared-memory stage) while giving each
+// thread several units of a real row to pipeline. Clamped down for rows with
+// fewer units, so short rows never launch lanes that do nothing.
+inline int quant_unit_threads(size_t nunits) {
+  int t = 32;
+  while ((size_t)t > nunits && t > 1) t /= 2;
+  return t;
 }
 
 // Grouped GEMV/GEMM functors: same contracts as QuantGemvFunctor /
@@ -1121,10 +1269,24 @@ QuantWeightTable<ExecSpace> make_quant_weight_table(
 
 namespace Impl {
 
-// Fused gate/up + SwiGLU for one decoded token: one team per (routed slot,
-// output column). Reads the routing slot's expert id and weight on device, so
-// no host fence is needed, and emits act[s, j] = silu(gate_e x)_j * (up_e x)_j
-// directly (the separate gate, up and swiglu launches disappear).
+// Fused gate/up + SwiGLU for one decoded token. One team covers
+// `rows_per_team` output columns of one routed slot: the team splits into that
+// many sub-teams of equal width, each reducing one output row, so the final
+// combine is a short sum over sub-teams instead of a whole-team tree. The
+// routing slot's expert id and weight are read on device (no host fence) and
+// the kernel emits act[s, j] = silu(gate_e x)_j * (up_e x)_j directly, so the
+// separate gate, up and swiglu launches disappear.
+//
+// Why several rows per team: at batch 1 a single output row is only K/32 units
+// (64 at K=2048), i.e. 2 units per thread, and one row per team caps the grid
+// at one-warp blocks. Fusing rows into one block keeps that per-thread unit
+// count (the load pipeline depth) while filling the SM with wider blocks:
+// measured on this RTX 3090 at K=2048/MI=1536/top-4/Q4_K, one row per
+// 32-thread team 412 GB/s vs four rows per 128-thread team 490 GB/s (short
+// bursts, boost clocks). The gate and up dots of a row run in the same inner
+// loop, so the activation window is loaded once for both matrices (it is 2
+// bytes/element for bf16 against 0.56 packed bytes per element for Q4_K: the
+// activation load stream is the larger one).
 template <class ExecSpace, class Scalar>
 struct QuantMoeGateUpFunctor {
   using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
@@ -1135,62 +1297,83 @@ struct QuantMoeGateUpFunctor {
   Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace> wts;  // [1, S]
   GgmlType gdtype, udtype;
   bool xvec;
-  size_t g_chunks, u_chunks;  // decode chunks per packed row (K)
+  size_t g_units, u_units;  // decode units per packed row (K)
   size_t g_row_bytes, u_row_bytes;
-  size_t rows;      // MI: output columns per expert
+  size_t rows;        // MI: output columns per expert
   size_t n_experts;
+  int rows_per_team;  // output rows reduced inside one team
 
   KOKKOS_INLINE_FUNCTION void operator()(const Member& team) const {
+    const int ts   = team.team_size();
+    const int rpt  = rows_per_team;
+    const int tpr  = ts / rpt;  // threads per output row
+    const int rank = team.team_rank();
+    const int sub  = rank / tpr;
+    const int lane = rank - sub * tpr;
+    float* scratch = static_cast<float*>(
+        team.team_shmem().get_shmem(sizeof(float) * 2 * (size_t)ts));
+    const size_t teams_per_slot = (rows + (size_t)rpt - 1) / (size_t)rpt;
     const size_t id = static_cast<size_t>(team.league_rank());
-    const size_t s  = id / rows;
-    const size_t j  = id - s * rows;
+    const size_t s  = id / teams_per_slot;
+    const size_t j0 = (id - s * teams_per_slot) * (size_t)rpt;
+    const size_t j  = j0 + (size_t)sub;
     const int e     = idx(0, s);
     // Routing ids come from the router kernel (always in range). The guard
     // keeps a bogus id from reading outside the expert tables and matching
     // the E == 0 / zero-weight convention: contribute nothing.
-    const bool bad = (e < 0) || (static_cast<size_t>(e) >= n_experts);
-    if (bad) {
-      if (team.team_rank() == 0) act(s, j) = static_cast<Scalar>(0);
-      return;
-    }
-    const auto xx    = X;
-    const Scalar* xd = xx.data();
-    // Column stride: quant_chunk_dot indexes the activation by *element*
-    // within the single row (X is [1, K] LayoutRight), so it wants stride(1)
-    // -- stride(0) is the row pitch and would walk off the buffer. The
-    // vectorized path in quant_q4k_chunk_dot additionally assumes the row is
-    // contiguous (stride(1) == 1), which xvec guarantees.
-    const size_t xs  = xx.stride(1);
-    const uint8_t* gr =
-        reinterpret_cast<const uint8_t*>(gbase(e)) + j * g_row_bytes;
-    const uint8_t* ur =
-        reinterpret_cast<const uint8_t*>(ubase(e)) + j * u_row_bytes;
-    const GgmlType gdt = gdtype, udt = udtype;
-    const bool xv      = xvec;
-    const size_t ng    = g_chunks, nu = u_chunks;
+    const bool bad = (e < 0) || (static_cast<size_t>(e) >= n_experts) ||
+                     j >= rows;
     float g = 0, u = 0;
-    Kokkos::parallel_reduce(
-        Kokkos::TeamThreadRange(team, ng),
-        KOKKOS_LAMBDA(size_t c, float& acc) {
-          acc += quant_chunk_dot(gdt, gr, xd, xs, c, xv);
-        },
-        g);
-    Kokkos::parallel_reduce(
-        Kokkos::TeamThreadRange(team, nu),
-        KOKKOS_LAMBDA(size_t c, float& acc) {
-          acc += quant_chunk_dot(udt, ur, xd, xs, c, xv);
-        },
-        u);
-    if (team.team_rank() == 0)
-      act(s, j) = static_cast<Scalar>(silu(g) * u);
+    if (!bad) {
+      const auto xx    = X;
+      const Scalar* xd = xx.data();
+      // Column stride: quant_unit_dot indexes the activation by *element*
+      // within the single row (X is [1, K] LayoutRight), so it wants stride(1)
+      // -- stride(0) is the row pitch and would walk off the buffer. The
+      // vectorized path additionally assumes the row is contiguous
+      // (stride(1) == 1), which xvec guarantees.
+      const size_t xs = xx.stride(1);
+      const uint8_t* gr =
+          reinterpret_cast<const uint8_t*>(gbase(e)) + j * g_row_bytes;
+      const uint8_t* ur =
+          reinterpret_cast<const uint8_t*>(ubase(e)) + j * u_row_bytes;
+      const GgmlType gdt = gdtype, udt = udtype;
+      const bool xv      = xvec;
+      const size_t ng = g_units, nu = u_units;
+      const size_t nc = ng < nu ? ng : nu;
+      for (size_t c = (size_t)lane; c < nc; c += (size_t)tpr) {
+        g += quant_unit_dot(gdt, gr, xd, xs, c, xv);
+        u += quant_unit_dot(udt, ur, xd, xs, c, xv);
+      }
+      // A mixed recipe can give gate and up different dtypes, hence different
+      // unit counts; the longer matrix then finishes in its own loop.
+      for (size_t c = nc + (size_t)lane; c < ng; c += (size_t)tpr)
+        g += quant_unit_dot(gdt, gr, xd, xs, c, xv);
+      for (size_t c = nc + (size_t)lane; c < nu; c += (size_t)tpr)
+        u += quant_unit_dot(udt, ur, xd, xs, c, xv);
+    }
+    scratch[(size_t)rank]              = g;
+    scratch[(size_t)ts + (size_t)rank] = u;
+    team.team_barrier();
+    if (rank < rpt) {
+      const size_t jr = j0 + (size_t)rank;
+      float sg = 0, su = 0;
+      for (int t = rank * tpr; t < (rank + 1) * tpr; ++t) {
+        sg += scratch[(size_t)t];
+        su += scratch[(size_t)ts + (size_t)t];
+      }
+      // Each output column belongs to exactly one sub-team, so this is an
+      // assignment: no ordering question and no caller-side zero fill.
+      if (jr < rows) act(s, jr) = static_cast<Scalar>(silu(sg) * su);
+    }
   }
 };
 
-// Down projection + weighted combine for one decoded token: one team per
-// output row d, summing every routed slot inside the same reduction
-// (y[d] = sum_s w_s * down_e[s][d,:] . act[s]). The slot loop lives in the
-// kernel, so y is *assigned* (no caller-side zero fill, no per-slot
-// weighted-add launch) and there is no atomics/ordering question.
+// Down projection + weighted combine for one decoded token: one team covers
+// `rows_per_team` output rows d, and the reduction over the routed slots
+// happens inside it (y[d] = sum_s w_s * down_e[s][d,:] . act[s]). The slot
+// loop lives in the kernel, so y is *assigned* (no caller-side zero fill, no
+// per-slot weighted-add launch) and there is no atomics/ordering question.
 template <class ExecSpace, class Scalar>
 struct QuantMoeDownFunctor {
   using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
@@ -1201,45 +1384,156 @@ struct QuantMoeDownFunctor {
   Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace> wts;  // [1, S]
   GgmlType dtype;
   bool xvec;
-  size_t nchunks;    // chunks per packed row (MI)
+  size_t n_units;    // decode units per packed row (MI)
   size_t row_bytes;  // down row stride
   size_t n_experts;
   size_t slots;
+  size_t rows;  // K: output rows of the down projection
+  int rows_per_team;
 
   KOKKOS_INLINE_FUNCTION void operator()(const Member& team) const {
-    const size_t d = static_cast<size_t>(team.league_rank());
-    const auto aa  = act;
+    const int ts   = team.team_size();
+    const int rpt  = rows_per_team;
+    const int tpr  = ts / rpt;
+    const int rank = team.team_rank();
+    const int sub  = rank / tpr;
+    const int lane = rank - sub * tpr;
+    float* scratch = static_cast<float*>(
+        team.team_shmem().get_shmem(sizeof(float) * (size_t)ts));
+    const size_t d0 = static_cast<size_t>(team.league_rank()) * (size_t)rpt;
+    const size_t d  = d0 + (size_t)sub;
+    const auto aa       = act;
     const Scalar* abase = aa.data();
     const size_t stride = aa.stride(0);
     const GgmlType dt = dtype;
     const bool xv     = xvec;
-    const size_t nc   = nchunks;
+    const size_t nc   = n_units;
     const size_t rb   = row_bytes;
     const size_t ne   = n_experts;
-    const size_t ns   = slots;
-    // Hoisted: device lambdas must not capture `this`.
-    const auto IDX = idx;
-    const auto WTS = wts;
-    const auto DB  = dbase;
-    float acc      = 0;
-    Kokkos::parallel_reduce(
-        Kokkos::TeamThreadRange(team, ns * nc),
-        KOKKOS_LAMBDA(size_t sc, float& out) {
-          const size_t s  = sc / nc;
-          const size_t c  = sc - s * nc;
-          const int e     = IDX(0, s);
-          if (e < 0 || static_cast<size_t>(e) >= ne) return;
-          const float w = WTS(0, s);
-          if (w == 0.0f) return;
-          const uint8_t* row =
-              reinterpret_cast<const uint8_t*>(DB(e)) + d * rb;
-          out += w * quant_chunk_dot(dt, row, abase + s * stride, size_t(1), c,
-                                     xv);
-        },
-        acc);
-    if (team.team_rank() == 0) Y(0, d) = static_cast<Scalar>(acc);
+    const size_t nu   = slots * nc;
+    float acc         = 0;
+    if (d < rows) {
+      for (size_t uc = (size_t)lane; uc < nu; uc += (size_t)tpr) {
+        const size_t s = uc / nc;
+        const size_t c = uc - s * nc;
+        const int e    = idx(0, s);
+        if (e < 0 || static_cast<size_t>(e) >= ne) continue;
+        const float w = wts(0, s);
+        if (w == 0.0f) continue;
+        const uint8_t* row =
+            reinterpret_cast<const uint8_t*>(dbase(e)) + d * rb;
+        acc += w * quant_unit_dot(dt, row, abase + s * stride, size_t(1), c,
+                                  xv);
+      }
+    }
+    scratch[(size_t)rank] = acc;
+    team.team_barrier();
+    if (rank < rpt) {
+      float sum = 0;
+      for (int t = rank * tpr; t < (rank + 1) * tpr; ++t)
+        sum += scratch[(size_t)t];
+      if (d < rows) Y(0, d) = static_cast<Scalar>(sum);
+    }
   }
 };
+
+// 128-bit activation loads need 16-byte-aligned rows.
+inline bool quant_aligned16(const void* p) {
+  return (reinterpret_cast<uintptr_t>(p) & 15u) == 0;
+}
+
+// Stage 1 of quant_moe_decode: act[s, j] = silu(gate_e x)_j * (up_e x)_j.
+// Split from the down stage so the two launches can be timed (and reasoned
+// about) separately; quant_moe_decode is the only production caller.
+template <class ExecSpace, class Scalar>
+void quant_moe_decode_gate_up(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& X,
+    const QuantWeightTable<ExecSpace>& gate,
+    const QuantWeightTable<ExecSpace>& up,
+    const Kokkos::View<int**, Kokkos::LayoutRight, ExecSpace>& idx,
+    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& wts,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& act,
+    const std::string& label) {
+  const size_t K  = X.extent(1);
+  const size_t MI = gate.rows;
+  const size_t S  = idx.extent(1);
+  const size_t ng = quant_unit_count(gate.dtype, K);
+  const size_t nu = quant_unit_count(up.dtype, K);
+  const bool xvec = quant_aligned16(X.data()) && X.stride(1) == 1;
+
+  // 32 threads per output row (see quant_unit_threads) and up to 4 rows fused
+  // into one 4-warp team. Both are launch-shape choices: the kernel derives
+  // the sub-team width from the real team size, so a backend that cannot field
+  // 128 threads (host backends cap at 1) simply gets narrower teams.
+  const size_t nc  = ng > nu ? ng : nu;
+  const int want_r = 4;
+  const int want   = quant_unit_threads(nc) * want_r;
+  QuantMoeGateUpFunctor<ExecSpace, Scalar> f{
+      X,            act,        gate.base, up.base,   idx,  wts,
+      gate.dtype,   up.dtype,   xvec,      ng,        nu,   gate.row_bytes,
+      up.row_bytes, MI,         gate.size(), want_r};
+  const std::size_t shmem = sizeof(float) * 2 * (std::size_t)want;
+  // Cached occupancy probe (KokkosDNN_Occupancy.hpp): decode runs this twice
+  // per MoE layer; the answer depends only on the functor type, the exec-space
+  // instance and the scratch reservation.
+  const int tmax =
+      ::KokkosDNN::Impl::cached_team_size_max<ExecSpace>(f, shmem);
+  const int ts = want < tmax ? want : (tmax > 1 ? tmax : 1);
+  f.rows_per_team = ts < want_r ? ts : want_r;
+  Kokkos::parallel_for(
+      label + "::gate_up",
+      Kokkos::TeamPolicy<ExecSpace>(
+          static_cast<int>((S * MI + (size_t)f.rows_per_team - 1) /
+                           (size_t)f.rows_per_team),
+          ts)
+          .set_scratch_size(0, Kokkos::PerTeam(shmem)),
+      f);
+}
+
+// Stage 2 of quant_moe_decode: Y[0, d] = sum_s w_s * down_e[s][d, :] . act[s].
+template <class ExecSpace, class Scalar>
+void quant_moe_decode_down(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& act,
+    const QuantWeightTable<ExecSpace>& down,
+    const Kokkos::View<int**, Kokkos::LayoutRight, ExecSpace>& idx,
+    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& wts,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& Y,
+    const std::string& label) {
+  const size_t K  = Y.extent(1);
+  const size_t MI = down.cols;
+  const size_t S  = idx.extent(1);
+  const size_t nd = quant_unit_count(down.dtype, MI);
+  const bool avec = quant_aligned16(act.data()) &&
+                    (act.stride(0) * sizeof(Scalar)) % 16 == 0;
+
+  // 64 threads per output row here rather than 32: a down row carries S*MI/32
+  // units (192 at S=4/MI=1536), so the extra width still leaves 3 units of
+  // load pipelining per thread while halving the block count. Measured on this
+  // RTX 3090 at that shape (Q6_K down, 10.3 MB/call, short bursts): 32
+  // threads/row 432 GB/s, 64 threads/row 466 GB/s, 128 threads/row 446 GB/s.
+  // Fusing rows buys nothing for down, whose per-row work is already 3x
+  // gate_up's, so rows_per_team stays 1.
+  const int row_threads = quant_unit_threads(S * nd);
+  const int want_r      = 1;
+  const int want        = row_threads < 64 ? row_threads : 64;
+  QuantMoeDownFunctor<ExecSpace, Scalar> f{
+      act,           Y,        down.base,     idx,   wts,
+      down.dtype,    avec,     nd,            down.row_bytes, down.size(),
+      S,             K, want_r};
+  const std::size_t shmem = sizeof(float) * (std::size_t)want;
+  const int tmax =
+      ::KokkosDNN::Impl::cached_team_size_max<ExecSpace>(f, shmem);
+  const int ts = want < tmax ? want : (tmax > 1 ? tmax : 1);
+  f.rows_per_team = ts < want_r ? ts : want_r;
+  Kokkos::parallel_for(
+      label + "::down",
+      Kokkos::TeamPolicy<ExecSpace>(
+          static_cast<int>((K + (size_t)f.rows_per_team - 1) /
+                           (size_t)f.rows_per_team),
+          ts)
+          .set_scratch_size(0, Kokkos::PerTeam(shmem)),
+      f);
+}
 
 }  // namespace Impl
 
@@ -1282,11 +1576,11 @@ void quant_moe_decode(
     throw std::invalid_argument("quant_moe_decode: act scratch too small");
   if (S == 0 || K == 0 || MI == 0) return;
   // Mixed K-quant recipes store gate/up and down with different dtypes
-  // (Q4_K_M keeps most experts Q4_K but a few tensors Q6_K), so each matrix
-  // keeps its own dtype and chunk count.
-  // The chunk layout assumes whole ggml blocks (a chunk never straddles one);
+  // (Q4_K_M keeps most experts Q4_K but the down projection Q6_K), so each
+  // matrix keeps its own dtype and unit count.
+  // The unit layout assumes whole ggml blocks (a unit never straddles one);
   // every K-quant expert matrix in practice is block aligned. Other dtypes
-  // fall back to a one-element chunk and work for any width.
+  // fall back to a one-element unit and work for any width.
   auto block_aligned = [](GgmlType dt, size_t n) {
     switch (dt) {
       case GgmlType::Q4_K:
@@ -1299,51 +1593,15 @@ void quant_moe_decode(
       !block_aligned(down.dtype, MI))
     throw std::invalid_argument(
         "quant_moe_decode: K-quant rows must be a multiple of 256 elements");
-  const size_t ng = Impl::quant_chunk_count(gate.dtype, K);
-  const size_t nu = Impl::quant_chunk_count(up.dtype, K);
-  const size_t nd = Impl::quant_chunk_count(down.dtype, MI);
-  if (ng == 0 || nu == 0 || nd == 0)
+  if (Impl::quant_unit_count(gate.dtype, K) == 0 ||
+      Impl::quant_unit_count(up.dtype, K) == 0 ||
+      Impl::quant_unit_count(down.dtype, MI) == 0)
     throw std::invalid_argument("quant_moe_decode: bad packed row");
-  // 128-bit activation loads need 16-byte-aligned rows.
-  auto aligned16 = [](const void* p) {
-    return (reinterpret_cast<uintptr_t>(p) & 15u) == 0;
-  };
-  const bool xvec = aligned16(X.data()) && X.stride(1) == 1;
-  const bool avec = aligned16(act.data()) &&
-                    (act.stride(0) * sizeof(Scalar)) % 16 == 0;
 
-  // Team size: one chunk per thread when the row allows it, clamped to what
-  // the backend can actually field. Host backends allow team_size 1 only, so
-  // probe from a team_size-1 policy (valid everywhere) and clamp; the chunk
-  // loops stride on the runtime team size, so a clamped team stays correct.
-  {
-    Impl::QuantMoeGateUpFunctor<ExecSpace, Scalar> f{
-        X, act, gate.base, up.base, idx, wts, gate.dtype, up.dtype, xvec, ng,
-        nu, gate.row_bytes, up.row_bytes, MI, gate.size()};
-    const size_t nc  = ng > nu ? ng : nu;
-    const int want   = Impl::quant_chunk_team_size(nc);
-    // Cached occupancy probe (KokkosDNN_Occupancy.hpp): decode runs this
-    // twice per MoE layer; the answer depends only on the functor type and
-    // the exec-space instance (no scratch here).
-    const int tmax   = ::KokkosDNN::Impl::cached_team_size_max<ExecSpace>(f);
-    const int ts     = want < tmax ? want : (tmax > 1 ? tmax : 1);
-    Kokkos::parallel_for(label + "::gate_up",
-                         Kokkos::TeamPolicy<ExecSpace>(
-                             static_cast<int>(S * MI), ts),
-                         f);
-  }
-  {
-    Impl::QuantMoeDownFunctor<ExecSpace, Scalar> f{
-        act, Y, down.base, idx, wts, down.dtype, avec, nd, down.row_bytes,
-        gate.size(), S};
-    const int want = Impl::quant_chunk_team_size(S * nd);
-    const int tmax = ::KokkosDNN::Impl::cached_team_size_max<ExecSpace>(f);
-    const int ts   = want < tmax ? want : (tmax > 1 ? tmax : 1);
-    Kokkos::parallel_for(label + "::down",
-                         Kokkos::TeamPolicy<ExecSpace>(static_cast<int>(K),
-                                                       ts),
-                         f);
-  }
+  Impl::quant_moe_decode_gate_up<ExecSpace, Scalar>(X, gate, up, idx, wts, act,
+                                                    label);
+  Impl::quant_moe_decode_down<ExecSpace, Scalar>(act, down, idx, wts, Y,
+                                                 label);
 }
 
 // y[N] = W[N,K] * x[K] with packed-quant W, FP32 accumulation.
