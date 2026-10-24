@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
+# Torch golden checksums for Qwen/Qwen-Image-2.1-Turbo (text-to-image only).
+#
+# Produced by: python3 scripts/qwen_image_21_golden.py \
+#     --weights /workspace/weights/Qwen-Image-2.1-Turbo \
+#     --out /workspace/weights/Qwen-Image-2.1-Turbo-golden
+# Config: prompt "A capybara wearing a wizard hat, oil painting",
+#   1024x1024, torch.Generator("cpu").manual_seed(42), checkpoint 8-step
+#   Turbo sample_sigmas, use_kv_cache=True, manual placement
+#   (text encoder on CPU, transformer+VAE on CUDA).
+# Env: torch 2.14.1+cu130, diffusers 0.42.0.dev0, RTX 3090, 2026-10-24.
+# Full artifacts (final latents .f32/.npy, PNG) live next to the weights
+# (git-ignored); only these scalar checksums are versioned.
+# All sums are float64 over the full tensor (see f64sum in the script).
+
+[a] prompt_embeds shape=(1, 19, 4096) dtype=torch.bfloat16
+[a] prompt_embeds[0,0]  f64sum=-66.24072265625
+[a] prompt_embeds[0,-1] f64sum=487.0107421875
+[b] initial latents shape=(1, 4096, 64)
+[b] initial latents f64sum=-62.91889151930809
+[c] transformer forward calls: 8 (expect 8 for Turbo)
+[c] step 0: noise_pred shape=(1, 4115, 64) f64sum=-21028.175584077835
+[c] step 1: noise_pred shape=(1, 4096, 64) f64sum=-11246.848942443728
+[c] step 2: noise_pred shape=(1, 4096, 64) f64sum=-10488.831165730953
+[c] step 3: noise_pred shape=(1, 4096, 64) f64sum=-10213.551013335586
+[c] step 4: noise_pred shape=(1, 4096, 64) f64sum=-10683.935044020414
+[c] step 5: noise_pred shape=(1, 4096, 64) f64sum=-11382.545000880957
+[c] step 6: noise_pred shape=(1, 4096, 64) f64sum=-12483.454845398664
+[c] step 7: noise_pred shape=(1, 4096, 64) f64sum=-12269.153574258089
+[d] steps recorded: 8
+[d] final latents shape=(1, 4096, 64)
+[d] final latents f64sum=12098.474563598633
