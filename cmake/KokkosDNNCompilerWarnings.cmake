@@ -81,6 +81,31 @@ if(Kokkos_ENABLE_CUDA AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
   endif()
 endif()
 
+# Backend occupancy heuristics must not fail the build. HIP clang reports
+# "failed to meet occupancy target given by 'amdgpu-waves-per-eu'" as
+# -Wpass-failed, which our -Werror would otherwise promote to a hard error
+# (e.g. a high-register MoE decode kernel reaching 3 instead of 4 waves on
+# gfx90a). Kokkos's own CI handles this the same way (-Werror plus
+# -Wno-pass-failed on HIP). Prefer -Wno-error=pass-failed (keep the warning
+# visible) and fall back to -Wno-pass-failed; both are probed so compilers
+# without the warning simply skip them. The flag must appear after -Werror
+# on the command line to take effect. Gated on the HIP backend so host-only
+# builds do not inherit a backend-specific flag (gcc rejects
+# -Wno-error=pass-failed outright).
+set(KOKKOSDNN_PASS_FAILED_NOERROR_FLAG "")
+if(Kokkos_ENABLE_HIP AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+  check_cxx_compiler_flag("-Wno-error=pass-failed"
+                          KOKKOSDNN_HAS_WNO_ERROR_PASS_FAILED)
+  if(KOKKOSDNN_HAS_WNO_ERROR_PASS_FAILED)
+    set(KOKKOSDNN_PASS_FAILED_NOERROR_FLAG "-Wno-error=pass-failed")
+  else()
+    check_cxx_compiler_flag("-Wno-pass-failed" KOKKOSDNN_HAS_WNO_PASS_FAILED)
+    if(KOKKOSDNN_HAS_WNO_PASS_FAILED)
+      set(KOKKOSDNN_PASS_FAILED_NOERROR_FLAG "-Wno-pass-failed")
+    endif()
+  endif()
+endif()
+
 function(kokkosdnn_enable_compiler_warnings target)
   if(NOT KokkosDNN_ENABLE_COMPILER_WARNINGS)
     return()
@@ -109,6 +134,10 @@ function(kokkosdnn_enable_compiler_warnings target)
         target_compile_options(${target} INTERFACE
           $<BUILD_INTERFACE:${KOKKOSDNN_NVCC_WERROR_FLAG}>)
       endif()
+      if(KOKKOSDNN_PASS_FAILED_NOERROR_FLAG)
+        target_compile_options(${target} INTERFACE
+          $<BUILD_INTERFACE:${KOKKOSDNN_PASS_FAILED_NOERROR_FLAG}>)
+      endif()
       unset(_flag)
     endif()
   else()
@@ -116,7 +145,8 @@ function(kokkosdnn_enable_compiler_warnings target)
       target_compile_options(${target} PRIVATE /W4 /WX)
     else()
       target_compile_options(${target} PRIVATE
-        ${KOKKOSDNN_SUPPORTED_WARNING_FLAGS} -Werror ${KOKKOSDNN_NVCC_WERROR_FLAG})
+        ${KOKKOSDNN_SUPPORTED_WARNING_FLAGS} -Werror ${KOKKOSDNN_NVCC_WERROR_FLAG}
+        ${KOKKOSDNN_PASS_FAILED_NOERROR_FLAG})
     endif()
   endif()
   unset(_type)
