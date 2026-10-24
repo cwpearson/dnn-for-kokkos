@@ -16,14 +16,24 @@ cmake -B build -DKokkosDNN_ENABLE_SERVER=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target kokkosdnn_server
 ./build/server/kokkosdnn_server --weights lfm2_5.gguf \
     --tokenizer /path/to/tokenizer.json [--config overlay.json] \
-    [--model lfm2_5] [--port 8000] [--prefix-cache-host]
+    [--max-seq-len 16384] [--model lfm2_5] [--port 8000] \
+    [--prefix-cache-host]
 ```
 
 `--help` / `--version` work without Kokkos weights. `--weights` and
 `--tokenizer` are required to serve; `--config` is an optional model-config
 JSON overlay on top of the baked-in `lfm2_5_24b_a2b` defaults.
+`--max-seq-len N` overrides the context window (the default is 8192, and the
+KV cache is allocated for N tokens), so prompts longer than 8k tokens need
+either this flag or a config overlay.
 `--prefix-cache-host` keeps the prefix-cache entry in host memory instead
 of device memory (saves VRAM at the cost of host<->device copies per turn).
+
+Startup logs the execution space, the device actually in use (name, compute
+capability, SM count, memory, clocks) and the dispatch table (`cuBLAS
+dispatch: ON/OFF`, `cuDNN SDPA dispatch: ON/OFF`). Check that block first
+when throughput is below expectations: a MIG slice, a partially visible
+device, or a build with the TPL dispatch compiled out all show up there.
 
 ## Docker
 
@@ -44,7 +54,12 @@ docker run --gpus all -p 8000:8000 \
 ```
 
 For a non-Ampere GPU, target it natively with
-`--build-arg CUDA_ARCH=HOPPER90` (any `Kokkos_ARCH_*` suffix works).
+`--build-arg CUDA_ARCH=HOPPER90` (any `Kokkos_ARCH_*` suffix works). The
+default `AMPERE80` build also carries compute_80 PTX, so it runs on Hopper
+and Blackwell through the driver's PTX JIT; that works, but the kernels are
+Ampere codegen and the JIT is repaid on every container start (no
+`~/.nv/ComputeCache` in the image). Build HOPPER90 for a native sm_90 SASS
+image on an H100.
 
 ## Routes
 
