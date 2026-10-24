@@ -13,15 +13,20 @@
 // (KokkosDNN_QwenImage21Dit.hpp, KokkosDNN_QwenImage21Encoder.hpp,
 // KokkosDNN_QwenImage21Vae.hpp, plus geometry in
 // KokkosDNN_QwenImage21Config.hpp) they are picked up via __has_include and
-// the corresponding phase runs the real model; otherwise the phase falls
+// the corresponding phase runs the real model (encode: raw-text BPE +
+// EncoderModel forward; decode: runtime-affine denormalize +
+// VaeModel::decode to RGBA); otherwise the phase falls
 // back to the placeholder Qwen21:: geometry / file / null path with a
-// logged reason, so the tree always builds. Macros
-// QWEN21_DRIVER_HAVE_{OPS,DIT,ENCODER,VAE} gate every use (see the shim
-// below). Status: Config geometry + the DiT are usable when present (the
-// driver samples with the real DiT, including --tiny on random weights);
-// the landed encoder forward() and VAE decode() are still skeleton TODOs
-// (they throw), so encode resolves --prompt-embeds-in files or null and
-// decode writes a grayscale preview, each with a logged reason.
+// logged reason, so the tree always builds. The BPE tables come from
+// models/moss_image/KokkosDNN_QwenTokenizer.hpp (probed, same shim).
+// QWEN21_DRIVER_HAVE_{OPS,DIT,ENCODER,VAE,TOKENIZER} gate every use (see
+// the shim below). Status: Config geometry + the DiT are usable when
+// present (the driver samples with the real DiT, including --tiny on
+// random weights); encode runs the in-process raw-text BPE +
+// EncoderModel forward when --tokenizer + --text-encoder are given (else
+// --prompt-embeds-in file or null), and decode runs the real VAE decode
+// to RGBA when --vae-weights + --vae-decode are given (else a grayscale
+// preview), each fallback with a logged reason.
 //
 //   qwen_image_21_generate [--tiny] [--weights transformer_dir]
 //                          [--prompt "text"]
@@ -30,18 +35,20 @@
 //                          [--prompt-embeds-in feats.f32]
 //                          [--height H] [--width W]
 //                          [--steps 8] [--cfg 1.0] [--shift 3.0]
+//                          [--sigmas driver|turbo]
 //                          [--seed 42]
 //                          [--vae-weights vae.safetensors [--vae-decode]]
 //                          [--out img.png]
 //                          [--staged]
 //
 // Text conditioning precedence: in-process Qwen forward (--tokenizer dir
-// with tokenizer.json + --text-encoder weights, once the landed encoder
-// forward() is implemented) -> --prompt-embeds-in file (alias
+// with tokenizer.json + --text-encoder weights, raw T2I template, no chat
+// template) -> --prompt-embeds-in file (alias
 // --text-weights) -> null (zeros) with the prompt logged. --tokenizer /
 // --text-encoder must be given together. --tiny skips the Qwen forward.
 // --vae-weights is validated whenever given; --vae-decode additionally runs
-// the real VAE decode once the landed decode() is implemented, else a
+// the real VAE decode (latents denormalized by the runtime vae/config.json
+// affine, then QwenImage21VaeModel::decode to RGBA), else a
 // channel-mean grayscale preview is written with a clear log. Raw fp32
 // latents (<stem>.f32, [C,H,W] row-major) are always written.
 //
@@ -69,7 +76,10 @@
 #include <functional>
 #include <iostream>
 #include <random>
+#include <sstream>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "KokkosDNN.hpp"
@@ -84,20 +94,23 @@
 //   models/qwen_image_21/KokkosDNN_QwenImage21Encoder.hpp (QwenImage21Encoder::Model/Weights)
 //   models/qwen_image_21/KokkosDNN_QwenImage21Vae.hpp     (QwenImage21Vae::Model/Weights)
 //
-// Status: Config geometry + the DiT (Model/Weights/random_init/
-// load_safetensors/resident_bytes/release + release_scratch) are usable
-// and consumed below when present. The landed QwenImage21EncoderModel::
-// forward and QwenImage21VaeModel::decode are still skeleton TODOs (they
-// throw), so the encode and decode phases fall back to file/null + preview
-// with a logged reason even when those headers are present. Every
-// true-pipeline use is gated on its QWEN21_DRIVER_HAVE_* macro, so this TU
-// builds with or without any of those headers. There is intentionally NO
-// hard dependency here (and none in CMakeLists.txt): the driver probes,
-// never requires.
+// Status: Config geometry + the DiT are usable when present (the driver
+// samples with the real DiT, including --tiny on random weights); the
+// landed encoder forward() and VAE decode() are wired below (raw-text BPE
+// + EncoderModel forward for encode, runtime-affine denormalize +
+// VaeModel::decode to RGBA for decode), each with a file/null + preview
+// fallback (with a logged reason) when their flags/headers are absent.
+// Every true-pipeline use is gated on its QWEN21_DRIVER_HAVE_* macro, so
+// this TU builds with or without any of those headers. There is
+// intentionally NO hard dependency here (and none in CMakeLists.txt): the
+// driver probes, never requires.
 //
-// ADAPT: enable the in-process Qwen forward in EncoderStage::run and the
-// real VAE decode in main once the landed forward()/decode() are
-// implemented (see the skeleton notes at those sites).
+// The in-process Qwen encode additionally needs the byte-level BPE tables
+// (models/moss_image/KokkosDNN_QwenTokenizer.hpp, Unicode tables +
+// runtime tokenizer.json load: structurally compatible with the Qwen-Image
+// processor tokenizer.json, no table regen). It is probed on the include
+// path first, then relative to this file for in-tree builds, and gated on
+// QWEN21_DRIVER_HAVE_TOKENIZER.
 #if defined(__has_include)
 #if __has_include("KokkosDNN_QwenImage21Config.hpp")
 #include "KokkosDNN_QwenImage21Config.hpp"
@@ -114,6 +127,13 @@
 #if __has_include("KokkosDNN_QwenImage21Vae.hpp")
 #include "KokkosDNN_QwenImage21Vae.hpp"
 #define QWEN21_DRIVER_HAVE_VAE 1
+#endif
+#if __has_include("KokkosDNN_QwenTokenizer.hpp")
+#include "KokkosDNN_QwenTokenizer.hpp"
+#define QWEN21_DRIVER_HAVE_TOKENIZER 1
+#elif __has_include("../../models/moss_image/KokkosDNN_QwenTokenizer.hpp")
+#include "../../models/moss_image/KokkosDNN_QwenTokenizer.hpp"
+#define QWEN21_DRIVER_HAVE_TOKENIZER 1
 #endif
 #endif
 
@@ -599,10 +619,11 @@ bool file_exists(const std::string& path) {
 }
 
 // Weights source: a single .safetensors file or a directory of shards
-// (sorted). Shared by --text-encoder and --weights. Only needed when a
-// true-pipeline header is present; guarded so header-less builds see no
-// unused-function warning.
-#if defined(QWEN21_DRIVER_HAVE_DIT) || defined(QWEN21_DRIVER_HAVE_ENCODER)
+// (sorted). Shared by --text-encoder, --weights, and --vae-weights. Only
+// needed when a true-pipeline header is present; guarded so header-less
+// builds see no unused-function warning.
+#if defined(QWEN21_DRIVER_HAVE_DIT) || defined(QWEN21_DRIVER_HAVE_ENCODER) || \
+    defined(QWEN21_DRIVER_HAVE_VAE)
 inline std::vector<std::string> resolve_shard_list(const std::string& path,
                                                    const std::string& flag) {
   std::vector<std::string> shards;
@@ -624,6 +645,311 @@ inline std::vector<std::string> resolve_shard_list(const std::string& path,
   return shards;
 }
 #endif
+
+#if defined(QWEN21_DRIVER_HAVE_ENCODER) && \
+    defined(QWEN21_DRIVER_HAVE_TOKENIZER)
+// ---- Raw-text Qwen2 BPE (no chat template) --------------------------------
+// The in-tree Tokenizer only exposes the MOSS single-turn chat-template
+// path (apply_chat_template + encode); the Qwen-Image-2.1 T2I prompt is a
+// RAW template (qwen21_format_prompt_t2i: system block + user + assistant
+// prefix, never the MOSS template), so the driver loads processor/
+// tokenizer.json into local tables and runs the same host-side pipeline
+// (added-special split -> NFC -> Qwen2 pre-tokenizer -> BPE ranks) through
+// the header's public Impl primitives. No table regeneration: the .inc
+// tables are Unicode data; vocab/merges/added come from the JSON at
+// runtime. Logic mirrors Tokenizer::parse_*/encode (same checks, same
+// longest-match split, same right truncation).
+struct RawQwenTables {
+  std::unordered_map<std::string, int> vocab;
+  std::unordered_map<std::string, int> ranks;
+  std::vector<std::pair<std::string, int>> specials;  // longest-first
+  size_t max_special_len = 0;
+  long long top_id = -1;
+  size_t vocab_size = 0;
+};
+
+namespace RawQwenDetail {
+namespace QT = KokkosDNN::QwenTokenizer;
+
+inline void parse_vocab(QT::Impl::JsonCursor& cur, RawQwenTables& t) {
+  cur.ws();
+  if (cur.peek() != '{') cur.fail("vocab must be an object");
+  ++cur.p;
+  t.vocab.reserve(160000);
+  while (true) {
+    cur.ws();
+    if (cur.peek() == '}') {
+      ++cur.p;
+      break;
+    }
+    std::string tok = cur.parse_string();
+    cur.ws();
+    if (cur.peek() != ':') cur.fail("expected ':'");
+    ++cur.p;
+    const long long id = cur.parse_int();
+    if (id < 0 || id > 10000000) cur.fail("vocab id out of range");
+    t.vocab[tok] = (int)id;
+    t.top_id = std::max(t.top_id, id);
+    cur.ws();
+    const char d = cur.peek();
+    if (d == ',') {
+      ++cur.p;
+      continue;
+    }
+    if (d == '}') {
+      ++cur.p;
+      break;
+    }
+    cur.fail("expected ',' or '}'");
+  }
+}
+
+inline void parse_merges(QT::Impl::JsonCursor& cur, RawQwenTables& t) {
+  cur.ws();
+  if (cur.peek() != '[') cur.fail("merges must be an array");
+  ++cur.p;
+  int rank = 0;
+  while (true) {
+    cur.ws();
+    if (cur.peek() == ']') {
+      ++cur.p;
+      break;
+    }
+    if (cur.peek() != '[') cur.fail("merge entry must be an array");
+    ++cur.p;
+    cur.ws();
+    const std::string left = cur.parse_string();
+    cur.ws();
+    if (cur.peek() != ',') cur.fail("expected ',' in merge entry");
+    ++cur.p;
+    const std::string right = cur.parse_string();
+    cur.ws();
+    if (cur.peek() != ']') cur.fail("expected ']' in merge entry");
+    ++cur.p;
+    if (left.empty() || right.empty() || left.find(' ') != std::string::npos ||
+        right.find(' ') != std::string::npos)
+      cur.fail("malformed merge entry");
+    t.ranks[left + " " + right] = rank++;
+    cur.ws();
+    const char d = cur.peek();
+    if (d == ',') {
+      ++cur.p;
+      continue;
+    }
+    if (d == ']') {
+      ++cur.p;
+      break;
+    }
+    cur.fail("expected ',' or ']'");
+  }
+}
+
+inline void parse_model(QT::Impl::JsonCursor& cur, RawQwenTables& t) {
+  cur.ws();
+  if (cur.peek() != '{') cur.fail("model must be an object");
+  ++cur.p;
+  while (true) {
+    cur.ws();
+    if (cur.peek() == '}') {
+      ++cur.p;
+      break;
+    }
+    std::string key = cur.parse_string();
+    cur.ws();
+    if (cur.peek() != ':') cur.fail("expected ':'");
+    ++cur.p;
+    if (key == "vocab") {
+      parse_vocab(cur, t);
+    } else if (key == "merges") {
+      parse_merges(cur, t);
+    } else {
+      cur.skip_value();
+    }
+    cur.ws();
+    const char d = cur.peek();
+    if (d == ',') {
+      ++cur.p;
+      continue;
+    }
+    if (d == '}') {
+      ++cur.p;
+      break;
+    }
+    cur.fail("expected ',' or '}'");
+  }
+}
+
+inline void parse_added(QT::Impl::JsonCursor& cur, RawQwenTables& t) {
+  cur.ws();
+  if (cur.peek() != '[') cur.fail("added_tokens must be an array");
+  ++cur.p;
+  while (true) {
+    cur.ws();
+    if (cur.peek() == ']') {
+      ++cur.p;
+      break;
+    }
+    if (cur.peek() != '{') cur.fail("added token must be an object");
+    ++cur.p;
+    std::string content;
+    long long id = -1;
+    while (true) {
+      cur.ws();
+      if (cur.peek() == '}') {
+        ++cur.p;
+        break;
+      }
+      std::string key = cur.parse_string();
+      cur.ws();
+      if (cur.peek() != ':') cur.fail("expected ':'");
+      ++cur.p;
+      if (key == "content") {
+        content = cur.parse_string();
+      } else if (key == "id") {
+        id = cur.parse_int();
+      } else {
+        cur.skip_value();
+      }
+      cur.ws();
+      const char d = cur.peek();
+      if (d == ',') {
+        ++cur.p;
+        continue;
+      }
+      if (d == '}') {
+        ++cur.p;
+        break;
+      }
+      cur.fail("expected ',' or '}'");
+    }
+    if (content.empty() || id < 0) cur.fail("bad added token entry");
+    t.specials.emplace_back(content, (int)id);
+    t.top_id = std::max(t.top_id, id);
+    cur.ws();
+    const char d = cur.peek();
+    if (d == ',') {
+      ++cur.p;
+      continue;
+    }
+    if (d == ']') {
+      ++cur.p;
+      break;
+    }
+    cur.fail("expected ',' or ']'");
+  }
+}
+}  // namespace RawQwenDetail
+
+inline RawQwenTables load_raw_qwen_tables(const std::string& path) {
+  namespace QT = KokkosDNN::QwenTokenizer;
+  std::ifstream f(path, std::ios::binary);
+  if (!f)
+    throw std::runtime_error("raw Qwen tables: cannot open '" + path + "'");
+  std::ostringstream ss;
+  ss << f.rdbuf();
+  const std::string js = ss.str();
+  QT::Impl::JsonCursor cur{js.data(), js.data() + js.size(), js.data()};
+  cur.ws();
+  if (cur.peek() != '{') cur.fail("top level must be an object");
+  ++cur.p;
+  RawQwenTables t;
+  bool have_model = false;
+  while (true) {
+    cur.ws();
+    if (cur.peek() == '}') {
+      ++cur.p;
+      break;
+    }
+    std::string key = cur.parse_string();
+    cur.ws();
+    if (cur.peek() != ':') cur.fail("expected ':'");
+    ++cur.p;
+    if (key == "model") {
+      RawQwenDetail::parse_model(cur, t);
+      have_model = true;
+    } else if (key == "added_tokens") {
+      RawQwenDetail::parse_added(cur, t);
+    } else {
+      cur.skip_value();
+    }
+    cur.ws();
+    const char d = cur.peek();
+    if (d == ',') {
+      ++cur.p;
+      continue;
+    }
+    if (d == '}') {
+      ++cur.p;
+      break;
+    }
+    cur.fail("expected ',' or '}'");
+  }
+  if (!have_model || t.vocab.empty())
+    throw std::runtime_error("raw Qwen tables: no model.vocab in '" + path +
+                             "'");
+  if (t.ranks.empty())
+    throw std::runtime_error("raw Qwen tables: no model.merges in '" + path +
+                             "'");
+  if (t.specials.empty())
+    throw std::runtime_error("raw Qwen tables: no added_tokens in '" + path +
+                             "'");
+  std::sort(t.specials.begin(), t.specials.end(),
+            [](const auto& a, const auto& b) {
+              return a.first.size() > b.first.size();
+            });
+  t.vocab_size = (size_t)(t.top_id + 1);
+  for (const auto& kv : t.specials)
+    t.max_special_len = std::max(t.max_special_len, kv.first.size());
+  return t;
+}
+
+// Raw-text encode: added-special longest-match split over the RAW text,
+// then (per gap) NFC -> Qwen2 pre-tokenizer -> BPE ranks, right-truncated
+// to max_len. No template is applied; the caller passes the already
+// formatted T2I string (qwen21_format_prompt_t2i).
+inline std::vector<int> encode_qwen_raw(const RawQwenTables& t,
+                                        const std::string& text,
+                                        size_t max_len) {
+  namespace QT = KokkosDNN::QwenTokenizer;
+  if (max_len == 0)
+    throw std::invalid_argument("encode_qwen_raw: max_len == 0");
+  std::vector<int> ids;
+  size_t i = 0;
+  const size_t n = text.size();
+  size_t seg_start = 0;
+  auto flush_gap = [&](size_t end) {
+    if (end == seg_start) return;
+    const std::string gap = text.substr(seg_start, end - seg_start);
+    std::vector<uint32_t> cps = QT::Impl::utf8_decode(gap);
+    QT::Impl::nfc_inplace(cps);
+    for (const auto& pre : QT::Impl::pretokenize(cps))
+      QT::Impl::bpe_encode_pretoken(pre, t.vocab, t.ranks, ids);
+  };
+  while (i < n) {
+    size_t hit_len = 0;
+    int hit_id = -1;
+    for (const auto& kv : t.specials) {
+      const size_t L = kv.first.size();
+      if (L > hit_len && i + L <= n && text.compare(i, L, kv.first) == 0) {
+        hit_len = L;
+        hit_id = kv.second;
+        if (L == t.max_special_len) break;
+      }
+    }
+    if (hit_len) {
+      flush_gap(i);
+      ids.push_back(hit_id);
+      i += hit_len;
+      seg_start = i;
+    } else {
+      ++i;
+    }
+  }
+  flush_gap(n);
+  if (ids.size() > max_len) ids.resize(max_len);
+  return ids;
+}
+#endif  // QWEN21_DRIVER_HAVE_ENCODER + QWEN21_DRIVER_HAVE_TOKENIZER
 
 // Encode stage: owns the caption-embedding state that the text encoder
 // produces and hands to the DiT sample phase (cond + null uncond).
@@ -675,6 +1001,116 @@ struct EncoderStage {
 // (ADAPT: implement the tokenize + on-device forward here once the landed
 // encoder forward() works.)
 
+#if defined(QWEN21_DRIVER_HAVE_ENCODER) && \
+    defined(QWEN21_DRIVER_HAVE_TOKENIZER)
+  // In-process Qwen forward: raw-text BPE (no chat template) of the T2I
+  // prompt, then the landed QwenImage21EncoderModel forward on-device.
+  // The pipeline drop_idx counts ONLY the system block
+  // ("<|im_start|>system\n<sys><|im_end|>\n", 14 ids for the fixed T2I
+  // prompt, matching diffusers'
+  // len(apply_chat_template(sys-only message))); the surviving rows START
+  // with the "<|im_start|>user\n" prefix (golden prompt_embeds row 0 is
+  // <|im_start|>). Using the full-head count would eat those live rows, so
+  // the user prefix is split off here (models/ is frozen) and the split is
+  // verified to re-encode id-for-id. The uncond branch stays zeros,
+  // matching the file/null path (guidance 1.0 takes no CFG branch anyway).
+  // The encoder weights are released before returning; only the [L,Cc]
+  // embeds survive (staged to device here), so the encoder and DiT are
+  // never resident together.
+  template <class CfgT>
+  static void run_qwen(EncoderStage& st, const CfgT& cfg,
+                       const std::string& prompt,
+                       const std::string& tokenizer_dir,
+                       const std::string& encoder_path) {
+    namespace QE = KokkosDNN::QwenImage21Encoder;
+    const std::string tok_json = tokenizer_dir + "/tokenizer.json";
+    if (!file_exists(tok_json))
+      throw std::runtime_error("--tokenizer '" + tokenizer_dir +
+                               "' has no tokenizer.json (need the "
+                               "Qwen-Image-2.1 processor/ dir)");
+    const RawQwenTables tabs = load_raw_qwen_tables(tok_json);
+    const size_t max_len = be_max_seq(cfg);
+    // Pipeline drop_idx = system block only (see above): qwen21_t2i_head()
+    // is that block plus the "<|im_start|>user\n" prefix, which stays in
+    // the conditioning sequence.
+    const std::string kUserPrefix = "<|im_start|>user\n";
+    const std::string full_head = QE::qwen21_t2i_head();
+    if (full_head.size() < kUserPrefix.size() ||
+        full_head.compare(full_head.size() - kUserPrefix.size(),
+                          kUserPrefix.size(), kUserPrefix) != 0)
+      throw std::runtime_error(
+          "in-process Qwen encode: T2I head lost its user-role prefix");
+    const std::string sys_block =
+        full_head.substr(0, full_head.size() - kUserPrefix.size());
+    const std::vector<int> sys_ids = encode_qwen_raw(tabs, sys_block, max_len);
+    const std::vector<int> prefix_ids =
+        encode_qwen_raw(tabs, kUserPrefix, max_len);
+    const std::vector<int> head_ids =
+        encode_qwen_raw(tabs, full_head, max_len);
+    if (sys_ids.empty() || prefix_ids.empty() || head_ids.empty() ||
+        head_ids.size() != sys_ids.size() + prefix_ids.size() ||
+        !std::equal(sys_ids.begin(), sys_ids.end(), head_ids.begin()) ||
+        !std::equal(prefix_ids.begin(), prefix_ids.end(),
+                    head_ids.begin() + (long)sys_ids.size()))
+      throw std::runtime_error(
+          "in-process Qwen encode: T2I head/prefix split mismatch");
+    const std::vector<int> ids =
+        encode_qwen_raw(tabs, QE::qwen21_format_prompt_t2i(prompt), max_len);
+    if (head_ids.empty() || ids.size() <= head_ids.size())
+      throw std::runtime_error(
+          "in-process Qwen encode: empty conditioning sequence");
+    const size_t drop = sys_ids.size(), S = ids.size();
+    QE::Config ecfg;
+    ecfg.validate();
+    if ((size_t)ecfg.hidden_dim != st.Cc)
+      throw std::runtime_error(
+          "Qwen encoder hidden (" + std::to_string(ecfg.hidden_dim) +
+          ") != caption dim (" + std::to_string(st.Cc) + ")");
+    QE::QwenImage21EncoderModel<Exec, Kokkos::Experimental::bhalf_t> enc(ecfg);
+    const std::vector<std::string> shards =
+        resolve_shard_list(encoder_path, "--text-encoder");
+    if (shards.size() != 1)
+      throw std::runtime_error(
+          "--text-encoder must be the single-shard text_encoder/ "
+          "model.safetensors (got " +
+          std::to_string(shards.size()) + " shards)");
+    std::printf("[loading %s]\n", encoder_path.c_str());
+    enc.weights().load_safetensors(shards[0]);
+    std::printf("[encode] Qwen weights resident: %.1f GB\n",
+                (double)enc.weights().resident_bytes() / 1e9);
+    Kokkos::View<int**, Kokkos::LayoutRight, Exec> toks("qwen21enc_toks", 1, S);
+    {
+      auto hm = Kokkos::create_mirror_view(toks);
+      for (size_t s = 0; s < S; ++s) hm(0, s) = ids[s];
+      Kokkos::deep_copy(toks, hm);
+    }
+    Kokkos::View<Kokkos::Experimental::bhalf_t***, Kokkos::LayoutRight, Exec>
+        hid("qwen21enc_hid", 1, S, (size_t)ecfg.hidden_dim);
+    KokkosDNN::DNNHandle<Exec> handle;
+    enc.forward(handle, toks, hid, (int)drop);
+    Kokkos::fence();
+    auto hhid = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), hid);
+    const size_t L = S - drop, Cc = st.Cc;
+    st.L = L;
+    st.embeds.assign(L * Cc, 0.0f);
+    st.neg_embeds.assign(L * Cc, 0.0f);
+    for (size_t t = 0; t < L; ++t)
+      for (size_t h = 0; h < Cc; ++h)
+        st.embeds[t * Cc + h] = (float)hhid(0, drop + t, h);
+    const size_t wbytes = enc.weights().resident_bytes();
+    enc.weights().release();
+    Kokkos::fence();
+    std::printf("[encode] released %.1f GB Qwen weights; %.1f MiB embeds "
+                "survive for the sample phase\n",
+                (double)wbytes / 1e9,
+                (double)(2 * L * Cc * sizeof(float)) / (1024.0 * 1024.0));
+    st.stage_device();
+    std::printf("[caption qwen] %zux%zu features (raw T2I template, "
+                "drop_idx=%zu, tok_vocab=%zu)\n",
+                st.L, st.Cc, drop, tabs.vocab_size);
+  }
+#endif
+
   template <class CfgT>
   static EncoderStage run(const CfgT& cfg, const std::string& prompt,
                           const std::string& caption_path,
@@ -683,15 +1119,42 @@ struct EncoderStage {
     EncoderStage st;
     st.L = be_max_seq(cfg);
     st.Cc = be_caption_dim(cfg);
-#ifdef QWEN21_DRIVER_HAVE_ENCODER
-    // The landed QwenImage21EncoderModel::forward is still a skeleton (it
-    // throws TODO), so the in-process forward is unavailable even with the
-    // header present: fall through to file/null with a logged reason.
-    // (ADAPT: tokenize + run the encoder forward here once it lands.)
+#if defined(QWEN21_DRIVER_HAVE_ENCODER) && \
+    defined(QWEN21_DRIVER_HAVE_TOKENIZER)
+    // In-process Qwen forward when --tokenizer + --text-encoder are given
+    // (and not --tiny: the smoke model uses random weights at test geometry,
+    // which real token ids cannot address). A throw inside the attempt
+    // falls back to file/null with a logged reason instead of failing.
+    if (!tiny && (!tokenizer_dir.empty() || !encoder_path.empty())) {
+      if (tokenizer_dir.empty() || encoder_path.empty())
+        throw std::runtime_error(
+            "--tokenizer and --text-encoder must be given together for the "
+            "in-process Qwen forward");
+      try {
+        run_qwen(st, cfg, prompt, tokenizer_dir, encoder_path);
+        return st;
+      } catch (const std::exception& e) {
+        std::fprintf(stderr,
+                     "warning: in-process Qwen encode failed (%s); falling "
+                     "back to %s\n",
+                     e.what(), caption_path.empty() ? "null" : "file");
+        // run_qwen only mutates st on success, but reset the dims anyway so
+        // the file/null path below always sizes from the backend maximum.
+        st.L = be_max_seq(cfg);
+        st.Cc = be_caption_dim(cfg);
+      }
+    }
+    if (tiny && (!tokenizer_dir.empty() || !encoder_path.empty()))
+      std::printf("[encode] --tiny skips the Qwen forward (random-weights "
+                  "smoke model); falling back to %s\n",
+                  caption_path.empty() ? "null" : "file");
+#elif defined(QWEN21_DRIVER_HAVE_ENCODER)
+    // The encoder header is present but the BPE tables header is not, so
+    // the in-process forward cannot tokenize: fall through to file/null.
     if (!tiny && (!tokenizer_dir.empty() || !encoder_path.empty()))
-      std::printf("[encode] --tokenizer/--text-encoder need a working "
-                  "QwenImage21EncoderModel::forward (still a skeleton TODO "
-                  "in this build); falling back to %s\n",
+      std::printf("[encode] --tokenizer/--text-encoder need "
+                  "KokkosDNN_QwenTokenizer.hpp, not present in this "
+                  "build; falling back to %s\n",
                   caption_path.empty() ? "null" : "file");
     if (tiny && (!tokenizer_dir.empty() || !encoder_path.empty()))
       std::printf("[encode] --tiny skips the Qwen forward (random-weights "
@@ -832,7 +1295,8 @@ std::vector<float> run_sample_loop_from_device(
     const Kokkos::View<float**, Kokkos::LayoutRight, Exec>& cond_d,
     const Kokkos::View<float**, Kokkos::LayoutRight, Exec>& uncond_d,
     int steps, float guidance, float shift, int H, int W,
-    const std::function<void(int, float, float)>& on_step = {}) {
+    const std::function<void(int, float, float)>& on_step = {},
+    const std::vector<float>* sigmas_override = nullptr) {
   if (steps <= 0)
     throw std::invalid_argument("qwen21 sample: steps must be > 0");
   if (!std::isfinite(guidance) || guidance < 0.0f)
@@ -902,7 +1366,10 @@ std::vector<float> run_sample_loop_from_device(
       });
   Kokkos::fence();
 
-  const std::vector<float> sigmas = build_sigmas_nearest_grid(steps, shift);
+  const std::vector<float> sigmas =
+      (sigmas_override && !sigmas_override->empty())
+          ? *sigmas_override
+          : build_sigmas_nearest_grid(steps, shift);
   std::vector<float> tvals(sigmas.size());
   for (size_t i = 0; i < sigmas.size(); ++i) tvals[i] = 1000.0f * sigmas[i];
   const int n = (int)sigmas.size() - 1;
@@ -1026,6 +1493,90 @@ struct DitForward {
 };
 #endif
 
+#ifdef QWEN21_DRIVER_HAVE_VAE
+// Real VAE decode: raw DiT latents [C,H,W] host float -> device [1,C,H,W]
+// -> pipeline denormalize (x*std+mean per channel, runtime affine from
+// vae/config.json) -> QwenImage21VaeModel::decode -> RGBA [oH,oW,4] u8
+// (x*0.5+0.5 by the pipeline, PNG alpha = ch 3). Returns true on success
+// (pix/oH/oW/oCh set, decoded); throws with a reason otherwise so the
+// caller can fall back to the grayscale preview.
+inline bool try_vae_decode_rgba(const std::vector<float>& lat, size_t C,
+                                size_t H, size_t W,
+                                const std::string& vae_weights,
+                                std::vector<unsigned char>& pix, size_t& oH,
+                                size_t& oW, int& oCh) {
+  namespace QV = KokkosDNN::QwenImage21Vae;
+  QV::Config vcfg;
+  {
+    std::error_code ec;
+    std::string cfg_path;
+    if (std::filesystem::is_directory(vae_weights, ec)) {
+      cfg_path = vae_weights + "/config.json";
+    } else {
+      const std::filesystem::path p(vae_weights);
+      cfg_path = p.has_parent_path()
+                     ? (p.parent_path() / "config.json").string()
+                     : "config.json";
+    }
+    QV::qwen21_load_vae_config_json(cfg_path, vcfg);
+  }
+  vcfg.validate();
+  std::printf("[vae affine %zuch] mean[0]=%.4g std[0]=%.4g (runtime "
+              "vae/config.json)\n",
+              (size_t)vcfg.z_dim, (double)vcfg.latents_mean[0],
+              (double)vcfg.latents_std[0]);
+  QV::QwenImage21VaeModel<Exec, DScalar> dec(vcfg);
+  {
+    std::error_code ec;
+    std::vector<std::string> shards =
+        std::filesystem::is_directory(vae_weights, ec)
+            ? resolve_shard_list(vae_weights, "--vae-weights")
+            : std::vector<std::string>{vae_weights};
+    std::printf("[loading %s]%s\n", vae_weights.c_str(),
+                shards.size() > 1 ? " (shards)" : "");
+    dec.weights().load_safetensors(shards);
+    std::printf("[vae] weights resident: %.3f GB\n",
+                (double)dec.weights().resident_bytes() / 1e9);
+  }
+  using V4 = Kokkos::View<DScalar****, Kokkos::LayoutRight, Exec>;
+  V4 z("qwen21vae_z", 1, C, H, W);
+  {
+    auto zh = Kokkos::create_mirror_view(z);
+    size_t k = 0;
+    for (size_t c = 0; c < C; ++c)
+      for (size_t h = 0; h < H; ++h)
+        for (size_t w = 0; w < W; ++w)
+          zh(0, c, h, w) = (DScalar)lat[k++];
+    Kokkos::deep_copy(z, zh);
+  }
+  KokkosDNN::DNNHandle<Exec> handle;
+  V4 zden = QV::QwenImage21VaeModel<Exec, DScalar>::denormalize_latents(z,
+                                                                       vcfg);
+  oH = (size_t)vcfg.compression * H;
+  oW = (size_t)vcfg.compression * W;
+  V4 rgba("qwen21vae_rgba", 1, (size_t)vcfg.out_channels, oH, oW);
+  dec.decode(handle, zden, rgba);
+  Kokkos::fence();
+  auto rh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), rgba);
+  pix.resize(oH * oW * (size_t)vcfg.out_channels);
+  for (size_t h = 0; h < oH; ++h)
+    for (size_t w = 0; w < oW; ++w)
+      for (int c = 0; c < vcfg.out_channels; ++c) {
+        float v = std::min(1.0f, std::max(-1.0f, (float)rh(0, (size_t)c, h, w))) *
+                      0.5f +
+                  0.5f;
+        v = std::min(1.0f, std::max(0.0f, v));
+        pix[(h * oW + w) * (size_t)vcfg.out_channels + (size_t)c] =
+            (unsigned char)(std::lround(255.0f * v));
+      }
+  oCh = vcfg.out_channels;
+  dec.weights().release();
+  Kokkos::fence();
+  QW::print_phase_memory("decode", 0, 0);
+  return true;
+}
+#endif  // QWEN21_DRIVER_HAVE_VAE
+
 void usage() {
   std::printf(
       "usage: qwen_image_21_generate [--tiny] [--weights transformer_dir]\n"
@@ -1035,6 +1586,7 @@ void usage() {
       "                    [--prompt-embeds-in feats.f32]\n"
       "                    [--height H] [--width W]\n"
       "                    [--steps N] [--cfg G] [--shift S]\n"
+      "                    [--sigmas driver|turbo]\n"
       "                    [--seed N]\n"
       "                    [--vae-weights vae.safetensors [--vae-decode]]\n"
       "                    [--out img.png]\n"
@@ -1048,8 +1600,8 @@ void usage() {
       "                 --tokenizer + --text-encoder, else needs\n"
       "                 --text-weights, else null)\n"
       "  --tokenizer    dir holding tokenizer.json;\n"
-      "                 requests the in-process Qwen forward with\n"
-      "                 --text-encoder (skeleton: falls back, see log)\n"
+      "                 with --text-encoder runs the in-process Qwen forward\n"
+      "                 (raw T2I template, no chat template)\n"
       "  --text-weights raw float32 LE caption features [L,Cc]\n"
       "                 (L <= maxlen, Cc == caption dim)\n"
       "  --text-encoder Qwen text-encoder weights: text_encoder/ shard dir\n"
@@ -1064,11 +1616,16 @@ void usage() {
       "  --steps        Euler steps (default 8 Turbo; --tiny forces 2\n"
       "                 unless --steps is given)\n"
       "  --cfg/--guidance CFG scale (!=1 takes the CFG branch; default 1.0)\n"
-      "  --shift/--flow-shift flow-matching sigma shift (default 3.0)\n"
+      "  --shift/--flow-shift flow-matching sigma shift (default 3.0;\n"
+      "                 ignored under --sigmas turbo)\n"
+      "  --sigmas       'driver' (default): nearest-grid schedule from\n"
+      "                 --steps/--shift; 'turbo': checkpoint sample_sigmas\n"
+      "                 verbatim (mu-shifted already, 8 steps, shift=1.0)\n"
       "  --seed         latent init seed (default 42)\n"
       "  --vae-weights  VAE checkpoint (validated whenever given)\n"
-      "  --vae-decode   run the real VAE decode when the VAE header +\n"
-      "                 weights are present (else grayscale preview)\n"
+      "  --vae-decode   run the real VAE decode (denormalize by the runtime\n"
+      "                 vae/config.json affine, decode to RGBA) when the VAE\n"
+      "                 header + weights are present, else grayscale preview\n"
       "  --out          PNG with KokkosDNN_ENABLE_IMAGE=ON, else PPM;\n"
       "                 raw F32 latents always written to <stem>.f32\n");
 }
@@ -1085,6 +1642,7 @@ int main(int argc, char** argv) {
   int steps = 8;
   bool steps_given = false;
   float guidance = 1.0f, flow_shift = 3.0f;
+  std::string sigmas_mode = "driver";
   uint64_t seed = 42;
   bool tiny = false;
   bool staged = false, vae_decode = false;
@@ -1129,6 +1687,14 @@ int main(int argc, char** argv) {
       guidance = std::stof(argv[++i]);
     } else if ((a == "--shift" || a == "--flow-shift") && i + 1 < argc) {
       flow_shift = std::stof(argv[++i]);
+    } else if (a == "--sigmas" && i + 1 < argc) {
+      sigmas_mode = argv[++i];
+      if (sigmas_mode != "driver" && sigmas_mode != "turbo") {
+        std::fprintf(stderr, "error: --sigmas must be 'driver' or 'turbo' "
+                             "(got '%s')\n",
+                     sigmas_mode.c_str());
+        return 1;
+      }
     } else if (a == "--seed" && i + 1 < argc) {
       seed = (uint64_t)std::stoull(argv[++i]);
     } else if (a == "--tiny") {
@@ -1290,7 +1856,9 @@ int main(int argc, char** argv) {
                 QW::kDitBudgetBytes / 1e9, QW::kVaeBudgetBytes / 1e9);
 
     if (!vae_weights.empty()) {
-      if (!file_exists(vae_weights))
+      std::error_code ec0;
+      const bool vae_is_dir = std::filesystem::is_directory(vae_weights, ec0);
+      if (!vae_is_dir && !file_exists(vae_weights))
         throw std::runtime_error("vae weights file '" + vae_weights +
                                  "' not found");
 #ifdef QWEN21_DRIVER_HAVE_VAE
@@ -1310,8 +1878,33 @@ int main(int argc, char** argv) {
 
     std::vector<float> x_init =
         QW::sample_gaussian(C * (size_t)H * (size_t)W, seed);
+    // Sigma schedule: 'driver' (default, current behavior) builds the
+    // nearest-grid schedule from --steps/--shift; 'turbo' uses the
+    // checkpoint sample_sigmas verbatim (mu-shifted already, so shift is
+    // 1.0/no-shift in that mode) plus a terminal 0, i.e. 8 Euler steps.
+    std::vector<float> turbo_sigmas;
+    if (sigmas_mode == "turbo") {
+#ifdef QWEN21_DRIVER_HAVE_OPS
+      for (double s : cfg.sample_sigmas)
+        turbo_sigmas.push_back((float)s);
+      turbo_sigmas.push_back(0.0f);
+      std::printf("[schedule turbo] checkpoint sample_sigmas verbatim "
+                  "(mu-shifted already; --shift/--steps ignored except for "
+                  "this note)\n");
+#else
+      throw std::runtime_error(
+          "--sigmas turbo needs the true QwenImage21::Config "
+          "(KokkosDNN_QwenImage21Config.hpp is not in this build)");
+#endif
+    }
+    const int steps_run =
+        (sigmas_mode == "turbo") ? (int)turbo_sigmas.size() - 1 : steps_eff;
+    if (sigmas_mode == "turbo" && steps_given && steps != steps_run)
+      std::printf("[schedule turbo] ignoring --steps %d (checkpoint schedule "
+                  "has %d steps)\n",
+                  steps, steps_run);
     std::printf("[sample] H=%d W=%d steps=%d cfg=%.3g shift=%.3g seed=%llu\n",
-                H, W, steps_eff, (double)guidance, (double)flow_shift,
+                H, W, steps_run, (double)guidance, (double)flow_shift,
                 (unsigned long long)seed);
 #ifdef QWEN21_DRIVER_HAVE_DIT
     KokkosDNN::DNNHandle<Exec> dit_handle;
@@ -1326,17 +1919,19 @@ int main(int argc, char** argv) {
     // as the fallback for the --prompt-embeds-in file path, which also lands
     // staged on-device via EncoderStage::run.
     std::vector<float> lat = run_sample_loop_from_device(
-        cfg, dit_forward, x_init, enc.device, enc.device_neg, steps_eff,
-        guidance, flow_shift, H, W, [](int i, float t, float sg) {
+        cfg, dit_forward, x_init, enc.device, enc.device_neg, steps_run,
+        guidance, flow_shift, H, W,
+        [](int i, float t, float sg) {
           std::printf("  step %3d t=%9.3f sigma=%.6f\n", i, (double)t,
                       (double)sg);
           std::fflush(stdout);
-        });
+        },
+        (sigmas_mode == "turbo") ? &turbo_sigmas : nullptr);
     const double secs =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
             .count();
     std::printf("[done] %.2fs total, %.2fs/step\n", secs,
-                secs / (double)std::max(steps_eff, 1));
+                secs / (double)std::max(steps_run, 1));
 
     double mean = 0.0, var = 0.0, mn = lat[0], mx = lat[0];
     for (float v : lat) {
@@ -1373,12 +1968,17 @@ int main(int argc, char** argv) {
     bool decoded = false;
     if (vae_decode) {
 #ifdef QWEN21_DRIVER_HAVE_VAE
-      std::printf("[vae] --vae-decode requested but the landed "
-                  "QwenImage21VaeModel::decode is still a skeleton (TODO); "
-                  "writing a grayscale preview instead\n");
-      // (ADAPT: run the real VAE decode here once the landed decode() is
-      // implemented: allocate QwenImage21VaeWeights, load_safetensors, scale
-      // latents by the runtime affine, QwenImage21VaeModel::decode to RGB.)
+      try {
+        decoded = try_vae_decode_rgba(lat, C, (size_t)H, (size_t)W,
+                                      vae_weights, pix, oH, oW, oCh);
+        std::printf("[decode] VAE RGBA %zux%zux%d ready for output\n", oH, oW,
+                    oCh);
+      } catch (const std::exception& e) {
+        std::fprintf(stderr,
+                     "warning: real VAE decode failed (%s); writing a "
+                     "grayscale preview instead\n",
+                     e.what());
+      }
 #else
       std::printf("[vae] --vae-decode requested but "
                   "KokkosDNN_QwenImage21Vae.hpp is not in this build; writing "
@@ -1410,7 +2010,18 @@ int main(int argc, char** argv) {
                     "to %s instead of PNG %s\n",
                     ppm.c_str(), out.c_str());
       if (decoded) {
-        save_ppm_rgb(ppm, pix, oH, oW);
+        if (oCh == 4) {
+          // PPM has no alpha: drop it (PNG keeps RGBA).
+          std::vector<unsigned char> rgb(oH * oW * 3);
+          for (size_t k = 0; k < oH * oW; ++k) {
+            rgb[3 * k] = pix[4 * k];
+            rgb[3 * k + 1] = pix[4 * k + 1];
+            rgb[3 * k + 2] = pix[4 * k + 2];
+          }
+          save_ppm_rgb(ppm, rgb, oH, oW);
+        } else {
+          save_ppm_rgb(ppm, pix, oH, oW);
+        }
       } else {
         save_ppm(ppm, pix, oH, oW);
       }

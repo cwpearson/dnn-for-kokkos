@@ -37,12 +37,14 @@ of scope for this driver; there is no image-conditioning flag by design.
 `--weights` takes the `transformer/` dir (or a single `.safetensors`);
 `--text-encoder` takes `text_encoder/` (or `model.safetensors`);
 `--tokenizer` takes the `processor/` dir; `--vae-weights` takes the VAE
-file. The `models/qwen_image_21` headers are present, so `--tiny` runs the
-real DiT geometry on random weights; full-geometry runs need the checkpoint
-files above. In-process Qwen encoding (`--tokenizer` + `--text-encoder`)
-and real VAE decode are still skeleton TODOs in the landed lib, so those
-phases fall back to file/null embeds + grayscale preview with a logged
-reason instead of failing.
+file (or dir). The `models/qwen_image_21` headers are present, so `--tiny`
+runs the real DiT geometry on random weights and full-geometry runs use
+the checkpoint files above. In-process Qwen encoding (`--tokenizer` +
+`--text-encoder`: raw-text BPE of the T2I template + `EncoderModel`
+forward, uncond zeros) and real VAE decode (runtime `vae/config.json`
+affine denormalize + `VaeModel::decode` to RGBA) are wired in; when their
+flags/headers are absent those phases fall back to file/null embeds +
+grayscale preview with a logged reason instead of failing.
 
 ## Flags
 
@@ -58,7 +60,8 @@ reason instead of failing.
 | `--height`/`--width` | 64 | latent H/W; x16 = pixels, so 64 means 1024px (placeholder path needs multiples of 16) |
 | `--steps` | 8 (Turbo) | Euler steps (`--tiny` forces 2 unless `--steps` is given) |
 | `--cfg`/`--guidance` | 1.0 | CFG scale (!=1 takes the CFG branch) |
-| `--shift`/`--flow-shift` | 3.0 | flow-matching sigma shift |
+| `--shift`/`--flow-shift` | 3.0 | flow-matching sigma shift (ignored under `--sigmas turbo`) |
+| `--sigmas` | `driver` | `driver`: nearest-grid schedule from `--steps`/`--shift` (default, unchanged); `turbo`: checkpoint `sample_sigmas` verbatim (mu-shifted already, 8 steps, shift=1.0/no-shift) |
 | `--seed` | 42 | latent init seed |
 | `--vae-weights` | — | VAE checkpoint (validated whenever given) |
 | `--vae-decode` | off | real VAE decode when the VAE header + weights are present, else grayscale preview |
