@@ -8,3 +8,4 @@
 compile_commands.json
 docs/_build/
 /RELEASE_TODOS.md
+/weights/
