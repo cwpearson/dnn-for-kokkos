@@ -50,6 +50,7 @@ add_executable(kokkosdnn_bench
   Bench_AttentionSliding.cpp
   Bench_AttentionBidirectional.cpp
   Bench_DecodeAttention.cpp
+  Bench_MoeDecode.cpp
   Bench_Elementwise.cpp
   Bench_Sampler.cpp
 )
