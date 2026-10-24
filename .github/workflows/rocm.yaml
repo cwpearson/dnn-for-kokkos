@@ -45,7 +45,7 @@ jobs:
       KOKKOS_INSTALL: ${{ github.workspace }}/kokkos-install
       ROCM_PATH: /opt/rocm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install build tools
         run: |
@@ -97,7 +97,7 @@ jobs:
       # submodules: recursive is required: the build needs desul/mdspan,
       # which git does not fetch by default.
       - name: Check out Kokkos
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: kokkos/kokkos
           ref: ${{ env.KOKKOS_VERSION }}

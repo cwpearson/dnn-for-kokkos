@@ -27,7 +27,7 @@ jobs:
       SMOLLM2_REPO: HuggingFaceTB/SmolLM2-135M
       SMOLLM2_DIR: ${{ github.workspace }}/smollm2-weights
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install build tools
         run: |
@@ -38,7 +38,7 @@ jobs:
       # submodules: recursive is required: the build needs desul/mdspan,
       # which git does not fetch by default.
       - name: Check out Kokkos
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: kokkos/kokkos
           ref: ${{ env.KOKKOS_VERSION }}
@@ -78,7 +78,7 @@ jobs:
       # (e.g. if the upstream weights change).
       - name: Cache SmolLM2-135M weights
         id: cache-smollm2
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: smollm2-weights
           key: smollm2-135m-v1
