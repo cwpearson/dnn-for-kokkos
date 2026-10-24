@@ -764,8 +764,11 @@ void log_encode_memory(const EncoderStage& st) {
 // Inference grid with `shift`, snapped to the nearest training-grid
 // (shift 1.0, 1000 points) entries, then a terminal 0 is appended.
 // unique_consecutive may shrink the count, so the caller must use
-// sigmas.size()-1 as the step count. Model timestep inputs are 1000*sig,
-// and the Euler update is x += (sig[i+1]-sig[i]) * v.
+// sigmas.size()-1 as the step count. The sample-loop `t` view carries
+// 1000*sig (placeholder-model and step-logging convention); the true DiT
+// forward takes the RAW [0, 1] sigma (scales by 1000 internally), so its
+// adapter divides back by 1000 at the call site. The Euler update is
+// x += (sig[i+1]-sig[i]) * v.
 inline std::vector<float> build_sigmas_nearest_grid(int steps, float shift) {
   if (steps <= 0)
     throw std::invalid_argument("qwen21 schedule: steps must be > 0");
@@ -1000,7 +1003,10 @@ struct DitForward {
       auto th = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), t);
       ts = th(0);
     }
-    model->forward(*handle, xtok, ytok, (double)ts, vtok, HH, WW);
+    // The sample-loop `t` view carries 1000*sigma (placeholder path and
+    // step logging convention); the real DiT forward takes the RAW [0, 1]
+    // sigma and scales by time_factor 1000 internally, so divide back here.
+    model->forward(*handle, xtok, ytok, (double)ts / 1000.0, vtok, HH, WW);
     Kokkos::parallel_for(
         "qwen21_fwd_unpack",
         Kokkos::MDRangePolicy<Exec, Kokkos::Rank<3>>({0, 0, 0}, {HH, WW, C}),

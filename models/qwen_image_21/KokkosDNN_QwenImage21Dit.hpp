@@ -27,17 +27,24 @@
 //
 // Dispatch contract (no backend-gated code anywhere here):
 //   * Every Linear goes through KokkosDNN::gemm (cuBLAS/hipBLAS ladder).
-//   * Joint attention goes through attention_mha_bidirectional (cuDNN SDPA
-//     ladder, else native streaming kernel).
-//   * Norms / SiLU / AdaLN go through the core entry points (rmsnorm,
-//     silu_forward, adaln_modulate_forward).
+//   * Joint attention is exact prefill segmentation mirroring
+//     QwenImage21AttnProcessor: the text prefix [0, S) runs causal
+//     attention_gqa_single (q_off = 0), the target rows [S, T) run full
+//     attention_mha_bidirectional over all keys (cuDNN SDPA ladder, else
+//     native streaming kernels). Pure T2I has a single text segment, so no
+//     per-segment loop is needed.
+//   * Block norms are affine-free LayerNorm (layernorm_noaffine_forward);
+//     RMSNorm survives only where the reference has it (QK norm_q/norm_k,
+//     ZeroCenterRMSNorm in txt_in).
+//   * SiLU / AdaLN scales go through the core entry points (silu_forward,
+//     layernorm_noaffine_forward).
 //   * The only device code added here (Impl::qwen21dit_* helpers) is
-//     small elementwise/layout glue with no TPL equivalent: zero-center
-//     norm, GELU-tanh, SwiGLU multiply, per-head QK RMSNorm, 3-axis RoPE,
+//     small elementwise/layout glue with no TPL equivalent: zero-centered
+//     norm, GELU-tanh, SwiGLU multiply, per-head QK RMSNorm, 3-axis RoPE
+//     with text-shared positions + zero-centered image grids, per-region
 //     scale/gate application, BCHW<->row transposes, column splits.
-// Forward() is a shape-correct skeleton that compiles and runs on
-// random_init() weights; numeric parity against the reference pipeline is
-// a TODO (golden test), explicitly marked below.
+// Forward() is shape-correct and follows the reference numerics lane by
+// lane (see GOLDEN notes below); KV-cache decode is out of scope.
 
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
@@ -56,6 +63,7 @@
 #include "KokkosDNN_Diffusion.hpp"
 #include "KokkosDNN_Gemm.hpp"
 #include "KokkosDNN_Handle.hpp"
+#include "KokkosDNN_LayerNorm.hpp"
 #include "KokkosDNN_RMSNorm.hpp"
 
 #include "KokkosDNN_QwenImage21Config.hpp"
@@ -137,7 +145,11 @@ namespace Impl {
 
 // ---- layout-only device glue (no arithmetic beyond elementwise) ----
 
-// ZeroCenterRMSNorm: y = (x - mean(x)) / sqrt(var + eps) * w.
+// ZeroCenterRMSNorm (matches QwenImage21ZeroCenterRMSNorm, whose stored
+// weight is scale - 1, i.e. the effective scale is weight + 1, in fp32):
+//   y = x / sqrt(mean(x^2) + eps) * (w + 1).
+// NOTE: this is a plain RMSNorm with a shifted weight, NOT a mean-centered
+// norm; the reference subtracts no mean.
 template <class ExecSpace, class Scalar>
 void qwen21dit_zero_center_norm(
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
@@ -151,19 +163,14 @@ void qwen21dit_zero_center_norm(
   Kokkos::parallel_for(
       label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {R, D}),
       KOKKOS_LAMBDA(size_t i, size_t j) {
-        float mean = 0;
-        for (size_t d = 0; d < D; ++d)
-          mean += static_cast<float>(x(i, d));
-        mean /= (float)D;
-        float var = 0;
+        float ss = 0;
         for (size_t d = 0; d < D; ++d) {
-          float v = static_cast<float>(x(i, d)) - mean;
-          var += v * v;
+          float v = static_cast<float>(x(i, d));
+          ss += v * v;
         }
-        float inv = 1.0f / sqrtf(var / (float)D + eps);
-        float v = static_cast<float>(x(i, j)) - mean;
-        y(i, j) =
-            static_cast<Scalar>(v * inv * static_cast<float>(w(j)));
+        float inv = 1.0f / sqrtf(ss / (float)D + eps);
+        y(i, j) = static_cast<Scalar>(static_cast<float>(x(i, j)) * inv *
+                                      (static_cast<float>(w(j)) + 1.0f));
       });
 }
 
@@ -229,33 +236,48 @@ void qwen21dit_qk_rmsnorm(
       });
 }
 
-// 3-axis RoPE over head_dim Dh = a0 + a1 + a2, in place on [T, H, Dh].
-// Image rows [0, img_rows) use (t=0, h, w) grid coords with W = grid_w;
-// text rows use their sequence index on all three axes. Frequencies are
-// theta^(-2j/ds) per section (theta from Config; assumption, golden TODO).
+// 3-axis RoPE over head_dim Dh = a0 + a1 + a2, in place on [T, H, Dh],
+// matching QwenImage21Rope for pure T2I (one text prefix + target block):
+//   * text rows [0, S) advance a SHARED position on all three axes:
+//     p0 = p1 = p2 = row index r.
+//   * target rows [S, T) freeze the frame axis at the position reached by
+//     the preceding text (p0 = S) and lay tokens out on height/width grids
+//     centred on zero: p1 = h - (H - H/2), p2 = w - (W - W/2) with
+//     j = r - S, h = j / W, w = j % W (negative indices are negative
+//     angles, matching the reference neg_index freq table).
+// Frequencies are theta^(-2k/ds) per section (theta from Config, 10000 per
+// the reference), i.e. rotation by angle p * theta^(-j/ds) on pair j.
 template <class ExecSpace, class Scalar, class V3>
 void qwen21dit_rope_3axis(
-    const V3& x, size_t img_rows, int a0, int a1, int a2, double theta,
-    size_t grid_w,
+    const V3& x, size_t text_len, size_t grid_h, size_t grid_w, int a0, int a1,
+    int a2, double theta,
     const std::string& label = "KokkosDNN::qwen21dit_rope") {
   const size_t T = x.extent(0), H = x.extent(1), Dh = x.extent(2);
   if ((size_t)(a0 + a1 + a2) != Dh)
     throw std::invalid_argument("qwen21dit_rope_3axis: axes/head_dim mismatch");
   if (T == 0 || H == 0 || Dh == 0) return;
-  if (grid_w == 0)
-    throw std::invalid_argument("qwen21dit_rope_3axis: grid_w must be > 0");
+  if (grid_h == 0 || grid_w == 0)
+    throw std::invalid_argument("qwen21dit_rope_3axis: grid dims must be > 0");
+  if (text_len + grid_h * grid_w != T)
+    throw std::invalid_argument("qwen21dit_rope_3axis: S + H*W must equal T");
+  const long h_off = (long)(grid_h - grid_h / 2);
+  const long w_off = (long)(grid_w - grid_w / 2);
+  const long frame = (long)text_len;
   Kokkos::parallel_for(
       label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, H}),
       KOKKOS_LAMBDA(size_t t, size_t h) {
-        size_t p0, p1, p2;
-        if (t < img_rows) {
-          p0 = 0;
-          p1 = t / grid_w;
-          p2 = t % grid_w;
+        long p0, p1, p2;
+        if (t < text_len) {
+          p0 = p1 = p2 = (long)t;
         } else {
-          p0 = p1 = p2 = t - img_rows;
+          const size_t j = t - text_len;
+          const long hh = (long)(j / grid_w);
+          const long ww = (long)(j % grid_w);
+          p0 = frame;
+          p1 = hh - h_off;
+          p2 = ww - w_off;
         }
-        const size_t ps[3] = {p0, p1, p2};
+        const long ps[3] = {p0, p1, p2};
         const int as[3] = {a0, a1, a2};
         size_t base = 0;
         for (int s = 0; s < 3; ++s) {
@@ -295,6 +317,30 @@ void qwen21dit_apply_scale(
       });
 }
 
+// Per-region scale application for causal_condition modulation:
+// rows [0, split) use s_txt (the t=0 row), rows [split, R) use s_img
+// (the sampled-timestep row). Matches _select_modulation_rows with
+// target_token_mask (text takes the trailing t=0 row).
+template <class ExecSpace, class Scalar>
+void qwen21dit_apply_scale_split(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
+    const Kokkos::View<Scalar*, ExecSpace>& s_txt,
+    const Kokkos::View<Scalar*, ExecSpace>& s_img, size_t split,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& y,
+    const std::string& label = "KokkosDNN::qwen21dit_scale_split") {
+  const size_t R = x.extent(0), D = x.extent(1);
+  if (y.extent(0) != R || y.extent(1) != D || s_txt.extent(0) != D ||
+      s_img.extent(0) != D || split > R)
+    throw std::invalid_argument("qwen21dit_apply_scale_split: dim mismatch");
+  if (R == 0 || D == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {R, D}),
+      KOKKOS_LAMBDA(size_t i, size_t j) {
+        float s = (i < split) ? static_cast<float>(s_txt(j))
+                              : static_cast<float>(s_img(j));
+        y(i, j) = static_cast<Scalar>(static_cast<float>(x(i, j)) * (1.0f + s));
+      });
+}
 // Tanh-gated residual: x = x + tanh(gate) * upd, gate [D] broadcast.
 template <class ExecSpace, class Scalar>
 void qwen21dit_gated_residual(
@@ -310,6 +356,31 @@ void qwen21dit_gated_residual(
       label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {R, D}),
       KOKKOS_LAMBDA(size_t i, size_t j) {
         float g = tanhf(static_cast<float>(gate(j)));
+        x(i, j) = static_cast<Scalar>(static_cast<float>(x(i, j)) +
+                                      g * static_cast<float>(upd(i, j)));
+      });
+}
+
+// Per-region tanh-gated residual for causal_condition modulation:
+// rows [0, split) use g_txt (the t=0 row), rows [split, R) use g_img.
+template <class ExecSpace, class Scalar>
+void qwen21dit_gated_residual_split(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& upd,
+    const Kokkos::View<Scalar*, ExecSpace>& g_txt,
+    const Kokkos::View<Scalar*, ExecSpace>& g_img, size_t split,
+    const std::string& label = "KokkosDNN::qwen21dit_gate_split") {
+  const size_t R = x.extent(0), D = x.extent(1);
+  if (upd.extent(0) != R || upd.extent(1) != D || g_txt.extent(0) != D ||
+      g_img.extent(0) != D || split > R)
+    throw std::invalid_argument(
+        "qwen21dit_gated_residual_split: dim mismatch");
+  if (R == 0 || D == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {R, D}),
+      KOKKOS_LAMBDA(size_t i, size_t j) {
+        float g = tanhf((i < split) ? static_cast<float>(g_txt(j))
+                                    : static_cast<float>(g_img(j)));
         x(i, j) = static_cast<Scalar>(static_cast<float>(x(i, j)) +
                                       g * static_cast<float>(upd(i, j)));
       });
@@ -702,29 +773,43 @@ struct QwenImage21DitScratch {
 };
 
 // Qwen-Image-2.1 DiT model: owns Weights + grow-only scratch. forward()
-// follows the reference pipeline structure (txt_in projection, timestep +
-// shared modulation, 32 single-stream blocks over the joint
-// [image | text] sequence, final scale-only norm + proj_out).
+// follows the reference pipeline stage by stage (txt_in projection with
+// ZeroCenterRMSNorm, timestep x1000 + shared modulation with the t=0 row
+// split, 32 single-stream blocks over the joint [text | target] sequence
+// with exact block-causal prefill segmentation, final scale-only
+// AdaLayerNormContinuous + proj_out over the target rows).
 //
-// GOLDEN TODOs (skeleton runs shape-correct on random weights, but these
-// need reference-parity validation before image-quality claims):
-//   * Block-causal mask: forward() currently attends bidirectionally over
-//     the joint sequence via attention_mha_bidirectional (correct for the
-//     image-image block). The text-causal restriction of causal_condition
-//     is NOT yet applied (needs a native masked kernel or an additive
-//     bias path); text-image cross terms are bidirectional for now.
-//   * Block input norms: the checkpoint exposes no per-block input-norm
-//     weights, so forward() uses unweighted RMSNorm (norm_eps); if the
-//     reference instead reuses modulation-derived scales, update.
-//   * Modulation lane semantics: the shared [4D] vector is sliced here as
-//     (attn_scale, attn_gate, mlp_scale, mlp_gate) with shifts folded;
-//     confirm lane order against the reference.
-//   * RoPE theta for the DiT is assumed (rope_theta, default 10000);
-//     confirm against the reference config.
-//   * Final AdaLayerNormContinuous: temb-conditioned (scale =
-//     norm_out_linear(silu(temb))) with affine-free norm; the skeleton
-//     uses unweighted RMSNorm as the norm and the single sampled-step
-//     temb for all rows (causal_condition t=0 row split is TODO).
+// GOLDEN notes (deviations from the reference, verified against
+// transformer_qwenimage21.py):
+//   * FIXED: joint layout is [text | target] (was [image | text]); the
+//     head slices the target rows [S, T) for proj_out. The driver keeps
+//     passing (img, context) separately, so NO driver change is needed
+//     for the layout; only the internal concatenation order changed.
+//   * FIXED: block input norms + final norm are affine-free LayerNorm
+//     (layernorm_noaffine_forward), matching img_norm1/img_norm2/norm_out.
+//   * FIXED: ZeroCenterRMSNorm is RMS (no mean subtraction) with effective
+//     scale (w + 1), matching QwenImage21ZeroCenterRMSNorm.
+//   * FIXED: timestep is scaled by time_factor 1000 BEFORE the sinusoid
+//     ([cos|sin] halves, 256-d), matching QwenImage21TemporalTimesteps.
+//     CONTRACT NOTE: forward() therefore takes the RAW [0, 1] sigma as
+//     `timestep`; the driver currently passes 1000*sigma (tvals), so it
+//     must divide by 1000 at the call site (follow-up, NOT done here).
+//   * FIXED: modulation lanes are (attn_scale, attn_gate, mlp_scale,
+//     mlp_gate) = mod1.scale, mod1.gate, mod2.scale, mod2.gate, matching
+//     the reference chunk order; text rows read the t=0 row, target rows
+//     the sampled row (causal_condition split via _select_modulation_rows
+//     semantics, implemented as per-region scale/gate application).
+//   * FIXED: 3-axis RoPE matches QwenImage21Rope for T2I (text advances a
+//     shared position on all axes; target frame frozen at S with
+//     zero-centered H/W grids; theta 10000, confirmed by the reference).
+//   * FIXED: block-causal mask is exact for T2I: text prefix runs causal
+//     attention_gqa_single, target rows run full
+//     attention_mha_bidirectional over all keys — the two-segment form of
+//     QwenImage21AttnProcessor (single text segment + target block).
+//   * OPEN (decode-mode parity): no KV cache; cached decode steps are
+//     future work. Prefill (step 0, no-cache) is the parity target.
+//   * OPEN: fp16 clip to [-65504, 65504] is skipped (Scalar here is float
+//     or bhalf_t, whose max is 65504 already).
 template <class ExecSpace, class Scalar>
 class QwenImage21DitModel {
  public:
@@ -746,8 +831,11 @@ class QwenImage21DitModel {
   void release_scratch() { scratch_.clear(); }
 
   // DiT forward: img [B, N, C] latent tokens + context [B, S, Td] encoder
-  // embeddings + scalar timestep -> out [B, N, C] velocity. latent_h/w
-  // default to cfg (N must equal latent_h * latent_w).
+  // embeddings + scalar timestep (RAW [0, 1] sigma; scaled by time_factor
+  // 1000 internally) -> out [B, N, C] velocity. latent_h/w default to cfg
+  // (N must equal latent_h * latent_w). TEXT-TO-IMAGE ONLY: the joint
+  // sequence is [text (S rows) | target (N rows)], T = S + N; proj_out
+  // reads the target rows [S, T).
   void forward(const DNNHandle<ExecSpace>& handle, const V3& img,
                const V3& context, double timestep, V3& out,
                size_t latent_h = 0, size_t latent_w = 0) {
@@ -770,30 +858,38 @@ class QwenImage21DitModel {
       throw std::invalid_argument("QwenImage21DitModel::forward: out mismatch");
     if (S == 0)
       throw std::invalid_argument("QwenImage21DitModel::forward: empty context");
-    const size_t T = N + S;
+    if (!cfg_.causal_condition)
+      throw std::invalid_argument(
+          "QwenImage21DitModel::forward: causal_condition=false unsupported "
+          "(t=0 row split required)");
+    const size_t T = S + N;
     const float eps = (float)cfg_.norm_eps;
+    const float attn_scale =
+        1.0f / std::sqrt(static_cast<float>(Hd));  // SDPA default 1/sqrt(E)
 
     using U2 = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace,
                             Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
     using U1 = Kokkos::View<Scalar*, ExecSpace,
                             Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+    using U3 = Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace,
+                            Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
 
-    // Timestep sinusoid on host (float64 phases, 256-d [cos|sin]), then
-    // one device row for the per-sample MLP below.
+    // Timestep sinusoid on host (float64 phases, 256-d [cos|sin] halves).
+    // Reference (QwenImage21TemporalTimesteps): timestep is scaled by
+    // time_factor 1000 BEFORE the sinusoid.
     constexpr size_t F = 256;
-    std::vector<float> sinus(F);
+    std::vector<float> sinus_s(F), sinus_0(F);
     {
-      const double t = timestep;
       for (size_t i = 0; i < F / 2; ++i) {
-        double ang =
-            t * std::exp(-std::log(10000.0) * (double)i / (double)(F / 2));
-        sinus[i] = (float)std::cos(ang);
-        sinus[i + F / 2] = (float)std::sin(ang);
+        const double inv =
+            std::exp(-std::log(10000.0) * (double)i / (double)(F / 2));
+        const double a_s = 1000.0 * timestep * inv;
+        sinus_s[i] = (float)std::cos(a_s);
+        sinus_s[i + F / 2] = (float)std::sin(a_s);
+        sinus_0[i] = 1.0f;  // t = 0: cos(0) = 1 ...
+        sinus_0[i + F / 2] = 0.0f;  // ... sin(0) = 0
       }
     }
-
-    V1 ones_D = scratch_.c1.get("ones", D);
-    Kokkos::deep_copy(ones_D, static_cast<Scalar>(1.0f));
 
     for (size_t b = 0; b < B; ++b) {
       U2 img_b(const_cast<Scalar*>(img.data()) + b * N * C, N, C);
@@ -821,49 +917,58 @@ class QwenImage21DitModel {
       KokkosDNN::gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1.0f), img_b,
                        weights_.img_in_W, static_cast<Scalar>(0.0f), img_t);
 
-      // --- timestep MLP: sinus -> Linear -> SiLU -> Linear -> [D] ---
-      V1 temb = scratch_.c1.get("temb", D);
+      // --- timestep MLP (TimestepEmbedder: Linear -> SiLU -> Linear) ---
+      // Two rows: sampled timestep + t = 0 (causal_condition). Text rows
+      // modulate from the t=0 row, target rows from the sampled row.
+      V2 s3 = scratch_.c2.get("s3", 2, D);
       {
-        V2 s1 = scratch_.c2.get("s1", 1, F);
-        V2 s2 = scratch_.c2.get("s2", 1, D);
+        V2 s1 = scratch_.c2.get("s1", 2, F);
+        V2 s2 = scratch_.c2.get("s2", 2, D);
         auto hs = Kokkos::create_mirror_view(Kokkos::HostSpace(), s1);
-        for (size_t i = 0; i < F; ++i) hs(0, i) = static_cast<Scalar>(sinus[i]);
+        for (size_t i = 0; i < F; ++i) {
+          hs(0, i) = static_cast<Scalar>(sinus_s[i]);
+          hs(1, i) = static_cast<Scalar>(sinus_0[i]);
+        }
         Kokkos::deep_copy(s1, hs);
         KokkosDNN::gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1.0f), s1, weights_.time1_W,
                          static_cast<Scalar>(0.0f), s2);
         KokkosDNN::silu_forward<ExecSpace, Scalar>(s2, s2);
-        V2 s3 = scratch_.c2.get("s3", 1, D);
         KokkosDNN::gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1.0f), s2, weights_.time2_W,
                          static_cast<Scalar>(0.0f), s3);
-        U1 s3_r(s3.data(), D);
-        Kokkos::deep_copy(temb, s3_r);
       }
 
-      // --- shared modulation: SiLU(temb) -> Linear -> 4 x [D] lanes ---
-      V2 mod4 = scratch_.c2.get("mod4", 1, 4 * D);
-      U1 lane_a, lane_g1, lane_b, lane_g2;
+      // --- shared modulation: SiLU(temb rows) -> Linear -> 2 x 4[D] ---
+      // Row 0 = sampled timestep (target rows), row 1 = t=0 (text rows).
+      // Lane order matches the reference chunking: mod1 = (attn_scale,
+      // attn_gate), mod2 = (mlp_scale, mlp_gate).
+      V2 mod4 = scratch_.c2.get("mod4", 2, 4 * D);
+      U1 a_s, g1_s, b_s, g2_s, a_z, g1_z, b_z, g2_z;
       {
-        V2 t1 = scratch_.c2.get("t1", 1, D);
-        U1 t1_r(t1.data(), D);
-        Kokkos::deep_copy(t1_r, temb);
+        V2 t1 = scratch_.c2.get("t1", 2, D);
+        Kokkos::deep_copy(t1, s3);
         KokkosDNN::silu_forward<ExecSpace, Scalar>(t1, t1);
         KokkosDNN::gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1.0f), t1, weights_.mod_W,
                          static_cast<Scalar>(0.0f), mod4);
         Scalar* mp = mod4.data();
-        lane_a = U1(mp, D);
-        lane_g1 = U1(mp + D, D);
-        lane_b = U1(mp + 2 * D, D);
-        lane_g2 = U1(mp + 3 * D, D);
+        a_s = U1(mp, D);
+        g1_s = U1(mp + D, D);
+        b_s = U1(mp + 2 * D, D);
+        g2_s = U1(mp + 3 * D, D);
+        Scalar* mz = mp + 4 * D;
+        a_z = U1(mz, D);
+        g1_z = U1(mz + D, D);
+        b_z = U1(mz + 2 * D, D);
+        g2_z = U1(mz + 3 * D, D);
       }
 
-      // --- joint sequence [image | text] ---
+      // --- joint sequence [text | target] ---
       V2 joint = scratch_.c2.get("joint", T, D);
       {
         Kokkos::parallel_for(
             "KokkosDNN::qwen21dit_concat",
             Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, D}),
             KOKKOS_LAMBDA(size_t r, size_t d) {
-              joint(r, d) = (r < N) ? img_t(r, d) : txt(r - N, d);
+              joint(r, d) = (r < S) ? txt(r, d) : img_t(r - S, d);
             });
       }
       V2 hn = scratch_.c2.get("hn", T, D);
@@ -875,40 +980,58 @@ class QwenImage21DitModel {
       V2 g2 = scratch_.c2.get("g", T, G);
       V2 h2 = scratch_.c2.get("h", T, G);
 
-      using U3 = Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace,
-                              Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
-
       for (size_t li = 0; li < weights_.blocks.size(); ++li) {
         const auto& bw = weights_.blocks[li];
-        // Attention path.
-        KokkosDNN::rmsnorm<ExecSpace, Scalar>(joint, ones_D, eps, hn);
-        Impl::qwen21dit_apply_scale<ExecSpace, Scalar>(hn, lane_a, hn);
+        // Attention path: affine-free LayerNorm, then per-region scale
+        // (text rows <- t=0 lane, target rows <- sampled lane).
+        KokkosDNN::layernorm_noaffine_forward<ExecSpace, Scalar>(joint, eps,
+                                                                 hn);
+        Impl::qwen21dit_apply_scale_split<ExecSpace, Scalar>(hn, a_z, a_s, S,
+                                                            hn);
         KokkosDNN::gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1.0f), hn, bw.to_q,
                          static_cast<Scalar>(0.0f), q2);
         KokkosDNN::gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1.0f), hn, bw.to_k,
                          static_cast<Scalar>(0.0f), k2);
         KokkosDNN::gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1.0f), hn, bw.to_v,
                          static_cast<Scalar>(0.0f), v2);
-        U3 q3(q2.data(), T, H, Hd), k3(k2.data(), T, H, Hd),
-            v3(v2.data(), T, H, Hd), o3(o2.data(), T, H, Hd);
-        Impl::qwen21dit_qk_rmsnorm<ExecSpace, Scalar>(q3, bw.norm_q, eps);
-        Impl::qwen21dit_qk_rmsnorm<ExecSpace, Scalar>(k3, bw.norm_k, eps);
+        U3 q_txt(q2.data(), S, H, Hd), k_pre(k2.data(), S, H, Hd),
+            v_pre(v2.data(), S, H, Hd), o_txt(o2.data(), S, H, Hd);
+        U3 q_tgt(q2.data() + S * H * Hd, N, H, Hd),
+            k_full(k2.data(), T, H, Hd), v_full(v2.data(), T, H, Hd),
+            o_tgt(o2.data() + S * H * Hd, N, H, Hd);
+        Impl::qwen21dit_qk_rmsnorm<ExecSpace, Scalar>(q_txt, bw.norm_q, eps);
+        Impl::qwen21dit_qk_rmsnorm<ExecSpace, Scalar>(
+            U3(q2.data() + S * H * Hd, N, H, Hd), bw.norm_q, eps);
+        Impl::qwen21dit_qk_rmsnorm<ExecSpace, Scalar>(k_pre, bw.norm_k, eps);
+        Impl::qwen21dit_qk_rmsnorm<ExecSpace, Scalar>(
+            U3(k2.data() + S * H * Hd, N, H, Hd), bw.norm_k, eps);
+        U3 q_full(q2.data(), T, H, Hd), k_full3(k2.data(), T, H, Hd);
         Impl::qwen21dit_rope_3axis<ExecSpace, Scalar>(
-            q3, N, cfg_.rope_axes[0], cfg_.rope_axes[1], cfg_.rope_axes[2],
-            cfg_.rope_theta, latent_w);
+            q_full, S, latent_h, latent_w, cfg_.rope_axes[0],
+            cfg_.rope_axes[1], cfg_.rope_axes[2], cfg_.rope_theta);
         Impl::qwen21dit_rope_3axis<ExecSpace, Scalar>(
-            k3, N, cfg_.rope_axes[0], cfg_.rope_axes[1], cfg_.rope_axes[2],
-            cfg_.rope_theta, latent_w);
-        // GOLDEN TODO: block-causal mask (text-causal); bidirectional here.
+            k_full3, S, latent_h, latent_w, cfg_.rope_axes[0],
+            cfg_.rope_axes[1], cfg_.rope_axes[2], cfg_.rope_theta);
+        // Exact block-causal prefill segmentation (the T2I form of
+        // QwenImage21AttnProcessor): the single text segment attends
+        // causally over its own prefix; the target block attends over all
+        // keys (prefix + its own internally-bidirectional block).
+        KokkosDNN::attention_gqa_single<ExecSpace, Scalar>(
+            handle, q_txt, k_pre, v_pre, (size_t)0, o_txt, attn_scale,
+            "KokkosDNN::qwen21dit_attn_txt");
         KokkosDNN::attention_mha_bidirectional<ExecSpace, Scalar>(
-            handle, q3, k3, v3, o3);
+            handle, q_tgt, k_full, v_full, o_tgt, attn_scale,
+            "KokkosDNN::qwen21dit_attn_img");
         U2 o2f(o2.data(), T, D);
         KokkosDNN::gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1.0f), o2f, bw.to_o,
                          static_cast<Scalar>(0.0f), hn);
-        Impl::qwen21dit_gated_residual<ExecSpace, Scalar>(joint, hn, lane_g1);
+        Impl::qwen21dit_gated_residual_split<ExecSpace, Scalar>(joint, hn,
+                                                               g1_z, g1_s, S);
         // SwiGLU FFN path.
-        KokkosDNN::rmsnorm<ExecSpace, Scalar>(joint, ones_D, eps, hn);
-        Impl::qwen21dit_apply_scale<ExecSpace, Scalar>(hn, lane_b, hn);
+        KokkosDNN::layernorm_noaffine_forward<ExecSpace, Scalar>(joint, eps,
+                                                                 hn);
+        Impl::qwen21dit_apply_scale_split<ExecSpace, Scalar>(hn, b_z, b_s, S,
+                                                            hn);
         KokkosDNN::gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1.0f), hn, bw.proj,
                          static_cast<Scalar>(0.0f), p2);
         KokkosDNN::gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1.0f), hn, bw.gate,
@@ -916,33 +1039,32 @@ class QwenImage21DitModel {
         Impl::qwen21dit_swiglu<ExecSpace, Scalar>(g2, p2, h2);
         KokkosDNN::gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1.0f), h2, bw.out,
                          static_cast<Scalar>(0.0f), hn);
-        Impl::qwen21dit_gated_residual<ExecSpace, Scalar>(joint, hn, lane_g2);
+        Impl::qwen21dit_gated_residual_split<ExecSpace, Scalar>(joint, hn,
+                                                               g2_z, g2_s, S);
       }
 
       // --- head: AdaLayerNormContinuous (temb-conditioned scale) + proj ---
-      // Reference: scale = norm_out_linear(silu(temb));
-      // joint = layernorm_affinefree(joint) * (1 + scale).
-      // GOLDEN TODO: reference uses affine-free LayerNorm (not RMSNorm)
-      // here and, with causal_condition, the t=0 temb row for text/
-      // condition tokens; this skeleton uses unweighted RMSNorm and the
-      // single sampled-step temb for all rows.
-      V1 nscale = scratch_.c1.get("nscale", D);
+      // Reference: scale = norm_out_linear(silu(temb)); rows selected by
+      // target_token_mask (text <- t=0 row, target <- sampled row);
+      // joint = layernorm_affinefree(joint) * (1 + scale); proj_out reads
+      // the target rows only.
       {
-        V2 t1 = scratch_.c2.get("t1n", 1, D);
-        U1 t1_r(t1.data(), D);
-        Kokkos::deep_copy(t1_r, temb);
+        V2 t1 = scratch_.c2.get("t1n", 2, D);
+        Kokkos::deep_copy(t1, s3);
         KokkosDNN::silu_forward<ExecSpace, Scalar>(t1, t1);
-        V2 ns2 = scratch_.c2.get("ns2", 1, D);
+        V2 ns2 = scratch_.c2.get("ns2", 2, D);
         KokkosDNN::gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1.0f), t1,
                          weights_.norm_out_W, static_cast<Scalar>(0.0f), ns2);
-        U1 ns_r(ns2.data(), D);
-        Kokkos::deep_copy(nscale, ns_r);
+        Scalar* np = ns2.data();
+        U1 ns_s(np, D), ns_z(np + D, D);
+        KokkosDNN::layernorm_noaffine_forward<ExecSpace, Scalar>(joint, eps,
+                                                                 hn);
+        Impl::qwen21dit_apply_scale_split<ExecSpace, Scalar>(hn, ns_z, ns_s,
+                                                            S, hn);
       }
-      KokkosDNN::rmsnorm<ExecSpace, Scalar>(joint, ones_D, eps, hn);
-      Impl::qwen21dit_apply_scale<ExecSpace, Scalar>(hn, nscale, hn);
       {
-        U2 hn_img(hn.data(), N, D);
-        KokkosDNN::gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1.0f), hn_img,
+        U2 hn_tgt(hn.data() + S * D, N, D);
+        KokkosDNN::gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1.0f), hn_tgt,
                          weights_.proj_out_W, static_cast<Scalar>(0.0f), out_b);
       }
     }
