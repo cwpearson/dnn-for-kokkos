@@ -82,7 +82,7 @@ void run_device(benchmark::State& state, const Case& c) {
   for (int i = 0; i < 16; ++i)  // warm up
     benchmark::DoNotOptimize(sampler.sample(d, opt, prior, rng).id);
   for (auto _ : state) {
-    const int id = sampler.sample(d, opt, prior, rng).id;
+    int id = sampler.sample(d, opt, prior, rng).id;
     benchmark::DoNotOptimize(id);
   }
   state.SetItemsProcessed(state.iterations());
@@ -102,7 +102,7 @@ void run_host(benchmark::State& state, const Case& c) {
   for (auto _ : state) {
     Kokkos::deep_copy(mirror, d);
     for (std::size_t i = 0; i < V; ++i) f[i] = static_cast<float>(mirror(i));
-    const int id =
+    int id =
         KokkosDNN::sample_host_logits_result(f.data(), V, opt, prior, rng).id;
     benchmark::DoNotOptimize(id);
   }
@@ -114,7 +114,7 @@ void run_greedy_device(benchmark::State& state) {
   const std::size_t V = static_cast<std::size_t>(state.range(0));
   const View d = device_logits(make_logits(V, 12345));
   for (auto _ : state) {
-    const int id = KokkosDNN::device_argmax<Exec, float>(d);
+    int id = KokkosDNN::device_argmax<Exec, float>(d);
     benchmark::DoNotOptimize(id);
   }
   state.SetItemsProcessed(state.iterations());
