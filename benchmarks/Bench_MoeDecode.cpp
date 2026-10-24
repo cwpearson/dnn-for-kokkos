@@ -36,6 +36,7 @@
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
 
+#include <cstdint>
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -216,14 +217,20 @@ void BM_MoeDecode_Fused(benchmark::State& state) {
 // Pure 16-byte-read kernel over one gate_up payload: the read-bandwidth
 // ceiling for this access size on this GPU, i.e. what a perfect MoE kernel
 // could reach.
+// Portable 16-byte unit: uint4 exists only with CUDA/HIP. An alignas(16) POD
+// of 4x u32 compiles and vectorizes the same way on every backend.
+struct alignas(16) MoeReadU32x4 {
+  uint32_t x, y, z, w;
+};
 struct ReadProbe {
-  const uint4* p;
+  const MoeReadU32x4* p;
   size_t n;  // 16-byte units
   Kokkos::View<int*, Exec> out;
   KOKKOS_FUNCTION void operator()(const size_t i) const {
     const size_t base = i * 4;
     if (base + 3 >= n) return;
-    const uint4 a = p[base], b = p[base + 1], c = p[base + 2], d = p[base + 3];
+    const MoeReadU32x4 a = p[base], b = p[base + 1], c = p[base + 2],
+                       d = p[base + 3];
     const uint32_t s = a.x ^ b.x ^ c.x ^ d.x ^ a.y ^ b.y ^ c.y ^ d.y ^ a.z ^
                        b.z ^ c.z ^ d.z ^ a.w ^ b.w ^ c.w ^ d.w;
     if (s == 0xdeadbeefu) out(0) = 1;
@@ -237,7 +244,7 @@ void BM_MoeDecode_ReadProbe(benchmark::State& state) {
   Kokkos::deep_copy(buf, uint8_t(3));
   Kokkos::View<int*, Exec> out("out", 1);
   const size_t n16 = bytes / 16;
-  ReadProbe f{reinterpret_cast<const uint4*>(buf.data()), n16, out};
+  ReadProbe f{reinterpret_cast<const MoeReadU32x4*>(buf.data()), n16, out};
   Kokkos::parallel_for("probe_warm", (n16 + 3) / 4, f);
   Kokkos::fence();
   state.counters["GB/s"] = benchmark::Counter(
