@@ -21,13 +21,15 @@
 // processor/tokenizer.json (11.4 MB) + tokenizer_config.json with the same
 // tablegen procedure; stub-owned TODO until then.
 //
-// This header is complete as a Config + weights loader; the 36-layer
-// forward (M-RoPE + GQA + SwiGLU, mirroring the MossImageEncoder block
-// structure) is marked TODO and currently throws.
+// This header is complete as a Config + weights loader + the 36-layer
+// forward (M-RoPE-as-plain-RoPE for text-only input + GQA + SwiGLU,
+// mirroring the MossImageEncoder block structure and verified against
+// modeling_qwen3_vl.py).
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <fstream>
 #include <map>
@@ -36,6 +38,9 @@
 #include <string>
 #include <vector>
 
+#include "KokkosDNN_Attention.hpp"
+#include "KokkosDNN_Embedding.hpp"
+#include "KokkosDNN_Gemm.hpp"
 #include "KokkosDNN_Handle.hpp"
 
 #include "KokkosDNN_QwenImage21Config.hpp"
@@ -49,16 +54,16 @@ struct Config {
   int hidden_dim = 4096;
   int num_q_heads = 32;
   int num_kv_heads = 8;  // GQA
-  int intermediate_dim = 12288;  // SwiGLU total (2 x gate branches)
+  int intermediate_dim = 12288;  // SwiGLU hidden (gate/up: [I, D])
   int vocab_size = 151936;
   double rope_theta = 5000000.0;
-  std::array<int, 3> mrope_sections = {24, 20, 20};
+  std::array<int, 3> mrope_sections = {24, 20, 20};  // sums to head_dim/2
   double norm_eps = 1e-6;
 
   int head_dim() const {
     return (num_q_heads > 0) ? hidden_dim / num_q_heads : 0;
   }
-  int gate_dim() const { return intermediate_dim / 2; }
+  int gate_dim() const { return intermediate_dim; }
 
   static Config tiny_test() {
     Config c;
@@ -68,6 +73,7 @@ struct Config {
     c.num_kv_heads = 2;
     c.intermediate_dim = 48;
     c.vocab_size = 256;
+    c.mrope_sections = {2, 1, 1};  // sums to head_dim/2 = 4
     return c;
   }
 
@@ -84,14 +90,15 @@ struct Config {
     if (num_kv_heads <= 0) bad("num_kv_heads must be > 0");
     if (num_q_heads % num_kv_heads != 0)
       bad("num_q_heads must be divisible by num_kv_heads");
+    if (head_dim() % 2 != 0) bad("head_dim must be even (rotary pairs)");
     if (intermediate_dim <= 0 || intermediate_dim % 2 != 0)
       bad("intermediate_dim must be a positive even number");
     if (vocab_size <= 0) bad("vocab_size must be > 0");
     if (!(rope_theta > 0) || !std::isfinite(rope_theta))
       bad("rope_theta must be positive and finite");
     if (mrope_sections[0] + mrope_sections[1] + mrope_sections[2] !=
-        head_dim())
-      bad("mrope_sections must sum to head_dim");
+        head_dim() / 2)
+      bad("mrope_sections must sum to head_dim/2");
     if (!(norm_eps > 0) || !std::isfinite(norm_eps))
       bad("norm_eps must be positive and finite");
   }
@@ -125,14 +132,14 @@ struct EncoderTensorSpec {
   bool matrix = false;
 };
 
-// Canonical Qwen3-VL text-tower weight list for a Config. Key layout
-// (suffix-matched; exact HF export prefixes may vary):
+// Canonical Qwen3-VL text-tower weight list for a Config. Checkpoint keys
+// live under model.language_model.* (normalized at load); the extra shard
+// members (lm_head.weight, model.visual.*) are skipped, not required here.
 //   model.layers.{i}.self_attn.{q,k,v,o}_proj.weight,
 //   model.layers.{i}.self_attn.{q,k}_norm.weight,
 //   model.layers.{i}.{input_layernorm,post_attention_layernorm}.weight,
 //   model.layers.{i}.mlp.{gate,up,down}_proj.weight,
 //   model.embed_tokens.weight, model.norm.weight.
-// (lm_head is tied/absent for the encoder path and not required.)
 inline std::vector<EncoderTensorSpec> qwen21_encoder_expected_tensors(
     const Config& cfg) {
   cfg.validate();
@@ -278,8 +285,12 @@ struct QwenImage21EncoderWeights {
   }
 
   // Load the REAL single-shard text_encoder/model.safetensors (F32/BF16).
-  // Suffix-matched names; throws on missing/unknown/dtype/shape mismatch.
-  // Needs allocate() first.
+  // The shard holds the full Qwen3VL checkpoint: text tensors live under
+  // "model.language_model.*", plus "lm_head.weight" and the vision tower
+  // ("model.visual.*"). Names are matched after stripping an optional
+  // ".language_model" infix; lm_head/visual keys are skipped (the T2I text
+  // path never reads them). Throws on missing/duplicate/dtype/shape
+  // mismatch, and on any other unknown tensor. Needs allocate() first.
   void load_safetensors(const std::string& shard_path) {
     if (embed.extent(0) == 0)
       throw std::runtime_error(
@@ -298,20 +309,20 @@ struct QwenImage21EncoderWeights {
     for (const auto& kv : entries) {
       const std::string& full = kv.first;
       const QwenImage21::Impl::Qwen21SafeEntry& en = kv.second;
+      const std::string norm = normalize_key(full);
       const EncoderTensorSpec* spec = nullptr;
       for (const auto& s : specs) {
-        if (full.size() >= s.name.size() &&
-            full.compare(full.size() - s.name.size(), s.name.size(), s.name) ==
-                0 &&
-            (full.size() == s.name.size() ||
-             full[full.size() - s.name.size() - 1] == '.')) {
-          if (!spec || s.name.size() > spec->name.size()) spec = &s;
+        if (norm == s.name) {
+          spec = &s;
+          break;
         }
       }
-      if (!spec)
+      if (!spec) {
+        if (ignorable_key(full)) continue;
         throw std::runtime_error(
             "QwenImage21EncoderWeights::load_safetensors: unknown tensor '" +
             full + "' in '" + shard_path + "'");
+      }
       if (found[spec->name])
         throw std::runtime_error(
             "QwenImage21EncoderWeights::load_safetensors: duplicate tensor '" +
@@ -328,6 +339,22 @@ struct QwenImage21EncoderWeights {
   }
 
  private:
+  // "model.language_model.layers.N...." -> "model.layers.N...." so the
+  // canonical spec names match the real checkpoint layout.
+  static std::string normalize_key(const std::string& full) {
+    const std::string infix = ".language_model.";
+    const size_t p = full.find(infix);
+    if (p == std::string::npos) return full;
+    return full.substr(0, p + 1) + full.substr(p + infix.size());
+  }
+
+  // Shard members the T2I text path never reads: the tied-absent lm head
+  // and the whole vision tower.
+  static bool ignorable_key(const std::string& full) {
+    if (full == "lm_head.weight") return true;
+    return full.compare(0, 13, "model.visual.") == 0;
+  }
+
   void load_one_tensor(std::ifstream& f, const std::string& full,
                        const QwenImage21::Impl::Qwen21SafeEntry& en,
                        const EncoderTensorSpec& s) {
@@ -437,46 +464,309 @@ struct QwenImage21EncoderWeights {
   }
 };
 
-// Encoder model: owns Weights. forward() (36-layer M-RoPE + GQA + SwiGLU
-// over left-padded token ids, final norm NEUTRALIZED, drop first _drop_idx
-// rows) is a TODO mirroring the MossImageEncoder block structure; it
-// currently throws.
+namespace Impl {
+
+// Host inv_freq table: inv[j] = theta^(-2j/Hd), j < Hd/2. Matches
+// Qwen3VLTextRotaryEmbedding.compute_default_rope_parameters with
+// dim = head_dim (denominator is the full head_dim, not Hd/2).
+inline std::vector<float> qwen21_rope_inv_host(int head_dim, double theta) {
+  const size_t Rh = static_cast<size_t>(head_dim) / 2;
+  std::vector<float> out(Rh);
+  const double Hd = static_cast<double>(head_dim);
+  for (size_t j = 0; j < Rh; ++j)
+    out[j] =
+        static_cast<float>(1.0 / std::pow(theta, (2.0 * (double)j) / Hd));
+  return out;
+}
+
+// Full-dim rotary apply, in place, HF Qwen3VL half-rotation pairing:
+// (a, b) = (x[d], x[d + Hd/2]), angle = pos * inv[d], pos = token index.
+// For text-only input all M-RoPE rows (T/H/W) equal arange(S), so the
+// interleaved recomposition reproduces these exact frequencies and this
+// plain RoPE is bit-faithful (verified: identical angles to the torch
+// rotary_emb forward at equal row positions). x: [T, H, Hd] contiguous.
+template <class ExecSpace, class XView, class FView>
+void qwen21_rope_inplace(const XView& x, const FView& inv_freq,
+                         const std::string& label = "Qwen21Enc::rope") {
+  const size_t T = x.extent(0), H = x.extent(1), D = x.extent(2);
+  if (D % 2 != 0)
+    throw std::invalid_argument("qwen21_rope_inplace: head_dim must be even");
+  const size_t Rh = D / 2;
+  if (inv_freq.extent(0) != Rh)
+    throw std::invalid_argument("qwen21_rope_inplace: inv_freq dim");
+  if (T == 0 || H == 0) return;
+  using Scalar = std::remove_const_t<typename XView::value_type>;
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, H}),
+      KOKKOS_LAMBDA(size_t t, size_t h) {
+        const float pos = static_cast<float>(t);
+        for (size_t j = 0; j < Rh; ++j) {
+          const float ang = pos * inv_freq(j);
+          const float c = cosf(ang), s = sinf(ang);
+          const float a = static_cast<float>(x(t, h, j));
+          const float b = static_cast<float>(x(t, h, j + Rh));
+          x(t, h, j) = static_cast<Scalar>(a * c - b * s);
+          x(t, h, j + Rh) = static_cast<Scalar>(a * s + b * c);
+        }
+      });
+}
+
+// Torch-exact RMSNorm: replicates Qwen3VLTextRMSNorm.forward's bf16
+// intermediate rounding (hidden.to(bf16) BEFORE the weight multiply, i.e.
+// two roundings) instead of the single-FP32-rounding core op. For float
+// Scalar this is numerically identical to KokkosDNN::rmsnorm; for bf16 it
+// matches the reference bit-for-bit on the rounding, which matters: the
+// layer-6 attention sink (~1e4, bf16 ulp 64) amplifies a last-bit norm
+// difference into macroscopic row-sum drift (verified: single-layer
+// maxabs 64.0 -> 0.125 on the golden prompt).
+template <class ExecSpace, class Scalar>
+void qwen21_rmsnorm(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
+    const Kokkos::View<Scalar*, ExecSpace>& w, float eps,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& y,
+    const std::string& label = "Qwen21Enc::rmsnorm") {
+  const size_t T = x.extent(0), D = x.extent(1);
+  if (y.extent(0) != T || y.extent(1) != D || w.extent(0) != D)
+    throw std::invalid_argument("qwen21_rmsnorm: dimension mismatch");
+  if (T == 0 || D == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, D}),
+      KOKKOS_LAMBDA(size_t t, size_t d) {
+        float ss = 0;
+        for (size_t k = 0; k < D; ++k) {
+          float v = static_cast<float>(x(t, k));
+          ss += v * v;
+        }
+        float inv = 1.0f / sqrtf(ss / (float)D + eps);
+        Scalar nb =
+            static_cast<Scalar>(static_cast<float>(x(t, d)) * inv);
+        y(t, d) = static_cast<Scalar>(static_cast<float>(nb) *
+                                      static_cast<float>(w(d)));
+      });
+}
+
+// Torch-exact per-head QK RMSNorm: same double rounding as above,
+// out[t,h,d] = w[d] * Scalar(flat[t,h*D+d] * inv(t,h)).
+template <class ExecSpace, class Scalar>
+void qwen21_qk_rmsnorm(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& flat,
+    const Kokkos::View<Scalar*, ExecSpace>& w, float eps,
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& out,
+    const std::string& label = "Qwen21Enc::qk_norm") {
+  const size_t T = out.extent(0), H = out.extent(1), D = out.extent(2);
+  if (flat.extent(0) != T || flat.extent(1) != H * D || w.extent(0) != D)
+    throw std::invalid_argument("qwen21_qk_rmsnorm: dimension mismatch");
+  if (T == 0 || H == 0 || D == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, H}),
+      KOKKOS_LAMBDA(size_t t, size_t h) {
+        float ss = 0;
+        for (size_t d = 0; d < D; ++d) {
+          float v = static_cast<float>(flat(t, h * D + d));
+          ss += v * v;
+        }
+        float inv = 1.0f / sqrtf(ss / (float)D + eps);
+        for (size_t d = 0; d < D; ++d) {
+          Scalar nb = static_cast<Scalar>(
+              static_cast<float>(flat(t, h * D + d)) * inv);
+          out(t, h, d) = static_cast<Scalar>(static_cast<float>(nb) *
+                                             static_cast<float>(w(d)));
+        }
+      });
+}
+
+// Torch-exact SwiGLU: the elementwise bf16 SiLU rounds the sigmoid before
+// the gate*up product (two roundings), out = Scalar(Scalar(silu(g)) * u).
+// For float Scalar identical to KokkosDNN::swiglu.
+template <class ExecSpace, class Scalar>
+void qwen21_swiglu(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& gate,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& up,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& out,
+    const std::string& label = "Qwen21Enc::swiglu") {
+  const size_t T = gate.extent(0), F = gate.extent(1);
+  if (up.extent(0) != T || up.extent(1) != F || out.extent(0) != T ||
+      out.extent(1) != F)
+    throw std::invalid_argument("qwen21_swiglu: dimension mismatch");
+  if (T == 0 || F == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, F}),
+      KOKKOS_LAMBDA(size_t t, size_t f) {
+        float g = static_cast<float>(gate(t, f));
+        Scalar sg = static_cast<Scalar>(g / (1.0f + expf(-g)));
+        out(t, f) = static_cast<Scalar>(static_cast<float>(sg) *
+                                        static_cast<float>(up(t, f)));
+      });
+}
+
+// Residual add, in place on x: x += branch. Same FP32-accumulate idiom as
+// the MossImageEncoder block.
+template <class ExecSpace, class XView, class BView>
+void qwen21_residual_add(const XView& x, const BView& branch,
+                         const std::string& label = "Qwen21Enc::residual") {
+  const size_t T = x.extent(0), D = x.extent(1);
+  if (branch.extent(0) != T || branch.extent(1) != D)
+    throw std::invalid_argument("qwen21_residual_add: dim mismatch");
+  if (T == 0 || D == 0) return;
+  using Scalar = std::remove_const_t<typename XView::value_type>;
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, D}),
+      KOKKOS_LAMBDA(size_t t, size_t d) {
+        x(t, d) = static_cast<Scalar>(static_cast<float>(x(t, d)) +
+                                      static_cast<float>(branch(t, d)));
+      });
+}
+
+}  // namespace Impl
+
+// Encoder model: owns Weights. forward() runs the 36-layer M-RoPE + GQA +
+// SwiGLU text tower over token ids (T2I path: no visual slots; the
+// image_pad mask is all-False and needs no plumbing here).
+//
+// Reference math (modeling_qwen3_vl.py, Qwen3VLText*):
+//   h = embed[ids]
+//   repeat per layer:
+//     h += o_proj(GQA(rope(qn(q_proj(n)), kn(k_proj(n))), v_proj(n))))
+//        with n = RMSNorm(h, in), qn/kn = per-head RMSNorm(Hd),
+//        rope = half-rotation pairs, scale = 1/sqrt(Hd), causal, KV heads
+//        repeated x num_q_heads/num_kv_heads; no attention bias.
+//     h += down_proj(silu(gate_proj(m)) * up_proj(m))
+//        with m = RMSNorm(h, post).
+//   NO final RMSNorm: the pipeline neutralizes model.norm and consumes the
+//   pre-norm output (transformers>=5.0 ties hidden_states[-1] to the
+//   post-norm value, ~1/3 the magnitude — not what the DiT was trained on).
 template <class ExecSpace, class Scalar>
 class QwenImage21EncoderModel {
  public:
   using V1 = Kokkos::View<Scalar*, ExecSpace>;
   using V2 = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
+  using V3 = Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>;
   using I1 = Kokkos::View<int*, ExecSpace>;
+  using I2 = Kokkos::View<int**, Kokkos::LayoutRight, ExecSpace>;
   using Weights = QwenImage21EncoderWeights<ExecSpace, Scalar>;
 
   explicit QwenImage21EncoderModel(const Config& cfg = Config()) {
     cfg.validate();
     cfg_ = cfg;
     weights_.allocate(cfg_);
+    auto hv = Impl::qwen21_rope_inv_host(cfg_.head_dim(), cfg_.rope_theta);
+    rope_inv_ = Kokkos::View<float*, ExecSpace>("qwen21enc_rope_inv", hv.size());
+    auto hm = Kokkos::create_mirror_view(rope_inv_);
+    for (size_t i = 0; i < hv.size(); ++i) hm(i) = hv[i];
+    Kokkos::deep_copy(rope_inv_, hm);
   }
 
   const Config& config() const { return cfg_; }
   Weights& weights() { return weights_; }
   const Weights& weights() const { return weights_; }
 
-  // tokens [B, S] int ids (left-padded) -> hidden [B, S, D] pre-norm output
-  // (final RMSNorm neutralized); caller drops the first drop_idx rows.
-  // TODO: implement the 36-layer M-RoPE/GQA/SwiGLU forward (golden test).
-  void forward(const DNNHandle<ExecSpace>& handle, const I1& tokens,
-               const V2& hidden, int drop_idx) {
-    (void)handle;
-    (void)tokens;
-    (void)hidden;
-    (void)drop_idx;
+  // tokens [B, S] int ids (left-padded per the pipeline; every row is
+  // consumed as-is with positions 0..S-1, exactly the text-only positions
+  // the reference builds) -> hidden [B, S, D] pre-norm output (the caller
+  // drops the first drop_idx rows). Exact for unpadded batches (the T2I
+  // golden is B=1, no pads); left-pad rows are NOT masked, so padded
+  // multi-prompt batches would see pad keys — pad-mask plumbing is an
+  // explicit follow-up, not wired here.
+  void forward(const DNNHandle<ExecSpace>& handle, const I2& tokens,
+               const V3& hidden, int drop_idx) {
     cfg_.validate();
-    throw std::runtime_error(
-        "QwenImage21EncoderModel::forward: TODO (36-layer M-RoPE/GQA/SwiGLU "
-        "forward not yet implemented; see MossImageEncoder pattern)");
+    const size_t B = tokens.extent(0), S = tokens.extent(1);
+    const size_t D = (size_t)cfg_.hidden_dim;
+    const size_t Nq = (size_t)cfg_.num_q_heads, Nk = (size_t)cfg_.num_kv_heads;
+    const size_t Hd = (size_t)cfg_.head_dim(), G = (size_t)cfg_.gate_dim();
+    if (hidden.extent(0) != B || hidden.extent(1) != S ||
+        hidden.extent(2) != D)
+      throw std::invalid_argument("QwenImage21EncoderModel::forward: hidden "
+                                  "must be [B, S, D]");
+    if (drop_idx < 0 || (size_t)drop_idx > S)
+      throw std::invalid_argument(
+          "QwenImage21EncoderModel::forward: drop_idx out of range");
+    if (weights_.embed.extent(0) == 0)
+      throw std::logic_error(
+          "QwenImage21EncoderModel::forward: weights empty");
+    if (B == 0 || S == 0) return;
+    // Host-side id range check (one mirror per forward; negligible vs a
+    // multi-GB encoder pass, and required for gather safety).
+    {
+      auto hm = Kokkos::create_mirror_view(tokens);
+      Kokkos::deep_copy(hm, tokens);
+      for (size_t b = 0; b < B; ++b)
+        for (size_t s = 0; s < S; ++s)
+          if (hm(b, s) < 0 || hm(b, s) >= cfg_.vocab_size)
+            throw std::invalid_argument(
+                "QwenImage21EncoderModel::forward: token id out of range");
+    }
+    const float scale = 1.0f / std::sqrt(static_cast<float>(Hd));
+    const float eps = static_cast<float>(cfg_.norm_eps);
+    using UView3 = Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace,
+                                Kokkos::MemoryUnmanaged>;
+    I1 row_ids("qwen21enc_ids", S);
+    V2 h("qwen21enc_h", S, D);
+    V2 n("qwen21enc_n", S, D);
+    V2 qf("qwen21enc_q", S, Nq * Hd);
+    V2 kf("qwen21enc_k", S, Nk * Hd);
+    V2 vf("qwen21enc_v", S, Nk * Hd);
+    V2 ao("qwen21enc_ao", S, D);
+    V2 o("qwen21enc_o", S, D);
+    V2 g("qwen21enc_g", S, G);
+    V2 u("qwen21enc_u", S, G);
+    V2 d("qwen21enc_d", S, D);
+    UView3 q3(qf.data(), S, Nq, Hd);
+    UView3 k3(kf.data(), S, Nk, Hd);
+    UView3 v3(vf.data(), S, Nk, Hd);
+    UView3 ao3(ao.data(), S, Nq, Hd);
+    for (size_t b = 0; b < B; ++b) {
+      Kokkos::View<int*, ExecSpace, Kokkos::MemoryUnmanaged> rowpre(
+          tokens.data() + b * S, S);
+      Kokkos::deep_copy(row_ids, rowpre);
+      KokkosDNN::embedding_gather<ExecSpace, Scalar>(weights_.embed, row_ids,
+                                                     h, "Qwen21Enc::embed");
+      for (int l = 0; l < cfg_.num_layers; ++l) {
+        const auto& L = weights_.layers[(size_t)l];
+        Impl::qwen21_rmsnorm<ExecSpace, Scalar>(h, L.in_norm, eps, n,
+                                     "Qwen21Enc::in_norm");
+        KokkosDNN::gemm<ExecSpace, Scalar>(handle, Scalar(1), n, L.q_W,
+                                           Scalar(0), qf, "Qwen21Enc::q");
+        KokkosDNN::gemm<ExecSpace, Scalar>(handle, Scalar(1), n, L.k_W,
+                                           Scalar(0), kf, "Qwen21Enc::k");
+        KokkosDNN::gemm<ExecSpace, Scalar>(handle, Scalar(1), n, L.v_W,
+                                           Scalar(0), vf, "Qwen21Enc::v");
+        Impl::qwen21_qk_rmsnorm<ExecSpace, Scalar>(qf, L.qn, eps, q3,
+                                        "Qwen21Enc::q_norm");
+        Impl::qwen21_qk_rmsnorm<ExecSpace, Scalar>(kf, L.kn, eps, k3,
+                                        "Qwen21Enc::k_norm");
+        Impl::qwen21_rope_inplace<ExecSpace>(q3, rope_inv_, "Qwen21Enc::rope_q");
+        Impl::qwen21_rope_inplace<ExecSpace>(k3, rope_inv_, "Qwen21Enc::rope_k");
+        KokkosDNN::attention_gqa_single<ExecSpace, Scalar>(
+            handle, q3, k3, v3, size_t{0}, ao3, scale, "Qwen21Enc::attn");
+        KokkosDNN::gemm<ExecSpace, Scalar>(handle, Scalar(1), ao, L.o_W,
+                                           Scalar(0), o, "Qwen21Enc::o");
+        Impl::qwen21_residual_add<ExecSpace>(h, o, "Qwen21Enc::res1");
+        Impl::qwen21_rmsnorm<ExecSpace, Scalar>(h, L.post_norm, eps, n,
+                                     "Qwen21Enc::post_norm");
+        KokkosDNN::gemm<ExecSpace, Scalar>(handle, Scalar(1), n, L.gate_W,
+                                           Scalar(0), g, "Qwen21Enc::gate");
+        KokkosDNN::gemm<ExecSpace, Scalar>(handle, Scalar(1), n, L.up_W,
+                                           Scalar(0), u, "Qwen21Enc::up");
+        Impl::qwen21_swiglu<ExecSpace, Scalar>(g, u, g, "Qwen21Enc::swiglu");
+        KokkosDNN::gemm<ExecSpace, Scalar>(handle, Scalar(1), g, L.down_W,
+                                           Scalar(0), d, "Qwen21Enc::down");
+        Impl::qwen21_residual_add<ExecSpace>(h, d, "Qwen21Enc::res2");
+      }
+      // Final RMSNorm NEUTRALIZED: copy the pre-norm output (pipeline hook
+      // parity). drop_idx rows are left for the caller to drop.
+      Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace,
+                   Kokkos::MemoryUnmanaged>
+          dst(hidden.data() + b * S * D, S, D);
+      Kokkos::deep_copy(dst, h);
+    }
+    Kokkos::fence();
   }
 
  private:
   Config cfg_;
   Weights weights_;
+  Kokkos::View<float*, ExecSpace> rope_inv_;  // [Hd/2]
 };
 
 }  // namespace QwenImage21Encoder
