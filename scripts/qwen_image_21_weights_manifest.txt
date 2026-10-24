@@ -1,0 +1,67 @@
+Qwen/Qwen-Image-2.1-Turbo weights manifest
+==========================================
+Local dir : /workspace/weights/Qwen-Image-2.1-Turbo/
+Source    : hf download Qwen/Qwen-Image-2.1-Turbo --local-dir /workspace/weights/Qwen-Image-2.1-Turbo
+Date      : 2026-10-24 (UTC)
+Total     : 32493338666 bytes (~30.3 GiB on disk; ~32.5 GB decimal)
+
+HuggingFace revision: fc13ba1986fcb905854dc8de2f52eee395f49b5b
+Pipeline class (model_index.json): QwenImage21Pipeline
+Checkpoint sample_sigmas (8-step Turbo schedule, auto-loaded):
+  [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568]
+Scheduler: FlowMatchEulerDiscreteScheduler
+Text encoder: Qwen3VLForConditionalGeneration (transformers Qwen3VLProcessor)
+Transformer : QwenImage21Transformer2DModel (diffusers)
+VAE         : AutoencoderKLQwenImage21 (diffusers)
+
+Safetensors shards (bytes):
+  text_encoder/model.safetensors ......................... 17534340584 (~16.33 GiB)
+  transformer/diffusion_pytorch_model-00001-of-00002.safetensors .. 9968332504 (~9.28 GiB)
+  transformer/diffusion_pytorch_model-00002-of-00002.safetensors .. 4261951904 (~3.97 GiB)
+  vae/diffusion_pytorch_model.safetensors ................ 675508656 (~644 MiB)
+  transformer index total_size ........................... 14230249472 (matches 9968332504+4261951904=14230284408 on-disk incl. headers)
+
+Sidecar files (all present):
+  processor/tokenizer.json ............................... 11422650
+  processor/tokenizer_config.json ........................ 705
+  processor/processor_config.json ........................ 1300
+  processor/chat_template.jinja .......................... 5292
+  text_encoder/config.json / generation_config.json ...... present
+  transformer/config.json + .index.json .................. present
+  vae/config.json ........................................ present
+  scheduler/scheduler_config.json ........................ present
+  model_index.json ....................................... present
+  README.md / LICENSE / .gitattributes .................. present
+  assets/*.png (13 preview files) ........................ present
+
+Golden reference:
+  Script : scripts/qwen_image_21_golden.py
+  Run    : python3 scripts/qwen_image_21_golden.py --weights /workspace/weights/Qwen-Image-2.1-Turbo --out goldens/qwen_image_21_turbo
+  Config : prompt "A capybara wearing a wizard hat, oil painting", 1024x1024,
+           seed 42 (torch.Generator("cpu")), checkpoint 8-step sigmas, use_kv_cache=True
+
+Golden run (2026-10-24, torch 2.14.1+cu130, diffusers 0.42.0.dev0,
+transformers 5.20.2, RTX 3090, placement=manual i.e. prompt encoded on
+CPU in bf16, DiT+VAE on CUDA; artifacts in
+/workspace/weights/Qwen-Image-2.1-Turbo-golden/):
+  [a] prompt_embeds shape=(1, 19, 4096) dtype=torch.bfloat16
+  [a] prompt_embeds[0,0]  f64sum=-66.24072265625
+  [a] prompt_embeds[0,-1] f64sum=487.0107421875
+  [b] initial latents shape=(1, 4096, 64) f64sum=-62.91889151930809
+  [c] transformer forward calls: 8
+  [c] step 0: noise_pred shape=(1, 4115, 64) f64sum=-21028.175584077835
+  [c] step 1: noise_pred shape=(1, 4096, 64) f64sum=-11246.848942443728
+  [c] step 2: noise_pred shape=(1, 4096, 64) f64sum=-10488.831165730953
+  [c] step 3: noise_pred shape=(1, 4096, 64) f64sum=-10213.551013335586
+  [c] step 4: noise_pred shape=(1, 4096, 64) f64sum=-10683.935044020414
+  [c] step 5: noise_pred shape=(1, 4096, 64) f64sum=-11382.545000880957
+  [c] step 6: noise_pred shape=(1, 4096, 64) f64sum=-12483.454845398664
+  [c] step 7: noise_pred shape=(1, 4096, 64) f64sum=-12269.153574258089
+  [d] final latents shape=(1, 4096, 64) f64sum=12098.474563598633
+  [d] qwen_image_21_turbo_final_latents.f32 (1048576 bytes raw float32) + .npy
+  [e] qwen_image_21_turbo_capybara.png (1024x1024 RGBA)
+  Full log: /workspace/weights/Qwen-Image-2.1-Turbo-golden-run.log
+NOTE: prompt-embed checksums are device-sensitive: an earlier GPU-encoded
+  run gave [0,0]=-167.2802734375 / [0,-1]=473.9169921875 for the same
+  prompt (bf16 CPU vs CUDA kernel differences). The values above are the
+  canonical golden (procedure fixed in the script: CPU encode).
