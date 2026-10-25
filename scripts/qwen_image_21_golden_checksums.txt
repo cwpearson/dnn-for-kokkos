@@ -10,8 +10,10 @@
 #   Turbo sample_sigmas, use_kv_cache=True, manual placement
 #   (text encoder on CPU, transformer+VAE on CUDA).
 # Env: torch 2.14.1+cu130, diffusers 0.42.0.dev0, RTX 3090, 2026-10-24.
-# Full artifacts (final latents .f32/.npy, PNG) live next to the weights
-# (git-ignored); only these scalar checksums are versioned.
+# Full artifacts (prompt_embeds.f32, initial_latents.f32, per-step
+# noise_pred/latents in the driver [C,H,W] layout, manifest.json, final
+# latents .f32/.npy, PNG) live next to the weights (git-ignored); only these
+# scalar checksums are versioned.
 # All sums are float64 over the full tensor (see f64sum in the script).
 
 [a] prompt_embeds shape=(1, 19, 4096) dtype=torch.bfloat16

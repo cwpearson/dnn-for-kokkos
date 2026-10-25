@@ -337,6 +337,7 @@ def compare_pair(
     atol: float | None,
     glayout: str = "flat",
     alayout: str = "flat",
+    row_cos_min: float | None = None,
 ) -> dict:
     golden_flat, golden_shape = read_array(gpath)
     actual_flat, actual_shape = read_array(apath)
@@ -384,11 +385,26 @@ def compare_pair(
     if atol is not None and m["max_abs"] > atol:
         reasons.append(f"max|diff| {m['max_abs']:.3e} > atol {atol:.1e}")
 
+    row_cos = None
+    if row_cos_min is not None and gshape is not None and len(gshape) == 2:
+        # Row-wise cosine is the meaningful gate for prompt embeddings: bf16
+        # device noise moves token rows almost rigidly, so a global rel-L2
+        # built from large row sums overstates the disagreement.
+        gg = golden_flat.reshape(gshape)
+        aa = actual_flat.reshape(gshape)
+        num = np.sum(gg * aa, axis=1)
+        den = np.linalg.norm(gg, axis=1) * np.linalg.norm(aa, axis=1)
+        cos = np.divide(num, den, out=np.zeros_like(num), where=den > 0)
+        row_cos = float(np.min(cos)) if cos.size else None
+        if row_cos is not None and row_cos < row_cos_min:
+            reasons.append(f"min row cosine {row_cos:.6f} < {row_cos_min:g}")
+
     return {
         "name": name,
         "shape": shown_shape,
         "count": count,
         "notes": notes,
+        "row_cos": row_cos,
         **m,
         "ok": not reasons,
         "reasons": reasons,
@@ -413,6 +429,9 @@ def print_table(rows: list[dict]) -> None:
             f"{fmt_exp(row['sum_actual'], 14, 6)}  "
             f"{'PASS' if row['ok'] else 'FAIL'}"
         )
+    for row in rows:
+        if row.get("row_cos") is not None:
+            print(f"  {row['name']}: min row cosine {row['row_cos']:.6f}")
 
 
 def compare_images(gpath: str, apath: str, psnr_min: float) -> dict:
@@ -528,6 +547,21 @@ def main(argv: list[str] | None = None) -> int:
         help=f"minimum image PSNR in dB for --images (default "
         f"{PSNR_MIN_DEFAULT:g})",
     )
+    ap.add_argument(
+        "--only",
+        metavar="NAMES",
+        default=None,
+        help="comma-separated tensor names to compare (e.g. "
+        "prompt_embeds.f32); default: every shared tensor",
+    )
+    ap.add_argument(
+        "--row-cos-min",
+        type=float,
+        default=None,
+        metavar="C",
+        help="optional minimum per-row cosine for 2-D tensors (e.g. 0.999 "
+        "for prompt_embeds); the row length comes from the manifest shape",
+    )
     args = ap.parse_args(argv)
 
     if args.rtol <= 0.0:
@@ -571,6 +605,12 @@ def main(argv: list[str] | None = None) -> int:
         pairs, skipped = collect_pairs(args.golden, args.actual)
         if args.final_golden:
             pairs.append(("final_latents", args.final_golden, args.final_actual))
+        if args.only:
+            wanted = {s.strip() for s in args.only.split(",") if s.strip()}
+            pairs = [p for p in pairs if p[0] in wanted]
+            skipped = [s for s in skipped if s[0] in wanted]
+            if not pairs:
+                die(f"--only {args.only!r} matched no shared tensor")
         for name, gpath, apath in pairs:
             is_final = name == "final_latents"
             rows.append(
@@ -583,6 +623,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.atol,
                     glayout=args.final_golden_layout if is_final else "flat",
                     alayout=args.final_actual_layout if is_final else "flat",
+                    row_cos_min=args.row_cos_min,
                 )
             )
 
