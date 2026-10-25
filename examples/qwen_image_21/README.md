@@ -68,9 +68,32 @@ grayscale preview with a logged reason instead of failing.
 | `--vae-decode` | off | real VAE decode when the VAE header + weights are present, else grayscale preview |
 | `--out` | `qwen_image_21_out.png` | PNG with `KokkosDNN_ENABLE_IMAGE=ON`, else PPM; raw `.f32` latents always written |
 | `--staged` | off | fenced staged release between phases (see below) |
+| `--dump-steps` | — | `DIR`: write golden-parity tensors (raw float32 LE) + `manifest.json`, then exit normally |
 
 Conditioning precedence: in-process Qwen (`--tokenizer` + `--text-encoder`)
 -> `--prompt-embeds-in` file -> null zeros (prompt logged).
+
+## Parity dumps (`--dump-steps DIR`)
+
+Golden-parity work needs per-step tensors, so `--dump-steps DIR` writes them
+(raw little-endian float32, driver layout: latents `[C,H,W]` row-major
+C-major `lat[(c*H+h)*W+w]`, prompt embeds `[L,Cc]` row-major):
+
+| File | Content |
+| ---- | ------- |
+| `prompt_embeds.f32` | cond conditioning exactly as staged for the DiT |
+| `prompt_embeds_neg.f32` | uncond view (only when `--cfg != 1`) |
+| `initial_latents.f32` | the sampler's `x_init`, no extra scaling |
+| `stepNN_noise_pred.f32` | model output `v` used for step NN (CFG-combined when CFG runs) |
+| `stepNN_noise_pred_cond.f32`, `_uncond.f32` | per-branch outputs (only under CFG) |
+| `stepNN_latents.f32` | post-Euler-update latents |
+| `manifest.json` | `format` (`kokkosdnn-qwen21-dump-v1`), prompt/source, H/W, channels, steps, exact `sigmas`, seed, cfg, `use_cfg`, `staged`, `--sigmas` mode, model label, per-tensor f64 sums |
+
+Each tensor is also logged as `[dump] <name> <numel> floats f64sum=<%.17g>`,
+followed by `[dump] wrote <n> tensors to DIR`. The extra device-to-host
+copies only happen when the flag is set, so the default sample path is
+unchanged. Works under `--tiny` (`--tiny --steps 2 --dump-steps /tmp/q21`
+dumps 512x16 zero embeds, 4x4 latents, and two steps).
 
 ## 24 GB fit table (bf16 projections)
 
