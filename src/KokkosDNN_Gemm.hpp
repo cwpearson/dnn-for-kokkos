@@ -12,6 +12,7 @@
 #include <type_traits>
 #include "KokkosDNN_Handle.hpp"
 #include "KokkosDNN_Macros.hpp"
+#include "KokkosDNN_GemmTensorCuda.hpp"
 #ifdef KOKKOSDNN_ENABLE_CUBLAS
 #include "tpl/cublas/KokkosDNN_CuBLAS.hpp"
 #endif
@@ -33,10 +34,14 @@ namespace Impl {
 //      cublasGemmEx (R_16BF I/O, FP32 accumulate) for bhalf_t -- TPL.
 //      hipBLAS on HIP with handle.use_hipblas mirrors this (hipblasSgemm /
 //      hipblasGemmEx, HIP_R_16BF I/O, FP32 accumulate) -- TPL.
-//   2. Portable tiled TeamPolicy kernel (all team-capable backends, all
+//   2. Native CUDA tensor-core kernel (SM80+, float/bhalf_t, gated shapes;
+//      TF32 for float -- see KokkosDNN_GemmTensorCuda.hpp). The one
+//      backend-gated kernel in the library: tensor cores have no portable
+//      spelling. Kill switch handle.use_tensor_cores.
+//   3. Portable tiled TeamPolicy kernel (all team-capable backends, all
 //      scalars) -- TeamPolicy + team scratch, no backend-gated code, no raw
 //      CUDA/cub/wmma intrinsics. FP32 accumulation, result cast to Scalar.
-//   3. Naive MDRange kernel (backends whose team_size_max cannot field the
+//   4. Naive MDRange kernel (backends whose team_size_max cannot field the
 //      team, e.g. Serial with max team size 1) -- obviously correct,
 //      memory-bound. Chosen at runtime via team_size_max, no backend
 //      #ifdefs.
@@ -726,10 +731,14 @@ void gemv_native(
 // on the handle's cached cuBLAS handle (created once per DNNHandle, stream
 // re-selected per call); on HIP the same ladder runs through hipBLAS
 // (hipblasSgemm / hipblasGemmEx via the handle's cached hipBLAS handle);
-// anything else (or a TPL failure) uses the
+// anything else (or a TPL failure) first tries the native CUDA tensor-core
+// kernel (TF32 for float, BF16 tensor for bhalf_t -- SM80+, gated shapes,
+// kill switch handle.use_tensor_cores; numerics in KokkosDNN_GemmTensorCuda.hpp)
+// and then uses the
 // portable shared-memory tiled kernel in Impl (design notes there), with
 // thin-fine/mid small-M specializations (TM=16/TN=32/TK=64 for M <= 16,
-// TM=32/TN=64/TK=32 for M <= 64) -- except rank-2 M == 1, which reuses the
+// TM=32/TN=64/TK=32 for M <= 64), base TM=64/TN=128/8x4 for larger M --
+// except rank-2 M == 1, which reuses the
 // native team-per-row GEMV kernel (same shape/working set as gemv).
 template <class ExecSpace, class Scalar>
 void gemm(const DNNHandle<ExecSpace>& handle, Scalar alpha,
@@ -850,7 +859,9 @@ void gemm(const DNNHandle<ExecSpace>& handle, Scalar alpha,
   // Native: rank-2 M == 1 is the same working set as GEMV (lm_head/vocab
   // row), so it reuses the team-per-row GEMV kernel with alpha/beta (one
   // team per N-row, vector-parallel K) instead of the tiled GEMM; M > 1
-  // uses the portable shared-memory tiled kernel (Impl notes).
+  // first tries the CUDA tensor-core kernel (TF32 for float, BF16 tensor
+  // for bhalf_t; SM80+, gated shapes -- kill switch handle.use_tensor_cores)
+  // and then uses the portable shared-memory tiled kernel (Impl notes).
   Impl::tpl_note_gemm(false);
   const float alpha_f = static_cast<float>(alpha);
   const float beta_f  = static_cast<float>(beta);
@@ -861,6 +872,10 @@ void gemm(const DNNHandle<ExecSpace>& handle, Scalar alpha,
     Impl::gemv_native<ExecSpace, Scalar>(x1, W, alpha_f, beta_f, y1, label);
     return;
   }
+  if (handle.use_tensor_cores &&
+      Impl::try_gemm_tensor_cuda<ExecSpace, Scalar>(X, W, alpha_f, beta_f, Y,
+                                                    nullptr))
+    return;
   Impl::gemm_tiled<ExecSpace, Scalar>(X, W, alpha_f, beta_f, Y, label);
 }
 

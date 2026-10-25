@@ -161,6 +161,12 @@ struct DNNHandle {
   // KokkosDNN_ENABLE_ACCELERATE is set. float only; other scalars fall back
   // to the native kernel at the call site.
   bool use_accelerate = false;
+  // Native CUDA tensor-core GEMM (TF32 for float, BF16 tensor for bhalf_t;
+  // see src/KokkosDNN_GemmTensorCuda.hpp). Active on CUDA SM80+ builds when
+  // the shape passes the launcher gates; the portable SIMT kernel is always
+  // the fallback. Default on (like the other performance dispatches);
+  // set false for bit parity with the portable FP32 kernel.
+  bool use_tensor_cores = false;
 
   // Opaque cached TPL handles (cublasHandle_t / cudnnHandle_t /
   // hipblasHandle_t / miopenHandle_t when the matching TPL is enabled on a
@@ -200,6 +206,15 @@ struct DNNHandle {
   }
 
   DNNHandle() {
+#if defined(KOKKOS_ENABLE_CUDA)
+    // Naming the backend here is deliberate: the tensor-core kernel below
+    // is CUDA-only (wmma), so the default keys off the CUDA execution
+    // space itself. Independent of the TPL flags: tensor cores are native.
+    constexpr bool is_cuda_tc = std::is_same_v<ExecSpace, Kokkos::Cuda>;
+    if constexpr (is_cuda_tc) {
+      use_tensor_cores = true;
+    }
+#endif
 #if (defined(KOKKOSDNN_ENABLE_CUBLAS) || defined(KOKKOSDNN_ENABLE_CUDNN)) && \
     defined(KOKKOS_ENABLE_CUDA)
     // Naming the backend here is deliberate: the TPL handles below are
@@ -252,6 +267,7 @@ struct DNNHandle {
         use_hipblas(other.use_hipblas),
         use_miopen(other.use_miopen),
         use_accelerate(other.use_accelerate),
+        use_tensor_cores(other.use_tensor_cores),
         cublas_ptr_(other.cublas_ptr_),
         cudnn_ptr_(other.cudnn_ptr_),
         hipblas_ptr_(other.hipblas_ptr_),
@@ -263,6 +279,7 @@ struct DNNHandle {
     other.use_hipblas  = false;
     other.use_miopen   = false;
     other.use_accelerate = false;
+    other.use_tensor_cores = false;
     other.cublas_ptr_  = nullptr;
     other.cudnn_ptr_   = nullptr;
     other.hipblas_ptr_ = nullptr;
@@ -278,6 +295,7 @@ struct DNNHandle {
       use_hipblas  = other.use_hipblas;
       use_miopen   = other.use_miopen;
       use_accelerate = other.use_accelerate;
+      use_tensor_cores = other.use_tensor_cores;
       cublas_ptr_  = other.cublas_ptr_;
       cudnn_ptr_   = other.cudnn_ptr_;
       hipblas_ptr_ = other.hipblas_ptr_;
@@ -289,6 +307,7 @@ struct DNNHandle {
       other.use_hipblas  = false;
       other.use_miopen   = false;
       other.use_accelerate = false;
+      other.use_tensor_cores = false;
       other.cublas_ptr_  = nullptr;
       other.cudnn_ptr_   = nullptr;
       other.hipblas_ptr_ = nullptr;

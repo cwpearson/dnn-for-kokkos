@@ -98,7 +98,8 @@ void add_bias_1d(const Kokkos::View<Scalar*, ExecSpace>& y,
 //   * Host + Accelerate, float: Accelerate sgemm + add_bias_2d (split;
 //     bhalf_t and strided shapes fall back to native).
 //   * Native (TPL off/unavailable, other scalars): bias is folded into the
-//     tiled GEMM (or M == 1 GEMV) write-back, so the native path is exactly
+//     tiled GEMM (or M == 1 GEMV) write-back -- M > 1 first tries the CUDA
+//     tensor-core kernel with fused bias -- so the native path is exactly
 //     one kernel launch.
 // The unbiased (empty-bias) path is a plain gemm() call, unchanged.
 // Existing gemm/gemv APIs are untouched.
@@ -203,8 +204,9 @@ void gemm_bias(
   }
 #endif
   // Native fused single pass: rank-2 M == 1 reuses the team-per-row GEMV
-  // kernel with fused bias (same working set), M > 1 uses the tiled GEMM
-  // with bias folded into write-back.
+  // kernel with fused bias (same working set), M > 1 first tries the CUDA
+  // tensor-core kernel with fused bias (kill switch use_tensor_cores) and
+  // then uses the tiled GEMM with bias folded into write-back.
   Impl::tpl_note_bias(false);
   if (M == 1) {
     Kokkos::View<Scalar*, ExecSpace,
@@ -214,6 +216,10 @@ void gemm_bias(
                                          b.data());
     return;
   }
+  if (handle.use_tensor_cores &&
+      Impl::try_gemm_tensor_cuda<ExecSpace, Scalar>(X, W, 1.0f, 0.0f, Y,
+                                                    b.data()))
+    return;
   Impl::gemm_tiled<ExecSpace, Scalar>(X, W, 1.0f, 0.0f, Y, label, b.data());
 }
 

@@ -301,3 +301,81 @@ TEST(GemmBias, DimensionMismatchThrows) {
   EXPECT_NO_THROW((KokkosDNN::gemv_bias(h, x, W, b, y)));
   EXPECT_NO_THROW((KokkosDNN::gemv_bias(h, x, W, empty_b, y)));
 }
+
+// CUDA tensor-core path with fused bias (src/KokkosDNN_GemmTensorCuda.hpp):
+// K/N-deep aligned shapes take the single-pass wmma fused-bias kernel on
+// SM80+ CUDA and the portable fused kernel everywhere else; one numerics
+// contract covers both (TF32-aware tolerances, same rationale as
+// GemmTensorCores in Test_Gemm.cpp). Covers full tiles and M/N edge
+// masking with a K-tail slab.
+template <class Scalar>
+void check_gemm_bias_large_aligned(int M, int N, int K, float tol_host,
+                                   float tol_portable) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  KokkosDNN::DNNHandle<Exec> h;
+  h.use_cublas       = false;
+  h.use_cudnn        = false;
+  h.use_accelerate   = false;
+  h.use_tensor_cores = true;  // native path; portable fallback elsewhere
+  KokkosDNN::DNNHandle<Exec> hp;
+  hp.use_cublas       = false;
+  hp.use_cudnn        = false;
+  hp.use_accelerate   = false;
+  hp.use_tensor_cores = false;  // forced portable reference
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> X("X", M, K), W("W", N, K),
+      Y("Y", M, N), Yp("Yp", M, N);
+  Kokkos::View<Scalar*, Exec> b("b", N);
+  auto hx = Kokkos::create_mirror_view(X);
+  auto hw = Kokkos::create_mirror_view(W);
+  auto hb = Kokkos::create_mirror_view(b);
+  for (int i = 0; i < M; ++i)
+    for (int k = 0; k < K; ++k)
+      hx(i, k) = static_cast<Scalar>(0.05f * ((i * 37 + k * 11) % 41) - 0.5f);
+  for (int j = 0; j < N; ++j)
+    for (int k = 0; k < K; ++k)
+      hw(j, k) = static_cast<Scalar>(0.05f * ((j * 23 + k * 5) % 37) - 0.4f);
+  for (int j = 0; j < N; ++j)
+    hb(j) = static_cast<Scalar>(2.0f * (j % 9) - 8.0f);
+  Kokkos::deep_copy(X, hx);
+  Kokkos::deep_copy(W, hw);
+  Kokkos::deep_copy(b, hb);
+  KokkosDNN::gemm_bias(h, X, W, b, Y);
+  KokkosDNN::gemm_bias(hp, X, W, b, Yp);
+  Kokkos::fence();
+  auto got = Kokkos::create_mirror_view(Y);
+  Kokkos::deep_copy(got, Y);
+  auto gotp = Kokkos::create_mirror_view(Yp);
+  Kokkos::deep_copy(gotp, Yp);
+  for (int i = 0; i < M; ++i)
+    for (int j = 0; j < N; ++j) {
+      float acc = 0;
+      for (int k = 0; k < K; ++k)
+        acc += static_cast<float>(hx(i, k)) * static_cast<float>(hw(j, k));
+      float want = acc + static_cast<float>(hb(j));
+      EXPECT_NEAR(static_cast<float>(got(i, j)), want, tol_host)
+          << "tensor gemm_bias mismatch at (" << i << "," << j << ") M=" << M
+          << " N=" << N << " K=" << K;
+      EXPECT_NEAR(static_cast<float>(got(i, j)),
+                  static_cast<float>(gotp(i, j)), tol_portable)
+          << "tensor-vs-portable bias mismatch at (" << i << "," << j
+          << ") M=" << M << " N=" << N << " K=" << K;
+    }
+}
+
+TEST(GemmBiasTensorCores, FloatFullTiles) {
+  check_gemm_bias_large_aligned<float>(128, 256, 256, 0.5f, 0.3f);
+}
+
+TEST(GemmBiasTensorCores, FloatEdgesAndKTail) {
+  check_gemm_bias_large_aligned<float>(100, 200, 168, 0.5f, 0.3f);
+}
+
+TEST(GemmBiasTensorCores, BHalfFullTiles) {
+  check_gemm_bias_large_aligned<Kokkos::Experimental::bhalf_t>(128, 256, 256,
+                                                               1.0f, 0.25f);
+}
+
+TEST(GemmBiasTensorCores, BHalfEdgesAndKTail) {
+  check_gemm_bias_large_aligned<Kokkos::Experimental::bhalf_t>(100, 200, 168,
+                                                               1.0f, 0.25f);
+}
