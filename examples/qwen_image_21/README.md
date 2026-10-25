@@ -62,7 +62,8 @@ grayscale preview with a logged reason instead of failing.
 | `--cfg`/`--guidance` | 1.0 | CFG scale (!=1 takes the CFG branch) |
 | `--shift`/`--flow-shift` | 3.0 | flow-matching sigma shift (ignored under `--sigmas turbo`) |
 | `--sigmas` | `driver` | `driver`: nearest-grid schedule from `--steps`/`--shift` (default, unchanged); `turbo`: checkpoint `sample_sigmas` verbatim (mu-shifted already, 8 steps, shift=1.0/no-shift) |
-| `--seed` | 42 | latent init seed |
+| `--seed` | 42 | latent init seed (ignored when `--init-latents-in` is given) |
+| `--init-latents-in` | — | raw float32 LE initial latents `[C,H,W]` row-major, C-major `lat[(c*H+h)*W+w]` (PRE-denormalization noise, no mean/std); replaces the mt19937 sample |
 | `--vae-weights` | — | VAE checkpoint (validated whenever given) |
 | `--vae-decode` | off | real VAE decode when the VAE header + weights are present, else grayscale preview |
 | `--out` | `qwen_image_21_out.png` | PNG with `KokkosDNN_ENABLE_IMAGE=ON`, else PPM; raw `.f32` latents always written |
