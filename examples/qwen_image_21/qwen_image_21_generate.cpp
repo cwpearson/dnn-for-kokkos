@@ -36,7 +36,7 @@
 //                          [--height H] [--width W]
 //                          [--steps 8] [--cfg 1.0] [--shift 3.0]
 //                          [--sigmas driver|turbo]
-//                          [--seed 42]
+//                          [--seed 42] [--init-latents-in lat.f32]
 //                          [--vae-weights vae.safetensors [--vae-decode]]
 //                          [--out img.png]
 //                          [--staged]
@@ -550,6 +550,31 @@ void save_raw_f32(const std::string& path, const std::vector<float>& v) {
   f.write(reinterpret_cast<const char*>(v.data()),
           (long long)(v.size() * sizeof(float)));
   if (!f) throw std::runtime_error("short write to '" + path + "'");
+}
+
+// Raw fp32 LE initial latents [C,H,W] row-major, flattened C-major as
+// lat[(c*H+h)*W+w] (the driver's native layout: matches the sampler's
+// x_init pack/unpack order and the <stem>.f32 files it writes).
+inline std::vector<float> load_init_latents_raw(const std::string& path,
+                                                size_t C, size_t H,
+                                                size_t W) {
+  std::ifstream f(path, std::ios::binary | std::ios::ate);
+  if (!f) throw std::runtime_error("qwen21: cannot open '" + path + "'");
+  const long long n = (long long)f.tellg();
+  if (n <= 0 || n % 4 != 0)
+    throw std::runtime_error("qwen21: bad float32 file '" + path + "'");
+  const size_t want = C * H * W;
+  if ((size_t)n / 4 != want)
+    throw std::runtime_error(
+        "qwen21: init latents file '" + path + "' holds " +
+        std::to_string(n / 4) + " floats, expected " + std::to_string(want) +
+        " ([C,H,W]=" + std::to_string(C) + "x" + std::to_string(H) + "x" +
+        std::to_string(W) + ")");
+  f.seekg(0, std::ios::beg);
+  std::vector<float> out(want);
+  f.read(reinterpret_cast<char*>(out.data()), n);
+  if (!f) throw std::runtime_error("qwen21: short read of '" + path + "'");
+  return out;
 }
 
 // Grayscale preview: channel-mean -> min/max normalize -> u8 -> nearest 16x.
@@ -1370,8 +1395,15 @@ std::vector<float> run_sample_loop_from_device(
       (sigmas_override && !sigmas_override->empty())
           ? *sigmas_override
           : build_sigmas_nearest_grid(steps, shift);
+  // AUDIT(a): turbo passes a non-empty sigmas_override, so this ternary
+  // bypasses build_sigmas_nearest_grid entirely and shift/flow_shift is
+  // unused for the schedule (still range-validated above, never applied).
   std::vector<float> tvals(sigmas.size());
   for (size_t i = 0; i < sigmas.size(); ++i) tvals[i] = 1000.0f * sigmas[i];
+  // AUDIT(d): the loop `t` view carries 1000*sigma (placeholder timestep
+  // and step-logging convention); the true-DiT adapter divides by 1000 at
+  // the call site so forward() sees the RAW [0,1] sigma (scaled to
+  // time_factor 1000 internally) — no double-scaling.
   const int n = (int)sigmas.size() - 1;
   const float g = guidance;
   auto t_h = Kokkos::create_mirror_view(t_d);
@@ -1380,11 +1412,17 @@ std::vector<float> run_sample_loop_from_device(
     // Scalar timestep only: single float host->device per step.
     t_h(0) = tvals[(size_t)i];
     Kokkos::deep_copy(t_d, t_h);
+    // AUDIT(b): Euler x += (sig[i+1]-sig[i]) * v with descending sigmas
+    // (plus terminal 0), so dt <= 0 stepping from noise toward data,
+    // matching FlowMatchEulerDiscreteScheduler / the reference __call__ loop.
     const float dt = sigmas[(size_t)i + 1] - sigmas[(size_t)i];
     // No fences inside the step: every forward, deep_copy, and kernel below
     // runs on the default execution space stream, so launch order already
     // guarantees correctness. The host consumes device data only after the
     // loop, where a single fence guards the final device->host copy.
+    // AUDIT(c): guidance == 1.0 forces use_cfg false (see do_cfg/same
+    // above), so this step runs exactly ONE forward (cond only, no
+    // unconditional branch) plus the plain Euler update.
     forward(x_d, t_d, y_cond_d, vc_d);
     if (use_cfg) {
       forward(x_d, t_d, y_unc_d, vu_d);
@@ -1587,7 +1625,7 @@ void usage() {
       "                    [--height H] [--width W]\n"
       "                    [--steps N] [--cfg G] [--shift S]\n"
       "                    [--sigmas driver|turbo]\n"
-      "                    [--seed N]\n"
+      "                    [--seed N] [--init-latents-in lat.f32]\n"
       "                    [--vae-weights vae.safetensors [--vae-decode]]\n"
       "                    [--out img.png]\n"
       "                    [--staged]\n"
@@ -1621,7 +1659,12 @@ void usage() {
       "  --sigmas       'driver' (default): nearest-grid schedule from\n"
       "                 --steps/--shift; 'turbo': checkpoint sample_sigmas\n"
       "                 verbatim (mu-shifted already, 8 steps, shift=1.0)\n"
-      "  --seed         latent init seed (default 42)\n"
+      "  --seed         latent init seed (default 42; ignored when\n"
+      "                 --init-latents-in is given)\n"
+      "  --init-latents-in raw float32 LE initial latents [C,H,W]\n"
+      "                 row-major, flattened C-major lat[(c*H+h)*W+w]\n"
+      "                 (C*H*W floats, PRE-denormalization latent noise:\n"
+      "                 no mean/std applied); replaces the mt19937 sample\n"
       "  --vae-weights  VAE checkpoint (validated whenever given)\n"
       "  --vae-decode   run the real VAE decode (denormalize by the runtime\n"
       "                 vae/config.json affine, decode to RGBA) when the VAE\n"
@@ -1635,7 +1678,7 @@ void usage() {
 int main(int argc, char** argv) {
   std::string weights = "transformer";
   std::string prompt = "a red panda reading a newspaper";
-  std::string text_weights, prompt_embeds_in;
+  std::string text_weights, prompt_embeds_in, init_latents_in;
   std::string tokenizer_dir, text_encoder;
   std::string vae_weights, out = "qwen_image_21_out.png";
   int height = 64, width = 64;
@@ -1670,6 +1713,8 @@ int main(int argc, char** argv) {
       text_weights = argv[++i];
     } else if (a == "--prompt-embeds-in" && i + 1 < argc) {
       prompt_embeds_in = argv[++i];
+    } else if (a == "--init-latents-in" && i + 1 < argc) {
+      init_latents_in = argv[++i];
     } else if (a == "--vae-weights" && i + 1 < argc) {
       vae_weights = argv[++i];
     } else if (a == "--vae-decode") {
@@ -1876,8 +1921,21 @@ int main(int argc, char** argv) {
       vae_decode = false;
     }
 
-    std::vector<float> x_init =
-        QW::sample_gaussian(C * (size_t)H * (size_t)W, seed);
+    std::vector<float> x_init;
+    if (!init_latents_in.empty()) {
+      // --init-latents-in: raw float32 LE initial latents in the driver's
+      // native layout ([C,H,W] row-major, flattened C-major as
+      // lat[(c*H+h)*W+w], the same order the sampler packs into
+      // x_d(0,c,h,w) and the <stem>.f32 files it writes). Values are
+      // PRE-denormalization latent noise (no mean/std applied); validated
+      // against C*H*W, deep-copied to device by the sample loop, and used
+      // in place of the mt19937 sample.
+      x_init = load_init_latents_raw(init_latents_in, C, (size_t)H, (size_t)W);
+      std::printf("[init-latents %s] %zux%dx%d floats (fp32 LE [C,H,W])\n",
+                  init_latents_in.c_str(), C, H, W);
+    } else {
+      x_init = QW::sample_gaussian(C * (size_t)H * (size_t)W, seed);
+    }
     // Sigma schedule: 'driver' (default, current behavior) builds the
     // nearest-grid schedule from --steps/--shift; 'turbo' uses the
     // checkpoint sample_sigmas verbatim (mu-shifted already, so shift is
