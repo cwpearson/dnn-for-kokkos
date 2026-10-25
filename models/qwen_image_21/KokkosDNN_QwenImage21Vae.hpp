@@ -55,6 +55,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "KokkosDNN_Handle.hpp"
@@ -769,7 +770,10 @@ inline void qwen21vae_attn_av(const V2& p, const V2& v, const V2& o,
       });
 }
 
-// In-place pipeline denormalize: x = x * std + mean per channel.
+// In-place pipeline denormalize: x = x * std + mean per channel. For bf16
+// storage reproduce the reference's two-op lane exactly: diffusers casts the
+// constants to the latent dtype, multiplies (round to bf16), then adds (round
+// to bf16). The fp32 path keeps the single-rounding form.
 template <class ExecSpace, class V4, class V1>
 inline void qwen21vae_denormalize_inplace(const V4& x, const V1& mean,
                                           const V1& std,
@@ -780,6 +784,9 @@ inline void qwen21vae_denormalize_inplace(const V4& x, const V1& mean,
     throw std::invalid_argument(
         "qwen21vae_denormalize_inplace: dimension mismatch");
   if (B == 0 || C == 0 || H == 0 || W == 0) return;
+  using VScalar = typename V4::value_type;
+  constexpr bool kTwoOpBf16 =
+      std::is_same_v<VScalar, Kokkos::Experimental::bhalf_t>;
   Kokkos::parallel_for(
       label, Kokkos::RangePolicy<ExecSpace>(0, B * C * H * W),
       KOKKOS_LAMBDA(size_t e) {
@@ -787,9 +794,19 @@ inline void qwen21vae_denormalize_inplace(const V4& x, const V1& mean,
         const size_t b = e / (C * H * W);
         const size_t rem = e % (H * W);
         const float v = static_cast<float>(x(b, c, rem / W, rem % W));
+        // Keep all declarations outside the constexpr selection: NVCC's
+        // extended device lambda cannot first-capture a variable inside an
+        // if-constexpr context.
+        const VScalar s = static_cast<VScalar>(static_cast<float>(std(c)));
+        const VScalar m = static_cast<VScalar>(static_cast<float>(mean(c)));
+        const VScalar t = static_cast<VScalar>(v * static_cast<float>(s));
+        const VScalar single =
+            static_cast<VScalar>(v * static_cast<float>(std(c)) +
+                                 static_cast<float>(mean(c)));
         x(b, c, rem / W, rem % W) =
-            static_cast<typename V4::value_type>(v * static_cast<float>(std(c)) +
-                                                 static_cast<float>(mean(c)));
+            kTwoOpBf16 ? static_cast<VScalar>(static_cast<float>(t) +
+                                              static_cast<float>(m))
+                       : single;
       });
 }
 
