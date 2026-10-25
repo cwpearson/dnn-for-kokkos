@@ -366,3 +366,95 @@ TEST(AttentionBidirectional, FutureTokensAffectEarlyOutputs) {
   EXPECT_EQ(causal_delta, 0.0f)
       << "causal out(0) changed under future-token perturbation";
 }
+
+// CUDA tensor-core fused bidirectional SDPA
+// (src/KokkosDNN_AttentionTensorCuda.hpp): bhalf_t D in {64, 128}
+// D-contiguous shapes past the small-size floor run the wmma kernel on
+// SM80+ CUDA and the portable kernel elsewhere, so one numerics contract
+// covers both. Tolerances are absolute on O(0.1) outputs: tight enough to
+// catch transpose/tiling bugs (which showed up as O(0.1)-O(1) deviations
+// during development) with margin over measured tensor-vs-portable
+// rounding (~1e-3 max on these shapes). Covers full tiles, T/K tails, the
+// D=64/128 engines, and a GQA mapping, vs both the host FP32 reference and
+// the forced-portable kernel.
+template <class Scalar>
+void check_bidir_tensor_cores(int T, int K, int Hq, int Hkv, int D,
+                              float tol_host, float tol_portable) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  KokkosDNN::DNNHandle<Exec> h;
+  h.use_cublas = false;
+  h.use_cudnn = false;
+  h.use_tensor_cores = true;  // native path; portable fallback elsewhere
+  KokkosDNN::DNNHandle<Exec> hp;
+  hp.use_cublas = false;
+  hp.use_cudnn = false;
+  hp.use_tensor_cores = false;  // forced portable reference
+  const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+
+  Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec> q("q", T, Hq, D),
+      k("k", K, Hkv, D), v("v", K, Hkv, D), ot("ot", T, Hq, D),
+      op("op", T, Hq, D);
+  auto hq = Kokkos::create_mirror_view(q);
+  auto hk = Kokkos::create_mirror_view(k);
+  auto hv = Kokkos::create_mirror_view(v);
+  for (int t = 0; t < T; ++t)
+    for (int hh = 0; hh < Hq; ++hh)
+      for (int d = 0; d < D; ++d)
+        hq(t, hh, d) =
+            static_cast<Scalar>(0.05f * ((t * 7 + hh * 13 + d * 3) % 17) - 0.2f);
+  for (int n = 0; n < K; ++n)
+    for (int hh = 0; hh < Hkv; ++hh)
+      for (int d = 0; d < D; ++d) {
+        hk(n, hh, d) =
+            static_cast<Scalar>(0.05f * ((n * 5 + hh * 11 + d) % 19) - 0.2f);
+        hv(n, hh, d) =
+            static_cast<Scalar>(0.05f * ((n * 3 + hh * 17 + d * 2) % 23) - 0.3f);
+      }
+  Kokkos::deep_copy(q, hq);
+  Kokkos::deep_copy(k, hk);
+  Kokkos::deep_copy(v, hv);
+
+  KokkosDNN::attention_mha_bidirectional<Exec>(h, q, k, v, ot, scale);
+  KokkosDNN::attention_mha_bidirectional<Exec>(hp, q, k, v, op, scale);
+  Kokkos::fence();
+  auto got = Kokkos::create_mirror_view(ot);
+  auto gop = Kokkos::create_mirror_view(op);
+  Kokkos::deep_copy(got, ot);
+  Kokkos::deep_copy(gop, op);
+
+  std::vector<float> ref((size_t)T * Hq * D);
+  host_bidir_ref<Scalar>(hq, hk, hv, scale, T, K, Hq, Hkv, D, ref.data());
+  for (int t = 0; t < T; ++t)
+    for (int hh = 0; hh < Hq; ++hh)
+      for (int d = 0; d < D; ++d) {
+        const float a = static_cast<float>(got(t, hh, d));
+        const float b = static_cast<float>(gop(t, hh, d));
+        const float c = ref[(size_t)(t * Hq + hh) * D + d];
+        EXPECT_NEAR(a, c, tol_host)
+            << "tensor bidir vs host at (" << t << "," << hh << "," << d
+            << ") T=" << T << " K=" << K << " Hq=" << Hq << " Hkv=" << Hkv
+            << " D=" << D;
+        EXPECT_NEAR(a, b, tol_portable)
+            << "tensor-vs-portable mismatch at (" << t << "," << hh << ","
+            << d << ") T=" << T << " K=" << K << " Hq=" << Hq << " Hkv=" << Hkv
+            << " D=" << D;
+      }
+}
+
+TEST(AttentionBidirectional, TensorCoresMHA128Tails) {
+  check_bidir_tensor_cores<Kokkos::Experimental::bhalf_t>(
+      /*T=*/150, /*K=*/140, /*Hq=*/8, /*Hkv=*/8, /*D=*/128,
+      /*tol_host=*/5e-2f, /*tol_portable=*/5e-3f);
+}
+
+TEST(AttentionBidirectional, TensorCoresMHA64Tail) {
+  check_bidir_tensor_cores<Kokkos::Experimental::bhalf_t>(
+      /*T=*/128, /*K=*/96, /*Hq=*/8, /*Hkv=*/8, /*D=*/64,
+      /*tol_host=*/5e-2f, /*tol_portable=*/5e-3f);
+}
+
+TEST(AttentionBidirectional, TensorCoresGQA128) {
+  check_bidir_tensor_cores<Kokkos::Experimental::bhalf_t>(
+      /*T=*/96, /*K=*/112, /*Hq=*/8, /*Hkv=*/2, /*D=*/128,
+      /*tol_host=*/5e-2f, /*tol_portable=*/5e-3f);
+}
