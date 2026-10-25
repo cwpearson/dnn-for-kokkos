@@ -248,6 +248,42 @@ void qwen21dit_qk_rmsnorm(
 //     angles, matching the reference neg_index freq table).
 // Frequencies are theta^(-2k/ds) per section (theta from Config, 10000 per
 // the reference), i.e. rotation by angle p * theta^(-j/ds) on pair j.
+// Per-(row, head) fiber of the 3-axis RoPE rotation below (shared by the
+// single- and dual-tensor launches so the angle math exists exactly once).
+template <class Scalar, class V3>
+KOKKOS_INLINE_FUNCTION void qwen21dit_rope_fiber(
+    const V3& x, size_t t, size_t h, size_t text_len, size_t grid_w,
+    long h_off, long w_off, long frame, int a0, int a1, int a2,
+    double theta) {
+  long p0, p1, p2;
+  if (t < text_len) {
+    p0 = p1 = p2 = (long)t;
+  } else {
+    const size_t j = t - text_len;
+    const long hh = (long)(j / grid_w);
+    const long ww = (long)(j % grid_w);
+    p0 = frame;
+    p1 = hh - h_off;
+    p2 = ww - w_off;
+  }
+  const long ps[3] = {p0, p1, p2};
+  const int as[3] = {a0, a1, a2};
+  size_t base = 0;
+  for (int s = 0; s < 3; ++s) {
+    const int ds = as[s];
+    for (int j = 0; j < ds; j += 2) {
+      float inv = powf((float)theta, -((float)j) / (float)ds);
+      float ang = (float)ps[s] * inv;
+      float co = cosf(ang), si = sinf(ang);
+      float x0 = static_cast<float>(x(t, h, base + (size_t)j));
+      float x1 = static_cast<float>(x(t, h, base + (size_t)j + 1));
+      x(t, h, base + (size_t)j) = static_cast<Scalar>(x0 * co - x1 * si);
+      x(t, h, base + (size_t)j + 1) = static_cast<Scalar>(x0 * si + x1 * co);
+    }
+    base += (size_t)ds;
+  }
+}
+
 template <class ExecSpace, class Scalar, class V3>
 void qwen21dit_rope_3axis(
     const V3& x, size_t text_len, size_t grid_h, size_t grid_w, int a0, int a1,
@@ -267,36 +303,123 @@ void qwen21dit_rope_3axis(
   Kokkos::parallel_for(
       label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, H}),
       KOKKOS_LAMBDA(size_t t, size_t h) {
-        long p0, p1, p2;
-        if (t < text_len) {
-          p0 = p1 = p2 = (long)t;
-        } else {
-          const size_t j = t - text_len;
-          const long hh = (long)(j / grid_w);
-          const long ww = (long)(j % grid_w);
-          p0 = frame;
-          p1 = hh - h_off;
-          p2 = ww - w_off;
-        }
-        const long ps[3] = {p0, p1, p2};
-        const int as[3] = {a0, a1, a2};
-        size_t base = 0;
-        for (int s = 0; s < 3; ++s) {
-          const int ds = as[s];
-          for (int j = 0; j < ds; j += 2) {
-            float inv =
-                powf((float)theta, -((float)j) / (float)ds);
-            float ang = (float)ps[s] * inv;
-            float co = cosf(ang), si = sinf(ang);
-            float x0 = static_cast<float>(x(t, h, base + (size_t)j));
-            float x1 = static_cast<float>(x(t, h, base + (size_t)j + 1));
-            x(t, h, base + (size_t)j) = static_cast<Scalar>(x0 * co - x1 * si);
-            x(t, h, base + (size_t)j + 1) =
-                static_cast<Scalar>(x0 * si + x1 * co);
-          }
-          base += (size_t)ds;
-        }
+        qwen21dit_rope_fiber<Scalar>(x, t, h, text_len, grid_w, h_off, w_off,
+                                     frame, a0, a1, a2, theta);
       });
+}
+
+// Dual-tensor 3-axis RoPE: the qwen21dit_rope_3axis rotation applied to q
+// and k in ONE launch (same bytes, half the launches, better occupancy).
+// Per-fiber math is unchanged (one shared-helper call per tensor), so this
+// is bitwise-identical to two separate calls. q and k must share geometry.
+template <class ExecSpace, class Scalar, class V3>
+void qwen21dit_rope_3axis_dual(
+    const V3& q, const V3& k, size_t text_len, size_t grid_h, size_t grid_w,
+    int a0, int a1, int a2, double theta,
+    const std::string& label = "KokkosDNN::qwen21dit_rope_dual") {
+  const size_t T = q.extent(0), H = q.extent(1), Dh = q.extent(2);
+  if ((size_t)(a0 + a1 + a2) != Dh)
+    throw std::invalid_argument(
+        "qwen21dit_rope_3axis_dual: axes/head_dim mismatch");
+  if (k.extent(0) != T || k.extent(1) != H || k.extent(2) != Dh)
+    throw std::invalid_argument(
+        "qwen21dit_rope_3axis_dual: q/k geometry mismatch");
+  if (T == 0 || H == 0 || Dh == 0) return;
+  if (grid_h == 0 || grid_w == 0)
+    throw std::invalid_argument(
+        "qwen21dit_rope_3axis_dual: grid dims must be > 0");
+  if (text_len + grid_h * grid_w != T)
+    throw std::invalid_argument(
+        "qwen21dit_rope_3axis_dual: S + H*W must equal T");
+  const long h_off = (long)(grid_h - grid_h / 2);
+  const long w_off = (long)(grid_w - grid_w / 2);
+  const long frame = (long)text_len;
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, H}),
+      KOKKOS_LAMBDA(size_t t, size_t h) {
+        qwen21dit_rope_fiber<Scalar>(q, t, h, text_len, grid_w, h_off, w_off,
+                                     frame, a0, a1, a2, theta);
+        qwen21dit_rope_fiber<Scalar>(k, t, h, text_len, grid_w, h_off, w_off,
+                                     frame, a0, a1, a2, theta);
+      });
+}
+
+// Fused affine-free LayerNorm + per-region scale (replaces
+// layernorm_noaffine_forward + qwen21dit_apply_scale_split pairs):
+//   y = (x - mean(x)) * inv * (1 + s[row < split ? txt : img]).
+// Same team-per-row two-pass FP32 algorithm as
+// KokkosDNN::Impl::LayerNormNoAffineFunctor (identical mean/var/inv op
+// order: rsqrt first, scale multiply folded into the write-back only),
+// saving one full [R, D] pass. In-place safe (x and y may alias: the
+// reductions only read x; writes start after the team's final barrier).
+// Not bitwise-identical to the two-pass form (one fewer Scalar rounding
+// on the write-back), well within tolerance.
+// Named functor (not a nested extended lambda): nvcc rejects an extended
+// __host__ __device__ lambda defined inside another extended lambda.
+template <class ExecSpace, class Scalar>
+struct LayernormNoaffineScaledSplitFunctor {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> x, y;
+  Kokkos::View<Scalar*, ExecSpace> s_txt, s_img;
+  float eps;
+  size_t D, split;
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& member) const {
+    const auto X = x;
+    const auto Y = y;
+    const auto ST = s_txt;
+    const auto SI = s_img;
+    const size_t t = static_cast<size_t>(member.league_rank());
+    const size_t sp = split;
+    const float Dn = static_cast<float>(D);
+    float sum = 0;
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(member, D),
+        KOKKOS_LAMBDA(size_t d, float& acc) {
+          acc += static_cast<float>(X(t, d));
+        },
+        sum);
+    const float mean = sum / Dn;
+    float sq = 0;
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(member, D),
+        KOKKOS_LAMBDA(size_t d, float& acc) {
+          float c = static_cast<float>(X(t, d)) - mean;
+          acc += c * c;
+        },
+        sq);
+    const float inv = 1.0f / sqrt(sq / Dn + eps);
+    Kokkos::parallel_for(
+        Kokkos::TeamThreadRange(member, D), KOKKOS_LAMBDA(size_t d) {
+          float n = (static_cast<float>(X(t, d)) - mean) * inv;
+          float s = (t < sp) ? static_cast<float>(ST(d))
+                             : static_cast<float>(SI(d));
+          Y(t, d) = static_cast<Scalar>(n * (1.0f + s));
+        });
+  }
+};
+
+// y = layernorm_noaffine(x) * (1 + per-region scale); s_txt covers rows
+// [0, split), s_img rows [split, R). Same checker/launch conventions as
+// layernorm_noaffine_forward (TeamPolicy over R rows).
+template <class ExecSpace, class Scalar>
+void qwen21dit_layernorm_noaffine_scaled(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
+    float eps, const Kokkos::View<Scalar*, ExecSpace>& s_txt,
+    const Kokkos::View<Scalar*, ExecSpace>& s_img, size_t split,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& y,
+    const std::string& label = "KokkosDNN::qwen21dit_ln_scaled") {
+  const size_t R = x.extent(0), D = x.extent(1);
+  if (y.extent(0) != R || y.extent(1) != D || s_txt.extent(0) != D ||
+      s_img.extent(0) != D || split > R)
+    throw std::invalid_argument(
+        "qwen21dit_layernorm_noaffine_scaled: dim mismatch");
+  if (R == 0 || D == 0) return;
+  LayernormNoaffineScaledSplitFunctor<ExecSpace, Scalar> f{x, y, s_txt,
+                                                           s_img, eps, D,
+                                                           split};
+  Kokkos::parallel_for(label, Kokkos::TeamPolicy<ExecSpace>(R, Kokkos::AUTO),
+                       f);
 }
 
 // Scale application: y = x * (1 + scale), row-broadcast over [R, D].
@@ -996,12 +1119,10 @@ class QwenImage21DitModel {
 
       for (size_t li = 0; li < weights_.blocks.size(); ++li) {
         const auto& bw = weights_.blocks[li];
-        // Attention path: affine-free LayerNorm, then per-region scale
+        // Attention path: fused affine-free LayerNorm + per-region scale
         // (text rows <- t=0 lane, target rows <- sampled lane).
-        KokkosDNN::layernorm_noaffine_forward<ExecSpace, Scalar>(joint, eps,
-                                                                 hn);
-        Impl::qwen21dit_apply_scale_split<ExecSpace, Scalar>(hn, a_z, a_s, S,
-                                                            hn);
+        Impl::qwen21dit_layernorm_noaffine_scaled<ExecSpace, Scalar>(
+            joint, eps, a_z, a_s, S, hn);
         KokkosDNN::gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1.0f), hn, bw.to_q,
                          static_cast<Scalar>(0.0f), q2);
         KokkosDNN::gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1.0f), hn, bw.to_k,
@@ -1010,21 +1131,19 @@ class QwenImage21DitModel {
                          static_cast<Scalar>(0.0f), v2);
         U3 q_txt(q2.data(), S, H, Hd), k_pre(k2.data(), S, H, Hd),
             v_pre(v2.data(), S, H, Hd), o_txt(o2.data(), S, H, Hd);
+        U3 q_full(q2.data(), T, H, Hd), k_full(k2.data(), T, H, Hd);
         U3 q_tgt(q2.data() + S * H * Hd, N, H, Hd),
-            k_full(k2.data(), T, H, Hd), v_full(v2.data(), T, H, Hd),
+            v_full(v2.data(), T, H, Hd),
             o_tgt(o2.data() + S * H * Hd, N, H, Hd);
-        Impl::qwen21dit_qk_rmsnorm<ExecSpace, Scalar>(q_txt, bw.norm_q, eps);
-        Impl::qwen21dit_qk_rmsnorm<ExecSpace, Scalar>(
-            U3(q2.data() + S * H * Hd, N, H, Hd), bw.norm_q, eps);
-        Impl::qwen21dit_qk_rmsnorm<ExecSpace, Scalar>(k_pre, bw.norm_k, eps);
-        Impl::qwen21dit_qk_rmsnorm<ExecSpace, Scalar>(
-            U3(k2.data() + S * H * Hd, N, H, Hd), bw.norm_k, eps);
-        U3 q_full(q2.data(), T, H, Hd), k_full3(k2.data(), T, H, Hd);
-        Impl::qwen21dit_rope_3axis<ExecSpace, Scalar>(
-            q_full, S, latent_h, latent_w, cfg_.rope_axes[0],
-            cfg_.rope_axes[1], cfg_.rope_axes[2], cfg_.rope_theta);
-        Impl::qwen21dit_rope_3axis<ExecSpace, Scalar>(
-            k_full3, S, latent_h, latent_w, cfg_.rope_axes[0],
+        // FUSED qk_rmsnorm (was 4 launches over txt/tgt halves): the halves
+        // are contiguous halves of q_full/k_full and rows are independent,
+        // so per-row math is unchanged.
+        Impl::qwen21dit_qk_rmsnorm<ExecSpace, Scalar>(q_full, bw.norm_q, eps);
+        Impl::qwen21dit_qk_rmsnorm<ExecSpace, Scalar>(k_full, bw.norm_k, eps);
+        // FUSED rope (was 2 launches): one launch covers q_full + k_full
+        // with identical per-fiber math.
+        Impl::qwen21dit_rope_3axis_dual<ExecSpace, Scalar>(
+            q_full, k_full, S, latent_h, latent_w, cfg_.rope_axes[0],
             cfg_.rope_axes[1], cfg_.rope_axes[2], cfg_.rope_theta);
         // Exact block-causal prefill segmentation (the T2I form of
         // QwenImage21AttnProcessor): the single text segment attends
@@ -1041,11 +1160,9 @@ class QwenImage21DitModel {
                          static_cast<Scalar>(0.0f), hn);
         Impl::qwen21dit_gated_residual_split<ExecSpace, Scalar>(joint, hn,
                                                                g1_z, g1_s, S);
-        // SwiGLU FFN path.
-        KokkosDNN::layernorm_noaffine_forward<ExecSpace, Scalar>(joint, eps,
-                                                                 hn);
-        Impl::qwen21dit_apply_scale_split<ExecSpace, Scalar>(hn, b_z, b_s, S,
-                                                            hn);
+        // SwiGLU FFN path (fused norm + scale, same lane convention).
+        Impl::qwen21dit_layernorm_noaffine_scaled<ExecSpace, Scalar>(
+            joint, eps, b_z, b_s, S, hn);
         KokkosDNN::gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1.0f), hn, bw.proj,
                          static_cast<Scalar>(0.0f), p2);
         KokkosDNN::gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1.0f), hn, bw.gate,
@@ -1071,10 +1188,8 @@ class QwenImage21DitModel {
                          weights_.norm_out_W, static_cast<Scalar>(0.0f), ns2);
         Scalar* np = ns2.data();
         U1 ns_s(np, D), ns_z(np + D, D);
-        KokkosDNN::layernorm_noaffine_forward<ExecSpace, Scalar>(joint, eps,
-                                                                 hn);
-        Impl::qwen21dit_apply_scale_split<ExecSpace, Scalar>(hn, ns_z, ns_s,
-                                                            S, hn);
+        Impl::qwen21dit_layernorm_noaffine_scaled<ExecSpace, Scalar>(
+            joint, eps, ns_z, ns_s, S, hn);
       }
       {
         U2 hn_tgt(hn.data() + S * D, N, D);
