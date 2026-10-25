@@ -39,7 +39,7 @@
 //                          [--seed 42] [--init-latents-in lat.f32]
 //                          [--vae-weights vae.safetensors [--vae-decode]]
 //                          [--out img.png]
-//                          [--staged]
+//                          [--staged] [--dump-steps DIR]
 //
 // Text conditioning precedence: in-process Qwen forward (--tokenizer dir
 // with tokenizer.json + --text-encoder weights, raw T2I template, no chat
@@ -63,6 +63,15 @@
 //
 // --tiny runs a random-weights smoke model on 4x4 latents, 2 steps
 // (no downloads).
+//
+// --dump-steps DIR writes golden-parity tensors as raw little-endian float32
+// (driver layout: latents [C,H,W] row-major C-major lat[(c*H+h)*W+w],
+// prompt embeds [L,Cc] row-major) plus manifest.json: prompt_embeds.f32
+// (and prompt_embeds_neg.f32 when --cfg != 1), initial_latents.f32, then
+// stepNN_noise_pred.f32 / stepNN_latents.f32 per step (with
+// stepNN_noise_pred_cond.f32 / _uncond.f32 when the CFG branch runs), each
+// logged with its f64 sum. Off by default: the sample loop only takes the
+// extra device->host copies when the flag is set.
 #include <Kokkos_Core.hpp>
 
 #include <algorithm>
@@ -577,6 +586,141 @@ inline std::vector<float> load_init_latents_raw(const std::string& path,
   return out;
 }
 
+// ---- Parity dumps (--dump-steps) -----------------------------------------
+// Golden-parity tensor dumps: every tensor is written as raw float32 in the
+// driver's own native (little-endian) layout, logged with its f64 sum, and
+// recorded in a hand-rolled manifest.json (no JSON dependency). Nothing here
+// touches the device: the caller hands over host copies taken only when the
+// flag is set.
+struct DumpTensor {
+  std::string name;  // tensor name (also the .f32 file stem)
+  size_t numel = 0;
+  double f64sum = 0.0;
+};
+
+struct DumpWriter {
+  std::string dir;
+  std::vector<DumpTensor> tensors;
+
+  explicit DumpWriter(const std::string& d) : dir(d) {
+    if (dir.empty()) return;
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (!std::filesystem::is_directory(dir))
+      throw std::runtime_error("--dump-steps: cannot create directory '" + dir +
+                               "'");
+    std::printf("[dump] writing parity tensors to %s\n", dir.c_str());
+    std::fflush(stdout);
+  }
+
+  bool active() const { return !dir.empty(); }
+
+  // One tensor: DIR/<name>.f32 plus "[dump] <name> <numel> floats
+  // f64sum=<%.17g>". The sum accumulates in double over the float32 values.
+  void write(const std::string& name, const std::vector<float>& v) {
+    if (!active()) return;
+    save_raw_f32(dir + "/" + name + ".f32", v);
+    double s = 0.0;
+    for (float x : v) s += (double)x;
+    tensors.push_back(DumpTensor{name, v.size(), s});
+    std::printf("[dump] %s %zu floats f64sum=%.17g\n", name.c_str(), v.size(),
+                s);
+    std::fflush(stdout);
+  }
+};
+
+// Manifest metadata: exactly what produced the dumped tensors.
+struct DumpManifest {
+  std::string prompt, prompt_source, model_label, sigmas_mode;
+  std::vector<float> sigmas;  // the schedule actually used, incl. terminal 0
+  int height = 0, width = 0, steps = 0;
+  size_t latent_channels = 0;
+  unsigned long long seed = 0;
+  double guidance = 1.0;
+  bool use_cfg = false, staged = false;
+};
+
+inline std::string json_escape(const std::string& s) {
+  std::string o;
+  for (char ch : s) {
+    const unsigned char c = (unsigned char)ch;
+    switch (ch) {
+      case '"': o += "\\\""; break;
+      case '\\': o += "\\\\"; break;
+      case '\n': o += "\\n"; break;
+      case '\r': o += "\\r"; break;
+      case '\t': o += "\\t"; break;
+      default:
+        if (c < 0x20) {
+          char buf[8];
+          std::snprintf(buf, sizeof(buf), "\\u%04x", (unsigned)c);
+          o += buf;
+        } else {
+          o += ch;
+        }
+    }
+  }
+  return o;
+}
+
+inline std::string json_num(double v) {
+  char buf[40];
+  std::snprintf(buf, sizeof(buf), "%.17g", v);
+  return buf;
+}
+
+// Hand-rolled JSON: metadata + per-tensor f64 sums, so a golden harness can
+// check that the files it read are the ones logged.
+inline void write_dump_manifest(const DumpWriter& dw, const DumpManifest& m) {
+  if (!dw.active()) return;
+  const std::string path = dw.dir + "/manifest.json";
+  std::ofstream f(path);
+  if (!f) throw std::runtime_error("cannot open '" + path + "' for writing");
+  f << "{\n";
+  f << "  \"format\": \"kokkosdnn-qwen21-dump-v1\",\n";
+  f << "  \"model\": \"" << json_escape(m.model_label) << "\",\n";
+  f << "  \"prompt\": \"" << json_escape(m.prompt) << "\",\n";
+  f << "  \"prompt_source\": \"" << json_escape(m.prompt_source) << "\",\n";
+  f << "  \"height\": " << m.height << ",\n";
+  f << "  \"width\": " << m.width << ",\n";
+  f << "  \"latent_channels\": " << m.latent_channels << ",\n";
+  f << "  \"steps\": " << m.steps << ",\n";
+  f << "  \"sigmas\": [";
+  for (size_t i = 0; i < m.sigmas.size(); ++i)
+    f << (i ? ", " : "") << json_num((double)m.sigmas[i]);
+  f << "],\n";
+  f << "  \"seed\": " << m.seed << ",\n";
+  f << "  \"cfg\": " << json_num(m.guidance) << ",\n";
+  f << "  \"guidance\": " << json_num(m.guidance) << ",\n";
+  f << "  \"use_cfg\": " << (m.use_cfg ? "true" : "false") << ",\n";
+  f << "  \"staged\": " << (m.staged ? "true" : "false") << ",\n";
+  f << "  \"sigmas_mode\": \"" << json_escape(m.sigmas_mode) << "\",\n";
+  f << "  \"layout\": \"float32 little-endian: latents [C,H,W] row-major "
+       "C-major lat[(c*H+h)*W+w]; prompt_embeds [L,Cc] row-major\",\n";
+#ifdef QWEN21_DRIVER_HAVE_DIT
+  f << "  \"latent_storage\": \"bfloat16 DiT state stored per step, dumped as "
+       "float32 (initial_latents.f32 is the fp32 x_init before that "
+       "quantization)\",\n";
+#else
+  f << "  \"latent_storage\": \"float32 (placeholder DScalar)\",\n";
+#endif
+  f << "  \"tensors\": [\n";
+  for (size_t i = 0; i < dw.tensors.size(); ++i) {
+    const DumpTensor& t = dw.tensors[i];
+    f << "    {\"name\": \"" << json_escape(t.name) << "\", \"file\": \""
+      << json_escape(t.name) << ".f32\", \"numel\": " << t.numel
+      << ", \"f64sum\": " << json_num(t.f64sum) << "}"
+      << (i + 1 < dw.tensors.size() ? "," : "") << "\n";
+  }
+  f << "  ]\n";
+  f << "}\n";
+  f.close();
+  if (!f) throw std::runtime_error("short write to '" + path + "'");
+  std::printf("[dump] wrote %zu tensors to %s\n", dw.tensors.size(),
+              dw.dir.c_str());
+  std::fflush(stdout);
+}
+
 // Grayscale preview: channel-mean -> min/max normalize -> u8 -> nearest 16x.
 std::vector<unsigned char> render_preview(const std::vector<float>& lat,
                                           size_t C, size_t H, size_t W,
@@ -997,6 +1141,10 @@ struct EncoderStage {
   Kokkos::View<float**, Kokkos::LayoutRight, Exec> device;  // [L,Cc] cond
   Kokkos::View<float**, Kokkos::LayoutRight, Exec> device_neg;  // [L,Cc] uncond
   size_t L = 0, Cc = 0;
+  // Conditioning source actually used: "qwen" (in-process forward), "file"
+  // (--text-weights / --prompt-embeds-in), or "null" (zeros). Recorded in the
+  // --dump-steps manifest.
+  const char* source = "null";
 
   // Device-stage both cond and uncond embeds (HostSpace + one deep_copy
   // each), the same handoff an on-device encoder output uses. The two views
@@ -1119,6 +1267,7 @@ struct EncoderStage {
     st.L = L;
     st.embeds.assign(L * Cc, 0.0f);
     st.neg_embeds.assign(L * Cc, 0.0f);
+    st.source = "qwen";
     for (size_t t = 0; t < L; ++t)
       for (size_t h = 0; h < Cc; ++h)
         st.embeds[t * Cc + h] = (float)hhid(0, drop + t, h);
@@ -1195,6 +1344,7 @@ struct EncoderStage {
     if (!caption_path.empty()) {
       try {
         st.embeds = QW::load_caption_raw(caption_path, (int)st.L, (int)st.Cc);
+        st.source = "file";
         std::printf("[caption %s] %zux%zu features\n", caption_path.c_str(),
                     st.L, st.Cc);
       } catch (const std::exception& e) {
@@ -1313,7 +1463,24 @@ inline std::vector<float> build_sigmas_nearest_grid(int steps, float shift) {
 // [L,Cc]) that stayed resident on the device across the encoder-release /
 // DiT-load boundary. The only copies are device-to-device (one
 // parallel_for per branch into the [1,L,Cc] loop views); nothing
-// round-trips through host or disk.
+// round-trips through host or disk except through the optional parity dump
+// hook below (off by default, so the default loop is copy-free).
+//
+// Per-step parity-dump hook (--dump-steps): `on_step_done(step, x, v,
+// v_cond, v_uncond)` receives host fp32 copies of the post-Euler-update
+// latents `x` and of the model output `v` actually used for that step, both
+// in the driver's [C,H,W] C-major layout. With the CFG branch active the
+// cond/uncond model outputs are passed too; otherwise both stay empty.
+struct StepDumpHook {
+  bool want_branches = false;
+  std::function<void(int, const std::vector<float>&, const std::vector<float>&,
+                     const std::vector<float>&, const std::vector<float>&)>
+      on_step_done;
+  // Optional out: whether the CFG branch actually ran (guidance != 1 and the
+  // cond/uncond captions differ).
+  bool* use_cfg_out = nullptr;
+};
+
 template <class CfgT, class Forward>
 std::vector<float> run_sample_loop_from_device(
     const CfgT& cfg, Forward&& forward, const std::vector<float>& x_init,
@@ -1321,7 +1488,8 @@ std::vector<float> run_sample_loop_from_device(
     const Kokkos::View<float**, Kokkos::LayoutRight, Exec>& uncond_d,
     int steps, float guidance, float shift, int H, int W,
     const std::function<void(int, float, float)>& on_step = {},
-    const std::vector<float>* sigmas_override = nullptr) {
+    const std::vector<float>* sigmas_override = nullptr,
+    const StepDumpHook& step_dump = {}) {
   if (steps <= 0)
     throw std::invalid_argument("qwen21 sample: steps must be > 0");
   if (!std::isfinite(guidance) || guidance < 0.0f)
@@ -1363,6 +1531,7 @@ std::vector<float> run_sample_loop_from_device(
         }
   }
   const bool use_cfg = do_cfg && !same;
+  if (step_dump.use_cfg_out) *step_dump.use_cfg_out = use_cfg;
 
   using LatR = Kokkos::View<DScalar****, Kokkos::LayoutRight, Exec>;
   using TokR = Kokkos::View<DScalar***, Kokkos::LayoutRight, Exec>;
@@ -1449,6 +1618,43 @@ std::vector<float> run_sample_loop_from_device(
             const float v = static_cast<float>(vc_d(b, c, h, w));
             x_d(b, c, h, w) = static_cast<DScalar>(xc + dt * v);
           });
+    }
+    if (step_dump.on_step_done) {
+      // Parity-dump only: fence, then take the host copies for this step.
+      // The default sample path never enters this block (no extra
+      // allocations and no device->host traffic).
+      Kokkos::fence();
+      auto vc_h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(),
+                                                      vc_d);
+      auto x_h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), x_d);
+      decltype(vc_h) vu_h;  // populated only when the CFG branch ran
+      if (use_cfg)
+        vu_h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), vu_d);
+      std::vector<float> x_step(C * T), v_step(C * T), v_cond, v_uncond;
+      if (use_cfg && step_dump.want_branches) {
+        v_cond.resize(C * T);
+        v_uncond.resize(C * T);
+      }
+      size_t kk = 0;
+      for (size_t c = 0; c < C; ++c)
+        for (size_t h = 0; h < HH; ++h)
+          for (size_t w = 0; w < WW; ++w) {
+            const float a = static_cast<float>(vc_h(0, c, h, w));
+            float vv = a;
+            if (use_cfg) {
+              const float b = static_cast<float>(vu_h(0, c, h, w));
+              // Same fp32 CFG combine the Euler kernel above applies.
+              vv = b + g * (a - b);
+              if (!v_cond.empty()) {
+                v_cond[kk] = a;
+                v_uncond[kk] = b;
+              }
+            }
+            v_step[kk] = vv;
+            x_step[kk] = static_cast<float>(x_h(0, c, h, w));
+            ++kk;
+          }
+      step_dump.on_step_done(i, x_step, v_step, v_cond, v_uncond);
     }
   }
   // Single fence for the whole loop: the host consumes device data only at
@@ -1628,7 +1834,7 @@ void usage() {
       "                    [--seed N] [--init-latents-in lat.f32]\n"
       "                    [--vae-weights vae.safetensors [--vae-decode]]\n"
       "                    [--out img.png]\n"
-      "                    [--staged]\n"
+      "                    [--staged] [--dump-steps DIR]\n"
       "\n"
       "  --tiny         random-weights smoke model, 4x4 latents, 2 steps\n"
       "                 (no files)\n"
@@ -1670,7 +1876,12 @@ void usage() {
       "                 vae/config.json affine, decode to RGBA) when the VAE\n"
       "                 header + weights are present, else grayscale preview\n"
       "  --out          PNG with KokkosDNN_ENABLE_IMAGE=ON, else PPM;\n"
-      "                 raw F32 latents always written to <stem>.f32\n");
+      "                 raw F32 latents always written to <stem>.f32\n"
+      "  --dump-steps   write golden-parity tensors (raw float32 LE + f64\n"
+      "                 sums + manifest.json) into DIR: prompt_embeds\n"
+      "                 (+ _neg when --cfg != 1), initial_latents, then\n"
+      "                 stepNN_noise_pred / stepNN_latents per Euler step;\n"
+      "                 off by default (no extra device->host copies)\n");
 }
 
 }  // namespace
@@ -1678,7 +1889,7 @@ void usage() {
 int main(int argc, char** argv) {
   std::string weights = "transformer";
   std::string prompt = "a red panda reading a newspaper";
-  std::string text_weights, prompt_embeds_in, init_latents_in;
+  std::string text_weights, prompt_embeds_in, init_latents_in, dump_dir;
   std::string tokenizer_dir, text_encoder;
   std::string vae_weights, out = "qwen_image_21_out.png";
   int height = 64, width = 64;
@@ -1715,6 +1926,8 @@ int main(int argc, char** argv) {
       prompt_embeds_in = argv[++i];
     } else if (a == "--init-latents-in" && i + 1 < argc) {
       init_latents_in = argv[++i];
+    } else if (a == "--dump-steps" && i + 1 < argc) {
+      dump_dir = argv[++i];
     } else if (a == "--vae-weights" && i + 1 < argc) {
       vae_weights = argv[++i];
     } else if (a == "--vae-decode") {
@@ -1964,6 +2177,41 @@ int main(int argc, char** argv) {
     std::printf("[sample] H=%d W=%d steps=%d cfg=%.3g shift=%.3g seed=%llu\n",
                 H, W, steps_run, (double)guidance, (double)flow_shift,
                 (unsigned long long)seed);
+    // ---- Parity dumps (--dump-steps DIR): inert unless the flag is set ----
+    DumpWriter dump(dump_dir);
+    std::vector<float> dump_sigmas;  // exact schedule, incl. terminal 0
+    bool dump_use_cfg = false;
+    if (dump.active()) {
+      // The driver-mode schedule is rebuilt here because the nearest-grid
+      // snap can drop repeated entries: the real step count is
+      // sigmas.size()-1, not necessarily --steps.
+      dump_sigmas = (sigmas_mode == "turbo")
+                        ? turbo_sigmas
+                        : build_sigmas_nearest_grid(steps_eff, flow_shift);
+      // Conditioning exactly as staged for the DiT ([L,Cc] row-major).
+      {
+        auto hc = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(),
+                                                      enc.device);
+        const size_t L = enc.device.extent(0), Cc = enc.device.extent(1);
+        std::vector<float> pe(L * Cc);
+        size_t k = 0;
+        for (size_t l = 0; l < L; ++l)
+          for (size_t c = 0; c < Cc; ++c) pe[k++] = (float)hc(l, c);
+        dump.write("prompt_embeds", pe);
+        if (guidance != 1.0f) {
+          auto hu = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(),
+                                                        enc.device_neg);
+          std::vector<float> ne(L * Cc);
+          k = 0;
+          for (size_t l = 0; l < L; ++l)
+            for (size_t c = 0; c < Cc; ++c) ne[k++] = (float)hu(l, c);
+          dump.write("prompt_embeds_neg", ne);
+        }
+      }
+      // The sampler's starting latents, exactly as handed to it (no
+      // additional scaling).
+      dump.write("initial_latents", x_init);
+    }
 #ifdef QWEN21_DRIVER_HAVE_DIT
     KokkosDNN::DNNHandle<Exec> dit_handle;
     DitForward dit_forward{&dit_model, &dit_handle, H, W};
@@ -1971,6 +2219,32 @@ int main(int argc, char** argv) {
     QW::Model<Exec, DScalar> model(cfg, w);
     DitForward dit_forward{&model};
 #endif
+    // Per-step parity dump (--dump-steps): writes stepNN_noise_pred.f32 /
+    // stepNN_latents.f32 (+ the cond/uncond branches under CFG) from the
+    // host copies the loop takes only when this hook is set.
+    StepDumpHook dump_hook;
+    if (dump.active()) {
+      dump_hook.want_branches = (guidance != 1.0f);
+      dump_hook.use_cfg_out = &dump_use_cfg;
+      dump_hook.on_step_done =
+          [&dump](int i, const std::vector<float>& x_step,
+                  const std::vector<float>& v_step,
+                  const std::vector<float>& v_cond,
+                  const std::vector<float>& v_uncond) {
+            char name[64];
+            std::snprintf(name, sizeof(name), "step%02d_noise_pred", i);
+            dump.write(name, v_step);
+            if (!v_cond.empty()) {
+              std::snprintf(name, sizeof(name), "step%02d_noise_pred_cond", i);
+              dump.write(name, v_cond);
+              std::snprintf(name, sizeof(name), "step%02d_noise_pred_uncond",
+                            i);
+              dump.write(name, v_uncond);
+            }
+            std::snprintf(name, sizeof(name), "step%02d_latents", i);
+            dump.write(name, x_step);
+          };
+    }
     const auto t0 = std::chrono::steady_clock::now();
     // Sample straight from the device-resident embeds staged above: no host
     // reload, no disk re-read. The host vectors (enc.embeds/neg_embeds) stay
@@ -1984,7 +2258,7 @@ int main(int argc, char** argv) {
                       (double)sg);
           std::fflush(stdout);
         },
-        (sigmas_mode == "turbo") ? &turbo_sigmas : nullptr);
+        (sigmas_mode == "turbo") ? &turbo_sigmas : nullptr, dump_hook);
     const double secs =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
             .count();
@@ -2006,6 +2280,28 @@ int main(int argc, char** argv) {
     std::string lat_path = with_extension(out, ".f32");
     save_raw_f32(lat_path, lat);
     std::printf("[wrote %s] raw fp32 latents\n", lat_path.c_str());
+
+    if (dump.active()) {
+      DumpManifest dm;
+      dm.prompt = prompt;
+      dm.prompt_source = enc.source;
+      dm.model_label = be_label(cfg);
+      dm.sigmas_mode = sigmas_mode;
+      dm.sigmas = dump_sigmas;
+      dm.height = H;
+      dm.width = W;
+      dm.steps = (int)dump_sigmas.size() - 1;
+      dm.latent_channels = C;
+      dm.seed = (unsigned long long)seed;
+      dm.guidance = (double)guidance;
+      dm.use_cfg = dump_use_cfg;
+      dm.staged = staged;
+      if (dm.steps != steps_run)
+        std::printf("[dump] note: snapped schedule has %d steps (driver "
+                    "reported %d)\n",
+                    dm.steps, steps_run);
+      write_dump_manifest(dump, dm);
+    }
 
     // Captions are no longer needed: drop host + device copies before decode.
     enc.release();
