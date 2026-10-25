@@ -38,6 +38,9 @@
 //                          [--sigmas driver|turbo]
 //                          [--seed 42] [--init-latents-in lat.f32]
 //                          [--vae-weights vae.safetensors [--vae-decode]]
+//                          [--decode-latents-in lat.f32
+//                           [--decode-latents-layout chw|token]
+//                           [--decode-out-f32 file]]
 //                          [--out img.png]
 //                          [--staged] [--dump-steps DIR]
 //
@@ -463,9 +466,14 @@ inline std::vector<float> sample_gaussian(size_t n, uint64_t seed) {
 }
 
 // Load raw float32 caption features [L, Cc] (row-major). Accepts [L,Cc],
-// [1,L,Cc], [1,1,L,Cc] flattened (takes the trailing block).
+// [1,L,Cc], [1,1,L,Cc] flattened (takes the trailing block). With
+// expect_L <= 0 the row count is inferred from the file size, so a golden
+// [19,4096] prompt-embed dump loads as-is instead of being forced to the
+// backend maximum sequence length.
 inline std::vector<float> load_caption_raw(const std::string& path, int expect_L,
                                            int expect_Cc) {
+  if (expect_Cc <= 0)
+    throw std::runtime_error("qwen21: caption dim must be > 0");
   std::ifstream f(path, std::ios::binary | std::ios::ate);
   if (!f) throw std::runtime_error("qwen21: cannot open '" + path + "'");
   const long long n = (long long)f.tellg();
@@ -475,6 +483,14 @@ inline std::vector<float> load_caption_raw(const std::string& path, int expect_L
   std::vector<float> out((size_t)n / 4);
   f.read(reinterpret_cast<char*>(out.data()), n);
   if (!f) throw std::runtime_error("qwen21: short read of '" + path + "'");
+  if (expect_L <= 0) {
+    if (out.size() % (size_t)expect_Cc != 0)
+      throw std::runtime_error(
+          "qwen21: caption file '" + path + "' holds " +
+          std::to_string(out.size()) + " floats, not a multiple of Cc=" +
+          std::to_string(expect_Cc) + " ([L,Cc])");
+    return out;
+  }
   const size_t want = (size_t)expect_L * (size_t)expect_Cc;
   if (out.size() == want) return out;
   if (out.size() > want && out.size() % want == 0)
@@ -635,6 +651,7 @@ struct DumpManifest {
   std::vector<float> sigmas;  // the schedule actually used, incl. terminal 0
   int height = 0, width = 0, steps = 0;
   size_t latent_channels = 0;
+  size_t prompt_len = 0, prompt_dim = 0;  // staged conditioning [L,Cc]
   unsigned long long seed = 0;
   double guidance = 1.0;
   bool use_cfg = false, staged = false;
@@ -684,6 +701,8 @@ inline void write_dump_manifest(const DumpWriter& dw, const DumpManifest& m) {
   f << "  \"height\": " << m.height << ",\n";
   f << "  \"width\": " << m.width << ",\n";
   f << "  \"latent_channels\": " << m.latent_channels << ",\n";
+  f << "  \"prompt_embeds_shape\": [" << m.prompt_len << ", "
+    << m.prompt_dim << "],\n";
   f << "  \"steps\": " << m.steps << ",\n";
   f << "  \"sigmas\": [";
   for (size_t i = 0; i < m.sigmas.size(); ++i)
@@ -719,6 +738,23 @@ inline void write_dump_manifest(const DumpWriter& dw, const DumpManifest& m) {
   std::printf("[dump] wrote %zu tensors to %s\n", dw.tensors.size(),
               dw.dir.c_str());
   std::fflush(stdout);
+}
+
+// Raw fp32 LE latents for --decode-latents-in. `chw` is the driver layout
+// lat[(c*H+h)*W+w]; `token` is torch's packed [H*W, C] (row t = h*W+w,
+// channel inner), i.e. the golden final-latents .f32. Both are validated
+// against C*H*W.
+inline std::vector<float> load_decode_latents(const std::string& path,
+                                              size_t C, size_t H, size_t W,
+                                              bool token_major) {
+  std::vector<float> raw = load_init_latents_raw(path, C, H, W);
+  if (!token_major) return raw;
+  std::vector<float> out(raw.size());
+  for (size_t h = 0; h < H; ++h)
+    for (size_t w = 0; w < W; ++w)
+      for (size_t c = 0; c < C; ++c)
+        out[(c * H + h) * W + w] = raw[(h * W + w) * C + c];
+  return out;
 }
 
 // Grayscale preview: channel-mean -> min/max normalize -> u8 -> nearest 16x.
@@ -1343,10 +1379,19 @@ struct EncoderStage {
 #endif
     if (!caption_path.empty()) {
       try {
-        st.embeds = QW::load_caption_raw(caption_path, (int)st.L, (int)st.Cc);
+        // Infer L from the file: golden prompt-embed dumps are [19,4096],
+        // not the backend's 512-row maximum. Validate against max_seq so a
+        // full-geometry file cannot overflow the tiny smoke model.
+        st.embeds = QW::load_caption_raw(caption_path, 0, (int)st.Cc);
+        const size_t L = st.embeds.size() / st.Cc;
+        if (L == 0 || L > be_max_seq(cfg))
+          throw std::runtime_error(
+              "caption file has " + std::to_string(L) +
+              " rows, max_seq is " + std::to_string(be_max_seq(cfg)));
+        st.L = L;
         st.source = "file";
-        std::printf("[caption %s] %zux%zu features\n", caption_path.c_str(),
-                    st.L, st.Cc);
+        std::printf("[caption %s] %zux%zu features (L inferred from file)\n",
+                    caption_path.c_str(), st.L, st.Cc);
       } catch (const std::exception& e) {
         if (tiny) {
           // A full-geometry file cannot condition the tiny smoke model;
@@ -1355,6 +1400,7 @@ struct EncoderStage {
                        "warning: caption file '%s' unusable here (%s); using "
                        "null embedding\n",
                        caption_path.c_str(), e.what());
+          st.L = be_max_seq(cfg);
           st.embeds.assign(st.L * st.Cc, 0.0f);
         } else {
           throw;
@@ -1748,7 +1794,8 @@ inline bool try_vae_decode_rgba(const std::vector<float>& lat, size_t C,
                                 size_t H, size_t W,
                                 const std::string& vae_weights,
                                 std::vector<unsigned char>& pix, size_t& oH,
-                                size_t& oW, int& oCh) {
+                                size_t& oW, int& oCh,
+                                std::vector<float>* rgba_f32 = nullptr) {
   namespace QV = KokkosDNN::QwenImage21Vae;
   QV::Config vcfg;
   {
@@ -1803,15 +1850,18 @@ inline bool try_vae_decode_rgba(const std::vector<float>& lat, size_t C,
   Kokkos::fence();
   auto rh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), rgba);
   pix.resize(oH * oW * (size_t)vcfg.out_channels);
+  if (rgba_f32) rgba_f32->resize(oH * oW * (size_t)vcfg.out_channels);
   for (size_t h = 0; h < oH; ++h)
     for (size_t w = 0; w < oW; ++w)
       for (int c = 0; c < vcfg.out_channels; ++c) {
-        float v = std::min(1.0f, std::max(-1.0f, (float)rh(0, (size_t)c, h, w))) *
-                      0.5f +
-                  0.5f;
+        const float clamped =
+            std::min(1.0f, std::max(-1.0f, (float)rh(0, (size_t)c, h, w)));
+        float v = clamped * 0.5f + 0.5f;
         v = std::min(1.0f, std::max(0.0f, v));
-        pix[(h * oW + w) * (size_t)vcfg.out_channels + (size_t)c] =
-            (unsigned char)(std::lround(255.0f * v));
+        const size_t idx = (h * oW + w) * (size_t)vcfg.out_channels +
+                           (size_t)c;
+        pix[idx] = (unsigned char)(std::lround(255.0f * v));
+        if (rgba_f32) (*rgba_f32)[idx] = clamped;
       }
   oCh = vcfg.out_channels;
   dec.weights().release();
@@ -1820,6 +1870,88 @@ inline bool try_vae_decode_rgba(const std::vector<float>& lat, size_t C,
   return true;
 }
 #endif  // QWEN21_DRIVER_HAVE_VAE
+
+// Shared image writer: PNG when the image component is built in, otherwise
+// the PPM fallback (which drops alpha). Used by the normal pipeline tail and
+// by the VAE-only parity path.
+inline void write_output_image(const std::string& out,
+                                const std::vector<unsigned char>& pix,
+                                size_t oH, size_t oW, int oCh, bool decoded) {
+#ifdef KOKKOSDNN_ENABLE_IMAGE
+  Kokkos::View<unsigned char***, Kokkos::LayoutRight, Kokkos::HostSpace> img(
+      "qwen21_out", oH, oW, (size_t)oCh);
+  for (size_t h = 0; h < oH; ++h)
+    for (size_t ww = 0; ww < oW; ++ww)
+      for (int c = 0; c < oCh; ++c)
+        img(h, ww, (size_t)c) = pix[(h * oW + ww) * (size_t)oCh + (size_t)c];
+  KokkosDNN::Image::save_image_png(out, img);
+  std::printf("[wrote %s] %zux%zu %s (PNG)\n", out.c_str(), oH, oW,
+              decoded ? "VAE RGB" : "grayscale preview");
+#else
+  const std::string ppm = with_extension(out, ".ppm");
+  if (ppm != out)
+    std::printf("[note] built without KokkosDNN_ENABLE_IMAGE: writing PPM "
+                "to %s instead of PNG %s\n",
+                ppm.c_str(), out.c_str());
+  if (decoded) {
+    if (oCh == 4) {
+      // PPM has no alpha: drop it (PNG keeps RGBA).
+      std::vector<unsigned char> rgb(oH * oW * 3);
+      for (size_t k = 0; k < oH * oW; ++k) {
+        rgb[3 * k] = pix[4 * k];
+        rgb[3 * k + 1] = pix[4 * k + 1];
+        rgb[3 * k + 2] = pix[4 * k + 2];
+      }
+      save_ppm_rgb(ppm, rgb, oH, oW);
+    } else {
+      save_ppm_rgb(ppm, pix, oH, oW);
+    }
+  } else {
+    save_ppm(ppm, pix, oH, oW);
+  }
+  std::printf("[wrote %s] %zux%zu %s (PPM)\n", ppm.c_str(), oH, oW,
+              decoded ? "VAE RGB" : "grayscale preview");
+#endif
+}
+
+// VAE-only parity path (--decode-latents-in): golden latents -> runtime
+// affine -> QwenImage21VaeModel::decode -> image. No encoder, no DiT, no
+// sampler, so a VAE change can be checked in seconds.
+inline void run_vae_only(const std::string& lat_path, bool token_major,
+                         size_t C, size_t H, size_t W,
+                         const std::string& vae_weights, const std::string& out,
+                         const std::string& f32_out) {
+#ifdef QWEN21_DRIVER_HAVE_VAE
+  std::vector<float> lat = load_decode_latents(lat_path, C, H, W, token_major);
+  std::printf("[decode-latents %s] %zux%zux%zu floats (%s layout)\n",
+              lat_path.c_str(), C, H, W, token_major ? "token" : "chw");
+  std::vector<float> rgba_f32;
+  size_t oH = 0, oW = 0;
+  int oCh = 1;
+  std::vector<unsigned char> pix;
+  const bool ok = try_vae_decode_rgba(lat, C, H, W, vae_weights, pix, oH, oW,
+                                      oCh,
+                                      f32_out.empty() ? nullptr : &rgba_f32);
+  if (!ok) throw std::runtime_error("VAE-only decode failed");
+  if (!f32_out.empty()) {
+    save_raw_f32(f32_out, rgba_f32);
+    std::printf("[wrote %s] post-clamp RGBA %zux%zux%d f32\n", f32_out.c_str(),
+                oH, oW, oCh);
+  }
+  write_output_image(out, pix, oH, oW, oCh, /*decoded=*/true);
+#else
+  (void)lat_path;
+  (void)token_major;
+  (void)C;
+  (void)H;
+  (void)W;
+  (void)vae_weights;
+  (void)out;
+  (void)f32_out;
+  throw std::runtime_error(
+      "--decode-latents-in needs KokkosDNN_QwenImage21Vae.hpp in this build");
+#endif
+}
 
 void usage() {
   std::printf(
@@ -1833,6 +1965,9 @@ void usage() {
       "                    [--sigmas driver|turbo]\n"
       "                    [--seed N] [--init-latents-in lat.f32]\n"
       "                    [--vae-weights vae.safetensors [--vae-decode]]\n"
+      "                    [--decode-latents-in lat.f32\n"
+      "                     [--decode-latents-layout chw|token]\n"
+      "                     [--decode-out-f32 file]]\n"
       "                    [--out img.png]\n"
       "                    [--staged] [--dump-steps DIR]\n"
       "\n"
@@ -1875,6 +2010,12 @@ void usage() {
       "  --vae-decode   run the real VAE decode (denormalize by the runtime\n"
       "                 vae/config.json affine, decode to RGBA) when the VAE\n"
       "                 header + weights are present, else grayscale preview\n"
+      "  --decode-latents-in raw fp32 LE latents to decode directly (skips\n"
+      "                 encode, DiT load and sampling; needs --vae-weights;\n"
+      "                 --height/--width are the latent dims)\n"
+      "  --decode-latents-layout 'chw' (default: lat[(c*H+h)*W+w]) or\n"
+      "                 'token' (torch packed [H*W,C], golden final latents)\n"
+      "  --decode-out-f32 also write the post-clamp RGBA decode as raw f32\n"
       "  --out          PNG with KokkosDNN_ENABLE_IMAGE=ON, else PPM;\n"
       "                 raw F32 latents always written to <stem>.f32\n"
       "  --dump-steps   write golden-parity tensors (raw float32 LE + f64\n"
@@ -1892,6 +2033,8 @@ int main(int argc, char** argv) {
   std::string text_weights, prompt_embeds_in, init_latents_in, dump_dir;
   std::string tokenizer_dir, text_encoder;
   std::string vae_weights, out = "qwen_image_21_out.png";
+  std::string decode_latents_in, decode_latents_layout = "chw",
+              decode_out_f32;
   int height = 64, width = 64;
   int steps = 8;
   bool steps_given = false;
@@ -1932,6 +2075,19 @@ int main(int argc, char** argv) {
       vae_weights = argv[++i];
     } else if (a == "--vae-decode") {
       vae_decode = true;
+    } else if (a == "--decode-latents-in" && i + 1 < argc) {
+      decode_latents_in = argv[++i];
+    } else if (a == "--decode-latents-layout" && i + 1 < argc) {
+      decode_latents_layout = argv[++i];
+      if (decode_latents_layout != "chw" && decode_latents_layout != "token") {
+        std::fprintf(stderr,
+                     "error: --decode-latents-layout must be 'chw' or "
+                     "'token' (got '%s')\n",
+                     decode_latents_layout.c_str());
+        return 1;
+      }
+    } else if (a == "--decode-out-f32" && i + 1 < argc) {
+      decode_out_f32 = argv[++i];
     } else if (a == "--height" && i + 1 < argc) {
       height = std::stoi(argv[++i]);
     } else if (a == "--width" && i + 1 < argc) {
@@ -2027,6 +2183,22 @@ int main(int argc, char** argv) {
     const size_t C = be_latent_channels(cfg);
     std::printf("[model %s: %s]\n", tiny ? "tiny_test" : "qwen-image-2.1",
                 be_label(cfg));
+
+    // ---- VAE-only parity path (--decode-latents-in) ----
+    // Bypasses encode + DiT load + sampler: golden latents go straight
+    // through the runtime affine + VAE decode. Needs the real VAE.
+    if (!decode_latents_in.empty()) {
+      if (vae_weights.empty())
+        throw std::runtime_error(
+            "--decode-latents-in needs --vae-weights (implies decode)");
+      if (tiny)
+        throw std::runtime_error(
+            "--decode-latents-in needs the real VAE; drop --tiny");
+      run_vae_only(decode_latents_in, decode_latents_layout == "token", C,
+                   (size_t)H, (size_t)W, vae_weights, out, decode_out_f32);
+      Kokkos::finalize();
+      return 0;
+    }
 
     // Resolve the caption source: --prompt-embeds-in is an alias of
     // --text-weights and wins when both are given with different values.
@@ -2292,6 +2464,8 @@ int main(int argc, char** argv) {
       dm.width = W;
       dm.steps = (int)dump_sigmas.size() - 1;
       dm.latent_channels = C;
+      dm.prompt_len = enc.device.extent(0);
+      dm.prompt_dim = enc.device.extent(1);
       dm.seed = (unsigned long long)seed;
       dm.guidance = (double)guidance;
       dm.use_cfg = dump_use_cfg;
@@ -2344,46 +2518,7 @@ int main(int argc, char** argv) {
       pix = render_preview(lat, C, (size_t)H, (size_t)W, oH, oW);
       QW::print_phase_memory("decode-preview", 0, 0);
     }
-#ifdef KOKKOSDNN_ENABLE_IMAGE
-    {
-      Kokkos::View<unsigned char***, Kokkos::LayoutRight, Kokkos::HostSpace>
-          img("qwen21_out", oH, oW, (size_t)oCh);
-      for (size_t h = 0; h < oH; ++h)
-        for (size_t ww = 0; ww < oW; ++ww)
-          for (int c = 0; c < oCh; ++c)
-            img(h, ww, (size_t)c) = pix[(h * oW + ww) * (size_t)oCh + (size_t)c];
-      KokkosDNN::Image::save_image_png(out, img);
-      std::printf("[wrote %s] %zux%zu %s (PNG)\n", out.c_str(), oH, oW,
-                  decoded ? "VAE RGB" : "grayscale preview");
-    }
-#else
-    {
-      const std::string ppm = with_extension(out, ".ppm");
-      if (ppm != out)
-        std::printf("[note] built without KokkosDNN_ENABLE_IMAGE: writing PPM "
-                    "to %s instead of PNG %s\n",
-                    ppm.c_str(), out.c_str());
-      if (decoded) {
-        if (oCh == 4) {
-          // PPM has no alpha: drop it (PNG keeps RGBA).
-          std::vector<unsigned char> rgb(oH * oW * 3);
-          for (size_t k = 0; k < oH * oW; ++k) {
-            rgb[3 * k] = pix[4 * k];
-            rgb[3 * k + 1] = pix[4 * k + 1];
-            rgb[3 * k + 2] = pix[4 * k + 2];
-          }
-          save_ppm_rgb(ppm, rgb, oH, oW);
-        } else {
-          save_ppm_rgb(ppm, pix, oH, oW);
-        }
-      } else {
-        save_ppm(ppm, pix, oH, oW);
-      }
-      // oCh is only consumed by the PNG path above.
-      std::printf("[wrote %s] %zux%zu %s (PPM)\n", ppm.c_str(), oH, oW,
-                  decoded ? "VAE RGB" : "grayscale preview");
-    }
-#endif
+    write_output_image(out, pix, oH, oW, oCh, decoded);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());
     rc = 1;
