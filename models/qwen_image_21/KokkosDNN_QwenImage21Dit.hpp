@@ -55,6 +55,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -874,18 +875,31 @@ class QwenImage21DitModel {
     using U3 = Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace,
                             Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
 
-    // Timestep sinusoid on host (float64 phases, 256-d [cos|sin] halves).
-    // Reference (QwenImage21TemporalTimesteps): timestep is scaled by
-    // time_factor 1000 BEFORE the sinusoid.
+    // Timestep sinusoid on host (float32 phases, 256-d [cos|sin] halves).
+    // Reference (QwenImage21TemporalTimesteps): the pipeline rounds the
+    // timestep to bf16, divides by 1000 (bf16), and only then does the
+    // transformer multiply by time_factor 1000 in fp32. Reproduce that lane
+    // for bf16 builds so steps 1..7 see the same effective timestep as the
+    // torch golden (step 0 at sigma=1.0 is unaffected: both are exact).
     constexpr size_t F = 256;
     std::vector<float> sinus_s(F), sinus_0(F);
     {
+      double t_arg = timestep;
+      if constexpr (std::is_same_v<Scalar, Kokkos::Experimental::bhalf_t>) {
+        const float t1000 = (float)(1000.0 * timestep);  // scheduler t, f32
+        const Scalar tq = static_cast<Scalar>(t1000);    // bf16(t)
+        const Scalar q =
+            static_cast<Scalar>((float)tq / 1000.0f);    // bf16(t/1000)
+        t_arg = 1000.0 * (double)(float)q;  // time_factor * timestep.float()
+      }
+      const float half_f = (float)(F / 2);
       for (size_t i = 0; i < F / 2; ++i) {
-        const double inv =
-            std::exp(-std::log(10000.0) * (double)i / (double)(F / 2));
-        const double a_s = 1000.0 * timestep * inv;
-        sinus_s[i] = (float)std::cos(a_s);
-        sinus_s[i + F / 2] = (float)std::sin(a_s);
+        // torch builds freqs in float32; keep the angle multiply fp32 too.
+        const float inv =
+            std::exp(-9.210340371976184f * (float)i / half_f);  // -ln(1e4)
+        const float a_s = (float)t_arg * inv;
+        sinus_s[i] = std::cos(a_s);
+        sinus_s[i + F / 2] = std::sin(a_s);
         sinus_0[i] = 1.0f;  // t = 0: cos(0) = 1 ...
         sinus_0[i + F / 2] = 0.0f;  // ... sin(0) = 0
       }

@@ -7,8 +7,10 @@
 // conditioning). Ground truth (HF research): 36 layers, hidden 4096,
 // 32 Q heads / 8 KV heads (GQA), head_dim 128, SwiGLU intermediate 12288,
 // vocab 151936, RoPE theta 5000000 with M-RoPE sections [24, 20, 20]; the
-// pipeline consumes hidden_states[-1] with the final RMSNorm NEUTRALIZED
-// (pre-norm output). text_encoder/model.safetensors is a single 17.5 GB
+// pipeline consumes hidden_states[-1] PRE-NORM (the last decoder-layer
+// output; the model's final RMSNorm is not applied in this environment).
+// Skipping the final norm here is therefore correct, not a neutralized
+// approximation. text_encoder/model.safetensors is a single 17.5 GB
 // bf16 shard. T2I prompt template (NOT apply_chat_template):
 //   <|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>
 //   \n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
