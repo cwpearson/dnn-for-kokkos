@@ -176,3 +176,91 @@ TEST(GemmEdges, PortableHost) {
           << "host gemm mismatch at (" << i << "," << j << ")";
     }
 }
+
+// CUDA tensor-core path (src/KokkosDNN_GemmTensorCuda.hpp): K/N-deep aligned
+// shapes take the wmma kernel on SM80+ CUDA (TF32 for float, BF16 tensor for
+// bhalf_t) and the portable kernel everywhere else, so one numerics
+// contract covers both. Tolerances are TF32-aware: absolute on O(10)
+// outputs, tight enough to catch transpose/tiling bugs (which showed up as
+// O(1)-O(10) deviations during development) with margin over measured TF32
+// rounding (~0.1 max on these shapes). Covers full tiles, M/N edge masking,
+// and the K-tail slab, with non-trivial alpha/beta.
+template <class Scalar>
+void check_gemm_large_aligned(int M, int N, int K, float tol_host,
+                              float tol_portable) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  KokkosDNN::DNNHandle<Exec> h;
+  h.use_cublas      = false;
+  h.use_cudnn       = false;
+  h.use_accelerate  = false;
+  h.use_tensor_cores = true;  // native path; portable fallback elsewhere
+  KokkosDNN::DNNHandle<Exec> hp;
+  hp.use_cublas        = false;
+  hp.use_cudnn         = false;
+  hp.use_accelerate    = false;
+  hp.use_tensor_cores  = false;  // forced portable reference
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> X("X", M, K), W("W", N, K),
+      Y("Y", M, N), Yp("Yp", M, N);
+  auto hx = Kokkos::create_mirror_view(X);
+  auto hw = Kokkos::create_mirror_view(W);
+  auto hy = Kokkos::create_mirror_view(Y);
+  for (int i = 0; i < M; ++i)
+    for (int k = 0; k < K; ++k)
+      hx(i, k) = static_cast<Scalar>(0.05f * ((i * 37 + k * 11) % 41) - 0.5f);
+  for (int j = 0; j < N; ++j)
+    for (int k = 0; k < K; ++k)
+      hw(j, k) = static_cast<Scalar>(0.05f * ((j * 23 + k * 5) % 37) - 0.4f);
+  // O(1) beta input so a dropped-beta term exceeds the tolerance.
+  for (int i = 0; i < M; ++i)
+    for (int j = 0; j < N; ++j)
+      hy(i, j) = static_cast<Scalar>(2.0f * ((i + j) % 7) - 6.0f);
+  Kokkos::deep_copy(X, hx);
+  Kokkos::deep_copy(W, hw);
+  Kokkos::deep_copy(Y, hy);
+  Kokkos::deep_copy(Yp, hy);  // beta term reads Y on both paths
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, Kokkos::HostSpace> hy0("hy0", M,
+                                                                     N);
+  Kokkos::deep_copy(hy0, hy);
+  const float alpha = 2.0f, beta = 0.5f;
+  KokkosDNN::gemm(h, static_cast<Scalar>(alpha), X, W,
+                  static_cast<Scalar>(beta), Y);
+  KokkosDNN::gemm(hp, static_cast<Scalar>(alpha), X, W,
+                  static_cast<Scalar>(beta), Yp);
+  Kokkos::fence();
+  auto got = Kokkos::create_mirror_view(Y);
+  Kokkos::deep_copy(got, Y);
+  auto gotp = Kokkos::create_mirror_view(Yp);
+  Kokkos::deep_copy(gotp, Yp);
+  for (int i = 0; i < M; ++i)
+    for (int j = 0; j < N; ++j) {
+      float acc = 0;
+      for (int k = 0; k < K; ++k)
+        acc += static_cast<float>(hx(i, k)) * static_cast<float>(hw(j, k));
+      float want = alpha * acc + beta * static_cast<float>(hy0(i, j));
+      EXPECT_NEAR(static_cast<float>(got(i, j)), want, tol_host)
+          << "tensor gemm mismatch at (" << i << "," << j << ") M=" << M
+          << " N=" << N << " K=" << K;
+      EXPECT_NEAR(static_cast<float>(got(i, j)),
+                  static_cast<float>(gotp(i, j)), tol_portable)
+          << "tensor-vs-portable mismatch at (" << i << "," << j << ") M=" << M
+          << " N=" << N << " K=" << K;
+    }
+}
+
+TEST(GemmTensorCores, FloatFullTiles) {
+  check_gemm_large_aligned<float>(128, 256, 256, 0.5f, 0.3f);
+}
+
+TEST(GemmTensorCores, FloatEdgesAndKTail) {
+  check_gemm_large_aligned<float>(100, 200, 168, 0.5f, 0.3f);
+}
+
+TEST(GemmTensorCores, BHalfFullTiles) {
+  check_gemm_large_aligned<Kokkos::Experimental::bhalf_t>(128, 256, 256, 1.0f,
+                                                          0.25f);
+}
+
+TEST(GemmTensorCores, BHalfEdgesAndKTail) {
+  check_gemm_large_aligned<Kokkos::Experimental::bhalf_t>(100, 200, 168, 1.0f,
+                                                          0.25f);
+}
