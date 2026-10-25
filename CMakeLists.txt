@@ -47,7 +47,12 @@ option(KokkosDNN_ENABLE_TEST_DISCOVERY "Register gtest tests via gtest_discover_
 # KokkosDNN_ENABLE_TESTS=ON.
 function(kokkosdnn_discover_tests TARGET)
   if(KokkosDNN_ENABLE_TEST_DISCOVERY)
-    gtest_discover_tests(${TARGET} ${ARGN})
+    # DISCOVERY_TIMEOUT: discovery executes the test binary at build time.
+    # The default 5 s is too tight on loaded CI runners (parallel links
+    # starve the probe; macos-arm failed on test_lfm25_weights_gguf with
+    # "Process terminated due to timeout"), so allow 60 s. Belt-and-braces
+    # with GTestMain skipping Kokkos init for --gtest_list_tests probes.
+    gtest_discover_tests(${TARGET} DISCOVERY_TIMEOUT 60 ${ARGN})
   endif()
 endfunction()
 
