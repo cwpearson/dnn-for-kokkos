@@ -192,6 +192,8 @@ void qwen21dit_gelu_tanh_inplace(
 }
 
 // SwiGLU multiply: out = silu(gate) * up, elementwise over [R, G].
+// 1D flattened RangePolicy (adjacent threads touch adjacent j: coalesced);
+// per-output-element ops are unchanged (bitwise-identical).
 template <class ExecSpace, class Scalar>
 void qwen21dit_swiglu(
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& gate,
@@ -204,14 +206,55 @@ void qwen21dit_swiglu(
     throw std::invalid_argument("qwen21dit_swiglu: dim mismatch");
   if (R == 0 || G == 0) return;
   Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {R, G}),
-      KOKKOS_LAMBDA(size_t i, size_t j) {
+      label, Kokkos::RangePolicy<ExecSpace>(0, R * G),
+      KOKKOS_LAMBDA(size_t n) {
+        const size_t i = n / G, j = n % G;
         float g = static_cast<float>(gate(i, j));
         float s = g / (1.0f + expf(-g));
         out(i, j) =
             static_cast<Scalar>(s * static_cast<float>(up(i, j)));
       });
 }
+
+// Team functor for qwen21dit_qk_rmsnorm: one team per (t, h) row, with a
+// TeamThreadRange reduction over Dh (coalesced: adjacent threads read
+// adjacent d) followed by the in-place scale pass in the same launch.
+// Replaces the fiber-per-thread MDRange form, whose per-thread sequential
+// Dh loop made adjacent threads stride by Dh (~15 GB/s effective); the
+// fused affine-free LayerNorm functor below already runs this pattern at
+// ~0.2ms/call. The tree reduction sums in a different order than the old
+// sequential loop, so this is tolerance-gated, not bitwise-identical.
+template <class ExecSpace, class Scalar, class V3, class W1>
+struct Qwen21ditQkRmsnormFunctor {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  V3 qk;
+  W1 w;
+  float eps;
+  size_t H, Dh;
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& member) const {
+    const auto X = qk;
+    const auto W = w;
+    const float E = eps;
+    const size_t DD = Dh;
+    const size_t idx = static_cast<size_t>(member.league_rank());
+    const size_t t = idx / H, h = idx % H;
+    float ss = 0;
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(member, DD),
+        KOKKOS_LAMBDA(size_t d, float& acc) {
+          float v = static_cast<float>(X(t, h, d));
+          acc += v * v;
+        },
+        ss);
+    const float inv = 1.0f / sqrtf(ss / (float)DD + E);
+    Kokkos::parallel_for(
+        Kokkos::TeamThreadRange(member, DD), KOKKOS_LAMBDA(size_t d) {
+          X(t, h, d) = static_cast<Scalar>(static_cast<float>(X(t, h, d)) *
+                                           inv * static_cast<float>(W(d)));
+        });
+  }
+};
 
 // Per-head QK RMSNorm over Dh with weight w ([Dh]), in place on [T, H, Dh].
 template <class ExecSpace, class Scalar, class V3>
@@ -222,19 +265,11 @@ void qwen21dit_qk_rmsnorm(
   if (w.extent(0) != Dh)
     throw std::invalid_argument("qwen21dit_qk_rmsnorm: dim mismatch");
   if (T == 0 || H == 0 || Dh == 0) return;
-  Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, H}),
-      KOKKOS_LAMBDA(size_t t, size_t h) {
-        float ss = 0;
-        for (size_t d = 0; d < Dh; ++d) {
-          float v = static_cast<float>(qk(t, h, d));
-          ss += v * v;
-        }
-        float inv = 1.0f / sqrtf(ss / (float)Dh + eps);
-        for (size_t d = 0; d < Dh; ++d)
-          qk(t, h, d) = static_cast<Scalar>(static_cast<float>(qk(t, h, d)) *
-                        inv * static_cast<float>(w(d)));
-      });
+  Qwen21ditQkRmsnormFunctor<ExecSpace, Scalar, V3,
+                            Kokkos::View<Scalar*, ExecSpace>>
+      f{qk, w, eps, H, Dh};
+  Kokkos::parallel_for(label, Kokkos::TeamPolicy<ExecSpace>(T * H, Kokkos::AUTO),
+                       f);
 }
 
 // 3-axis RoPE over head_dim Dh = a0 + a1 + a2, in place on [T, H, Dh],
@@ -248,13 +283,59 @@ void qwen21dit_qk_rmsnorm(
 //     angles, matching the reference neg_index freq table).
 // Frequencies are theta^(-2k/ds) per section (theta from Config, 10000 per
 // the reference), i.e. rotation by angle p * theta^(-j/ds) on pair j.
+// RoPE inv-freq table: inv[p] = theta^(-j/ds) for all (section s, pair j)
+// pairs, laid out [s0 pairs][s1 pairs][s2 pairs] (np = Dh/2 entries).
+// Computed ONCE per DiT forward on device with the same device powf
+// expression as the per-fiber loop below, so the table values are
+// bitwise-identical to the hoisted powf calls. Axes must be positive
+// even (matches Config::validate).
+template <class ExecSpace>
+Kokkos::View<float*, ExecSpace> qwen21dit_rope_inv_table(
+    int a0, int a1, int a2, double theta,
+    const std::string& label = "KokkosDNN::qwen21dit_rope_inv") {
+  const int as[3] = {a0, a1, a2};
+  size_t base[3] = {0, 0, 0};
+  size_t np = 0;
+  for (int s = 0; s < 3; ++s) {
+    if (as[s] <= 0 || as[s] % 2 != 0)
+      throw std::invalid_argument(
+          "qwen21dit_rope_inv_table: axes must be positive even numbers");
+    base[s] = np;
+    np += (size_t)as[s] / 2;
+  }
+  if (!(theta > 0) || !std::isfinite(theta))
+    throw std::invalid_argument(
+        "qwen21dit_rope_inv_table: theta must be positive and finite");
+  Kokkos::View<float*, ExecSpace> inv(
+      Kokkos::ViewAllocateWithoutInitializing(label), np);
+  const size_t n0 = base[1], n1 = base[2];
+  Kokkos::parallel_for(
+      label, Kokkos::RangePolicy<ExecSpace>(0, np),
+      KOKKOS_LAMBDA(size_t p) {
+        int ds = a0;
+        size_t j = 2 * p;
+        if (p >= n1) {
+          ds = a2;
+          j = 2 * (p - n1);
+        } else if (p >= n0) {
+          ds = a1;
+          j = 2 * (p - n0);
+        }
+        // Same expression as the per-fiber loop (was evaluated per fiber).
+        inv(p) = powf((float)theta, -((float)j) / (float)ds);
+      });
+  return inv;
+}
+
 // Per-(row, head) fiber of the 3-axis RoPE rotation below (shared by the
 // single- and dual-tensor launches so the angle math exists exactly once).
+// inv is the qwen21dit_rope_inv_table for (a0, a1, a2, theta); angle math
+// (pos * inv, cosf/sinf, rotation) is unchanged.
 template <class Scalar, class V3>
 KOKKOS_INLINE_FUNCTION void qwen21dit_rope_fiber(
     const V3& x, size_t t, size_t h, size_t text_len, size_t grid_w,
     long h_off, long w_off, long frame, int a0, int a1, int a2,
-    double theta) {
+    const float* inv) {
   long p0, p1, p2;
   if (t < text_len) {
     p0 = p1 = p2 = (long)t;
@@ -268,12 +349,12 @@ KOKKOS_INLINE_FUNCTION void qwen21dit_rope_fiber(
   }
   const long ps[3] = {p0, p1, p2};
   const int as[3] = {a0, a1, a2};
-  size_t base = 0;
+  size_t base = 0;   // element offset into the head dim
+  size_t pbase = 0;  // pair offset into the inv table
   for (int s = 0; s < 3; ++s) {
     const int ds = as[s];
     for (int j = 0; j < ds; j += 2) {
-      float inv = powf((float)theta, -((float)j) / (float)ds);
-      float ang = (float)ps[s] * inv;
+      float ang = (float)ps[s] * inv[pbase + (size_t)(j / 2)];
       float co = cosf(ang), si = sinf(ang);
       float x0 = static_cast<float>(x(t, h, base + (size_t)j));
       float x1 = static_cast<float>(x(t, h, base + (size_t)j + 1));
@@ -281,17 +362,20 @@ KOKKOS_INLINE_FUNCTION void qwen21dit_rope_fiber(
       x(t, h, base + (size_t)j + 1) = static_cast<Scalar>(x0 * si + x1 * co);
     }
     base += (size_t)ds;
+    pbase += (size_t)ds / 2;
   }
 }
 
 template <class ExecSpace, class Scalar, class V3>
 void qwen21dit_rope_3axis(
-    const V3& x, size_t text_len, size_t grid_h, size_t grid_w, int a0, int a1,
-    int a2, double theta,
+    const V3& x, const Kokkos::View<float*, ExecSpace>& inv, size_t text_len,
+    size_t grid_h, size_t grid_w, int a0, int a1, int a2,
     const std::string& label = "KokkosDNN::qwen21dit_rope") {
   const size_t T = x.extent(0), H = x.extent(1), Dh = x.extent(2);
   if ((size_t)(a0 + a1 + a2) != Dh)
     throw std::invalid_argument("qwen21dit_rope_3axis: axes/head_dim mismatch");
+  if (inv.extent(0) != Dh / 2)
+    throw std::invalid_argument("qwen21dit_rope_3axis: inv table dim mismatch");
   if (T == 0 || H == 0 || Dh == 0) return;
   if (grid_h == 0 || grid_w == 0)
     throw std::invalid_argument("qwen21dit_rope_3axis: grid dims must be > 0");
@@ -300,11 +384,12 @@ void qwen21dit_rope_3axis(
   const long h_off = (long)(grid_h - grid_h / 2);
   const long w_off = (long)(grid_w - grid_w / 2);
   const long frame = (long)text_len;
+  const float* invp = inv.data();
   Kokkos::parallel_for(
       label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, H}),
       KOKKOS_LAMBDA(size_t t, size_t h) {
         qwen21dit_rope_fiber<Scalar>(x, t, h, text_len, grid_w, h_off, w_off,
-                                     frame, a0, a1, a2, theta);
+                                     frame, a0, a1, a2, invp);
       });
 }
 
@@ -312,10 +397,17 @@ void qwen21dit_rope_3axis(
 // and k in ONE launch (same bytes, half the launches, better occupancy).
 // Per-fiber math is unchanged (one shared-helper call per tensor), so this
 // is bitwise-identical to two separate calls. q and k must share geometry.
+// inv is the qwen21dit_rope_inv_table for (a0, a1, a2, theta), built ONCE
+// per forward by the caller (the table depends only on geometry/theta,
+// which are block-invariant). 1D flattened over (fiber, pair): adjacent
+// threads rotate adjacent pairs (coalesced); the old fiber-per-thread
+// MDRange form strided adjacent threads by Dh (~30 GB/s effective).
+// Per-pair ops (angle, sincos, rotation) are unchanged, so this is
+// bitwise-identical to the fiber form.
 template <class ExecSpace, class Scalar, class V3>
 void qwen21dit_rope_3axis_dual(
-    const V3& q, const V3& k, size_t text_len, size_t grid_h, size_t grid_w,
-    int a0, int a1, int a2, double theta,
+    const V3& q, const V3& k, const Kokkos::View<float*, ExecSpace>& inv,
+    size_t text_len, size_t grid_h, size_t grid_w, int a0, int a1, int a2,
     const std::string& label = "KokkosDNN::qwen21dit_rope_dual") {
   const size_t T = q.extent(0), H = q.extent(1), Dh = q.extent(2);
   if ((size_t)(a0 + a1 + a2) != Dh)
@@ -324,6 +416,9 @@ void qwen21dit_rope_3axis_dual(
   if (k.extent(0) != T || k.extent(1) != H || k.extent(2) != Dh)
     throw std::invalid_argument(
         "qwen21dit_rope_3axis_dual: q/k geometry mismatch");
+  if (inv.extent(0) != Dh / 2)
+    throw std::invalid_argument(
+        "qwen21dit_rope_3axis_dual: inv table dim mismatch");
   if (T == 0 || H == 0 || Dh == 0) return;
   if (grid_h == 0 || grid_w == 0)
     throw std::invalid_argument(
@@ -334,13 +429,53 @@ void qwen21dit_rope_3axis_dual(
   const long h_off = (long)(grid_h - grid_h / 2);
   const long w_off = (long)(grid_w - grid_w / 2);
   const long frame = (long)text_len;
+  const size_t P = Dh / 2;  // total pairs
+  const size_t p0 = (size_t)a0 / 2, p1 = (size_t)a1 / 2;
+  const size_t n0 = p0, n1 = p0 + p1;  // pair-section bases
+  const size_t e1 = (size_t)a0, e2 = (size_t)a0 + (size_t)a1;  // elem bases
+  const float* invp = inv.data();
   Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, H}),
-      KOKKOS_LAMBDA(size_t t, size_t h) {
-        qwen21dit_rope_fiber<Scalar>(q, t, h, text_len, grid_w, h_off, w_off,
-                                     frame, a0, a1, a2, theta);
-        qwen21dit_rope_fiber<Scalar>(k, t, h, text_len, grid_w, h_off, w_off,
-                                     frame, a0, a1, a2, theta);
+      label, Kokkos::RangePolicy<ExecSpace>(0, T * H * P),
+      KOKKOS_LAMBDA(size_t n) {
+        const size_t f = n / P, pp = n % P;
+        const size_t t = f / H, h = f % H;
+        // Section s and in-section pair k from the pair index.
+        int s = 0;
+        size_t kk = pp;
+        if (pp >= n1) {
+          s = 2;
+          kk = pp - n1;
+        } else if (pp >= n0) {
+          s = 1;
+          kk = pp - n0;
+        }
+        // Position: text rows advance a shared position; target rows use
+        // the frozen frame on axis 0 and zero-centered grids on axes 1-2.
+        long pos;
+        if (t < text_len) {
+          pos = (long)t;
+        } else {
+          const size_t j = t - text_len;
+          if (s == 0) {
+            pos = frame;
+          } else if (s == 1) {
+            pos = (long)(j / grid_w) - h_off;
+          } else {
+            pos = (long)(j % grid_w) - w_off;
+          }
+        }
+        const float ang = (float)pos * invp[pp];
+        const float co = cosf(ang), si = sinf(ang);
+        const size_t ebase = (s == 0) ? 2 * kk : (s == 1) ? e1 + 2 * kk
+                                                          : e2 + 2 * kk;
+        float q0 = static_cast<float>(q(t, h, ebase));
+        float q1 = static_cast<float>(q(t, h, ebase + 1));
+        q(t, h, ebase) = static_cast<Scalar>(q0 * co - q1 * si);
+        q(t, h, ebase + 1) = static_cast<Scalar>(q0 * si + q1 * co);
+        float k0 = static_cast<float>(k(t, h, ebase));
+        float k1 = static_cast<float>(k(t, h, ebase + 1));
+        k(t, h, ebase) = static_cast<Scalar>(k0 * co - k1 * si);
+        k(t, h, ebase + 1) = static_cast<Scalar>(k0 * si + k1 * co);
       });
 }
 
@@ -487,6 +622,12 @@ void qwen21dit_gated_residual(
 
 // Per-region tanh-gated residual for causal_condition modulation:
 // rows [0, split) use g_txt (the t=0 row), rows [split, R) use g_img.
+// The gate vectors are [D] broadcast over R rows, so the old fiber
+// recomputed tanhf(gate(j)) R times per column. The tanh is hoisted into
+// a [2*D] float buffer (fully overwritten before use, so allocated
+// WithoutInitializing) and the MAC runs as a 1D flattened RangePolicy
+// (adjacent threads touch adjacent j: coalesced). Per-output-element ops
+// are unchanged, so this is bitwise-identical to the fiber form.
 template <class ExecSpace, class Scalar>
 void qwen21dit_gated_residual_split(
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
@@ -500,11 +641,19 @@ void qwen21dit_gated_residual_split(
     throw std::invalid_argument(
         "qwen21dit_gated_residual_split: dim mismatch");
   if (R == 0 || D == 0) return;
+  Kokkos::View<float*, ExecSpace> tg(
+      Kokkos::ViewAllocateWithoutInitializing(label + "_gate_tanh"), 2 * D);
   Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {R, D}),
-      KOKKOS_LAMBDA(size_t i, size_t j) {
-        float g = tanhf((i < split) ? static_cast<float>(g_txt(j))
-                                    : static_cast<float>(g_img(j)));
+      label + "_tanh", Kokkos::RangePolicy<ExecSpace>(0, 2 * D),
+      KOKKOS_LAMBDA(size_t k) {
+        tg(k) = (k < D) ? tanhf(static_cast<float>(g_txt(k)))
+                        : tanhf(static_cast<float>(g_img(k - D)));
+      });
+  Kokkos::parallel_for(
+      label, Kokkos::RangePolicy<ExecSpace>(0, R * D),
+      KOKKOS_LAMBDA(size_t n) {
+        const size_t i = n / D, j = n % D;
+        float g = (i < split) ? tg(j) : tg(D + j);
         x(i, j) = static_cast<Scalar>(static_cast<float>(x(i, j)) +
                                       g * static_cast<float>(upd(i, j)));
       });
@@ -1117,6 +1266,12 @@ class QwenImage21DitModel {
       V2 g2 = scratch_.c2.get("g", T, G);
       V2 h2 = scratch_.c2.get("h", T, G);
 
+      // RoPE inv-freq table: block-invariant (geometry/theta fixed), so
+      // build ONCE per forward and reuse across all 32 blocks.
+      Kokkos::View<float*, ExecSpace> rope_inv =
+          Impl::qwen21dit_rope_inv_table<ExecSpace>(
+              cfg_.rope_axes[0], cfg_.rope_axes[1], cfg_.rope_axes[2],
+              cfg_.rope_theta);
       for (size_t li = 0; li < weights_.blocks.size(); ++li) {
         const auto& bw = weights_.blocks[li];
         // Attention path: fused affine-free LayerNorm + per-region scale
@@ -1143,8 +1298,8 @@ class QwenImage21DitModel {
         // FUSED rope (was 2 launches): one launch covers q_full + k_full
         // with identical per-fiber math.
         Impl::qwen21dit_rope_3axis_dual<ExecSpace, Scalar>(
-            q_full, k_full, S, latent_h, latent_w, cfg_.rope_axes[0],
-            cfg_.rope_axes[1], cfg_.rope_axes[2], cfg_.rope_theta);
+            q_full, k_full, rope_inv, S, latent_h, latent_w, cfg_.rope_axes[0],
+            cfg_.rope_axes[1], cfg_.rope_axes[2]);
         // Exact block-causal prefill segmentation (the T2I form of
         // QwenImage21AttnProcessor): the single text segment attends
         // causally over its own prefix; the target block attends over all
