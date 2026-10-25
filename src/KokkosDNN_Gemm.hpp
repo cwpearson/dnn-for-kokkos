@@ -53,16 +53,16 @@ namespace Impl {
 // outputs instead of 1, cutting DRAM traffic ~20x on the benchmark shapes
 // (M=16/N=4096/K=4096: ~100 MB vs ~2 GB).
 //
-// Tile geometries (tuned for skinny-M Llama inference on Ampere):
-//   Base     : team (block) = 256 threads owns TMxTN = 32x128 output tile,
-//              RTxCT = 4x4 register block (16 FMA/thread/K-step).
+// Tile geometries (tuned on Ampere; base also covers large-M MOSS shapes):
+//   Base     : team (block) = 256 threads owns TMxTN = 64x128 output tile,
+//              RTxCT = 8x4 register block (32 FMA/thread/K-step).
 //   Mid      : team = 128 threads owns TMxTN = 32x64, 4x4 block (M <= 64;
 //              M=64/N=4096: 128 teams).
 //   Thin-fine: team = 128 threads owns TMxTN = 16x32, 2x2 block (M <= 16;
 //              M=16/N=4096: 128 teams, no padded-row waste).
 //   K is streamed in TK-wide slabs through shared (TK=32 base/mid, TK=64
 //   thin-fine -- fewer barriers/exposures pay off for the small kernel);
-//   shared budget is (TM+TN)*(TK+1) floats: base (32+128)*33 ~= 21 KB, mid
+//   shared budget is (TM+TN)*(TK+1) floats: base (64+128)*33 ~= 25 KB, mid
 //   (32+64)*33 ~= 12.7 KB, thin-fine (16+32)*65 ~= 12.5 KB (small teams let
 //   many more blocks stay resident per SM for latency hiding).
 //   Thread mapping: tr = rank/ColGroups (row group), tc = rank%ColGroups
@@ -108,12 +108,12 @@ namespace Impl {
 // of the portable kernel -- extend those if you change thread mapping, the
 // load paths, or the geometry thresholds.
 // ---------------------------------------------------------------------------
-constexpr int GemmTM = 32;
+constexpr int GemmTM = 64;
 constexpr int GemmTN = 128;
 constexpr int GemmTK = 32;  // K-slab width; see GemmSK for the store stride.
 constexpr int GemmSK = GemmTK + 1;  // padded shared stride (bank conflicts).
 constexpr int GemmTeamSize = 256;
-constexpr int GemmRT = 4;  // rows per thread (GemmTM * GemmTN / team / CT)
+constexpr int GemmRT = 8;  // rows per thread (GemmTM * GemmTN / team / CT)
 constexpr int GemmCT = 4;  // cols per thread
 
 // Small-M specializations for inference shapes (thresholds in gemm_tiled;
@@ -300,11 +300,15 @@ struct TiledGemmFunctor {
       team.team_barrier();
       // -- register-blocked outer product over the slab (RT*CT FMA/thread/
       // K-step; sX row is warp-broadcast, sW column is bank-conflict-free
-      // thanks to the SK stride). UNROLL (per-geometry template param, 4
-      // for the small kernel, 2 elsewhere) sets the kk partial-unroll:
-      // deeper independent LDS->FMA chains help when teams are scarce;
-      // full unrolling explodes the live set into 170+ regs/thread and
-      // craters occupancy to 1 block/SM.
+      // thanks to the SK stride). Both operands are explicitly staged in
+      // registers (xr + wr) so each shared value is loaded once per kk and
+      // reused RT/CT times from registers -- the sW address does not depend
+      // on r, but without the explicit array the compiler may re-issue the
+      // shared load inside the r-loop on some backends. UNROLL (per-geometry
+      // template param, 4 for the small kernel, 2 elsewhere) sets the kk
+      // partial-unroll: deeper independent LDS->FMA chains help when teams
+      // are scarce; full unrolling explodes the live set into 170+ regs/thread
+      // and craters occupancy to 1 block/SM.
       if constexpr (UNROLL == 4) {
 KOKKOSDNN_PRAGMA_UNROLL_N(4)
         for (int kk = 0; kk < TK; ++kk) {
@@ -312,11 +316,15 @@ KOKKOSDNN_PRAGMA_UNROLL_N(4)
 KOKKOSDNN_PRAGMA_UNROLL()
           for (int r = 0; r < RT; ++r)
             xr[r] = sX[(tr * RT + r) * SK + kk];
+          float wr[CT];
+KOKKOSDNN_PRAGMA_UNROLL()
+          for (int c = 0; c < CT; ++c)
+            wr[c] = sW[(tc * CT + c) * SK + kk];
 KOKKOSDNN_PRAGMA_UNROLL()
           for (int r = 0; r < RT; ++r) {
 KOKKOSDNN_PRAGMA_UNROLL()
             for (int c = 0; c < CT; ++c)
-              acc[r][c] += xr[r] * sW[(tc * CT + c) * SK + kk];
+              acc[r][c] += xr[r] * wr[c];
           }
         }
       } else {
@@ -326,11 +334,15 @@ KOKKOSDNN_PRAGMA_UNROLL_N(2)
 KOKKOSDNN_PRAGMA_UNROLL()
           for (int r = 0; r < RT; ++r)
             xr[r] = sX[(tr * RT + r) * SK + kk];
+          float wr[CT];
+KOKKOSDNN_PRAGMA_UNROLL()
+          for (int c = 0; c < CT; ++c)
+            wr[c] = sW[(tc * CT + c) * SK + kk];
 KOKKOSDNN_PRAGMA_UNROLL()
           for (int r = 0; r < RT; ++r) {
 KOKKOSDNN_PRAGMA_UNROLL()
             for (int c = 0; c < CT; ++c)
-              acc[r][c] += xr[r] * sW[(tc * CT + c) * SK + kk];
+              acc[r][c] += xr[r] * wr[c];
           }
         }
       }
@@ -497,7 +509,8 @@ void gemm_tiled(
   //             (M=16/N=4096: 128 teams, ~12.5 KB shared/team).
   //   M <= 64 : mid  TM=32/TN=64/4x4/TK=32, 128-thread teams (M=64/N=4096:
   //             128 teams, ~12.7 KB shared/team).
-  //   else    : base TM=32/TN=128/4x4/TK=32, 256-thread teams.
+  //   else    : base TM=64/TN=128/8x4/TK=32, 256-thread teams (M=4096/N=4096:
+  //             64x32 = 2048 teams, ~25 KB shared/team).
   if (M <= size_t(GemmThinFineTM)) {
     gemm_tiled_impl<ExecSpace, Scalar, GemmThinFineTM, GemmThinFineTN,
                     GemmThinFineTK, GemmThinFineRT, GemmThinFineCT, 4>(
