@@ -10,8 +10,27 @@ schedule, ``use_kv_cache=True``), and dumps:
   (c) per-step noise_pred checksums (one transformer forward call per step)
   (d) final latents checksum + saved raw float32 file
   (e) decoded PNG
+  (f) parity artifacts for the C++ driver (--dump-artifacts, default ON)
 
 All checksums are printed to stdout.
+
+Driver dump contract (``examples/qwen_image_21/qwen_image_21_generate.cpp
+--dump-steps DIR``), every file little-endian raw float32:
+
+  DIR/prompt_embeds.f32        [L, Cc] row-major, exact DiT conditioning
+  DIR/initial_latents.f32      [C, H, W] channel-major: lat[(c*H+h)*W+w]
+  DIR/step{ii}_noise_pred.f32  [C, H, W] image tokens only (cfg=1 cond branch)
+  DIR/step{ii}_latents.f32     [C, H, W] post-Euler-step latents
+  DIR/manifest.json            prompt/size/steps/sigmas/seed/cfg/sums/versions
+
+Torch packs latents as [1, H*W, C] token rows (row-major over (h, w)), so a
+token tensor [N, C] becomes the driver's [C, H, W] via
+reshape(H, W, C).permute(2, 0, 1). With use_kv_cache=True the step-0 forward
+output is [1, L+N, C] over the joint sequence [text | target] (text first,
+per models/qwen_image_21/KokkosDNN_QwenImage21Dit.hpp), so only the last N
+rows are the image prediction the pipeline consumes; the golden therefore
+dumps that slice as step00_noise_pred.f32 and the whole [L+N, C] tensor as
+step00_noise_pred_full.f32 for reference.
 
 Requirements (CUDA build of torch recommended; CPU-only works but is slow):
     pip install git+https://github.com/huggingface/diffusers.git
@@ -26,6 +45,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 
 
@@ -62,11 +82,33 @@ except ImportError:
 PROMPT = "A capybara wearing a wizard hat, oil painting"
 WIDTH, HEIGHT = 1024, 1024
 SEED = 42
+# The VAE compresses 16x, so the DiT sees one token per 16x16 pixel tile.
+LATENT_SCALE = 16
 
 
 def f64sum(t: "torch.Tensor") -> float:
     """float64 checksum of a tensor (computed on CPU for determinism)."""
     return float(t.detach().to(device="cpu", dtype=torch.float64).sum().item())
+
+
+def to_f32(x: "torch.Tensor") -> "np.ndarray":
+    """Detach to contiguous CPU float32 (bf16 -> f32 is exact)."""
+    return x.detach().to(device="cpu", dtype=torch.float32).contiguous().numpy()
+
+
+def tokens_to_chw(tok: "torch.Tensor", h: int, w: int) -> "np.ndarray":
+    """[N, C] token rows (row-major over h,w) -> [C, h, w] driver layout."""
+    n, c = int(tok.shape[0]), int(tok.shape[1])
+    if n != h * w:
+        die(f"token count {n} != latent grid {h}x{w} = {h * w}")
+    return np.ascontiguousarray(to_f32(tok).reshape(h, w, c).transpose(2, 0, 1))
+
+
+def write_f32(path: str, arr: "np.ndarray") -> None:
+    """Write little-endian raw float32 and log the byte count."""
+    a = np.ascontiguousarray(arr, dtype=np.float32)
+    a.tofile(path)
+    print(f"[f] wrote {path} ({a.nbytes} bytes, raw float32, shape {a.shape})")
 
 
 def as_tensor(x):
@@ -103,6 +145,15 @@ def main() -> None:
         help="manual: text encoder stays on CPU, transformer+VAE on CUDA "
         "(default; fits 24 GB VRAM). model-offload: diffusers CPU offload "
         "hooks. full: everything on --device (needs a very large GPU).",
+    )
+    ap.add_argument(
+        "--dump-artifacts",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="also write the C++ driver parity dump (prompt_embeds.f32, "
+        "initial_latents.f32, step{ii}_noise_pred.f32, step{ii}_latents.f32, "
+        "step00_noise_pred_full.f32, manifest.json) next to the PNG "
+        "(default: on; --no-dump-artifacts keeps only the final latents/PNG)",
     )
     args = ap.parse_args()
 
@@ -264,6 +315,7 @@ def main() -> None:
         call_kwargs["prompt"] = PROMPT
     if tensor_inputs_kw is not None:
         call_kwargs[tensor_inputs_kw] = ["latents"]
+    pipeline_arg = "prompt_embeds" if "prompt_embeds" in call_kwargs else "prompt"
     result = pipe(**call_kwargs)
     image = result.images[0]
 
@@ -299,6 +351,173 @@ def main() -> None:
     png_path = os.path.join(outdir, "qwen_image_21_turbo_capybara.png")
     image.save(png_path)
     print(f"[e] wrote {png_path} (size {image.size})")
+
+    # ---- (f) parity artifacts for the C++ driver ---------------------------
+    # Layout contract: see the module docstring. All files are little-endian
+    # raw float32 in the driver's channel-major [C, H, W] latent layout.
+    if args.dump_artifacts:
+        steps = len(latents_traj)
+        channels = int(final_lat.shape[-1])
+        lat_h = HEIGHT // LATENT_SCALE
+        lat_w = WIDTH // LATENT_SCALE
+        ntok = lat_h * lat_w
+        if int(final_lat.shape[1]) != ntok:
+            die(
+                f"latent token count {int(final_lat.shape[1])} != "
+                f"{lat_h}x{lat_w} = {ntok}"
+            )
+
+        # Conditioning actually passed to the DiT: [1, L, Cc] -> [L, Cc].
+        pe_f32 = to_f32(pe[0])
+        prompt_len = int(pe_f32.shape[0])
+        write_f32(os.path.join(outdir, "prompt_embeds.f32"), pe_f32)
+
+        # Initial latents were captured packed as torch rows [1, N, C].
+        if not initial_latents:
+            die("cannot dump initial_latents.f32: prepare_latents was not captured")
+        x0_chw = tokens_to_chw(initial_latents[0][0], lat_h, lat_w)
+        write_f32(os.path.join(outdir, "initial_latents.f32"), x0_chw)
+
+        per_step: list[dict] = [
+            {"step": i} for i in range(max(len(noise_preds), len(latents_traj)))
+        ]
+
+        # Per-step velocity prediction. Step 0 (KV-cache prefill) covers the
+        # joint [text | target] sequence; the pipeline itself keeps only the
+        # last N rows (noise_pred[:, -latents.size(1):]), the image tokens.
+        for i, npred in enumerate(noise_preds):
+            full = npred[0]  # [rows, C]
+            rows = int(full.shape[0])
+            if rows == ntok + prompt_len:
+                img = full[prompt_len:]
+            elif rows == ntok:
+                img = full
+            else:
+                die(
+                    f"step {i}: noise_pred has {rows} rows, expected {ntok} "
+                    f"(image only) or {ntok + prompt_len} (text|target)"
+                )
+            img_chw = tokens_to_chw(img, lat_h, lat_w)
+            write_f32(os.path.join(outdir, f"step{i:02d}_noise_pred.f32"), img_chw)
+            per_step[i]["noise_pred_shape"] = [
+                channels,
+                lat_h,
+                lat_w,
+            ]
+            per_step[i]["noise_pred_f64sum"] = float(
+                np.sum(img_chw, dtype=np.float64)
+            )
+            if i == 0:
+                full_f32 = to_f32(full)
+                write_f32(
+                    os.path.join(outdir, "step00_noise_pred_full.f32"), full_f32
+                )
+                per_step[i]["noise_pred_full_shape"] = list(full_f32.shape)
+                per_step[i]["noise_pred_full_f64sum"] = float(
+                    np.sum(full_f32, dtype=np.float64)
+                )
+
+        # Post-Euler-step latents (latents_traj[i] is the state after step i).
+        for i, lat in enumerate(latents_traj):
+            lat_chw = tokens_to_chw(lat[0], lat_h, lat_w)
+            write_f32(os.path.join(outdir, f"step{i:02d}_latents.f32"), lat_chw)
+            per_step[i]["latents_shape"] = [channels, lat_h, lat_w]
+            per_step[i]["latents_f64sum"] = float(
+                np.sum(lat_chw, dtype=np.float64)
+            )
+
+        # Schedule actually used. The pipeline feeds the checkpoint's
+        # sample_sigmas (8 entries) through the scheduler, which appends the
+        # terminal 0 -> 9 values for 8 steps; that is exactly the driver's
+        # `--sigmas turbo` array (sample_sigmas + 0.0).
+        sigmas = None
+        sigma_source = "unavailable"
+        sched = getattr(pipe, "scheduler", None)
+        sched_sigmas = (
+            getattr(sched, "sigmas", None) if sched is not None else None
+        )
+        if sched_sigmas is not None:
+            if hasattr(sched_sigmas, "detach"):  # torch tensor
+                sched_sigmas = sched_sigmas.detach().reshape(-1).tolist()
+            sigmas = [float(s) for s in sched_sigmas]
+            sigma_source = "pipe.scheduler.sigmas after the run"
+        else:
+            pcfg = getattr(pipe, "config", None)
+            cfg_sigmas = None
+            if pcfg is not None:
+                if hasattr(pcfg, "get"):
+                    cfg_sigmas = pcfg.get("sample_sigmas")
+                else:
+                    cfg_sigmas = getattr(pcfg, "sample_sigmas", None)
+            if cfg_sigmas:
+                sigmas = [float(s) for s in cfg_sigmas] + [0.0]
+                sigma_source = "checkpoint sample_sigmas + terminal 0"
+        if sigmas is not None and len(sigmas) != steps + 1:
+            print(
+                f"[f] WARNING: {len(sigmas)} sigmas for {steps} steps "
+                f"(expected {steps + 1})",
+                file=sys.stderr,
+            )
+
+        try:
+            import transformers
+
+            transformers_version = transformers.__version__
+        except Exception:  # pragma: no cover - informational only
+            transformers_version = "unavailable"
+
+        manifest = {
+            "tool": "scripts/qwen_image_21_golden.py",
+            "reference": "diffusers.QwenImage21Pipeline",
+            "prompt": PROMPT,
+            "prompt_source": {
+                "method": "pipeline.encode_prompt() with the pipeline's raw "
+                "T2I template (no chat template)",
+                "pipeline_arg": pipeline_arg,
+                "prompt_embeds_dtype": str(pe.dtype).replace("torch.", ""),
+            },
+            "width": WIDTH,
+            "height": HEIGHT,
+            "latent_shape": [channels, lat_h, lat_w],
+            "latent_tokens": ntok,
+            "latent_channels": channels,
+            "latent_layout": "[C,H,W] channel-major: lat[(c*H+h)*W+w]",
+            "prompt_embeds_shape": [prompt_len, int(pe_f32.shape[1])],
+            "prompt_embeds_dtype": str(pe.dtype).replace("torch.", ""),
+            "prompt_embeds_f64sum": float(np.sum(pe_f32, dtype=np.float64)),
+            "initial_latents_f64sum": float(np.sum(x0_chw, dtype=np.float64)),
+            "final_latents_f64sum": float(np.sum(lat_f32, dtype=np.float64)),
+            "steps": steps,
+            "num_transformer_calls": len(noise_preds),
+            "sigmas": sigmas,
+            "sigma_source": sigma_source,
+            "seed": args.seed,
+            "generator": f"torch.Generator('cpu').manual_seed({args.seed})",
+            "cfg": 1.0,
+            "cfg_note": "pipeline true_cfg_scale default = 1.0 (guidance off, "
+            "single cond branch)",
+            "use_kv_cache": True,
+            "placement": args.placement,
+            "device": args.device,
+            "artifact_dtype": "float32 little-endian raw",
+            "sums_note": "all f64 sums are over the float32 artifacts written "
+            "here (not over the model's bf16 tensors)",
+            "versions": {
+                "torch": torch.__version__,
+                "diffusers": diffusers.__version__,
+                "transformers": transformers_version,
+                "numpy": np.__version__,
+            },
+            "per_step": per_step,
+        }
+        manifest_path = os.path.join(outdir, "manifest.json")
+        with open(manifest_path, "w") as fh:
+            json.dump(manifest, fh, indent=2)
+            fh.write("\n")
+        print(f"[f] wrote {manifest_path} ({steps} steps, "
+              f"{len(noise_preds)} transformer calls, sigmas={sigmas})")
+        print(f"[f] parity artifacts in {outdir}")
+
     print("DONE")
 
 
