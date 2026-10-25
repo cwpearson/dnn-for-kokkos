@@ -13,6 +13,7 @@
 #include <type_traits>
 #include "KokkosDNN_Handle.hpp"
 #include "KokkosDNN_Macros.hpp"
+#include "KokkosDNN_AttentionTensorCuda.hpp"
 #ifdef KOKKOSDNN_ENABLE_CUDNN
 #include "tpl/cudnn/KokkosDNN_CuDNN.hpp"
 #endif
@@ -2418,6 +2419,17 @@ void attention_bidirectional_streaming(const DNNHandle<ExecSpace>& handle,
   }
 #endif
 
+  // Native CUDA tensor-core fused SDPA (bhalf_t, D in {64, 128},
+  // D-contiguous; SM80+; kill switch handle.use_tensor_cores). The one
+  // backend-gated kernel in the attention family -- see
+  // KokkosDNN_AttentionTensorCuda.hpp for the numerics contract. Shapes it
+  // declines (float, odd head dims, strided/unaligned views, tiny shapes)
+  // run the portable kernel below.
+  if (handle.use_tensor_cores &&
+      Impl::try_bidir_sdpa_tensor_cuda<ExecSpace>(q, k, v, out, eff)) {
+    return;
+  }
+
   // Native path: single-kernel team-blocked FlashAttention-style kernel
   // (Q/acc chunks + K/V tiles in team scratch, one normalization at the end
   // per D-chunk); see BidirFlashFunctor for structure. Transient extras are
@@ -2457,8 +2469,10 @@ void attention_bidirectional_streaming(const DNNHandle<ExecSpace>& handle,
 // TPL: float and bhalf_t dispatch to the non-causal cuDNN SDPA graph
 // first (see tpl/cudnn/); single-head float shapes past the graph's
 // head-dim engine limit (D > 128, e.g. the VAE mid-block) take the TPL
-// math composition there instead. Any failure falls back to the native
-// kernel. Otherwise native.
+// math composition there instead. Next, bhalf_t D in {64, 128}
+// D-contiguous shapes on CUDA SM80+ take the native tensor-core fused SDPA
+// (handle.use_tensor_cores kill switch; TF32-free -- exact BF16 products).
+// Any failure falls back to the native portable kernel. Otherwise native.
 //
 // Two overloads: explicit <ExecSpace, Scalar> and a deduction overload
 // taking Scalar from the query view. Both share the Impl core above so
