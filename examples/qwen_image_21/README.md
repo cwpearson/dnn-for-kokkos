@@ -23,12 +23,14 @@ Without `--prompt` on a TTY (and without the file/parity handoff flags
 `--decode-latents-in`), the driver runs as a REPL: it prints the current
 pixel `HxW` (and latent `HxW`), asks for a prompt, asks for an output
 filename, generates, and repeats indefinitely until EOF or `quit`/`exit`. The
-previous prompt is offered for editing each time (GNU readline when
-available), and `/w N` / `/h N` set the pixel width/height going forward
-(rounded to the nearest patch-stride multiple at generation time). An empty
-prompt re-asks; an empty filename auto-numbers `qwen_image_21_out_<n>.png`;
-the per-iteration seed is `--seed` + iteration, so repeats of the same prompt
-still vary.
+previous prompt is offered for editing each time (UP/DN move through the
+in-memory prompt history, never written to disk), and `/w N` / `/h N` set
+the pixel width/height going forward (rounded to the nearest patch-stride
+multiple at generation time). ESC at the filename step goes back to the
+prompt step (previous prompt pre-filled); ESC at the prompt step re-asks.
+An empty prompt re-asks; an empty filename auto-numbers
+`qwen_image_21_out_<n>.png`; the per-iteration seed is `--seed` + iteration,
+so repeats of the same prompt still vary.
 
 ```sh
 qwen_image_21_generate --staged \
