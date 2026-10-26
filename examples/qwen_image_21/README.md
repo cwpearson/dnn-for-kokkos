@@ -1,5 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-# SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 # Qwen-Image-2.1 text-to-image driver (TEXT-TO-IMAGE ONLY)
 
 `qwen_image_21_generate` runs staged text-to-image inference:
