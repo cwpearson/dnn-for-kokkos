@@ -16,6 +16,7 @@ models/lfm2_5/   LFM2.5 model library (weights/tokenizer/config)
 models/moss_image/ MOSS-Image pipeline headers (DiT/encoder/VAE/Qwen tokenizer)
 server/          OpenAI-compatible HTTP server (thin binary; no model logic)
 examples/        thin drivers linking models/* or core (lfm2_5, moss_image, llama, ...)
+examples/common/ shared example support (readline REPL helper)
 examples/llama/  Llama inference example (not part of the library)
 examples/smollm2/ SmolLM2 inference example (not part of the library)
 examples/xor/    XOR MLP training example
