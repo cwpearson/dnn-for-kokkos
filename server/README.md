@@ -76,7 +76,7 @@ image on an H100.
 
 | Param | Mapping |
 |---|---|
-| `messages[]` | `role` in `system,user,assistant,tool` (`developer`→`user`, `function`→`tool`); string `content` (text-part arrays joined); assistant turns may carry `tool_calls` (validated, `content` may be `null`); rendered via `render_lfm25_chatml_with_tools` + `encode_chatml_with_tools` |
+| `messages[]` | `role` in `system,user,assistant,tool` (`developer`→`user`, `function`→`tool`); string `content` (text-part arrays joined); assistant turns may carry `tool_calls` (validated, `content` may be `null`) plus `thinking`/`reasoning`/`reasoning_content` (trace replay, first non-empty wins); rendered via `render_lfm25_chatml_with_tools` + `encode_chatml_with_tools` |
 | `tools[]` | `[{type:"function", function:{name, description?, parameters?, strict?}}]` validated, then injected as `List of tools: [...]` JSON in the system prompt (native LFM2.5 tool format); `[]` = no-op |
 | `tool_choice` | `"auto"` (default) \| `"none"` (no injection) \| `"required"` / `{"type":"function","function":{"name"}}` (best-effort `MUST call` system directive — prompted, not constrained) |
 | `parallel_tool_calls` | `false` keeps only the first parsed call (default `true`) |
@@ -98,9 +98,31 @@ Agentic loop: with `tools` set, a turn that emits native
 `call-kdnn-N` ids, `content` is the surrounding text or `null`) instead of
 leaking marker text into `content`. Execute the functions, append the
 assistant turn (with its `tool_calls`) plus one `tool`-role message per
-result, and call again. Streaming emits content deltas live, then one
-`tool_calls` delta chunk per call, then the `tool_calls` finish chunk.
-`tool` history turns render natively, so multi-turn loops are exact.
+result, and call again. Streaming emits `reasoning_content` deltas for the
+`<think>` trace and `content` deltas live, then one `tool_calls` delta
+chunk per call, then the `tool_calls` finish chunk. `tool` history turns
+render natively, so multi-turn loops are exact. A truncated turn (capped by
+`max_tokens`) that ends inside a call block still returns the recoverable
+calls instead of leaking call markup into `content`. A recovered
+length-capped turn still reports `finish_reason:"tool_calls"` (the length
+cap is hidden), so validate the arguments before executing — they may be
+cut mid-list.
+Turn boundaries: the `<|im_end|>` terminator always ends the turn, even
+with a custom `stop` list, and a length-capped turn ending mid-marker has
+only its longest trailing partial marker head stripped (an earlier `<`
+followed by `<` is content).
+
+Thinking: LFM2.5-Instruct always reasons inside `<think>...</think>` first.
+The trace never appears in `content`: streaming sends it as
+`reasoning_content` deltas (the DeepSeek/OpenRouter convention, which Zed
+renders in its thinking trace), non-streaming as the message-level
+`reasoning_content` field (omitted when empty). History assistant turns
+accept `thinking` / `reasoning` / `reasoning_content` (first non-empty
+wins, matching the upstream chat template) and re-render them into the
+prompt's `<think>` block, so Zed's `interleaved_reasoning` replay keeps
+its trace. A `<think>` opener only counts before any non-whitespace
+content (the template emits thinking first); model text that merely
+mentions the tag stays in `content`.
 
 Unsupported (400 `invalid_request_error`, never silently ignored):
 `n>1`, legacy `functions` / `function_call` (retired; use
@@ -118,6 +140,13 @@ Limits to know:
 - Only `function` tools / `function` tool_choice targets are supported.
 - `response_format` fence-stripping applies to non-streaming replies;
   streamed JSON deltas arrive unmodified.
+- Zed (OpenAI-compatible provider, chat-completions path) is supported:
+  `parallel_tool_calls:false`, `stream_options:{"include_usage":true}`,
+  and `reasoning_content` replay all work; thinking surfaces in Zed's
+  thinking trace, tool calls execute normally. Prefer a generous
+  `max_completion_tokens` (thinking consumes completion budget — a cap
+  hit mid-call still returns the recoverable call, but with truncated
+  arguments and `finish_reason:"tool_calls"`).
 
 ## Errors
 

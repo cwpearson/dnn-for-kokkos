@@ -241,17 +241,35 @@ std::vector<int> encode_chatml_with_tools(
     bool preserve_thinking = true);
 
 // Split raw completion text (decoded with skip_special_tokens=false) into
-// display text + tool calls. Every complete
+// display text + tool calls + reasoning. Every complete
 // <|tool_call_start|>...<|tool_call_end|> region becomes calls (in order;
 // ids are empty, the server assigns them); surrounding text, truncated at
-// the first <|im_end|> and trimmed of blank lines left by excision, is the
-// display content. Unclosed trailing markers are treated as text, not
-// calls. Never throws on model output (malformed blocks are skipped).
+// the first stop string, is the display content (the <|im_end|> turn
+// terminator always applies, independent of `stops`). A length-capped
+// input ending mid-marker has its trailing partial control-marker head
+// stripped up front, so fragments never leak into either view. <think>...</think> reasoning blocks (the LFM2.5-Instruct
+// thinking trace, always emitted at the start of a turn) are extracted into
+// `reasoning` and removed from the display text so OpenAI-compatible
+// clients can surface them as `reasoning_content` instead of leaking
+// literal <think> tags into `content`. An opener only counts before any
+// non-whitespace display content (the template emits thinking first), so
+// model text that merely mentions the tag stays content. An unclosed
+// trailing <think> treats the rest of the turn as reasoning; a lone
+// </think> without an opener passes through into the text. Unclosed
+// trailing tool markers (a turn cut by
+// max_tokens/length inside or just before a call block) are recovered
+// best-effort: complete calls (closed parens) in the truncated list become
+// calls instead of leaking call markup into the display text; a tail cut
+// mid-arguments recovers nothing and stays text. Recovery carries no
+// truncation marker, so validate arguments before executing.
+// Never throws on model output (malformed blocks are skipped).
 struct ToolParseResult {
   std::string text;
+  std::string reasoning;  // concatenated <think> contents ("" when none)
   std::vector<ToolCall> calls;
 };
-ToolParseResult parse_tool_calls(const std::string& raw);
+ToolParseResult parse_tool_calls(
+    const std::string& raw, const std::vector<std::string>& stops = {});
 
 // Convert one native call-block body, e.g. `[f(a="1"), g(x=2)]` (brackets
 // optional), into calls. Arguments convert from the native pythonic form
@@ -260,24 +278,91 @@ ToolParseResult parse_tool_calls(const std::string& raw);
 std::vector<ToolCall> parse_tool_call_block(const std::string& block);
 
 // Incremental variant of parse_tool_calls for SSE streaming: feed raw
-// pieces (each sampled id decoded with skip_special_tokens=false); push()
-// returns display text newly safe to stream (call regions, stop markers,
-// and partial UTF-8 tails are held back); finish() flushes the tail and
-// returns the parsed calls. Total display text = concatenated push()
-// deltas + finish().text.
+// pieces (each sampled id decoded with skip_special_tokens=false) via
+// feed(); each call returns the display and reasoning text newly safe to
+// stream since the last call (either may be empty = "hold"). push() /
+// poll_reasoning() split the same work across two calls for callers that
+// consume the channels separately (call poll once per push); finish()
+// flushes the tail and returns the parsed calls. The turn terminator is
+// always in the stop set (unioned in from the constructor argument), so a
+// complete <|im_end|> never leaks into content however the caller
+// configures stops. Holding (rather than emitting) retractable bytes
+// keeps both views monotone in the input, and every entry point rebases
+// instead of throwing, so streaming never throws. Reasoning and display
+// are disjoint views: total display text = concatenated display deltas +
+// finish().text, total reasoning = concatenated reasoning deltas +
+// finish().reasoning. Totaled streaming output agrees with the whole-text
+// parse_tool_calls() on the same input (with the same stops), including
+// the unclosed-trailing recovery.
+//
+// Cost: the parser is a single-pass incremental machine. Each input byte
+// is classified once (think split, call excision, stop cut run on the
+// newly arrived bytes plus a bounded marker/stop overlap window — at most
+// one trailing head, the longest matching prefix, is ever held), so a
+// turn costs O(n) total, not O(n^2): long thinking traces and long
+// trailing `<` runs stream in amortized O(1) per token.
+struct StreamDeltas {
+  std::string display;
+  std::string reasoning;
+};
+
 class ToolCallStreamParser {
  public:
   explicit ToolCallStreamParser(
       const std::vector<std::string>& stop_strings = {});
+  // One parser step for one raw piece: returns display + reasoning deltas
+  // newly safe to stream. A single call per token keeps the per-turn cost
+  // linear; prefer this over push()+poll_reasoning() on hot paths.
+  StreamDeltas feed(const std::string& raw_piece);
   // Returns display text newly safe to stream (may be empty = "hold").
+  // Stashes the reasoning delta for the next poll_reasoning() call.
   std::string push(const std::string& raw_piece);
-  // Tail text (not yet emitted) + parsed calls.
+  // Returns reasoning text accumulated since the last poll (may be empty).
+  std::string poll_reasoning();
+  // Tail text (not yet emitted) + tail reasoning + parsed calls.
   ToolParseResult finish();
 
  private:
+  // Layer 1: scan raw_ for tool-call block structure; deliver the settled
+  // prefix (everything before the first unclosed block start, minus a
+  // trailing partial control-marker head) to l2_consume() in order.
+  void l1_drive();
+  // Layer 2: think split over the settled stream (stateful across calls);
+  // display bytes flow to l3_consume(), reasoning bytes to out_r_.
+  void l2_consume(const std::string& piece);
+  // Layer 3: tool-call block excision over the display stream; outside
+  // bytes accumulate in out_e_.
+  void l3_consume(const std::string& piece);
+  // Layer 4: advance the stop search over out_e_ and carve the display /
+  // reasoning deltas out of out_e_ / out_r_ with hold-backs for partial
+  // UTF-8, control-marker heads, and custom stop heads.
+  StreamDeltas emit_deltas();
+
   std::string raw_;
+  // Layer 1 (settled delivery) state.
+  size_t l1_delivered_ = 0;  // raw_ bytes delivered to layer 2
+  bool l1_in_block_ = false;
+  size_t l1_block_start_ = 0;  // raw_ offset of the open block's start
+  size_t l1_end_search_ = 0;   // end-marker search cursor (while in block)
+  std::string l1_prehold_;  // held head bytes preceding the open block
+  // Layer 2 (think split) state.
+  bool l2_in_think_ = false;
+  bool l2_ws_ = true;  // display emitted so far is all whitespace
+  std::string l2_pend_;  // undecided settled tail (bounded by marker lens)
+  // Layer 3 (call excision) state.
+  bool l3_in_call_ = false;
+  std::string l3_pend_;  // undecided display tail (bounded by marker lens)
+  // Layer 4 (stop cut + emission) state.
+  std::string out_e_;  // post-excision display (append-only)
+  std::string out_r_;  // firm reasoning (append-only)
+  size_t l4_stop_search_ = 0;  // stop search cursor over out_e_
+  bool l4_stopped_ = false;
+  size_t l4_cut_ = 0;  // display cut position (valid when stopped)
+  std::string stash_r_;  // reasoning delta held for poll_reasoning()
   size_t emitted_ = 0;  // chars of display text already returned
+  size_t emitted_r_ = 0;  // chars of reasoning text already returned
   std::vector<std::string> stops_;
+  size_t max_stop_len_ = 1;
 };
 
 // Argument conversion between the native pythonic form and JSON.

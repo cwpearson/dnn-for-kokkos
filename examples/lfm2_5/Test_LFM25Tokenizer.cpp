@@ -376,6 +376,24 @@ TEST(LFM25Tokenizer, ToolParse) {  using KokkosDNN::LFM25::kEosToken;
   EXPECT_EQ(v[1].arguments, "{\"x\":\"y\",\"z\":null}");
   EXPECT_TRUE(parse_tool_call_block("").empty());
   EXPECT_TRUE(parse_tool_call_block("no-parens").empty());
+  // A max_tokens cut usually drops the trailing ']' but keeps '[': each
+  // bracket is stripped independently so mid-list truncations still
+  // recover the complete calls.
+  {
+    auto m1 = parse_tool_call_block("[f(a=1, b=2)");
+    ASSERT_EQ(m1.size(), 1u);
+    EXPECT_EQ(m1[0].name, "f");
+    auto m2 = parse_tool_call_block("[f(a=1), g(b=2)");
+    ASSERT_EQ(m2.size(), 2u);
+    EXPECT_EQ(m2[0].name, "f");
+    EXPECT_EQ(m2[1].name, "g");
+    // First call complete, second cut mid-args: only the first recovers.
+    auto m3 = parse_tool_call_block("[f(a=1), g(b=2");
+    ASSERT_EQ(m3.size(), 1u);
+    EXPECT_EQ(m3[0].name, "f");
+    // Cut inside the only call's args: nothing recoverable.
+    EXPECT_TRUE(parse_tool_call_block("[f(a=").empty());
+  }
 
   const std::string raw =
       std::string("Hi ") + kToolCallStartToken +
@@ -390,12 +408,58 @@ TEST(LFM25Tokenizer, ToolParse) {  using KokkosDNN::LFM25::kEosToken;
   ToolParseResult plain = parse_tool_calls("just text");
   EXPECT_TRUE(plain.calls.empty());
   EXPECT_EQ(plain.text, "just text");
+  EXPECT_TRUE(plain.reasoning.empty());
 
-  // Unclosed marker is text, never a call.
+  // Unclosed trailing call block (length-capped): recovered best-effort so
+  // a cut-off call still executes instead of leaking markup. Mid-list cuts
+  // (trailing ']' missing) recover the complete calls.
   ToolParseResult open =
-      parse_tool_calls(std::string("a") + kToolCallStartToken + "[f(x=1)");
-  EXPECT_TRUE(open.calls.empty());
-  EXPECT_EQ(open.text, "a[f(x=1)");
+      parse_tool_calls(std::string("a") + kToolCallStartToken + "[f(x=1)]");
+  ASSERT_EQ(open.calls.size(), 1u);
+  EXPECT_EQ(open.calls[0].name, "f");
+  EXPECT_EQ(open.text, "a");
+  ToolParseResult open_list = parse_tool_calls(
+      std::string("a") + kToolCallStartToken + "[f(a=1), g(b=2)");
+  ASSERT_EQ(open_list.calls.size(), 2u);
+  EXPECT_EQ(open_list.calls[0].name, "f");
+  EXPECT_EQ(open_list.calls[1].name, "g");
+  EXPECT_EQ(open_list.text, "a");
+  // Unparseable trailing bytes stay text, never a call.
+  ToolParseResult junk =
+      parse_tool_calls(std::string("a") + kToolCallStartToken + "oops");
+  EXPECT_TRUE(junk.calls.empty());
+  EXPECT_EQ(junk.text, "aoops");
+
+  // <think> blocks split into reasoning, never into display.
+  ToolParseResult th = parse_tool_calls(
+      std::string("<think>hmm</think>answer") + kToolCallStartToken +
+      "[f(x=1)]" + kToolCallEndToken);
+  EXPECT_EQ(th.reasoning, "hmm");
+  EXPECT_EQ(th.text, "answer");
+  ASSERT_EQ(th.calls.size(), 1u);
+  EXPECT_EQ(th.calls[0].name, "f");
+  // Unclosed trailing think at turn start: the rest is reasoning.
+  ToolParseResult th_open = parse_tool_calls(std::string("<think>thinking"));
+  EXPECT_EQ(th_open.reasoning, "thinking");
+  EXPECT_EQ(th_open.text, "");
+  // A mid-turn <think> is literal content (thinking leads the turn).
+  ToolParseResult th_mid =
+      parse_tool_calls(std::string("pre <think>thinking"));
+  EXPECT_TRUE(th_mid.reasoning.empty());
+  EXPECT_EQ(th_mid.text, "pre <think>thinking");
+  // The turn terminator cuts regardless of custom stops (the parser sees
+  // specials): no <|im_end|> leak with a custom stop list.
+  EXPECT_EQ(parse_tool_calls("a<|im_end|>b", {"STOP"}).text, "a");
+  EXPECT_EQ(parse_tool_calls("The answer is 42<|im_end|>", {"STOP"}).text,
+            "The answer is 42");
+  // Length-capped mid-marker inputs strip the fragment in whole-text too.
+  EXPECT_EQ(parse_tool_calls("hello <|im_e").text, "hello ");
+  EXPECT_EQ(parse_tool_calls("hello <|tool_call_st").text, "hello ");
+  // Only the single longest head is stripped: an earlier '<' followed by
+  // '<' is unambiguous content.
+  EXPECT_EQ(parse_tool_calls("hello <<").text, "hello <");
+  EXPECT_EQ(parse_tool_calls("hello <<<").text, "hello <<");
+  EXPECT_EQ(parse_tool_calls("<think>abc<<").reasoning, "abc<");
 }
 
 TEST(LFM25Tokenizer, ToolArgsConvert) {
@@ -428,12 +492,17 @@ TEST(LFM25Tokenizer, ToolStreamParser) {
       "[f(a=1), g(x=\"y\")]" + kToolCallEndToken + " done" + kEosToken;
   // Byte-at-a-time feeding agrees with the whole-text parse.
   ToolCallStreamParser fed;
-  std::string acc;
-  for (char ch : raw) acc += fed.push(std::string(1, ch));
+  std::string acc, racc;
+  for (char ch : raw) {
+    acc += fed.push(std::string(1, ch));
+    racc += fed.poll_reasoning();
+  }
   ToolParseResult tail = fed.finish();
   acc += tail.text;
+  racc += tail.reasoning;
   const ToolParseResult whole = parse_tool_calls(raw);
   EXPECT_EQ(acc, whole.text);
+  EXPECT_EQ(racc, whole.reasoning);
   ASSERT_EQ(tail.calls.size(), 2u);
   EXPECT_EQ(tail.calls[0].name, "f");
   EXPECT_EQ(tail.calls[1].arguments, "{\"x\":\"y\"}");
@@ -444,6 +513,133 @@ TEST(LFM25Tokenizer, ToolStreamParser) {
   for (size_t i = 0; i < snow.size(); ++i) out += plain.push(snow.substr(i, 1));
   out += plain.finish().text;
   EXPECT_EQ(out, snow);
+}
+
+TEST(LFM25Tokenizer, ToolStreamCustomStop) {
+  using KokkosDNN::LFM25::ToolCallStreamParser;
+  using KokkosDNN::LFM25::ToolParseResult;
+  using KokkosDNN::LFM25::parse_tool_calls;
+  // Byte-at-a-time over a completing custom stop: partial heads are held
+  // (never emitted and retracted), totals agree, and the tail does not
+  // leak the stop back in. Used to throw std::out_of_range from push().
+  ToolCallStreamParser fed({"STOP"});
+  std::string acc, racc;
+  const std::string raw = "hello STOP world";
+  for (char ch : raw) {
+    acc += fed.push(std::string(1, ch));
+    racc += fed.poll_reasoning();
+    EXPECT_EQ(acc.find("STO"), std::string::npos);
+  }
+  ToolParseResult tail = fed.finish();
+  acc += tail.text;
+  racc += tail.reasoning;
+  const ToolParseResult whole = parse_tool_calls(raw, {"STOP"});
+  EXPECT_EQ(acc, whole.text);
+  EXPECT_EQ(acc, "hello ");
+  EXPECT_EQ(racc, whole.reasoning);
+  EXPECT_TRUE(tail.calls.empty());
+  EXPECT_TRUE(tail.text.empty());
+}
+
+TEST(LFM25Tokenizer, ToolStreamReasoningFragments) {
+  using KokkosDNN::LFM25::parse_tool_calls;
+  using KokkosDNN::LFM25::ToolCallStreamParser;
+  using KokkosDNN::LFM25::ToolParseResult;
+  // Length-capped turns can end mid-marker inside an unclosed <think> trace.
+  // The whole-text parse strips the trailing fragment; the streaming view
+  // must hold (never emit) the same bytes so finish() cannot drop a byte
+  // the client has already seen as reasoning_content. Byte-at-a-time here
+  // also covers chunk boundaries splitting a marker.
+  const std::vector<std::string> frags = {
+      "<",          "<|tool_call_st", "<|tool_call_end", "<|im_e",
+      "<thi",       "</thi",          "<<",              "<<<",
+      "<|tool_call_start|><"};
+  for (const std::string& frag : frags) {
+    const std::string raw = std::string("<think>hello ") + frag;
+    const ToolParseResult whole = parse_tool_calls(raw);
+    // No fragment leaks into either view. Only the single longest trailing
+    // head is stripped: an earlier '<' followed by '<' is unambiguous
+    // content, so "<<"/"<<<" keep all but the last '<' as reasoning.
+    std::string expect_reasoning = "hello ";
+    if (frag == "<<")
+      expect_reasoning = "hello <";
+    else if (frag == "<<<")
+      expect_reasoning = "hello <<";
+    EXPECT_EQ(whole.text, "") << "frag=" << frag;
+    EXPECT_EQ(whole.reasoning, expect_reasoning) << "frag=" << frag;
+    ToolCallStreamParser fed;
+    std::string acc, racc;
+    for (char ch : raw) {
+      acc += fed.push(std::string(1, ch));
+      racc += fed.poll_reasoning();
+      // Monotone: already-streamed bytes stay a prefix of the whole-text
+      // result (finish() cannot retract them).
+      EXPECT_TRUE(whole.text.find(acc) == 0) << "frag=" << frag;
+      EXPECT_TRUE(whole.reasoning.find(racc) == 0) << "frag=" << frag;
+    }
+    ToolParseResult tail = fed.finish();
+    acc += tail.text;
+    racc += tail.reasoning;
+    EXPECT_EQ(acc, whole.text) << "frag=" << frag;
+    EXPECT_EQ(racc, whole.reasoning) << "frag=" << frag;
+    EXPECT_TRUE(tail.calls.empty()) << "frag=" << frag;
+  }
+  // A disproved fragment head streams once complete (no permanent hold).
+  {
+    const std::string raw = std::string("<think>a < b</think>hi");
+    const ToolParseResult whole = parse_tool_calls(raw);
+    EXPECT_EQ(whole.reasoning, "a < b");
+    EXPECT_EQ(whole.text, "hi");
+    ToolCallStreamParser fed;
+    std::string acc, racc;
+    for (char ch : raw) {
+      acc += fed.push(std::string(1, ch));
+      racc += fed.poll_reasoning();
+      EXPECT_TRUE(whole.text.find(acc) == 0);
+      EXPECT_TRUE(whole.reasoning.find(racc) == 0);
+    }
+    ToolParseResult tail = fed.finish();
+    acc += tail.text;
+    racc += tail.reasoning;
+    EXPECT_EQ(acc, whole.text);
+    EXPECT_EQ(racc, whole.reasoning);
+  }
+}
+
+TEST(LFM25Tokenizer, ToolStreamTrailingLtRun) {
+  using KokkosDNN::LFM25::parse_tool_calls;
+  using KokkosDNN::LFM25::ToolCallStreamParser;
+  using KokkosDNN::LFM25::ToolParseResult;
+  // Only the single longest head is held: "hello <<" streams "hello <"
+  // with the last '<' held, and a long '<' run never stalls the stream
+  // (the fixpoint hold kept the whole run back and rescanned it per push).
+  const std::string raw = std::string("hello ") + std::string(2000, '<');
+  const ToolParseResult whole = parse_tool_calls(raw);
+  EXPECT_EQ(whole.text, std::string("hello ") + std::string(1999, '<'));
+  ToolCallStreamParser fed;
+  std::string acc, racc;
+  size_t fed_n = 0;
+  for (size_t p = 0; p < raw.size(); p += 8) {
+    const std::string chunk = raw.substr(p, 8);
+    acc += fed.push(chunk);
+    racc += fed.poll_reasoning();
+    fed_n += chunk.size();
+    // Prefix of the whole-text result with bounded lag (one head per
+    // layer): the stream keeps up instead of stalling to the end.
+    EXPECT_TRUE(whole.text.find(acc) == 0);
+    EXPECT_LE(fed_n - acc.size(), 64u) << "p=" << p;
+    EXPECT_TRUE(racc.empty());
+  }
+  // finish() is idempotent: the tail is computed, not drained.
+  const ToolParseResult tail1 = fed.finish();
+  const ToolParseResult tail2 = fed.finish();
+  EXPECT_EQ(tail1.text, tail2.text);
+  EXPECT_EQ(tail1.reasoning, tail2.reasoning);
+  EXPECT_EQ(tail1.calls.size(), tail2.calls.size());
+  acc += tail1.text;
+  racc += tail1.reasoning;
+  EXPECT_EQ(acc, whole.text);
+  EXPECT_TRUE(tail1.calls.empty());
 }
 
 TEST(LFM25Tokenizer, StopStrings) {
