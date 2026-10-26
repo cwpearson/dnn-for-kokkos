@@ -28,8 +28,16 @@
 // to RGBA when --vae-weights + --vae-decode are given (else a grayscale
 // preview), each fallback with a logged reason.
 //
+// Interactive loop (default): without --prompt on a TTY (and without the
+// file/parity handoff flags) the driver asks for a prompt, asks for a
+// filename, generates, and repeats until EOF or quit/exit. Giving --prompt
+// (or any of --prompt-embeds-in/--text-weights, --init-latents-in,
+// --dump-steps, --decode-latents-in, or non-TTY stdin) runs ONE generation
+// and exits. The per-iteration seed is --seed + iteration; an empty
+// filename auto-numbers qwen_image_21_out_<n>.png.
+//
 //   qwen_image_21_generate [--tiny] [--weights transformer_dir]
-//                          [--prompt "text"]
+//                          [--prompt "text"]   (one-off; omit to loop)
 //                          [--tokenizer tok_dir] [--text-encoder enc_dir]
 //                          [--text-weights feats.f32]
 //                          [--prompt-embeds-in feats.f32]
@@ -43,8 +51,7 @@
 //                           [--decode-out-f32 file]]
 //                          [--out img.png]
 //                          [--staged] [--dump-steps DIR]
-//
-// Text conditioning precedence: in-process Qwen forward (--tokenizer dir
+//// Text conditioning precedence: in-process Qwen forward (--tokenizer dir
 // with tokenizer.json + --text-encoder weights, raw T2I template, no chat
 // template) -> --prompt-embeds-in file (alias
 // --text-weights) -> null (zeros) with the prompt logged. --tokenizer /
@@ -61,7 +68,11 @@
 // device-resident embeds -> releases the DiT -> Kokkos::fence() -> decodes,
 // so the 17.5GB encoder, the 14.2GB DiT, and the VAE are never resident at
 // once. No disk round-trip and no second process: the embeds are separate
-// (MiB) allocations from the (GiB) encoder weights. Each phase logs its
+// (MiB) allocations from the (GiB) encoder weights. In the interactive loop
+// the encoder and transformer additionally live in HOST memory (loaded once
+// before the first prompt) and are copied host->device per iteration, so
+// --staged keeps the same one-component-resident property every iteration
+// without re-reading the ~32 GB checkpoint from disk. Each phase logs its
 // resident estimate (weights bytes + activation estimate).
 //
 // --tiny runs a random-weights smoke model on 4x4 latents, 2 steps
@@ -91,6 +102,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -1953,6 +1965,128 @@ inline void run_vae_only(const std::string& lat_path, bool token_major,
 #endif
 }
 
+void usage();
+template <class CfgT>
+int run_interactive_loop(const CfgT& cfg, const struct LoopFixedOpts& o);
+
+// ---- Interactive generation loop (default) --------------------------------
+// When --prompt is absent (and no parity/file handoff flags are given) the
+// driver runs as a REPL on a TTY: it asks for a prompt, asks for an output
+// filename, generates, and repeats indefinitely until EOF or quit/exit.
+// The encoder and transformer weights are loaded ONCE into host memory
+// (HostSpace mirrors) before the first prompt; every iteration copies the
+// needed component host->device, runs the phase, and releases the device
+// copy -- so --staged keeps the same one-component-resident property per
+// iteration without re-reading the ~32 GB checkpoint from disk.
+// File/parity modes (--prompt-embeds-in/--text-weights, --init-latents-in,
+// --dump-steps, --decode-latents-in) and non-TTY stdin force the legacy
+// one-off run. In the loop the latent seed is base --seed + iteration, so
+// successive images differ even for the same prompt.
+
+inline bool stdin_is_tty() { return ::isatty(STDIN_FILENO) != 0; }
+
+// Print msg, flush, read one line. Returns false on EOF/error. Strips a
+// trailing CR so CRLF consoles behave.
+inline bool ask_line(const char* msg, std::string& out) {
+  std::fputs(msg, stdout);
+  std::fflush(stdout);
+  if (!std::getline(std::cin, out)) return false;
+  if (!out.empty() && out.back() == '\r') out.pop_back();
+  return true;
+}
+
+inline bool is_quit_word(const std::string& s) {
+  return s == "quit" || s == "exit" || s == ":q";
+}
+
+#ifdef QWEN21_DRIVER_HAVE_DIT
+// Host<->device Dit weight copy (both directions: instantiate with
+// DstExec/SrcExec as needed). Both sides must be allocated from the same
+// config; extents are checked by deep_copy.
+template <class DstExec, class SrcExec>
+void copy_dit_weights(
+    KokkosDNN::QwenImage21Dit::QwenImage21DitWeights<DstExec, DScalar>& dst,
+    const KokkosDNN::QwenImage21Dit::QwenImage21DitWeights<SrcExec, DScalar>&
+        src) {
+  if (dst.blocks.size() != src.blocks.size())
+    throw std::runtime_error("copy_dit_weights: block count mismatch");
+  Kokkos::deep_copy(dst.txt_norm, src.txt_norm);
+  Kokkos::deep_copy(dst.txt_in_W, src.txt_in_W);
+  Kokkos::deep_copy(dst.txt_out_W, src.txt_out_W);
+  Kokkos::deep_copy(dst.img_in_W, src.img_in_W);
+  Kokkos::deep_copy(dst.time1_W, src.time1_W);
+  Kokkos::deep_copy(dst.time2_W, src.time2_W);
+  Kokkos::deep_copy(dst.mod_W, src.mod_W);
+  Kokkos::deep_copy(dst.norm_out_W, src.norm_out_W);
+  Kokkos::deep_copy(dst.proj_out_W, src.proj_out_W);
+  for (size_t i = 0; i < dst.blocks.size(); ++i) {
+    auto& d = dst.blocks[i];
+    const auto& s = src.blocks[i];
+    Kokkos::deep_copy(d.to_q, s.to_q);
+    Kokkos::deep_copy(d.to_k, s.to_k);
+    Kokkos::deep_copy(d.to_v, s.to_v);
+    Kokkos::deep_copy(d.to_o, s.to_o);
+    Kokkos::deep_copy(d.norm_q, s.norm_q);
+    Kokkos::deep_copy(d.norm_k, s.norm_k);
+    Kokkos::deep_copy(d.proj, s.proj);
+    Kokkos::deep_copy(d.gate, s.gate);
+    Kokkos::deep_copy(d.out, s.out);
+  }
+  Kokkos::fence();
+}
+#endif
+
+#if defined(QWEN21_DRIVER_HAVE_ENCODER) && \
+    defined(QWEN21_DRIVER_HAVE_TOKENIZER)
+// Host<->device encoder weight copy (bhalf_t, matching run_qwen's
+// EncoderModel<Exec, bhalf_t>).
+template <class DstExec, class SrcExec>
+void copy_enc_weights(
+    KokkosDNN::QwenImage21Encoder::QwenImage21EncoderWeights<
+        DstExec, Kokkos::Experimental::bhalf_t>& dst,
+    const KokkosDNN::QwenImage21Encoder::QwenImage21EncoderWeights<
+        SrcExec, Kokkos::Experimental::bhalf_t>& src) {
+  if (dst.layers.size() != src.layers.size())
+    throw std::runtime_error("copy_enc_weights: layer count mismatch");
+  Kokkos::deep_copy(dst.embed, src.embed);
+  Kokkos::deep_copy(dst.final_norm, src.final_norm);
+  for (size_t i = 0; i < dst.layers.size(); ++i) {
+    auto& d = dst.layers[i];
+    const auto& s = src.layers[i];
+    Kokkos::deep_copy(d.q_W, s.q_W);
+    Kokkos::deep_copy(d.k_W, s.k_W);
+    Kokkos::deep_copy(d.v_W, s.v_W);
+    Kokkos::deep_copy(d.o_W, s.o_W);
+    Kokkos::deep_copy(d.qn, s.qn);
+    Kokkos::deep_copy(d.kn, s.kn);
+    Kokkos::deep_copy(d.in_norm, s.in_norm);
+    Kokkos::deep_copy(d.post_norm, s.post_norm);
+    Kokkos::deep_copy(d.gate_W, s.gate_W);
+    Kokkos::deep_copy(d.up_W, s.up_W);
+    Kokkos::deep_copy(d.down_W, s.down_W);
+  }
+  Kokkos::fence();
+}
+#endif
+
+// Fixed generation options shared by every loop iteration (prompt, output
+// path, and per-iteration seed vary).
+struct LoopFixedOpts {
+  std::string weights = "transformer";
+  std::string tokenizer_dir;
+  std::string text_encoder;
+  int H = 64, W = 64;
+  int steps_eff = 8;
+  float guidance = 1.0f, flow_shift = 3.0f;
+  std::string sigmas_mode = "driver";
+  uint64_t seed = 42;
+  std::string vae_weights;
+  bool vae_decode = false;
+  std::string out_default = "qwen_image_21_out.png";
+  bool staged = false;
+  bool tiny = false;
+};
+
 void usage() {
   std::printf(
       "usage: qwen_image_21_generate [--tiny] [--weights transformer_dir]\n"
@@ -1977,7 +2111,14 @@ void usage() {
       "                 or single .safetensors (default: transformer)\n"
       "  --prompt       caption text (Qwen-encoded in-process with\n"
       "                 --tokenizer + --text-encoder, else needs\n"
-      "                 --text-weights, else null)\n"
+      "                 --text-weights, else null). Giving --prompt runs ONE\n"
+      "                 generation and exits; without it (TTY stdin, no\n"
+      "                 --prompt-embeds-in/--text-weights/--init-latents-in/\n"
+      "                 --dump-steps/--decode-latents-in) the driver loops:\n"
+      "                 it asks for a prompt, asks for a filename, generates,\n"
+      "                 and repeats until EOF or quit/exit (empty prompt\n"
+      "                 re-asks; empty filename auto-numbers). The per-iteration\n"
+      "                 seed is --seed + iteration.\n"
       "  --tokenizer    dir holding tokenizer.json;\n"
       "                 with --text-encoder runs the in-process Qwen forward\n"
       "                 (raw T2I template, no chat template)\n"
@@ -2025,6 +2166,427 @@ void usage() {
       "                 off by default (no extra device->host copies)\n");
 }
 
+// ---- Interactive loop driver (both backends) -------------------------------
+// CfgT is KokkosDNN::QwenImage21::Config (true pipeline) or QW::Config
+// (placeholder); be_* traits select geometry. Parity/file handoff modes are
+// excluded by construction (main forces one-off when --prompt-embeds-in,
+// --text-weights, --init-latents-in, --dump-steps, or --decode-latents-in is
+// given), so this path never dumps and always samples fresh latents.
+template <class CfgT>
+int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
+  const int H = o.tiny ? 4 : o.H, W = o.tiny ? 4 : o.W;
+  if (!o.tiny) {
+    if (H <= 0 || W <= 0)
+      throw std::runtime_error("--height/--width must be positive (got " +
+                               std::to_string(o.H) + "x" +
+                               std::to_string(o.W) + ")");
+#ifndef QWEN21_DRIVER_HAVE_DIT
+    if (H % 16 != 0 || W % 16 != 0)
+      throw std::runtime_error(
+          "--height/--width must be positive multiples of 16 (got " +
+          std::to_string(o.H) + "x" + std::to_string(o.W) + ")");
+#endif
+    if (H % be_patch(cfg) != 0 || W % be_patch(cfg) != 0)
+      throw std::runtime_error("--height/--width must tile patch_size=" +
+                               std::to_string(be_patch(cfg)));
+  }
+  const size_t C = be_latent_channels(cfg);
+  std::printf("[model %s: %s]\n", o.tiny ? "tiny_test" : "qwen-image-2.1",
+              be_label(cfg));
+
+  // VAE checkpoint validated once (decoded per iteration from disk; 0.7GB).
+  bool vae_decode = o.vae_decode;
+  if (!o.vae_weights.empty()) {
+    std::error_code ec0;
+    const bool vae_is_dir = std::filesystem::is_directory(o.vae_weights, ec0);
+    if (!vae_is_dir && !file_exists(o.vae_weights))
+      throw std::runtime_error("vae weights file '" + o.vae_weights +
+                               "' not found");
+#ifdef QWEN21_DRIVER_HAVE_VAE
+    std::printf("[vae %s] validated%s\n", o.vae_weights.c_str(),
+                vae_decode ? "; decode enabled"
+                           : "; pass --vae-decode to decode (else grayscale "
+                             "preview)");
+#else
+    std::printf("[vae %s] validated, but KokkosDNN_QwenImage21Vae.hpp is "
+                "not in this build; writing a grayscale preview instead\n",
+                o.vae_weights.c_str());
+#endif
+  } else if (vae_decode) {
+    std::printf("[vae] --vae-decode needs --vae-weights; writing a "
+                "grayscale preview instead\n");
+    vae_decode = false;
+  }
+
+#ifdef QWEN21_DRIVER_HAVE_DIT
+  // DiT weights live in host memory from here on; each iteration copies
+  // host->device, samples, and releases the device copy.
+  KokkosDNN::QwenImage21Dit::QwenImage21DitWeights<Kokkos::HostSpace, DScalar>
+      dit_host;
+  bool have_dit_host = false;
+  if (!o.tiny) {
+    const std::vector<std::string> shards =
+        resolve_shard_list(o.weights, "--weights");
+    KokkosDNN::QwenImage21Dit::QwenImage21DitModel<Exec, DScalar> tmp(cfg);
+    if (shards.size() > 1)
+      std::printf("[loading %zu shards]\n", shards.size());
+    else
+      std::printf("[loading %s]\n", o.weights.c_str());
+    try {
+      tmp.weights().load_safetensors(shards);
+    } catch (const std::exception& e) {
+      throw std::runtime_error(std::string(e.what()) +
+                               " (need Qwen-Image-2.1 weights or --tiny)");
+    }
+    dit_host.allocate(cfg);
+    copy_dit_weights(dit_host, tmp.weights());
+    have_dit_host = true;
+    std::printf("[loop] DiT weights resident in host memory: %.1f GB "
+                "(copied host->device each iteration%s)\n",
+                (double)tmp.weights().resident_bytes() / 1e9,
+                o.staged ? ", staged" : "");
+  }
+#endif
+
+#if defined(QWEN21_DRIVER_HAVE_ENCODER) && \
+    defined(QWEN21_DRIVER_HAVE_TOKENIZER)
+  // In-process Qwen inputs preloaded once: BPE tables + host encoder
+  // weights. The per-iteration forward copies host->device into a fresh
+  // device model and drops it when the embeds are staged.
+  RawQwenTables loop_tabs;
+  std::vector<int> loop_head_ids;
+  size_t loop_drop = 0;
+  KokkosDNN::QwenImage21Encoder::Config loop_ecfg;
+  KokkosDNN::QwenImage21Encoder::QwenImage21EncoderWeights<
+      Kokkos::HostSpace, Kokkos::Experimental::bhalf_t>
+      enc_host;
+  bool have_enc_host = false;
+  if (!o.tiny && (!o.tokenizer_dir.empty() || !o.text_encoder.empty())) {
+    if (o.tokenizer_dir.empty() || o.text_encoder.empty())
+      throw std::runtime_error(
+          "--tokenizer and --text-encoder must be given together for the "
+          "in-process Qwen forward");
+    namespace QELoop = KokkosDNN::QwenImage21Encoder;
+    const std::string tok_json = o.tokenizer_dir + "/tokenizer.json";
+    if (!file_exists(tok_json))
+      throw std::runtime_error("--tokenizer '" + o.tokenizer_dir +
+                               "' has no tokenizer.json (need the "
+                               "Qwen-Image-2.1 processor/ dir)");
+    loop_tabs = load_raw_qwen_tables(tok_json);
+    const size_t max_len = be_max_seq(cfg);
+    const std::string kUserPrefix = "<|im_start|>user\n";
+    const std::string full_head = QELoop::qwen21_t2i_head();
+    if (full_head.size() < kUserPrefix.size() ||
+        full_head.compare(full_head.size() - kUserPrefix.size(),
+                          kUserPrefix.size(), kUserPrefix) != 0)
+      throw std::runtime_error(
+          "in-process Qwen encode: T2I head lost its user-role prefix");
+    const std::string sys_block =
+        full_head.substr(0, full_head.size() - kUserPrefix.size());
+    const std::vector<int> sys_ids =
+        encode_qwen_raw(loop_tabs, sys_block, max_len);
+    const std::vector<int> prefix_ids =
+        encode_qwen_raw(loop_tabs, kUserPrefix, max_len);
+    loop_head_ids = encode_qwen_raw(loop_tabs, full_head, max_len);
+    if (sys_ids.empty() || prefix_ids.empty() || loop_head_ids.empty() ||
+        loop_head_ids.size() != sys_ids.size() + prefix_ids.size() ||
+        !std::equal(sys_ids.begin(), sys_ids.end(), loop_head_ids.begin()) ||
+        !std::equal(prefix_ids.begin(), prefix_ids.end(),
+                    loop_head_ids.begin() + (long)sys_ids.size()))
+      throw std::runtime_error(
+          "in-process Qwen encode: T2I head/prefix split mismatch");
+    loop_drop = sys_ids.size();
+    loop_ecfg.validate();
+    if ((size_t)loop_ecfg.hidden_dim != be_caption_dim(cfg))
+      throw std::runtime_error(
+          "Qwen encoder hidden (" + std::to_string(loop_ecfg.hidden_dim) +
+          ") != caption dim (" + std::to_string(be_caption_dim(cfg)) + ")");
+    KokkosDNN::QwenImage21Encoder::QwenImage21EncoderModel<
+        Exec, Kokkos::Experimental::bhalf_t>
+        enc_tmp(loop_ecfg);
+    const std::vector<std::string> eshards =
+        resolve_shard_list(o.text_encoder, "--text-encoder");
+    if (eshards.size() != 1)
+      throw std::runtime_error(
+          "--text-encoder must be the single-shard text_encoder/ "
+          "model.safetensors (got " +
+          std::to_string(eshards.size()) + " shards)");
+    std::printf("[loading %s]\n", o.text_encoder.c_str());
+    enc_tmp.weights().load_safetensors(eshards[0]);
+    enc_host.allocate(loop_ecfg);
+    copy_enc_weights(enc_host, enc_tmp.weights());
+    have_enc_host = true;
+    std::printf("[loop] Qwen encoder weights resident in host memory: %.1f "
+                "GB (copied host->device each iteration)\n",
+                (double)enc_tmp.weights().resident_bytes() / 1e9);
+  }
+  if (o.tiny && (!o.tokenizer_dir.empty() || !o.text_encoder.empty()))
+    std::printf("[encode] --tiny skips the Qwen forward (random-weights "
+                "smoke model); using null embeddings\n");
+#else
+  if (!o.tiny && (!o.tokenizer_dir.empty() || !o.text_encoder.empty()))
+    std::printf("[encode] --tokenizer/--text-encoder need "
+                "KokkosDNN_QwenImage21Encoder.hpp + "
+                "KokkosDNN_QwenTokenizer.hpp, not present in this build; "
+                "using null embeddings\n");
+#endif
+
+  // Sigma schedule is prompt-independent: build once, reuse every iteration.
+  std::vector<float> base_sigmas;
+  if (o.sigmas_mode == "turbo") {
+#ifdef QWEN21_DRIVER_HAVE_OPS
+    for (double s : cfg.sample_sigmas)
+      base_sigmas.push_back(static_cast<float>(s));
+    base_sigmas.push_back(0.0f);
+    std::printf("[schedule turbo] checkpoint sample_sigmas verbatim "
+                "(mu-shifted already)\n");
+#else
+    throw std::runtime_error(
+        "--sigmas turbo needs the true QwenImage21::Config "
+        "(KokkosDNN_QwenImage21Config.hpp is not in this build)");
+#endif
+  } else {
+    base_sigmas = build_sigmas_nearest_grid(o.steps_eff, o.flow_shift);
+  }
+  const int steps_run = static_cast<int>(base_sigmas.size()) - 1;
+
+  std::printf(
+      "[loop] interactive generation: prompt, then output filename, per "
+      "iteration (EOF or quit/exit stops; empty prompt re-asks; empty "
+      "filename auto-numbers qwen_image_21_out_<n>.png; seed = %llu + "
+      "iteration)\n",
+      (unsigned long long)o.seed);
+  std::fflush(stdout);
+  size_t iter = 0;
+  while (true) {
+    std::string cur_prompt;
+    if (!ask_line("prompt> ", cur_prompt)) break;
+    if (is_quit_word(cur_prompt)) break;
+    if (cur_prompt.empty()) continue;
+    std::string cur_out_raw;
+    if (!ask_line("output> ", cur_out_raw)) break;
+    if (is_quit_word(cur_out_raw)) continue;  // cancel this one
+    const std::string cur_out =
+        cur_out_raw.empty()
+            ? ("qwen_image_21_out_" + std::to_string(iter) + ".png")
+            : cur_out_raw;
+    const uint64_t cur_seed = o.seed + iter;
+    std::printf("[iter %zu] seed=%llu out=%s\n", iter,
+                (unsigned long long)cur_seed, cur_out.c_str());
+    std::fflush(stdout);
+
+    // ---- Phase 1: encode (device encoder is a per-iteration copy) ----
+    EncoderStage enc;
+    bool encoded = false;
+#if defined(QWEN21_DRIVER_HAVE_ENCODER) && \
+    defined(QWEN21_DRIVER_HAVE_TOKENIZER)
+    if (have_enc_host) {
+      try {
+        namespace QEIter = KokkosDNN::QwenImage21Encoder;
+        const size_t max_len = be_max_seq(cfg);
+        const std::vector<int> ids = encode_qwen_raw(
+            loop_tabs, QEIter::qwen21_format_prompt_t2i(cur_prompt), max_len);
+        if (loop_head_ids.empty() || ids.size() <= loop_head_ids.size())
+          throw std::runtime_error(
+              "in-process Qwen encode: empty conditioning sequence");
+        KokkosDNN::QwenImage21Encoder::QwenImage21EncoderModel<
+            Exec, Kokkos::Experimental::bhalf_t>
+            enc_model(loop_ecfg);
+        copy_enc_weights(enc_model.weights(), enc_host);
+        Kokkos::View<int**, Kokkos::LayoutRight, Exec> toks("qwen21enc_toks",
+                                                            1, ids.size());
+        {
+          auto hm = Kokkos::create_mirror_view(toks);
+          for (size_t s = 0; s < ids.size(); ++s) hm(0, s) = ids[s];
+          Kokkos::deep_copy(toks, hm);
+        }
+        Kokkos::View<Kokkos::Experimental::bhalf_t***, Kokkos::LayoutRight,
+                      Exec>
+            hid("qwen21enc_hid", 1, ids.size(),
+                (size_t)loop_ecfg.hidden_dim);
+        KokkosDNN::DNNHandle<Exec> enc_handle;
+        enc_model.forward(enc_handle, toks, hid, (int)loop_drop);
+        Kokkos::fence();
+        auto hhid =
+            Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), hid);
+        const size_t L = ids.size() - loop_drop;
+        const size_t Cc = be_caption_dim(cfg);
+        enc.L = L;
+        enc.Cc = Cc;
+        enc.embeds.assign(L * Cc, 0.0f);
+        enc.neg_embeds.assign(L * Cc, 0.0f);
+        enc.source = "qwen";
+        for (size_t t = 0; t < L; ++t)
+          for (size_t h = 0; h < Cc; ++h)
+            enc.embeds[t * Cc + h] = (float)hhid(0, loop_drop + t, h);
+        std::printf("[caption qwen] %zux%zu features (host->device copy, "
+                    "drop_idx=%zu)\n",
+                    enc.L, enc.Cc, loop_drop);
+        enc.stage_device();
+        encoded = true;
+        // enc_model goes out of scope here: the device encoder copy is
+        // released while the host cache above survives for the next prompt.
+      } catch (const std::exception& e) {
+        std::fprintf(stderr,
+                     "warning: in-process Qwen encode failed (%s); using "
+                     "null embedding\n",
+                     e.what());
+      }
+    }
+#endif
+    if (!encoded) {
+      enc.L = be_max_seq(cfg);
+      enc.Cc = be_caption_dim(cfg);
+      enc.embeds.assign(enc.L * enc.Cc, 0.0f);
+      enc.neg_embeds.assign(enc.L * enc.Cc, 0.0f);
+      enc.source = "null";
+      std::printf("[caption null] prompt \"%s\" has no features here; using "
+                  "zeros (%zux%zu)\n",
+                  cur_prompt.c_str(), enc.L, enc.Cc);
+      enc.stage_device();
+    }
+    log_encode_memory(enc);
+    if (o.staged) {
+      Kokkos::fence();
+      QW::print_phase_memory("encode-released", enc.device_bytes(), 0);
+      std::printf("[staged] keeping %.1f MiB of embeds resident on device "
+                  "across the DiT load (no disk round-trip)\n",
+                  (double)enc.device_bytes() / (1024.0 * 1024.0));
+    }
+
+    // ---- Phase 2: DiT (device copy restored from the host cache) ----
+#ifdef QWEN21_DRIVER_HAVE_DIT
+    KokkosDNN::QwenImage21Dit::QwenImage21DitModel<Exec, DScalar> dit_model(
+        cfg);
+    {
+      auto& w = dit_model.weights();
+      if (have_dit_host) {
+        copy_dit_weights(w, dit_host);
+        std::printf("[loading host->device %.1f GB]\n",
+                    (double)w.resident_bytes() / 1e9);
+      } else if (o.tiny) {
+        w.random_init(o.seed);
+        std::printf("[tiny random weights] layers=%d hidden=%d latent=%dx%d\n",
+                    cfg.num_layers, cfg.hidden_dim, H, W);
+      } else {
+        throw std::runtime_error(
+            "need Qwen-Image-2.1 weights or --tiny (unreachable: host load "
+            "would have failed before the loop)");
+      }
+      QW::print_phase_memory("sample", w.resident_bytes(),
+                             dit_model.scratch_bytes());
+    }
+#else
+    QW::Weights<Exec, DScalar> w;
+    if (o.tiny) {
+      QW::random_init(cfg, w, o.seed);
+      std::printf("[tiny random weights] hidden=%d depth=%d latent=%dx%d\n",
+                  cfg.hidden_size, cfg.depth, H, W);
+    } else {
+      throw std::runtime_error(
+          "weights file '" + o.weights +
+          "' needs the true Qwen-Image-2.1 DiT "
+          "(KokkosDNN_QwenImage21Dit.hpp is not in this build); pass --tiny "
+          "for the random-weights smoke run. See README for the expected "
+          "checkpoint layout.");
+    }
+    QW::print_phase_memory("sample", w.resident_bytes(), w.resident_bytes());
+#endif
+    std::printf("[budget] full-checkpoint projection: DiT %.1f GB + VAE %.3f "
+                "GB + activations vs 24GB (see README fit table)\n",
+                QW::kDitBudgetBytes / 1e9, QW::kVaeBudgetBytes / 1e9);
+
+    std::vector<float> x_init =
+        QW::sample_gaussian(C * (size_t)H * (size_t)W, cur_seed);
+    std::printf("[sample] H=%d W=%d steps=%d cfg=%.3g shift=%.3g seed=%llu\n",
+                H, W, steps_run, (double)o.guidance, (double)o.flow_shift,
+                (unsigned long long)cur_seed);
+#ifdef QWEN21_DRIVER_HAVE_DIT
+    KokkosDNN::DNNHandle<Exec> dit_handle;
+    DitForward dit_forward{&dit_model, &dit_handle, H, W};
+#else
+    QW::Model<Exec, DScalar> model(cfg, w);
+    DitForward dit_forward{&model};
+#endif
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<float> lat = run_sample_loop_from_device(
+        cfg, dit_forward, x_init, enc.device, enc.device_neg, steps_run,
+        o.guidance, o.flow_shift, H, W,
+        [](int i, float t, float sg) {
+          std::printf("  step %3d t=%9.3f sigma=%.6f\n", i, (double)t,
+                      (double)sg);
+          std::fflush(stdout);
+        },
+        &base_sigmas, StepDumpHook{});
+    const double secs =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+            .count();
+    std::printf("[done] %.2fs total, %.2fs/step\n", secs,
+                secs / (double)std::max(steps_run, 1));
+
+    double mean = 0.0, var = 0.0, mn = lat[0], mx = lat[0];
+    for (float v : lat) {
+      mean += v;
+      mn = std::min(mn, (double)v);
+      mx = std::max(mx, (double)v);
+    }
+    mean /= (double)lat.size();
+    for (float v : lat) var += (v - mean) * (v - mean);
+    var /= (double)lat.size();
+    std::printf("[latents %zux%zux%zu] mean=%.6f std=%.6f min=%.4f max=%.4f\n",
+                C, (size_t)H, (size_t)W, mean, std::sqrt(var), mn, mx);
+
+    const std::string lat_path = with_extension(cur_out, ".f32");
+    save_raw_f32(lat_path, lat);
+    std::printf("[wrote %s] raw fp32 latents\n", lat_path.c_str());
+
+    // Captions are no longer needed: drop host + device copies before decode.
+    enc.release();
+    // ---- Phase 3: decode (the DiT device copy is released first) ----
+#ifdef QWEN21_DRIVER_HAVE_DIT
+    dit_model.weights().release();
+    dit_model.release_scratch();
+#else
+    w.release();
+#endif
+    Kokkos::fence();
+    QW::print_phase_memory("dit-released", 0, 0);
+    size_t oH = 0, oW = 0;
+    [[maybe_unused]] int oCh = 1;
+    std::vector<unsigned char> pix;
+    bool decoded = false;
+    if (vae_decode) {
+#ifdef QWEN21_DRIVER_HAVE_VAE
+      try {
+        decoded = try_vae_decode_rgba(lat, C, (size_t)H, (size_t)W,
+                                      o.vae_weights, pix, oH, oW, oCh);
+        std::printf("[decode] VAE RGBA %zux%zux%d ready for output\n", oH, oW,
+                    oCh);
+      } catch (const std::exception& e) {
+        std::fprintf(stderr,
+                     "warning: real VAE decode failed (%s); writing a "
+                     "grayscale preview instead\n",
+                     e.what());
+      }
+#else
+      std::printf("[vae] --vae-decode requested but "
+                  "KokkosDNN_QwenImage21Vae.hpp is not in this build; writing "
+                  "a grayscale preview instead (need the VAE worktree "
+                  "header + --vae-weights)\n");
+#endif
+    }
+    if (!decoded) {
+      pix = render_preview(lat, C, (size_t)H, (size_t)W, oH, oW);
+      QW::print_phase_memory("decode-preview", 0, 0);
+    }
+    write_output_image(cur_out, pix, oH, oW, oCh, decoded);
+    ++iter;
+  }
+  std::printf("[loop] done after %zu generation%s\n", iter,
+              iter == 1 ? "" : "s");
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2043,6 +2605,7 @@ int main(int argc, char** argv) {
   uint64_t seed = 42;
   bool tiny = false;
   bool staged = false, vae_decode = false;
+  bool prompt_given = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -2059,6 +2622,7 @@ int main(int argc, char** argv) {
       tiny = false;
     } else if (a == "--prompt" && i + 1 < argc) {
       prompt = argv[++i];
+      prompt_given = true;
     } else if (a == "--tokenizer" && i + 1 < argc) {
       tokenizer_dir = argv[++i];
     } else if (a == "--text-encoder" && i + 1 < argc) {
@@ -2208,6 +2772,37 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "warning: --prompt-embeds-in wins over --text-weights\n");
       caption_src = prompt_embeds_in;
+    }
+
+    // Default interactive loop: no --prompt (and no file/parity handoff) on
+    // a TTY means prompt -> filename -> generate, indefinitely. Weights are
+    // preloaded once into host memory and copied host->device per iteration
+    // (see run_interactive_loop). Anything script-like -- an explicit
+    // --prompt, a caption/latent file, --dump-steps, or non-TTY stdin --
+    // takes the legacy one-off path below, so golden/CI runs are unchanged.
+    const bool loop_mode =
+        !prompt_given && caption_src.empty() && init_latents_in.empty() &&
+        dump_dir.empty() && stdin_is_tty();
+    if (loop_mode) {
+      LoopFixedOpts lo;
+      lo.weights = weights;
+      lo.tokenizer_dir = tokenizer_dir;
+      lo.text_encoder = text_encoder;
+      lo.H = H;
+      lo.W = W;
+      lo.steps_eff = steps_eff;
+      lo.guidance = guidance;
+      lo.flow_shift = flow_shift;
+      lo.sigmas_mode = sigmas_mode;
+      lo.seed = seed;
+      lo.vae_weights = vae_weights;
+      lo.vae_decode = vae_decode;
+      lo.out_default = out;
+      lo.staged = staged;
+      lo.tiny = tiny;
+      const int lrc = run_interactive_loop(cfg, lo);
+      Kokkos::finalize();
+      return lrc;
     }
 
     // ---- Phase 1: encode (no DiT weights are loaded yet) ----
