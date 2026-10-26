@@ -26,9 +26,9 @@
 //                       [--slg-layers 24 --slg-scale 3.0
 //                        --slg-start 0.0 --slg-stop 1.0]
 //                       [--seed 42]
-//                       [--vae-weights vae.safetensors [--vae-decode]]
+//                       [--vae-weights vae.safetensors [--no-vae-decode]]
 //                       [--out img.png]
-//                       [--staged]
+//                       [--no-staged]
 //
 // Text conditioning precedence: in-process Qwen forward (--tokenizer dir
 // with tokenizer.json + --text-encoder weights: BPE + chat template +
@@ -36,17 +36,20 @@
 // released before the DiT load) -> --prompt-embeds-in file (alias
 // --text-weights) -> null (zeros) with the prompt logged. --tokenizer /
 // --text-encoder must be given together. --tiny skips the Qwen forward.
-// --vae-weights is validated whenever given; --vae-decode additionally runs
-// the real VAE decode when the VAE header + weights are present, else a
-// channel-mean grayscale preview is written with a clear log. Raw fp32
+// --vae-weights is validated whenever given; VAE decode runs by default
+// (the real VAE decode when the VAE header + weights are present, else a
+// channel-mean grayscale preview with a clear log; pass --no-vae-decode
+// for the preview). Raw fp32
 // latents (<stem>.f32, [C,H,W] row-major) are always written.
 //
-// Staged execution (24GB fit): --staged runs encode -> releases the encoder
+// Staged execution (24GB fit, default): encode -> releases the encoder
 // weights (the MiB-scale embeds stay resident on the device) ->
 // Kokkos::fence() -> loads the DiT -> samples straight from the
 // device-resident embeds -> releases the DiT -> Kokkos::fence() -> decodes,
 // so the 16.8GB encoder, the 10.2GB DiT, and the VAE are never resident at
-// once. No disk round-trip and no second process: the embeds are separate
+// once. Pass --no-staged for the legacy single-phase run (encoder embeds
+// stay live across the DiT load, no fenced encoder-release point). No disk
+// round-trip and no second process: the embeds are separate
 // (MiB) allocations from the (GiB) encoder weights. --prompt-embeds-in
 // remains for loading precomputed file embeds (e.g. from
 // scripts/moss_encode.py). Each phase logs its resident estimate (weights
@@ -972,9 +975,9 @@ void usage() {
       "                    [--slg-layers A,B --slg-scale S\n"
       "                     --slg-start F --slg-stop F]\n"
       "                    [--seed N]\n"
-      "                    [--vae-weights vae.safetensors [--vae-decode]]\n"
+      "                    [--vae-weights vae.safetensors [--no-vae-decode]]\n"
       "                    [--out img.png]\n"
-      "                    [--staged]\n"
+      "                    [--no-staged]\n"
       "\n"
       "  --tiny         random-weights smoke model, 4x4 latents (no files)\n"
       "  --weights      DiT transformer checkpoint: transformer/ shard dir\n"
@@ -991,10 +994,12 @@ void usage() {
       "  --text-encoder Qwen text-encoder weights: text_encoder/ shard dir\n"
       "                 or single .safetensors\n"
       "  --prompt-embeds-in alias of --text-weights (wins if both differ)\n"
-      "  --staged       encode -> release encoder weights (MiB embeds stay\n"
-      "                 resident on device) -> fence -> load DiT -> sample\n"
-      "                 from device embeds -> release DiT -> fence -> decode\n"
-      "                 (one component resident at a time, no disk round-trip)\n"
+      "  --staged       (default ON) encode -> release encoder weights (MiB\n"
+      "                 embeds stay resident on device) -> fence -> load DiT\n"
+      "                 -> sample from device embeds -> release DiT -> fence\n"
+      "                 -> decode (one component resident at a time, no disk\n"
+      "                 round-trip). Pass --no-staged for the legacy\n"
+      "                 single-phase run\n"
       "  --height/--width latent H/W (default 64; x16 = pixels, so 64\n"
       "                 means 1024px; placeholder path needs multiples of 16)\n"
       "  --steps        Euler steps (default 50)\n"
@@ -1009,8 +1014,9 @@ void usage() {
       "                 steps in denoising order (default 0..1)\n"
       "  --seed         latent init seed (default 42)\n"
       "  --vae-weights  VAE checkpoint (validated whenever given)\n"
-      "  --vae-decode   run the real VAE decode when the VAE header +\n"
-      "                 weights are present (else grayscale preview)\n"
+      "  --vae-decode   (default ON) run the real VAE decode when the VAE\n"
+      "                 header + weights are present (else grayscale preview).\n"
+      "                 Pass --no-vae-decode for the preview\n"
       "  --out          PNG with KokkosDNN_ENABLE_IMAGE=ON, else PPM;\n"
       "                 raw F32 latents always written to <stem>.f32\n");
 }
@@ -1032,7 +1038,7 @@ int main(int argc, char** argv) {
   float slg_scale = 0.0f, slg_start = 0.0f, slg_stop = 1.0f;
   uint64_t seed = 42;
   bool tiny = false;
-  bool staged = false, vae_decode = false;
+  bool staged = true, vae_decode = true;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -1063,6 +1069,8 @@ int main(int argc, char** argv) {
       vae_weights = argv[++i];
     } else if (a == "--vae-decode") {
       vae_decode = true;
+    } else if (a == "--no-vae-decode" || a == "--no-vae_decode") {
+      vae_decode = false;
     } else if (a == "--height" && i + 1 < argc) {
       height = std::stoi(argv[++i]);
     } else if (a == "--width" && i + 1 < argc) {
@@ -1091,6 +1099,8 @@ int main(int argc, char** argv) {
       tiny = true;
     } else if (a == "--staged") {
       staged = true;
+    } else if (a == "--no-staged" || a == "--no-stage") {
+      staged = false;
     } else if (a == "--help" || a == "-h") {
       usage();
       return 0;
@@ -1230,9 +1240,9 @@ int main(int argc, char** argv) {
                   "across the DiT load (no disk round-trip)\n",
                   (double)enc.device_bytes() / (1024.0 * 1024.0));
     } else {
-      std::printf("[note] single-phase run: encoder embeds stay live "
-                  "across the DiT load (pass --staged for the fenced, logged "
-                  "encoder-release point)\n");
+      std::printf("[note] single-phase run (--no-staged): encoder embeds stay\n"
+                  "                 live across the DiT load (no fenced, logged\n"
+                  "                 encoder-release point)\n");
     }
 
     // ---- Phase 2: DiT load ----
@@ -1312,16 +1322,16 @@ int main(int argc, char** argv) {
                                  "' not found");
 #ifdef MOSS_DRIVER_HAVE_VAE
       std::printf("[vae %s] validated%s\n", vae_weights.c_str(),
-                  vae_decode ? "; decode enabled" : "; pass --vae-decode "
-                               "to decode (else grayscale preview)");
+                  vae_decode ? "; decode enabled (default)"
+                             : "; preview (pass --vae-decode to decode)");
 #else
       std::printf("[vae %s] validated, but KokkosDNN_MossImageVae.hpp is not "
                   "in this build; writing a grayscale preview instead\n",
                   vae_weights.c_str());
 #endif
     } else if (vae_decode) {
-      std::printf("[vae] --vae-decode needs --vae-weights; writing a "
-                  "grayscale preview instead\n");
+      std::printf("[vae] VAE decode needs --vae-weights (else grayscale "
+                  "preview); disabling decode for this run\n");
       vae_decode = false;
     }
 
@@ -1450,7 +1460,7 @@ int main(int argc, char** argv) {
       decoded = true;
       MO::print_phase_memory("decode", (size_t)MO::kVaeBudgetBytes, 0);
 #else
-      std::printf("[vae] --vae-decode requested but "
+      std::printf("[vae] VAE decode requested (default) but "
                   "KokkosDNN_MossImageVae.hpp is not in this build; writing "
                   "a grayscale preview instead (need the VAE worktree "
                   "header + --vae-weights)\n");
