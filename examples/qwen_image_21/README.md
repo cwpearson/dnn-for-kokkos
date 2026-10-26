@@ -20,17 +20,20 @@ of scope for this driver; there is no image-conditioning flag by design.
 
 Without `--prompt` on a TTY (and without the file/parity handoff flags
 `--prompt-embeds-in`/`--text-weights`, `--init-latents-in`, `--dump-steps`,
-`--decode-latents-in`), the driver runs as a REPL: it asks for a prompt,
-asks for an output filename, generates, and repeats indefinitely until EOF
-or `quit`/`exit`. An empty prompt re-asks; an empty filename auto-numbers
-`qwen_image_21_out_<n>.png`; the per-iteration seed is `--seed` + iteration,
-so repeats of the same prompt still vary.
+`--decode-latents-in`), the driver runs as a REPL: it prints the current
+latent `HxW`, asks for a prompt, asks for an output filename, generates,
+and repeats indefinitely until EOF or `quit`/`exit`. The previous prompt is
+offered for editing each time (GNU readline when available), and `/w N` /
+`/h N` set the latent width/height going forward. An empty prompt re-asks;
+an empty filename auto-numbers `qwen_image_21_out_<n>.png`; the per-iteration
+seed is `--seed` + iteration, so repeats of the same prompt still vary.
 
 ```sh
 qwen_image_21_generate --staged \
   --weights <ckpt>/transformer \
   --text-encoder <ckpt>/text_encoder --tokenizer <ckpt>/processor \
   --vae-weights <ckpt>/vae/diffusion_pytorch_model.safetensors --vae-decode
+# [size] latent 64x64 (x16 pixels = 1024x1024)
 # prompt> a red panda reading a newspaper
 # output> red_panda.png
 # prompt> quit

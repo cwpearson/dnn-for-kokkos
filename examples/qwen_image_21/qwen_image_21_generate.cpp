@@ -31,7 +31,10 @@
 //
 // Interactive loop (default): without --prompt on a TTY (and without the
 // file/parity handoff flags) the driver asks for a prompt, asks for a
-// filename, generates, and repeats until EOF or quit/exit. Giving --prompt
+// filename, generates, and repeats until EOF or quit/exit. Each iteration
+// prints the current latent HxW on the line before the prompt, offers the
+// previous prompt for editing (GNU readline when available), and accepts
+// /w N and /h N to set the width/height going forward. Giving --prompt
 // (or any of --prompt-embeds-in/--text-weights, --init-latents-in,
 // --dump-steps, --decode-latents-in, or non-TTY stdin) runs ONE generation
 // and exits. The per-iteration seed is --seed + iteration; an empty
@@ -104,12 +107,14 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unistd.h>
 #include <utility>
 #include <vector>
 
 #include "KokkosDNN.hpp"
+#include "KokkosDNN_ExampleReadline.hpp"
 
 // ---- True-pipeline compatibility shim ------------------------------------
 //
@@ -1988,18 +1993,83 @@ int run_interactive_loop(const CfgT& cfg, const struct LoopFixedOpts& o);
 
 inline bool stdin_is_tty() { return ::isatty(STDIN_FILENO) != 0; }
 
-// Print msg, flush, read one line. Returns false on EOF/error. Strips a
-// trailing CR so CRLF consoles behave.
-inline bool ask_line(const char* msg, std::string& out) {
-  std::fputs(msg, stdout);
-  std::fflush(stdout);
-  if (!std::getline(std::cin, out)) return false;
-  if (!out.empty() && out.back() == '\r') out.pop_back();
-  return true;
+inline bool is_quit_word(std::string_view s) {
+  return s == "quit" || s == "exit" || s == ":q";
 }
 
-inline bool is_quit_word(const std::string& s) {
-  return s == "quit" || s == "exit" || s == ":q";
+// Trim ASCII blanks from both ends so "  /w 128  " still parses as a size
+// command and whitespace-only lines re-ask like empty ones.
+inline std::string_view trim_ws(std::string_view s) {
+  const size_t b = s.find_first_not_of(" \t");
+  if (b == std::string_view::npos) return {};
+  const size_t e = s.find_last_not_of(" \t");
+  return s.substr(b, e - b + 1);
+}
+
+// Interactive "/w N" / "/h N": set the latent width/height going forward.
+// Returns true when the line was a size command (handled: the caller
+// re-prompts without generating). Anything else starting with '/' falls
+// through as a normal prompt, so "/where ..." is never hijacked.
+inline bool try_size_command(std::string_view line, int& H, int& W, int patch,
+                             bool tiny) {
+  const std::string_view t = trim_ws(line);
+  if (t.empty() || t[0] != '/') return false;
+  const char cmd = (t.size() > 1) ? t[1] : '\0';
+  if (cmd != 'w' && cmd != 'h') return false;
+  // Require end/blank/digit after the letter so "/where ..." stays a prompt.
+  if (t.size() > 2 && t[2] != ' ' && t[2] != '\t' &&
+      (t[2] < '0' || t[2] > '9'))
+    return false;
+  const std::string_view rest = trim_ws(t.substr(2));
+  if (rest.empty()) {
+    std::printf("[size] latent %dx%d\n", H, W);
+    std::fflush(stdout);
+    return true;
+  }
+  int val = 0;
+  try {
+    size_t pos = 0;
+    val = std::stoi(std::string(rest), &pos);
+    if (pos != rest.size()) throw std::invalid_argument("trailing text");
+  } catch (const std::exception&) {
+    std::printf("[size] usage: /w N | /h N (got \"%.*s\")\n",
+                static_cast<int>(rest.size()), rest.data());
+    std::fflush(stdout);
+    return true;
+  }
+  if (tiny) {
+    std::printf("[size] --tiny uses fixed 4x4 latents; ignoring /%c %d\n", cmd,
+                val);
+    std::fflush(stdout);
+    return true;
+  }
+  const char* what = (cmd == 'w') ? "width" : "height";
+  if (val <= 0) {
+    std::printf("[size] %s must be positive (got %d)\n", what, val);
+    std::fflush(stdout);
+    return true;
+  }
+#ifndef QWEN21_DRIVER_HAVE_DIT
+  if (val % 16 != 0) {
+    std::printf("[size] %s must be a multiple of 16 (got %d)\n", what, val);
+    std::fflush(stdout);
+    return true;
+  }
+#endif
+  if (val % patch != 0) {
+    std::printf("[size] %s must tile patch_size=%d (got %d)\n", what, patch,
+                val);
+    std::fflush(stdout);
+    return true;
+  }
+  if (cmd == 'w') {
+    W = val;
+  } else {
+    H = val;
+  }
+  std::printf("[size] now %dx%d\n", H, W);
+  std::fflush(stdout);
+  return true;
 }
 
 #ifdef QWEN21_DRIVER_HAVE_DIT
@@ -2121,7 +2191,10 @@ void usage() {
       "                 it asks for a prompt, asks for a filename, generates,\n"
       "                 and repeats until EOF or quit/exit (empty prompt\n"
       "                 re-asks; empty filename auto-numbers). The per-iteration\n"
-      "                 seed is --seed + iteration.\n"
+      "                 seed is --seed + iteration. In the loop /w N and /h N\n"
+      "                 set the latent width/height going forward, and the\n"
+      "                 previous prompt is offered for editing (GNU readline\n"
+      "                 when available).\n"
       "  --tokenizer    dir holding tokenizer.json;\n"
       "                 with --text-encoder runs the in-process Qwen forward\n"
       "                 (raw T2I template, no chat template)\n"
@@ -2180,22 +2253,26 @@ void usage() {
 // given), so this path never dumps and always samples fresh latents.
 template <class CfgT>
 int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
-  const int H = o.tiny ? 4 : o.H, W = o.tiny ? 4 : o.W;
-  if (!o.tiny) {
+  // Mutable geometry: /w N and /h N update these going forward (per-iteration
+  // snapshot below). --tiny pins 4x4.
+  int cur_H = o.tiny ? 4 : o.H, cur_W = o.tiny ? 4 : o.W;
+  const auto validate_hw = [&](int H, int W) {
+    if (o.tiny) return;
     if (H <= 0 || W <= 0)
       throw std::runtime_error("--height/--width must be positive (got " +
-                               std::to_string(o.H) + "x" +
-                               std::to_string(o.W) + ")");
+                               std::to_string(H) + "x" + std::to_string(W) +
+                               ")");
 #ifndef QWEN21_DRIVER_HAVE_DIT
     if (H % 16 != 0 || W % 16 != 0)
       throw std::runtime_error(
           "--height/--width must be positive multiples of 16 (got " +
-          std::to_string(o.H) + "x" + std::to_string(o.W) + ")");
+          std::to_string(H) + "x" + std::to_string(W) + ")");
 #endif
     if (H % be_patch(cfg) != 0 || W % be_patch(cfg) != 0)
       throw std::runtime_error("--height/--width must tile patch_size=" +
                                std::to_string(be_patch(cfg)));
-  }
+  };
+  validate_hw(cur_H, cur_W);
   const size_t C = be_latent_channels(cfg);
   std::printf("[model %s: %s]\n", o.tiny ? "tiny_test" : "qwen-image-2.1",
               be_label(cfg));
@@ -2362,20 +2439,54 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
       "filename auto-numbers qwen_image_21_out_<n>.png; seed = %llu + "
       "iteration)\n",
       (unsigned long long)o.seed);
+  if (!o.tiny) {
+    std::printf("[loop] /w N and /h N set the latent width/height for later "
+                "iterations; the previous prompt is offered for editing\n");
+  } else if (KokkosDNN::Example::Readline::Available()) {
+    std::printf("[loop] readline editing enabled (previous prompt offered "
+                "for editing each time)\n");
+  }
   std::fflush(stdout);
   size_t iter = 0;
+  std::string prev_prompt;
+  const int patch = be_patch(cfg);
   while (true) {
+    if (!o.tiny) {
+      // Current geometry on its own line, ahead of the prompt line.
+      std::printf("[size] latent %dx%d (x16 pixels = %dx%d)\n", cur_H, cur_W,
+                  cur_H * 16, cur_W * 16);
+      std::fflush(stdout);
+    }
     std::string cur_prompt;
-    if (!ask_line("prompt> ", cur_prompt)) break;
-    if (is_quit_word(cur_prompt)) break;
-    if (cur_prompt.empty()) continue;
+    const std::string* prefill =
+        prev_prompt.empty() ? nullptr : &prev_prompt;
+    if (!KokkosDNN::Example::Readline::PromptLine("prompt> ", cur_prompt,
+                                                 prefill,
+                                                 /*add_to_history=*/true))
+      break;
+    if (try_size_command(cur_prompt, cur_H, cur_W, patch, o.tiny)) continue;
+    if (is_quit_word(trim_ws(cur_prompt))) break;
+    if (trim_ws(cur_prompt).empty()) continue;
+    prev_prompt = cur_prompt;
     std::string cur_out_raw;
-    if (!ask_line("output> ", cur_out_raw)) break;
-    if (is_quit_word(cur_out_raw)) continue;  // cancel this one
+    if (!KokkosDNN::Example::Readline::PromptLine("output> ", cur_out_raw,
+                                                 /*prefill=*/nullptr,
+                                                 /*add_to_history=*/false))
+      break;
+    if (is_quit_word(trim_ws(cur_out_raw))) continue;  // cancel this one
     const std::string cur_out =
-        cur_out_raw.empty()
+        trim_ws(cur_out_raw).empty()
             ? ("qwen_image_21_out_" + std::to_string(iter) + ".png")
-            : cur_out_raw;
+            : std::string(trim_ws(cur_out_raw));
+    // Per-iteration geometry snapshot (/w /h validated on set; re-check
+    // here belt-and-braces before allocating).
+    const int H = cur_H, W = cur_W;
+    try {
+      validate_hw(H, W);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "error: %s\n", e.what());
+      continue;
+    }
     const uint64_t cur_seed = o.seed + iter;
     std::printf("[iter %zu] seed=%llu out=%s\n", iter,
                 (unsigned long long)cur_seed, cur_out.c_str());

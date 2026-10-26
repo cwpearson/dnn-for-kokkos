@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 # SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
+# Shared example support (KokkosDNN::example_readline: readline REPL helper).
+add_subdirectory(common)
 add_subdirectory(llama)
 add_subdirectory(dinov3)
 add_subdirectory(smollm2)
