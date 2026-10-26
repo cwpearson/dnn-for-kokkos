@@ -126,8 +126,9 @@ class Geometry:
                 self.channels, self.height, self.width = (int(v) for v in latent)
             if self.channels is None:
                 # Accept the flat driver-manifest spelling too. The driver's
-                # height/width are latent dims; the golden manifest's are
-                # pixels, but that one always ships latent_shape (above).
+                # height/width are output pixels (with latent_h/latent_w and
+                # latent_shape alongside); the golden manifest's are pixels
+                # as well, but that one always ships latent_shape (above).
                 c = m.get("C", m.get("latent_channels"))
                 height = m.get("H", m.get("latent_h", m.get("height")))
                 width = m.get("W", m.get("latent_w", m.get("width")))

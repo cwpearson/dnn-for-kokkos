@@ -98,7 +98,7 @@ echo "==> strict identical-inputs run: torch embeds + torch latents"
   --prompt "$prompt" \
   --prompt-embeds-in "$golden/prompt_embeds.f32" \
   --init-latents-in "$golden/initial_latents.f32" \
-  --height 64 --width 64 --steps 8 --sigmas turbo --cfg 1.0 \
+  --height 1024 --width 1024 --steps 8 --sigmas turbo --cfg 1.0 \
   --vae-weights "$weights/vae/diffusion_pytorch_model.safetensors" --vae-decode \
   --dump-steps "$work/driver" \
   --out "$work/out.png" 2>&1 | tee "$work/driver.log"
@@ -124,7 +124,7 @@ if [[ "$vae_only" == 1 && -f "$weights/vae/diffusion_pytorch_model.safetensors" 
     --decode-latents-in "$golden/qwen_image_21_turbo_final_latents.f32" \
     --decode-latents-layout token \
     --vae-weights "$weights/vae/diffusion_pytorch_model.safetensors" \
-    --height 64 --width 64 \
+    --height 1024 --width 1024 \
     --out "$work/vae_only.png" 2>&1 | tee "$work/vae_only.log"
   if [[ -f "$work/vae_only.png" ]]; then
     python3 "$repo_root/scripts/qwen_image_21_compare.py" \
@@ -143,7 +143,7 @@ if [[ "$encoder" == 1 ]]; then
     --weights "$weights/transformer" \
     --text-encoder "$weights/text_encoder" --tokenizer "$weights/processor" \
     --prompt "$prompt" \
-    --height 64 --width 64 --steps 1 --sigmas driver --cfg 1.0 \
+    --height 1024 --width 1024 --steps 1 --sigmas driver --cfg 1.0 \
     --init-latents-in "$golden/initial_latents.f32" \
     --dump-steps "$work/encoder/driver" \
     --out "$work/encoder/out.png" 2>&1 | tee "$work/encoder.log"
@@ -161,7 +161,7 @@ if [[ "$in_process" == 1 ]]; then
     --weights "$weights/transformer" \
     --text-encoder "$weights/text_encoder" --tokenizer "$weights/processor" \
     --prompt "$prompt" \
-    --height 64 --width 64 --steps 8 --sigmas turbo --cfg 1.0 --seed 42 \
+    --height 1024 --width 1024 --steps 8 --sigmas turbo --cfg 1.0 --seed 42 \
     --vae-weights "$weights/vae/diffusion_pytorch_model.safetensors" --vae-decode \
     --dump-steps "$work/inproc/driver" \
     --out "$work/inproc/out.png" 2>&1 | tee "$work/inproc.log"
