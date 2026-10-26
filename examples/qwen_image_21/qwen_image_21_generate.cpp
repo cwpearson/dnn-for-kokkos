@@ -25,8 +25,9 @@
 // random weights); encode runs the in-process raw-text BPE +
 // EncoderModel forward when --tokenizer + --text-encoder are given (else
 // --prompt-embeds-in file or null), and decode runs the real VAE decode
-// to RGBA when --vae-weights + --vae-decode are given (else a grayscale
-// preview), each fallback with a logged reason.
+// to RGBA by default when --vae-weights are given (else a grayscale
+// preview; pass --no-vae-decode for the preview), each fallback with a
+// logged reason.
 //
 // Interactive loop (default): without --prompt on a TTY (and without the
 // file/parity handoff flags) the driver asks for a prompt, asks for a
@@ -45,33 +46,35 @@
 //                          [--steps 8] [--cfg 1.0] [--shift 3.0]
 //                          [--sigmas driver|turbo]
 //                          [--seed 42] [--init-latents-in lat.f32]
-//                          [--vae-weights vae.safetensors [--vae-decode]]
+//                          [--vae-weights vae.safetensors [--no-vae-decode]]
 //                          [--decode-latents-in lat.f32
 //                           [--decode-latents-layout chw|token]
 //                           [--decode-out-f32 file]]
 //                          [--out img.png]
-//                          [--staged] [--dump-steps DIR]
+//                          [--no-staged] [--dump-steps DIR]
 //// Text conditioning precedence: in-process Qwen forward (--tokenizer dir
 // with tokenizer.json + --text-encoder weights, raw T2I template, no chat
 // template) -> --prompt-embeds-in file (alias
 // --text-weights) -> null (zeros) with the prompt logged. --tokenizer /
 // --text-encoder must be given together. --tiny skips the Qwen forward.
-// --vae-weights is validated whenever given; --vae-decode additionally runs
-// the real VAE decode (latents denormalized by the runtime vae/config.json
-// affine, then QwenImage21VaeModel::decode to RGBA), else a
-// channel-mean grayscale preview is written with a clear log. Raw fp32
+// --vae-weights is validated whenever given; VAE decode runs by default
+// (latents denormalized by the runtime vae/config.json affine, then
+// QwenImage21VaeModel::decode to RGBA; pass --no-vae-decode for the
+// channel-mean grayscale preview). Raw fp32
 // latents (<stem>.f32, [C,H,W] row-major) are always written.
 //
-// Staged execution (24GB fit): --staged runs encode -> releases the encoder
+// Staged execution (24GB fit, default): encode -> releases the encoder
 // weights (the MiB-scale embeds stay resident on the device) ->
 // Kokkos::fence() -> loads the DiT -> samples straight from the
 // device-resident embeds -> releases the DiT -> Kokkos::fence() -> decodes,
 // so the 17.5GB encoder, the 14.2GB DiT, and the VAE are never resident at
-// once. No disk round-trip and no second process: the embeds are separate
+// once. Pass --no-staged for the legacy single-phase run. No disk round-trip
+// and no second process: the embeds are separate
 // (MiB) allocations from the (GiB) encoder weights. In the interactive loop
 // the encoder and transformer additionally live in HOST memory (loaded once
 // before the first prompt) and are copied host->device per iteration, so
-// --staged keeps the same one-component-resident property every iteration
+// staging (default) keeps the same one-component-resident property every
+// iteration
 // without re-reading the ~32 GB checkpoint from disk. Each phase logs its
 // resident estimate (weights bytes + activation estimate).
 //
@@ -1976,8 +1979,8 @@ int run_interactive_loop(const CfgT& cfg, const struct LoopFixedOpts& o);
 // The encoder and transformer weights are loaded ONCE into host memory
 // (HostSpace mirrors) before the first prompt; every iteration copies the
 // needed component host->device, runs the phase, and releases the device
-// copy -- so --staged keeps the same one-component-resident property per
-// iteration without re-reading the ~32 GB checkpoint from disk.
+// copy -- so staging (default) keeps the same one-component-resident property
+// per iteration without re-reading the ~32 GB checkpoint from disk.
 // File/parity modes (--prompt-embeds-in/--text-weights, --init-latents-in,
 // --dump-steps, --decode-latents-in) and non-TTY stdin force the legacy
 // one-off run. In the loop the latent seed is base --seed + iteration, so
@@ -2081,9 +2084,9 @@ struct LoopFixedOpts {
   std::string sigmas_mode = "driver";
   uint64_t seed = 42;
   std::string vae_weights;
-  bool vae_decode = false;
+  bool vae_decode = true;
   std::string out_default = "qwen_image_21_out.png";
-  bool staged = false;
+  bool staged = true;
   bool tiny = false;
 };
 
@@ -2098,12 +2101,12 @@ void usage() {
       "                    [--steps N] [--cfg G] [--shift S]\n"
       "                    [--sigmas driver|turbo]\n"
       "                    [--seed N] [--init-latents-in lat.f32]\n"
-      "                    [--vae-weights vae.safetensors [--vae-decode]]\n"
+      "                    [--vae-weights vae.safetensors [--no-vae-decode]]\n"
       "                    [--decode-latents-in lat.f32\n"
       "                     [--decode-latents-layout chw|token]\n"
       "                     [--decode-out-f32 file]]\n"
       "                    [--out img.png]\n"
-      "                    [--staged] [--dump-steps DIR]\n"
+      "                    [--no-staged] [--dump-steps DIR]\n"
       "\n"
       "  --tiny         random-weights smoke model, 4x4 latents, 2 steps\n"
       "                 (no files)\n"
@@ -2127,10 +2130,12 @@ void usage() {
       "  --text-encoder Qwen text-encoder weights: text_encoder/ shard dir\n"
       "                 or single .safetensors\n"
       "  --prompt-embeds-in alias of --text-weights (wins if both differ)\n"
-      "  --staged       encode -> release encoder weights (MiB embeds stay\n"
-      "                 resident on device) -> fence -> load DiT -> sample\n"
-      "                 from device embeds -> release DiT -> fence -> decode\n"
-      "                 (one component resident at a time, no disk round-trip)\n"
+      "  --staged       (default ON) encode -> release encoder weights (MiB\n"
+      "                 embeds stay resident on device) -> fence -> load DiT\n"
+      "                 -> sample from device embeds -> release DiT -> fence\n"
+      "                 -> decode (one component resident at a time, no disk\n"
+      "                 round-trip). Pass --no-staged for the legacy\n"
+      "                 single-phase run\n"
       "  --height/--width latent H/W (default 64; x16 = pixels, so 64\n"
       "                 means 1024px; placeholder path needs multiples of 16)\n"
       "  --steps        Euler steps (default 8 Turbo; --tiny forces 2\n"
@@ -2148,9 +2153,10 @@ void usage() {
       "                 (C*H*W floats, PRE-denormalization latent noise:\n"
       "                 no mean/std applied); replaces the mt19937 sample\n"
       "  --vae-weights  VAE checkpoint (validated whenever given)\n"
-      "  --vae-decode   run the real VAE decode (denormalize by the runtime\n"
-      "                 vae/config.json affine, decode to RGBA) when the VAE\n"
-      "                 header + weights are present, else grayscale preview\n"
+      "  --vae-decode   (default ON) run the real VAE decode (denormalize by\n"
+      "                 the runtime vae/config.json affine, decode to RGBA)\n"
+      "                 when the VAE header + weights are present, else\n"
+      "                 grayscale preview. Pass --no-vae-decode for the preview\n"
       "  --decode-latents-in raw fp32 LE latents to decode directly (skips\n"
       "                 encode, DiT load and sampling; needs --vae-weights;\n"
       "                 --height/--width are the latent dims)\n"
@@ -2195,6 +2201,7 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
               be_label(cfg));
 
   // VAE checkpoint validated once (decoded per iteration from disk; 0.7GB).
+  // VAE decode is ON by default whenever --vae-weights are given.
   bool vae_decode = o.vae_decode;
   if (!o.vae_weights.empty()) {
     std::error_code ec0;
@@ -2204,17 +2211,16 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
                                "' not found");
 #ifdef QWEN21_DRIVER_HAVE_VAE
     std::printf("[vae %s] validated%s\n", o.vae_weights.c_str(),
-                vae_decode ? "; decode enabled"
-                           : "; pass --vae-decode to decode (else grayscale "
-                             "preview)");
+                vae_decode ? "; decode enabled (default)"
+                           : "; preview (pass --vae-decode to decode)");
 #else
     std::printf("[vae %s] validated, but KokkosDNN_QwenImage21Vae.hpp is "
                 "not in this build; writing a grayscale preview instead\n",
                 o.vae_weights.c_str());
 #endif
   } else if (vae_decode) {
-    std::printf("[vae] --vae-decode needs --vae-weights; writing a "
-                "grayscale preview instead\n");
+    std::printf("[vae] VAE decode needs --vae-weights (else grayscale "
+                "preview); disabling decode for this run\n");
     vae_decode = false;
   }
 
@@ -2569,7 +2575,7 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
                      e.what());
       }
 #else
-      std::printf("[vae] --vae-decode requested but "
+      std::printf("[vae] VAE decode requested (default) but "
                   "KokkosDNN_QwenImage21Vae.hpp is not in this build; writing "
                   "a grayscale preview instead (need the VAE worktree "
                   "header + --vae-weights)\n");
@@ -2604,7 +2610,7 @@ int main(int argc, char** argv) {
   std::string sigmas_mode = "driver";
   uint64_t seed = 42;
   bool tiny = false;
-  bool staged = false, vae_decode = false;
+  bool staged = true, vae_decode = true;
   bool prompt_given = false;
 
   for (int i = 1; i < argc; ++i) {
@@ -2639,6 +2645,8 @@ int main(int argc, char** argv) {
       vae_weights = argv[++i];
     } else if (a == "--vae-decode") {
       vae_decode = true;
+    } else if (a == "--no-vae-decode" || a == "--no-vae_decode") {
+      vae_decode = false;
     } else if (a == "--decode-latents-in" && i + 1 < argc) {
       decode_latents_in = argv[++i];
     } else if (a == "--decode-latents-layout" && i + 1 < argc) {
@@ -2679,6 +2687,8 @@ int main(int argc, char** argv) {
       tiny = true;
     } else if (a == "--staged") {
       staged = true;
+    } else if (a == "--no-staged" || a == "--no-stage") {
+      staged = false;
     } else if (a == "--help" || a == "-h") {
       usage();
       return 0;
@@ -2824,9 +2834,9 @@ int main(int argc, char** argv) {
                   "across the DiT load (no disk round-trip)\n",
                   (double)enc.device_bytes() / (1024.0 * 1024.0));
     } else {
-      std::printf("[note] single-phase run: encoder embeds stay live "
-                  "across the DiT load (pass --staged for the fenced, logged "
-                  "encoder-release point)\n");
+      std::printf("[note] single-phase run (--no-staged): encoder embeds stay\n"
+                  "                 live across the DiT load (no fenced, logged\n"
+                  "                 encoder-release point)\n");
     }
 
     // ---- Phase 2: DiT load ----
@@ -2888,16 +2898,16 @@ int main(int argc, char** argv) {
                                  "' not found");
 #ifdef QWEN21_DRIVER_HAVE_VAE
       std::printf("[vae %s] validated%s\n", vae_weights.c_str(),
-                  vae_decode ? "; decode enabled" : "; pass --vae-decode "
-                               "to decode (else grayscale preview)");
+                  vae_decode ? "; decode enabled (default)"
+                             : "; preview (pass --vae-decode to decode)");
 #else
       std::printf("[vae %s] validated, but KokkosDNN_QwenImage21Vae.hpp is "
                   "not in this build; writing a grayscale preview instead\n",
                   vae_weights.c_str());
 #endif
     } else if (vae_decode) {
-      std::printf("[vae] --vae-decode needs --vae-weights; writing a "
-                  "grayscale preview instead\n");
+      std::printf("[vae] VAE decode needs --vae-weights (else grayscale "
+                  "preview); disabling decode for this run\n");
       vae_decode = false;
     }
 
@@ -3103,7 +3113,7 @@ int main(int argc, char** argv) {
                      e.what());
       }
 #else
-      std::printf("[vae] --vae-decode requested but "
+      std::printf("[vae] VAE decode requested (default) but "
                   "KokkosDNN_QwenImage21Vae.hpp is not in this build; writing "
                   "a grayscale preview instead (need the VAE worktree "
                   "header + --vae-weights)\n");
