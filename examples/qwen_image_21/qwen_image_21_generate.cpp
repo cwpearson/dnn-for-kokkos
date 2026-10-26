@@ -33,9 +33,11 @@
 // file/parity handoff flags) the driver asks for a prompt, asks for a
 // filename, generates, and repeats until EOF or quit/exit. Each iteration
 // prints the current pixel HxW (and latent HxW) on the line before the
-// prompt, offers the previous prompt for editing (GNU readline when
-// available), and accepts /w N and /h N to set the pixel width/height going
-// forward (rounded to the nearest patch-stride multiple, see --height). Giving --prompt
+// prompt, offers the previous prompt for editing (UP/DN move through the
+// in-memory prompt history), accepts /w N and /h N to set the pixel
+// width/height going forward (rounded to the nearest patch-stride multiple,
+// see --height), and treats ESC at the filename step as back-to-prompt
+// (ESC re-asks at the prompt step). Giving --prompt
 // (or any of --prompt-embeds-in/--text-weights, --init-latents-in,
 // --dump-steps, --decode-latents-in, or non-TTY stdin) runs ONE generation
 // and exits. The per-iteration seed is --seed + iteration; an empty
@@ -2234,8 +2236,10 @@ void usage() {
       "                 seed is --seed + iteration. In the loop /w N and /h N\n"
       "                 set the pixel width/height going forward (rounded to\n"
       "                 the patch stride at generation time), and the\n"
-      "                 previous prompt is offered for editing (GNU readline\n"
-      "                 when available).\n"
+      "                 previous prompt is offered for editing (UP/DN move\n"
+      "                 through the in-memory prompt history). ESC at output>\n"
+      "                 goes back to prompt> (previous prompt pre-filled);\n"
+      "                 ESC at prompt> re-asks.\n"
       "  --tokenizer    dir holding tokenizer.json;\n"
       "                 with --text-encoder runs the in-process Qwen forward\n"
       "                 (raw T2I template, no chat template)\n"
@@ -2504,19 +2508,25 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
     std::string cur_prompt;
     const std::string* prefill =
         prev_prompt.empty() ? nullptr : &prev_prompt;
+    bool prompt_esc = false;
     if (!KokkosDNN::Example::Readline::PromptLine("prompt> ", cur_prompt,
                                                  prefill,
-                                                 /*add_to_history=*/true))
+                                                 /*add_to_history=*/true,
+                                                 &prompt_esc))
       break;
+    if (prompt_esc) continue;  // ESC re-asks with the same prefill
     if (try_size_command(cur_prompt, cur_Hpx, cur_Wpx, o.tiny)) continue;
     if (is_quit_word(trim_ws(cur_prompt))) break;
     if (trim_ws(cur_prompt).empty()) continue;
     prev_prompt = cur_prompt;
     std::string cur_out_raw;
+    bool out_esc = false;
     if (!KokkosDNN::Example::Readline::PromptLine("output> ", cur_out_raw,
                                                  /*prefill=*/nullptr,
-                                                 /*add_to_history=*/false))
+                                                 /*add_to_history=*/false,
+                                                 &out_esc))
       break;
+    if (out_esc) continue;  // ESC at output> goes back to prompt>
     if (is_quit_word(trim_ws(cur_out_raw))) continue;  // cancel this one
     const std::string cur_out =
         trim_ws(cur_out_raw).empty()
