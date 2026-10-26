@@ -16,6 +16,35 @@ are always written; `--out` holds a VAE RGB image or a grayscale preview.
 Editing is excluded: Qwen-Image-Edit (reference-image conditioning) is out
 of scope for this driver; there is no image-conditioning flag by design.
 
+## Interactive loop (default) vs one-off
+
+Without `--prompt` on a TTY (and without the file/parity handoff flags
+`--prompt-embeds-in`/`--text-weights`, `--init-latents-in`, `--dump-steps`,
+`--decode-latents-in`), the driver runs as a REPL: it asks for a prompt,
+asks for an output filename, generates, and repeats indefinitely until EOF
+or `quit`/`exit`. An empty prompt re-asks; an empty filename auto-numbers
+`qwen_image_21_out_<n>.png`; the per-iteration seed is `--seed` + iteration,
+so repeats of the same prompt still vary.
+
+```sh
+qwen_image_21_generate --staged \
+  --weights <ckpt>/transformer \
+  --text-encoder <ckpt>/text_encoder --tokenizer <ckpt>/processor \
+  --vae-weights <ckpt>/vae/diffusion_pytorch_model.safetensors --vae-decode
+# prompt> a red panda reading a newspaper
+# output> red_panda.png
+# prompt> quit
+```
+
+The encoder and transformer weights are loaded ONCE into host memory before
+the first prompt; every iteration copies the needed component host->device,
+runs the phase, and releases the device copy, so `--staged` keeps the same
+one-component-resident property per iteration without re-reading the
+~32 GB checkpoint from disk.
+
+Giving `--prompt` (or any file/parity flag, or piping stdin) runs ONE
+generation and exits, which is what the golden/CI harnesses use.
+
 ## Acquiring the checkpoint (Hugging Face, ~32.5 GB)
 
 Public repo `Qwen/Qwen-Image-2.1-Turbo` (~30.3 GiB on disk; ~32.5 GB
@@ -92,7 +121,7 @@ grayscale preview with a logged reason instead of failing.
 | ---- | ------- | ------- |
 | `--tiny` | off | random-weights smoke model, 4x4 latents, 2 steps, no downloads |
 | `--weights` | `transformer` | DiT checkpoint: `transformer/` shard dir or single `.safetensors` |
-| `--prompt` | `a red panda reading a newspaper` | caption text |
+| `--prompt` | none (loops) | caption text; giving it runs one generation and exits, omitting it (TTY, no file/parity flags) enters the interactive prompt/filename loop |
 | `--tokenizer` | — | dir holding `tokenizer.json`; with `--text-encoder` runs the in-process Qwen forward |
 | `--text-encoder` | — | Qwen text-encoder weights: dir or single `.safetensors` |
 | `--text-weights` | — | raw float32 LE caption features `[L,Cc]`; `L` is inferred from the file size (and must be <= the backend max sequence length) |
@@ -174,8 +203,8 @@ latents.
 ## Staged recipe
 
 ```sh
-# Smoke test (no weights, CPU or GPU):
-qwen_image_21_generate --tiny --steps 2 --staged
+# Smoke test (no weights, CPU or GPU; --prompt keeps it one-off):
+qwen_image_21_generate --tiny --steps 2 --staged --prompt "smoke test"
 
 # Staged full run (once the models/qwen_image_21 headers land):
 qwen_image_21_generate --staged \
