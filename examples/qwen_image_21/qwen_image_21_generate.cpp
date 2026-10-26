@@ -32,9 +32,10 @@
 // Interactive loop (default): without --prompt on a TTY (and without the
 // file/parity handoff flags) the driver asks for a prompt, asks for a
 // filename, generates, and repeats until EOF or quit/exit. Each iteration
-// prints the current latent HxW on the line before the prompt, offers the
-// previous prompt for editing (GNU readline when available), and accepts
-// /w N and /h N to set the width/height going forward. Giving --prompt
+// prints the current pixel HxW (and latent HxW) on the line before the
+// prompt, offers the previous prompt for editing (GNU readline when
+// available), and accepts /w N and /h N to set the pixel width/height going
+// forward (rounded to the nearest patch-stride multiple, see --height). Giving --prompt
 // (or any of --prompt-embeds-in/--text-weights, --init-latents-in,
 // --dump-steps, --decode-latents-in, or non-TTY stdin) runs ONE generation
 // and exits. The per-iteration seed is --seed + iteration; an empty
@@ -45,7 +46,8 @@
 //                          [--tokenizer tok_dir] [--text-encoder enc_dir]
 //                          [--text-weights feats.f32]
 //                          [--prompt-embeds-in feats.f32]
-//                          [--height H] [--width W]
+//                          [--height H] [--width W]   (output pixels;
+//                           each rounds to the nearest 16*patch multiple)
 //                          [--steps 8] [--cfg 1.0] [--shift 3.0]
 //                          [--sigmas driver|turbo]
 //                          [--seed 42] [--init-latents-in lat.f32]
@@ -589,6 +591,48 @@ inline const char* be_label(const KokkosDNN::QwenImage21::Config&) {
 }
 #endif
 
+// ---- Pixel-space geometry -------------------------------------------------
+// --height/--width are output-image pixels (default 1024). The DiT samples a
+// latent grid at 1/16 of the pixels (VAE compression 16; the placeholder
+// preview upscales by the same nominal 16x); each latent dim must tile the
+// DiT patch (be_patch: 1 for the true pipeline, 2 for the placeholder), so
+// the pixel stride is 16*patch and each request rounds to the nearest stride
+// multiple (ties round up, minimum one stride). The latent grid is then
+// pixels/16; the actual pixel dims (what the VAE/preview emits) are
+// latent*16.
+inline constexpr int kPixelScale = 16;
+
+inline int snap_pixels_to_stride(int px, int stride) {
+  if (px <= 0)
+    throw std::invalid_argument("pixel dims must be positive (got " +
+                                std::to_string(px) + ")");
+  if (stride <= 0)
+    throw std::invalid_argument("pixel stride must be positive (got " +
+                                std::to_string(stride) + ")");
+  long long r = std::lround((double)px / (double)stride);
+  if (r < 1) r = 1;
+  return (int)(r * (long long)stride);
+}
+
+struct PixelGeometry {
+  int px_h = 0, px_w = 0;    // actual output pixels (what the image holds)
+  int lat_h = 0, lat_w = 0;  // DiT latent grid (pixels/16, tiles be_patch)
+};
+
+inline PixelGeometry resolve_pixel_geometry(int req_h_px, int req_w_px,
+                                            int patch) {
+  if (patch <= 0)
+    throw std::invalid_argument("patch_size must be > 0 (got " +
+                                std::to_string(patch) + ")");
+  PixelGeometry g;
+  const int stride = kPixelScale * patch;
+  g.px_h = snap_pixels_to_stride(req_h_px, stride);
+  g.px_w = snap_pixels_to_stride(req_w_px, stride);
+  g.lat_h = g.px_h / kPixelScale;
+  g.lat_w = g.px_w / kPixelScale;
+  return g;
+}
+
 void save_raw_f32(const std::string& path, const std::vector<float>& v) {
   std::ofstream f(path, std::ios::binary);
   if (!f) throw std::runtime_error("cannot open '" + path + "' for writing");
@@ -669,7 +713,9 @@ struct DumpWriter {
 struct DumpManifest {
   std::string prompt, prompt_source, model_label, sigmas_mode;
   std::vector<float> sigmas;  // the schedule actually used, incl. terminal 0
-  int height = 0, width = 0, steps = 0;
+  int height = 0, width = 0;  // actual output pixels (rounded, see --height)
+  int latent_h = 0, latent_w = 0;  // DiT latent grid (pixels/16)
+  int steps = 0;
   size_t latent_channels = 0;
   size_t prompt_len = 0, prompt_dim = 0;  // staged conditioning [L,Cc]
   unsigned long long seed = 0;
@@ -720,6 +766,10 @@ inline void write_dump_manifest(const DumpWriter& dw, const DumpManifest& m) {
   f << "  \"prompt_source\": \"" << json_escape(m.prompt_source) << "\",\n";
   f << "  \"height\": " << m.height << ",\n";
   f << "  \"width\": " << m.width << ",\n";
+  f << "  \"latent_h\": " << m.latent_h << ",\n";
+  f << "  \"latent_w\": " << m.latent_w << ",\n";
+  f << "  \"latent_shape\": [" << m.latent_channels << ", " << m.latent_h
+    << ", " << m.latent_w << "],\n";
   f << "  \"latent_channels\": " << m.latent_channels << ",\n";
   f << "  \"prompt_embeds_shape\": [" << m.prompt_len << ", "
     << m.prompt_dim << "],\n";
@@ -2006,11 +2056,12 @@ inline std::string_view trim_ws(std::string_view s) {
   return s.substr(b, e - b + 1);
 }
 
-// Interactive "/w N" / "/h N": set the latent width/height going forward.
+// Interactive "/w N" / "/h N": set the output pixel width/height going
+// forward (rounded to the nearest patch-stride multiple at generation time).
 // Returns true when the line was a size command (handled: the caller
 // re-prompts without generating). Anything else starting with '/' falls
 // through as a normal prompt, so "/where ..." is never hijacked.
-inline bool try_size_command(std::string_view line, int& H, int& W, int patch,
+inline bool try_size_command(std::string_view line, int& Hpx, int& Wpx,
                              bool tiny) {
   const std::string_view t = trim_ws(line);
   if (t.empty() || t[0] != '/') return false;
@@ -2022,7 +2073,7 @@ inline bool try_size_command(std::string_view line, int& H, int& W, int patch,
     return false;
   const std::string_view rest = trim_ws(t.substr(2));
   if (rest.empty()) {
-    std::printf("[size] latent %dx%d\n", H, W);
+    std::printf("[size] %dx%d px\n", Hpx, Wpx);
     std::fflush(stdout);
     return true;
   }
@@ -2032,7 +2083,7 @@ inline bool try_size_command(std::string_view line, int& H, int& W, int patch,
     val = std::stoi(std::string(rest), &pos);
     if (pos != rest.size()) throw std::invalid_argument("trailing text");
   } catch (const std::exception&) {
-    std::printf("[size] usage: /w N | /h N (got \"%.*s\")\n",
+    std::printf("[size] usage: /w N | /h N (pixels; got \"%.*s\")\n",
                 static_cast<int>(rest.size()), rest.data());
     std::fflush(stdout);
     return true;
@@ -2045,29 +2096,18 @@ inline bool try_size_command(std::string_view line, int& H, int& W, int patch,
   }
   const char* what = (cmd == 'w') ? "width" : "height";
   if (val <= 0) {
-    std::printf("[size] %s must be positive (got %d)\n", what, val);
-    std::fflush(stdout);
-    return true;
-  }
-#ifndef QWEN21_DRIVER_HAVE_DIT
-  if (val % 16 != 0) {
-    std::printf("[size] %s must be a multiple of 16 (got %d)\n", what, val);
-    std::fflush(stdout);
-    return true;
-  }
-#endif
-  if (val % patch != 0) {
-    std::printf("[size] %s must tile patch_size=%d (got %d)\n", what, patch,
-                val);
+    std::printf("[size] %s pixels must be positive (got %d)\n", what, val);
     std::fflush(stdout);
     return true;
   }
   if (cmd == 'w') {
-    W = val;
+    Wpx = val;
   } else {
-    H = val;
+    Hpx = val;
   }
-  std::printf("[size] now %dx%d\n", H, W);
+  std::printf("[size] now %dx%d px (rounded to the patch stride when "
+              "generating)\n",
+              Hpx, Wpx);
   std::fflush(stdout);
   return true;
 }
@@ -2148,7 +2188,7 @@ struct LoopFixedOpts {
   std::string weights = "transformer";
   std::string tokenizer_dir;
   std::string text_encoder;
-  int H = 64, W = 64;
+  int H = 1024, W = 1024;  // requested output pixels (rounded at generation)
   int steps_eff = 8;
   float guidance = 1.0f, flow_shift = 3.0f;
   std::string sigmas_mode = "driver";
@@ -2192,7 +2232,8 @@ void usage() {
       "                 and repeats until EOF or quit/exit (empty prompt\n"
       "                 re-asks; empty filename auto-numbers). The per-iteration\n"
       "                 seed is --seed + iteration. In the loop /w N and /h N\n"
-      "                 set the latent width/height going forward, and the\n"
+      "                 set the pixel width/height going forward (rounded to\n"
+      "                 the patch stride at generation time), and the\n"
       "                 previous prompt is offered for editing (GNU readline\n"
       "                 when available).\n"
       "  --tokenizer    dir holding tokenizer.json;\n"
@@ -2209,8 +2250,10 @@ void usage() {
       "                 -> decode (one component resident at a time, no disk\n"
       "                 round-trip). Pass --no-staged for the legacy\n"
       "                 single-phase run\n"
-      "  --height/--width latent H/W (default 64; x16 = pixels, so 64\n"
-      "                 means 1024px; placeholder path needs multiples of 16)\n"
+      "  --height/--width output pixels H/W (default 1024; each rounds to\n"
+      "                 the nearest 16*patch px multiple, so the latent grid\n"
+      "                 pixels/16 tiles the DiT patch; true path stride 16px,\n"
+      "                 placeholder stride 32px)\n"
       "  --steps        Euler steps (default 8 Turbo; --tiny forces 2\n"
       "                 unless --steps is given)\n"
       "  --cfg/--guidance CFG scale (!=1 takes the CFG branch; default 1.0)\n"
@@ -2232,7 +2275,7 @@ void usage() {
       "                 grayscale preview. Pass --no-vae-decode for the preview\n"
       "  --decode-latents-in raw fp32 LE latents to decode directly (skips\n"
       "                 encode, DiT load and sampling; needs --vae-weights;\n"
-      "                 --height/--width are the latent dims)\n"
+      "                 --height/--width are the output pixels)\n"
       "  --decode-latents-layout 'chw' (default: lat[(c*H+h)*W+w]) or\n"
       "                 'token' (torch packed [H*W,C], golden final latents)\n"
       "  --decode-out-f32 also write the post-clamp RGBA decode as raw f32\n"
@@ -2253,26 +2296,27 @@ void usage() {
 // given), so this path never dumps and always samples fresh latents.
 template <class CfgT>
 int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
-  // Mutable geometry: /w N and /h N update these going forward (per-iteration
-  // snapshot below). --tiny pins 4x4.
-  int cur_H = o.tiny ? 4 : o.H, cur_W = o.tiny ? 4 : o.W;
-  const auto validate_hw = [&](int H, int W) {
-    if (o.tiny) return;
-    if (H <= 0 || W <= 0)
-      throw std::runtime_error("--height/--width must be positive (got " +
-                               std::to_string(H) + "x" + std::to_string(W) +
-                               ")");
-#ifndef QWEN21_DRIVER_HAVE_DIT
-    if (H % 16 != 0 || W % 16 != 0)
-      throw std::runtime_error(
-          "--height/--width must be positive multiples of 16 (got " +
-          std::to_string(H) + "x" + std::to_string(W) + ")");
-#endif
-    if (H % be_patch(cfg) != 0 || W % be_patch(cfg) != 0)
-      throw std::runtime_error("--height/--width must tile patch_size=" +
-                               std::to_string(be_patch(cfg)));
+  // Mutable geometry: /w N and /h N update the requested pixels going
+  // forward (rounded to the patch stride per iteration below). --tiny pins
+  // 4x4 latents.
+  const int patch = be_patch(cfg);
+  int cur_Hpx = o.tiny ? 4 * kPixelScale : o.H;
+  int cur_Wpx = o.tiny ? 4 * kPixelScale : o.W;
+  const auto resolve_hw = [&](int req_h_px, int req_w_px) {
+    if (o.tiny) {
+      PixelGeometry g;
+      g.px_h = g.px_w = 4 * kPixelScale;
+      g.lat_h = g.lat_w = 4;
+      return g;
+    }
+    return resolve_pixel_geometry(req_h_px, req_w_px, patch);
   };
-  validate_hw(cur_H, cur_W);
+  PixelGeometry cur_geo = resolve_hw(cur_Hpx, cur_Wpx);
+  if (!o.tiny && (cur_geo.px_h != cur_Hpx || cur_geo.px_w != cur_Wpx))
+    std::printf("[size] rounded %dx%d px -> %dx%d px (latent %dx%d, stride "
+                "%dpx)\n",
+                cur_Hpx, cur_Wpx, cur_geo.px_h, cur_geo.px_w, cur_geo.lat_h,
+                cur_geo.lat_w, kPixelScale * patch);
   const size_t C = be_latent_channels(cfg);
   std::printf("[model %s: %s]\n", o.tiny ? "tiny_test" : "qwen-image-2.1",
               be_label(cfg));
@@ -2440,7 +2484,7 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
       "iteration)\n",
       (unsigned long long)o.seed);
   if (!o.tiny) {
-    std::printf("[loop] /w N and /h N set the latent width/height for later "
+    std::printf("[loop] /w N and /h N set the pixel width/height for later "
                 "iterations; the previous prompt is offered for editing\n");
   } else if (KokkosDNN::Example::Readline::Available()) {
     std::printf("[loop] readline editing enabled (previous prompt offered "
@@ -2449,12 +2493,12 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
   std::fflush(stdout);
   size_t iter = 0;
   std::string prev_prompt;
-  const int patch = be_patch(cfg);
   while (true) {
     if (!o.tiny) {
       // Current geometry on its own line, ahead of the prompt line.
-      std::printf("[size] latent %dx%d (x16 pixels = %dx%d)\n", cur_H, cur_W,
-                  cur_H * 16, cur_W * 16);
+      cur_geo = resolve_hw(cur_Hpx, cur_Wpx);
+      std::printf("[size] %dx%d px (latent %dx%d)\n", cur_geo.px_h,
+                  cur_geo.px_w, cur_geo.lat_h, cur_geo.lat_w);
       std::fflush(stdout);
     }
     std::string cur_prompt;
@@ -2464,7 +2508,7 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
                                                  prefill,
                                                  /*add_to_history=*/true))
       break;
-    if (try_size_command(cur_prompt, cur_H, cur_W, patch, o.tiny)) continue;
+    if (try_size_command(cur_prompt, cur_Hpx, cur_Wpx, o.tiny)) continue;
     if (is_quit_word(trim_ws(cur_prompt))) break;
     if (trim_ws(cur_prompt).empty()) continue;
     prev_prompt = cur_prompt;
@@ -2478,15 +2522,13 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
         trim_ws(cur_out_raw).empty()
             ? ("qwen_image_21_out_" + std::to_string(iter) + ".png")
             : std::string(trim_ws(cur_out_raw));
-    // Per-iteration geometry snapshot (/w /h validated on set; re-check
-    // here belt-and-braces before allocating).
-    const int H = cur_H, W = cur_W;
-    try {
-      validate_hw(H, W);
-    } catch (const std::exception& e) {
-      std::fprintf(stderr, "error: %s\n", e.what());
-      continue;
-    }
+    // Per-iteration geometry snapshot (/w /h set pixel requests; rounding to
+    // the patch stride happens here, belt-and-braces, before allocating).
+    const int H = cur_geo.lat_h, W = cur_geo.lat_w;
+    const int pxH = cur_geo.px_h, pxW = cur_geo.px_w;
+    if (!o.tiny && (cur_geo.px_h != cur_Hpx || cur_geo.px_w != cur_Wpx))
+      std::printf("[size] rounded %dx%d px -> %dx%d px (latent %dx%d)\n",
+                  cur_Hpx, cur_Wpx, pxH, pxW, H, W);
     const uint64_t cur_seed = o.seed + iter;
     std::printf("[iter %zu] seed=%llu out=%s\n", iter,
                 (unsigned long long)cur_seed, cur_out.c_str());
@@ -2615,8 +2657,9 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
 
     std::vector<float> x_init =
         QW::sample_gaussian(C * (size_t)H * (size_t)W, cur_seed);
-    std::printf("[sample] H=%d W=%d steps=%d cfg=%.3g shift=%.3g seed=%llu\n",
-                H, W, steps_run, (double)o.guidance, (double)o.flow_shift,
+    std::printf("[sample] %dx%d px (latent %dx%d) steps=%d cfg=%.3g shift=%.3g "
+                "seed=%llu\n",
+                pxH, pxW, H, W, steps_run, (double)o.guidance, (double)o.flow_shift,
                 (unsigned long long)cur_seed);
 #ifdef QWEN21_DRIVER_HAVE_DIT
     KokkosDNN::DNNHandle<Exec> dit_handle;
@@ -2714,7 +2757,7 @@ int main(int argc, char** argv) {
   std::string vae_weights, out = "qwen_image_21_out.png";
   std::string decode_latents_in, decode_latents_layout = "chw",
               decode_out_f32;
-  int height = 64, width = 64;
+  int height = 1024, width = 1024;
   int steps = 8;
   bool steps_given = false;
   float guidance = 1.0f, flow_shift = 3.0f;
@@ -2845,26 +2888,23 @@ int main(int argc, char** argv) {
     cfg.validate();
 #endif
     const int steps_eff = (!steps_given && tiny) ? 2 : steps;
-    const int H = tiny ? 4 : height, W = tiny ? 4 : width;
-    if (!tiny) {
-      // Driver H/W are latent dims (x16 = pixels, so 64 means 1024px, the
-      // reference default). The placeholder path additionally requires
-      // multiples of 16 (historical); the true path only needs positive
-      // dims that tile the patch.
-      if (H <= 0 || W <= 0)
-        throw std::runtime_error("--height/--width must be positive (got " +
-                                 std::to_string(height) + "x" +
-                                 std::to_string(width) + ")");
-#ifndef QWEN21_DRIVER_HAVE_DIT
-      if (H % 16 != 0 || W % 16 != 0)
-        throw std::runtime_error(
-            "--height/--width must be positive multiples of 16 (got " +
-            std::to_string(height) + "x" + std::to_string(width) + ")");
-#endif
-      if (H % be_patch(cfg) != 0 || W % be_patch(cfg) != 0)
-        throw std::runtime_error("--height/--width must tile patch_size=" +
-                                 std::to_string(be_patch(cfg)));
+    // --height/--width are output pixels (default 1024); each rounds to the
+    // nearest 16*patch multiple (see resolve_pixel_geometry). --tiny pins
+    // 4x4 latents (64px) regardless.
+    PixelGeometry geo;
+    if (tiny) {
+      geo.px_h = geo.px_w = 4 * kPixelScale;
+      geo.lat_h = geo.lat_w = 4;
+    } else {
+      geo = resolve_pixel_geometry(height, width, be_patch(cfg));
+      if (geo.px_h != height || geo.px_w != width)
+        std::printf("[size] rounded %dx%d px -> %dx%d px (latent %dx%d, "
+                    "stride %dpx)\n",
+                    height, width, geo.px_h, geo.px_w, geo.lat_h, geo.lat_w,
+                    kPixelScale * be_patch(cfg));
     }
+    const int H = geo.lat_h, W = geo.lat_w;
+    const int pxH = geo.px_h, pxW = geo.px_w;
     const size_t C = be_latent_channels(cfg);
     std::printf("[model %s: %s]\n", tiny ? "tiny_test" : "qwen-image-2.1",
                 be_label(cfg));
@@ -2909,8 +2949,8 @@ int main(int argc, char** argv) {
       lo.weights = weights;
       lo.tokenizer_dir = tokenizer_dir;
       lo.text_encoder = text_encoder;
-      lo.H = H;
-      lo.W = W;
+      lo.H = height;
+      lo.W = width;
       lo.steps_eff = steps_eff;
       lo.guidance = guidance;
       lo.flow_shift = flow_shift;
@@ -3062,8 +3102,9 @@ int main(int argc, char** argv) {
       std::printf("[schedule turbo] ignoring --steps %d (checkpoint schedule "
                   "has %d steps)\n",
                   steps, steps_run);
-    std::printf("[sample] H=%d W=%d steps=%d cfg=%.3g shift=%.3g seed=%llu\n",
-                H, W, steps_run, (double)guidance, (double)flow_shift,
+    std::printf("[sample] %dx%d px (latent %dx%d) steps=%d cfg=%.3g shift=%.3g "
+                "seed=%llu\n",
+                pxH, pxW, H, W, steps_run, (double)guidance, (double)flow_shift,
                 (unsigned long long)seed);
     // ---- Parity dumps (--dump-steps DIR): inert unless the flag is set ----
     DumpWriter dump(dump_dir);
@@ -3176,8 +3217,10 @@ int main(int argc, char** argv) {
       dm.model_label = be_label(cfg);
       dm.sigmas_mode = sigmas_mode;
       dm.sigmas = dump_sigmas;
-      dm.height = H;
-      dm.width = W;
+      dm.height = pxH;
+      dm.width = pxW;
+      dm.latent_h = H;
+      dm.latent_w = W;
       dm.steps = (int)dump_sigmas.size() - 1;
       dm.latent_channels = C;
       dm.prompt_len = enc.device.extent(0);

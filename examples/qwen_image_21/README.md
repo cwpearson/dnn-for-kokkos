@@ -21,19 +21,21 @@ of scope for this driver; there is no image-conditioning flag by design.
 Without `--prompt` on a TTY (and without the file/parity handoff flags
 `--prompt-embeds-in`/`--text-weights`, `--init-latents-in`, `--dump-steps`,
 `--decode-latents-in`), the driver runs as a REPL: it prints the current
-latent `HxW`, asks for a prompt, asks for an output filename, generates,
-and repeats indefinitely until EOF or `quit`/`exit`. The previous prompt is
-offered for editing each time (GNU readline when available), and `/w N` /
-`/h N` set the latent width/height going forward. An empty prompt re-asks;
-an empty filename auto-numbers `qwen_image_21_out_<n>.png`; the per-iteration
-seed is `--seed` + iteration, so repeats of the same prompt still vary.
+pixel `HxW` (and latent `HxW`), asks for a prompt, asks for an output
+filename, generates, and repeats indefinitely until EOF or `quit`/`exit`. The
+previous prompt is offered for editing each time (GNU readline when
+available), and `/w N` / `/h N` set the pixel width/height going forward
+(rounded to the nearest patch-stride multiple at generation time). An empty
+prompt re-asks; an empty filename auto-numbers `qwen_image_21_out_<n>.png`;
+the per-iteration seed is `--seed` + iteration, so repeats of the same prompt
+still vary.
 
 ```sh
 qwen_image_21_generate --staged \
   --weights <ckpt>/transformer \
   --text-encoder <ckpt>/text_encoder --tokenizer <ckpt>/processor \
   --vae-weights <ckpt>/vae/diffusion_pytorch_model.safetensors --vae-decode
-# [size] latent 64x64 (x16 pixels = 1024x1024)
+# [size] 1024x1024 px (latent 64x64)
 # prompt> a red panda reading a newspaper
 # output> red_panda.png
 # prompt> quit
@@ -129,7 +131,7 @@ grayscale preview with a logged reason instead of failing.
 | `--text-encoder` | — | Qwen text-encoder weights: dir or single `.safetensors` |
 | `--text-weights` | — | raw float32 LE caption features `[L,Cc]`; `L` is inferred from the file size (and must be <= the backend max sequence length) |
 | `--prompt-embeds-in` | — | alias of `--text-weights` (wins if both differ) |
-| `--height`/`--width` | 64 | latent H/W; x16 = pixels, so 64 means 1024px (placeholder path needs multiples of 16) |
+| `--height`/`--width` | 1024 | output pixels H/W; each rounds to the nearest 16*patch px multiple (true path stride 16px, placeholder 32px), so the latent grid pixels/16 tiles the DiT patch |
 | `--steps` | 8 (Turbo) | Euler steps (`--tiny` forces 2 unless `--steps` is given) |
 | `--cfg`/`--guidance` | 1.0 | CFG scale (!=1 takes the CFG branch) |
 | `--shift`/`--flow-shift` | 3.0 | flow-matching sigma shift (ignored under `--sigmas turbo`) |
@@ -138,7 +140,7 @@ grayscale preview with a logged reason instead of failing.
 | `--init-latents-in` | — | raw float32 LE initial latents `[C,H,W]` row-major, C-major `lat[(c*H+h)*W+w]` (PRE-denormalization noise, no mean/std); replaces the mt19937 sample |
 | `--vae-weights` | — | VAE checkpoint (validated whenever given) |
 | `--vae-decode` | off | real VAE decode when the VAE header + weights are present, else grayscale preview |
-| `--decode-latents-in` | — | raw fp32 LE latents to decode directly (skips encode/DiT/sampling; needs `--vae-weights`); H/W are latent dims |
+| `--decode-latents-in` | — | raw fp32 LE latents to decode directly (skips encode/DiT/sampling; needs `--vae-weights`); H/W are the output pixels |
 | `--decode-latents-layout` | `chw` | `chw` = driver layout `lat[(c*H+h)*W+w]`; `token` = torch packed `[H*W,C]` (golden final latents) |
 | `--decode-out-f32` | — | also write the post-clamp RGBA decode as raw f32 `[H,W,4]` (VAE-only parity) |
 | `--out` | `qwen_image_21_out.png` | PNG with `KokkosDNN_ENABLE_IMAGE=ON`, else PPM; raw `.f32` latents always written |
@@ -173,7 +175,7 @@ dumps 512x16 zero embeds, 4x4 latents, and two steps).
 ## VAE-only parity
 
 `--decode-latents-in FILE --decode-latents-layout token --vae-weights
-<ckpt>/vae/diffusion_pytorch_model.safetensors --height 64 --width 64`
+<ckpt>/vae/diffusion_pytorch_model.safetensors --height 1024 --width 1024`
 feeds the golden final latents straight through the runtime
 `vae/config.json` affine and the native decoder, without the encoder, the
 DiT, or the sampler (seconds instead of minutes). Use `--decode-out-f32`
@@ -184,7 +186,7 @@ qwen_image_21_generate \
   --decode-latents-in <golden>/qwen_image_21_turbo_final_latents.f32 \
   --decode-latents-layout token \
   --vae-weights <ckpt>/vae/diffusion_pytorch_model.safetensors \
-  --height 64 --width 64 --decode-out-f32 /tmp/q21_vae_rgba.f32 \
+  --height 1024 --width 1024 --decode-out-f32 /tmp/q21_vae_rgba.f32 \
   --out /tmp/q21_vae.png
 ```
 
@@ -214,7 +216,7 @@ qwen_image_21_generate --staged \
   --weights <ckpt>/transformer \
   --text-encoder <ckpt>/text_encoder --tokenizer <ckpt>/processor \
   --prompt "a red panda reading a newspaper" \
-  --height 64 --width 64 --steps 8 --cfg 1.0 \
+  --height 1024 --width 1024 --steps 8 --cfg 1.0 \
   --vae-weights <ckpt>/vae/diffusion_pytorch_model.safetensors --vae-decode \
   --out qwen_out.png
 ```
