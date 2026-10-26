@@ -16,6 +16,48 @@ are always written; `--out` holds a VAE RGB image or a grayscale preview.
 Editing is excluded: Qwen-Image-Edit (reference-image conditioning) is out
 of scope for this driver; there is no image-conditioning flag by design.
 
+## Acquiring the checkpoint (Hugging Face, ~32.5 GB)
+
+Public repo `Qwen/Qwen-Image-2.1-Turbo` (~30.3 GiB on disk; ~32.5 GB
+decimal). Neither the build nor the tests download it (only `--help` /
+`--tiny` runs are weight-free). Never commit weights to the repo.
+
+```bash
+pip install -U "huggingface_hub[cli]"
+hf download Qwen/Qwen-Image-2.1-Turbo --local-dir <ckpt>
+```
+
+Sharded/full download on a small disk: fetch per piece instead (repeat
+`--include`; each command merges into the same `<ckpt>` dir):
+
+```bash
+hf download Qwen/Qwen-Image-2.1-Turbo --include "transformer/*" \
+  --local-dir <ckpt>     # DiT, 2 shards, ~14.2 GB
+hf download Qwen/Qwen-Image-2.1-Turbo --include "text_encoder/*" \
+  --local-dir <ckpt>     # Qwen text encoder, 1 shard, ~17.5 GB
+hf download Qwen/Qwen-Image-2.1-Turbo --include "processor/*" \
+  --local-dir <ckpt>     # tokenizer.json + configs, KB
+hf download Qwen/Qwen-Image-2.1-Turbo --include "vae/*" \
+  --local-dir <ckpt>     # VAE decoder, ~0.676 GB
+hf download Qwen/Qwen-Image-2.1-Turbo \
+  --include "scheduler/*" --include "model_index.json" \
+  --local-dir <ckpt>     # Turbo 8-step sigmas + component map, KB
+```
+
+Subset guide: VAE-only parity (`--decode-latents-in`) needs just `vae/`;
+encoder-only (`--encoder` gate in `scripts/qwen_image_21_verify.sh`) needs
+`text_encoder/` + `processor/`; the strict end-to-end gate needs
+`transformer/` plus the golden artifacts (see below).
+
+Flag mapping: `--weights` = `<ckpt>/transformer` (shard dir or single
+`.safetensors`); `--text-encoder` = `<ckpt>/text_encoder` (single-shard
+`model.safetensors`); `--tokenizer` = `<ckpt>/processor` (dir holding
+`tokenizer.json`); `--vae-weights` =
+`<ckpt>/vae/diffusion_pytorch_model.safetensors` (validated whenever
+given, decoded only with `--vae-decode`). Only the MiB-scale `.f32`
+handoff files (`[L,Cc]` embeds, `[C,H,W]` latents) ever need to move
+between machines — never the 32 GB weights.
+
 ## Checkpoint layout (Hugging Face, ~32.5 GB total)
 
 ```
@@ -155,8 +197,8 @@ DiT, fences, and decodes.
 
 The example is checked against a diffusers/torch reference for the fixed
 prompt `"A capybara wearing a wizard hat, oil painting"`, 1024x1024, seed 42,
-and the checkpoint's 8-step Turbo schedule. Generate the reference once
-(torch + CUDA, ~35 GB of weights) and run the harness:
+and the checkpoint's 8-step Turbo schedule. Fetch the checkpoint as above,
+then generate the reference once (torch + CUDA) and run the harness:
 
 ```sh
 python3 scripts/qwen_image_21_golden.py \
@@ -167,7 +209,12 @@ scripts/qwen_image_21_verify.sh \
   --golden /workspace/weights/Qwen-Image-2.1-Turbo-golden
 ```
 
-`qwen_image_21_golden.py` writes prompt embeddings, initial latents, every
+`qwen_image_21_golden.py` needs `torch` (CUDA build recommended),
+`diffusers` with `QwenImage21Pipeline` (install from source:
+`pip install git+https://github.com/huggingface/diffusers.git`),
+`transformers>=5.17.0`, `accelerate`, `pillow`, `safetensors`, and `numpy`
+(manifest run: torch 2.14.1+cu130, diffusers 0.42.0.dev0, transformers
+5.20.2). It writes prompt embeddings, initial latents, every
 per-step `noise_pred` and post-Euler latents, the final latents, the PNG, and
 a `manifest.json`. Regenerating them reproduces the versioned scalar
 checksums in `scripts/qwen_image_21_golden_checksums.txt` bit-for-bit.
