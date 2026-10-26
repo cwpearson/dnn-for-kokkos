@@ -51,6 +51,7 @@ using KokkosDNN::LFM25::ChatMessage;
 using KokkosDNN::LFM25::Config;
 using KokkosDNN::LFM25::ToolCall;
 using KokkosDNN::LFM25::ToolCallStreamParser;
+using KokkosDNN::LFM25::StreamDeltas;
 using KokkosDNN::LFM25::ToolParseResult;
 using KokkosDNN::LFM25::DefaultScalar;
 using KokkosDNN::LFM25::Session;
@@ -802,10 +803,12 @@ bool parse_common(const json& body, const Config& cfg,
 
 // messages -> vector<ChatMessage>. "developer" maps to "user";
 // "function" (legacy role) maps to "tool". Assistant turns may carry
-// OpenAI `tool_calls` (validated, arguments string or object); "tool"
-// turns carry the function result plus an optional `tool_call_id` link.
-// Assistant content may be null when tool_calls are present, and is
-// required otherwise; every other role requires string content.
+// OpenAI `tool_calls` (validated, arguments string or object) plus a
+// `thinking` / `reasoning` / `reasoning_content` trace (first non-empty
+// wins, replayed into the prompt's <think> block). "tool" turns carry the
+// function result plus an optional `tool_call_id` link; assistant
+// `content` may be null when tool_calls are present, and is required otherwise; every
+// other role requires string content.
 // Non-text content parts and message-level `function_call` are rejected
 // (400) rather than silently dropped.
 bool parse_messages(const json& body, std::vector<ChatMessage>& out,
@@ -868,6 +871,19 @@ bool parse_messages(const json& body, std::vector<ChatMessage>& out,
     const bool has_content =
         m.find("content") != m.end() && !m["content"].is_null();
     if (msg.role == "assistant") {
+      // Thinking replay: Zed (interleaved_reasoning) and the LFM2.5
+      // chat template itself (`thinking or reasoning or
+      // reasoning_content`) carry the trace outside `content`. Accept all
+      // three spellings so multi-turn history preserves the trace for the
+      // prompt renderer; first non-empty wins.
+      for (const char* k : {"thinking", "reasoning", "reasoning_content"}) {
+        auto tit = m.find(k);
+        if (tit != m.end() && tit->is_string() &&
+            !tit->get<std::string>().empty()) {
+          msg.thinking = tit->get<std::string>();
+          break;
+        }
+      }
       auto tcit = m.find("tool_calls");
       if (tcit != m.end() && !tcit->is_null()) {
         if (!tcit->is_array() || tcit->empty()) {
@@ -1008,12 +1024,17 @@ json tool_calls_json(ServerState& st, const std::vector<ToolCall>& calls) {
 
 // Assembled non-streaming turn: OpenAI message payload + finish reason.
 // Pure JSON mapping (no inference): `text` is the parser display text in
-// tools mode, the detokenized text otherwise; `calls` the parsed native
-// calls (post parallel_tool_calls truncation); `session_finish` the
-// Session finish string. With calls the message carries `tool_calls`
-// (fresh ids), `content` null when no display text remains, and finish
-// "tool_calls"; otherwise a plain content message. json_mode strips
-// markdown fences from the display text in all cases.
+// every mode (never Session's raw detokenized text); `reasoning` is the parsed
+// <think> trace (emitted as `reasoning_content`, the DeepSeek/OpenRouter
+// convention Zed and other OpenAI-compatible clients read); `calls` the
+// parsed native calls (post parallel_tool_calls truncation);
+// `session_finish` the Session finish string. With calls the message
+// carries `tool_calls` (fresh ids), `content` null when no display text
+// remains, and finish "tool_calls" — even when `session_finish` was
+// "length": a recovered length-capped turn hides the cap, so callers must
+// treat the arguments as possibly truncated. Otherwise a plain content
+// message.
+// json_mode strips markdown fences from the display text in all cases.
 struct AssembledMessage {
   json message;
   std::string finish;
@@ -1022,6 +1043,7 @@ struct AssembledMessage {
 AssembledMessage assemble_chat_message(ServerState& st,
                                        const ParsedRequest& pr,
                                        std::string text,
+                                       std::string reasoning,
                                        std::vector<ToolCall> calls,
                                        const std::string& session_finish) {
   AssembledMessage out;
@@ -1029,6 +1051,9 @@ AssembledMessage assemble_chat_message(ServerState& st,
   if (pr.tools_active && !pr.parallel_tool_calls && calls.size() > 1)
     calls.resize(1);
   out.message = {{"role", "assistant"}};
+  // The trace travels out-of-band so it never pollutes `content` (Zed
+  // renders `reasoning_content` in its thinking trace, not the answer).
+  if (!reasoning.empty()) out.message["reasoning_content"] = std::move(reasoning);
   if (pr.tools_active && !calls.empty()) {
     out.message["content"] =
         text.empty() ? json(nullptr) : json(std::move(text));
@@ -1055,22 +1080,26 @@ json tool_call_delta(size_t i, const std::string& id, const ToolCall& c) {
                     c.arguments.empty() ? "{}" : c.arguments}}}}})}};
 }
 
-// Feed one sampled token through the tool stream parser in tools mode:
-// decode the raw piece (specials visible) and return releasable display
-// text. Never throws (undecodable ids contribute nothing).
-std::string tool_feed(ServerState& st, ToolCallStreamParser& parser,
-                      const StepOutcome& s) {
-  std::string raw_piece;
+// Feed one sampled token through the stream parser: decode the raw piece
+// (specials visible) and return the display + reasoning newly releasable.
+// The parser holds back <think> traces and tool-call regions so neither
+// leaks into `content`. Used in every mode so the thinking trace never
+// pollutes the answer with or without tools. One parser step per token
+// keeps the per-turn cost linear. Never throws: an undecodable id
+// contributes nothing, and a parser failure degrades to a held delta
+// (recovered at finish) instead of killing the turn with a 500 or a
+// mid-stream SSE error.
+StreamDeltas tool_feed(ServerState& st, ToolCallStreamParser& parser,
+                       const StepOutcome& s) {
   try {
     // Persistent 1-elem staging: tools-mode decode already costs a map
     // lookup + string build per token; no need for a vector malloc too.
     thread_local std::vector<int> idbuf{0};
     idbuf[0] = s.id;
-    raw_piece = st.tok.decode(idbuf, false);
+    return parser.feed(st.tok.decode(idbuf, false));
   } catch (...) {
-    raw_piece.clear();
+    return {};
   }
-  return parser.push(raw_piece);
 }
 
 // ---------------------------------------------------------------------------
@@ -1255,32 +1284,33 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
           KokkosDNN::LFM25::encode_chatml_with_tools(
               st.tok, pr.messages, pr.tools_json, sys_suffix, true, true);
       tm.encode_ms = now_ms() - t_encode;
-      // Tools mode feeds raw per-step pieces (specials visible) through
-      // the stream parser so native call blocks become `tool_calls`
-      // instead of leaking into content; plain mode keeps Session's
-      // detokenized text byte-for-byte.
+      // Every turn feeds raw per-step pieces (specials visible) through
+      // the stream parser: native call blocks become `tool_calls` and the
+      // <think> trace becomes `reasoning_content` instead of leaking into
+      // `content`. The parser display replaces Session's detokenized text
+      // in every mode (equal in plain-text turns containing only handled
+      // markers; any other special token stays raw in the parser display).
+      // Without tools, parsed calls are
+      // dropped — the client asked for text, not function calls.
       ToolCallStreamParser tool_parser(resolved_stops(pr));
-      std::string tool_text;
-      std::function<bool(const StepOutcome&)> on_step;
-      if (pr.tools_active) {
-        on_step = [&](const StepOutcome& s) {
-          tool_text += tool_feed(st, tool_parser, s);
-          return true;
-        };
-      }
+      std::string tool_text, tool_reasoning;
+      std::function<bool(const StepOutcome&)> on_step =
+          [&](const StepOutcome& s) {
+            StreamDeltas d = tool_feed(st, tool_parser, s);
+            tool_text += std::move(d.display);
+            tool_reasoning += std::move(d.reasoning);
+            return true;
+          };
       GenResult r = run_session(st, full_ids, content_ids, pr.opts, pr.has_seed,
                                 pr.seed, pr.req_max_tokens, on_step, &tm);
-      std::string text = r.text;
+      ToolParseResult tp = tool_parser.finish();
+      tool_text += tp.text;
+      tool_reasoning += tp.reasoning;
       std::vector<ToolCall> calls;
-      if (pr.tools_active) {
-        ToolParseResult tp = tool_parser.finish();
-        tool_text += tp.text;
-        text = std::move(tool_text);
-        calls = std::move(tp.calls);
-      }
-      AssembledMessage turn =
-          assemble_chat_message(st, pr, std::move(text), std::move(calls),
-                                r.finish);
+      if (pr.tools_active) calls = std::move(tp.calls);
+      AssembledMessage turn = assemble_chat_message(
+          st, pr, std::move(tool_text), std::move(tool_reasoning),
+          std::move(calls), r.finish);
       send_json(res, 200,
                 json{{"id", id},
                      {"object", "chat.completion"},
@@ -1378,24 +1408,32 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
                   if (!sse_peer_alive(sink)) sse_ok = false;
                 }
                 if (!sse_ok) return false;
-                if (!p.tools_active) {
-                  if (!s.delta.empty())
-                    chunk({{"content", s.delta}}, nullptr);
-                  return sse_ok;
-                }
-                std::string d = tool_feed(st, tool_parser, s);
-                if (!d.empty()) chunk({{"content", d}}, nullptr);
+                // <think> traces stream as `reasoning_content` (Zed renders
+                // them in the thinking trace, not the answer); display text
+                // as `content`. Never the twain shall leak.
+                StreamDeltas d = tool_feed(st, tool_parser, s);
+                if (!d.display.empty())
+                  chunk({{"content", std::move(d.display)}}, nullptr);
+                if (!d.reasoning.empty())
+                  chunk({{"reasoning_content", std::move(d.reasoning)}},
+                        nullptr);
                 return sse_ok;
               },
               &tm);
-          // (display text was already streamed piece-wise via on_step.)
+          // (display + reasoning were already streamed piece-wise via
+          // on_step.)
           std::string finish = r.finish;
-          if (sse_ok && p.tools_active) {
+          if (sse_ok) {
             // (json_mode fence stripping is a non-streaming affordance;
             // streamed deltas arrive unmodified.)
             ToolParseResult tp = tool_parser.finish();
             if (!tp.text.empty()) chunk({{"content", tp.text}}, nullptr);
-            std::vector<ToolCall> calls = std::move(tp.calls);
+            if (!tp.reasoning.empty())
+              chunk({{"reasoning_content", tp.reasoning}}, nullptr);
+            // Without tools the client asked for text: parsed calls are
+            // dropped (their blocks were already excised from `content`).
+            std::vector<ToolCall> calls;
+            if (p.tools_active) calls = std::move(tp.calls);
             if (!p.parallel_tool_calls && calls.size() > 1) calls.resize(1);
             if (!calls.empty()) {
               for (size_t i = 0; i < calls.size(); ++i)
@@ -1488,15 +1526,26 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
       const std::vector<int> full_ids =
           KokkosDNN::LFM25::encode_chatml(st.tok, pr.messages, true, true);
       tm.encode_ms = now_ms() - t_encode;
+      // Legacy envelope has no reasoning/tool channels: the <think> trace
+      // and any call blocks are stripped from the text (never leaked).
+      // Only the display channel is consumed (no reasoning poll).
+      ToolCallStreamParser tool_parser(resolved_stops(pr));
+      std::string tool_text;
+      std::function<bool(const StepOutcome&)> on_step =
+          [&](const StepOutcome& s) {
+            tool_text += tool_feed(st, tool_parser, s).display;
+            return true;
+          };
       GenResult r = run_session(st, full_ids, content_ids, pr.opts, pr.has_seed,
-                                pr.seed, pr.req_max_tokens, nullptr, &tm);
+                                pr.seed, pr.req_max_tokens, on_step, &tm);
+      tool_text += tool_parser.finish().text;
       send_json(res, 200,
                 json{{"id", id},
                      {"object", "text_completion"},
                      {"created", created},
                      {"model", st.model_id},
                      {"choices",
-                      json::array({{{"text", r.text},
+                      json::array({{{"text", tool_text},
                                     {"index", 0},
                                     {"finish_reason", r.finish}}})},
                      {"usage",
@@ -1562,6 +1611,9 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
               KokkosDNN::LFM25::encode_chatml(st.tok, p.messages, true, true);
           tm.encode_ms = now_ms() - t_encode;
           bool sse_ok = true;
+          // Legacy envelope has no reasoning/tool channels: stream display
+          // text only (the <think> trace and call blocks never leak).
+          ToolCallStreamParser tool_parser(resolved_stops(p));
           GenResult r = run_session(
               st, full_ids, content_ids, p.opts, p.has_seed, p.seed,
               p.req_max_tokens,
@@ -1571,19 +1623,34 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
                   if (!sse_peer_alive(sink)) sse_ok = false;
                 }
                 if (!sse_ok) return false;
-                if (s.delta.empty()) return sse_ok;
+                const std::string d =
+                    tool_feed(st, tool_parser, s).display;
+                if (d.empty()) return sse_ok;
                 sse_ok = sse_send(
                     sink, json{{"id", id},
                                {"object", "text_completion.chunk"},
                                {"created", created},
                                {"model", st.model_id},
                                {"choices",
-                                json::array({{{"text", s.delta},
+                                json::array({{{"text", d},
                                               {"index", 0},
                                               {"finish_reason", nullptr}}})}});
                 return sse_ok;
               },
               &tm);
+          if (sse_ok) {
+            const std::string tail = tool_parser.finish().text;
+            if (!tail.empty())
+              sse_send(sink,
+                       json{{"id", id},
+                            {"object", "text_completion.chunk"},
+                            {"created", created},
+                            {"model", st.model_id},
+                            {"choices",
+                             json::array({{{"text", tail},
+                                           {"index", 0},
+                                           {"finish_reason", nullptr}}})}});
+          }
           if (sse_ok) {
             sse_send(sink,
                      json{{"id", id},

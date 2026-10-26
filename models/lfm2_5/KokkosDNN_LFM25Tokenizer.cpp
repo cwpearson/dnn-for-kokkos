@@ -8,6 +8,7 @@
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 namespace KokkosDNN {
@@ -1367,23 +1368,126 @@ std::string tool_format_call(const ToolCall& c) {
   return c.name + "(" + args_json_to_pythonic(c.arguments) + ")";
 }
 
-// Length of the trailing incomplete UTF-8 sequence in b (0 when the end
-// is character-complete). Mirrors IncrementalDetokenizer policy.
-size_t tool_trailing_partial_utf8(const std::string& b) {
-  const size_t n = b.size();
-  if (n == 0) return 0;
-  size_t cont = 0;
-  while (cont < n && cont < 4 &&
-         (static_cast<unsigned char>(b[n - 1 - cont]) & 0xC0u) == 0x80u)
-    ++cont;
-  if (cont >= 4 || cont == n) return 0;
-  const unsigned char lead = static_cast<unsigned char>(b[n - 1 - cont]);
-  size_t want = 1;
-  if (lead >= 0xC0u && lead < 0xE0u) want = 2;
-  else if (lead >= 0xE0u && lead < 0xF0u) want = 3;
-  else if (lead >= 0xF0u && lead < 0xF8u) want = 4;
-  else return 0;
-  return (1 + cont < want) ? 1 + cont : 0;
+// Markers whose trailing partial heads must never leak into streamed or
+// whole-text output (a length-capped turn can end mid-marker, and a chunk
+// boundary can split one). Kept in one place so the whole-text parse and
+// the streaming hold-back agree byte-for-byte.
+const char* const kHoldMarkers[] = {kThinkStartToken, kThinkEndToken,
+                                    kToolCallStartToken, kToolCallEndToken,
+                                    kEosToken};
+
+// Length of the trailing partial marker head at the end of b (0 when the
+// end is marker-clean). Only proper prefixes count: a complete marker is
+// structural, not a fragment.
+size_t trailing_partial_marker(const std::string& b) {
+  size_t hold = 0;
+  for (const char* m : kHoldMarkers) {
+    const std::string s(m);
+    if (s.size() <= 1) continue;
+    const size_t max_k = std::min(b.size(), s.size() - 1);
+    for (size_t k = max_k; k >= 1; --k) {
+      if (b.compare(b.size() - k, k, s, 0, k) == 0) {
+        hold = std::max(hold, k);
+        break;
+      }
+      if (k == 1) break;  // size_t underflow guard
+    }
+  }
+  return hold;
+}
+
+// Only the single longest trailing partial control-marker head is ever
+// stripped/held: any earlier '<' is followed by '<' and therefore cannot
+// begin a marker, so it is unambiguous content. Stripping to a fixpoint
+// would drop those content bytes ("hello <<" -> "hello " instead of
+// "hello <") and, in the streaming layers, hold an unbounded run while
+// rescanning it on every push (O(N^2)). l2/l3 already use this single-head
+// form; the whole-text parse, l1 and l4 must agree with it byte-for-byte.
+
+// Think-block split: extracts the leading LFM2.5 <think>...</think>
+// reasoning trace from raw completion text (specials visible). display is
+// the input with think blocks removed (markers included); reasoning
+// concatenates the block contents in order. The Instruct template emits
+// the thinking trace first, so an opener only counts while no
+// non-whitespace display content precedes it; a later literal `<think>`
+// (e.g. the model discussing its own special tokens) stays display
+// content instead of swallowing the answer into reasoning. A block closes
+// at the first </think>; a tool call start or the turn terminator also
+// ends the block implicitly (the terminator itself is left in the display
+// for the tool/stop stages), so a turn cut or generated without a close
+// tag still separates reasoning from content. An unclosed trailing
+// <think> treats the rest as reasoning; a lone </think> without an opener
+// passes through into the display.
+struct SplitThink {
+  std::string display;
+  std::string reasoning;
+};
+
+SplitThink split_think_blocks(const std::string& raw) {
+  SplitThink out;
+  const std::string open = kThinkStartToken;
+  const std::string close = kThinkEndToken;
+  const std::string tool_start = kToolCallStartToken;
+  const std::string eos = kEosToken;
+  // An opener only counts before any non-whitespace display content (the
+  // template emits thinking first); anything already emitted plus the gap
+  // before the opener must be blank. Tracks incrementally: prior_out_ws is
+  // whether out.display so far is all whitespace.
+  bool prior_out_ws = true;
+  size_t pos = 0;
+  while (true) {
+    const size_t s = raw.find(open, pos);
+    if (s == std::string::npos) {
+      out.display += raw.substr(pos);
+      break;
+    }
+    // Gap blank (and nothing non-blank emitted yet)?
+    bool gap_ws = prior_out_ws;
+    for (size_t i = pos; gap_ws && i < s; ++i)
+      if (!std::isspace(static_cast<unsigned char>(raw[i]))) gap_ws = false;
+    if (!gap_ws) {
+      // Literal `<think>` inside content (or a tool-call argument): keep
+      // the marker and keep scanning after it.
+      out.display += raw.substr(pos, s - pos + open.size());
+      prior_out_ws = false;
+      pos = s + open.size();
+      continue;
+    }
+    out.display += raw.substr(pos, s - pos);
+    const size_t inner = s + open.size();
+    size_t e = std::string::npos;
+    size_t e_kind = 0;  // 0 = close tag, 1 = implicit terminator
+    for (const auto& cand :
+         {std::make_pair(raw.find(close, inner), size_t(0)),
+          std::make_pair(raw.find(tool_start, inner), size_t(1)),
+          std::make_pair(raw.find(eos, inner), size_t(1))}) {
+      if (cand.first != std::string::npos &&
+          (e == std::string::npos || cand.first < e)) {
+        e = cand.first;
+        e_kind = cand.second;
+      }
+    }
+    if (e == std::string::npos) {
+      out.reasoning += raw.substr(inner);
+      break;
+    }
+    out.reasoning += raw.substr(inner, e - inner);
+    pos = (e_kind == 0) ? e + close.size() : e;
+  }
+  return out;
+}
+
+// The turn terminator ends every turn, independent of caller stops:
+// without it a custom stop list would leak a complete <|im_end|> into
+// content (the parser decodes with specials visible) and the flushed
+// tail could re-emit text past a custom stop cut. Union, don't replace,
+// so caller stops keep working.
+std::vector<std::string> with_turn_terminator(
+    std::vector<std::string> stops) {
+  for (const auto& s : stops)
+    if (s == kEosToken) return stops;
+  stops.emplace_back(kEosToken);
+  return stops;
 }
 
 }  // namespace
@@ -1470,9 +1574,11 @@ std::vector<ToolCall> parse_tool_call_block(const std::string& block) {
   std::vector<ToolCall> calls;
   try {
     std::string t = tool_trim(block);
-    // Native blocks wrap calls in [...]; tolerate a missing pair.
-    if (t.size() >= 2 && t.front() == '[' && t.back() == ']')
-      t = tool_trim(t.substr(1, t.size() - 2));
+    // Native blocks wrap calls in [...]; tolerate either bracket missing
+    // (a max_tokens cut usually drops the trailing ']' but keeps '[').
+    // Strip each end independently so "[f(a=1), g(b=2)" still recovers f.
+    if (!t.empty() && t.front() == '[') t = tool_trim(t.substr(1));
+    if (!t.empty() && t.back() == ']') t = tool_trim(t.substr(0, t.size() - 1));
     if (t.empty()) return calls;
     for (const std::string& item : tool_split_top(t, ',')) {
       const std::string e = tool_trim(item);
@@ -1492,34 +1598,60 @@ std::vector<ToolCall> parse_tool_call_block(const std::string& block) {
   return calls;
 }
 
-ToolParseResult parse_tool_calls(const std::string& raw) {
+ToolParseResult parse_tool_calls(const std::string& raw,
+                                 const std::vector<std::string>& stops) {
   ToolParseResult r;
   try {
+    // Length-capped turns can end mid-marker; strip the single trailing
+    // partial control-marker head up front so neither display nor
+    // reasoning leaks a fragment the streaming view deliberately held.
+    // Same single-head helper as the streaming settled region: both views
+    // drop exactly the same bytes, so an already-streamed delta is always
+    // a prefix of the whole-text result and finish() never retracts.
+    std::string input = raw;
+    if (const size_t hold = trailing_partial_marker(input); hold > 0)
+      input.erase(input.size() - hold);
+    const SplitThink th = split_think_blocks(input);
+    r.reasoning = th.reasoning;
     const std::string start = kToolCallStartToken;
     const std::string end = kToolCallEndToken;
+    const std::string& text_in = th.display;
     std::string text;
     size_t pos = 0;
     while (true) {
-      const size_t s = raw.find(start, pos);
+      const size_t s = text_in.find(start, pos);
       if (s == std::string::npos) {
-        text += raw.substr(pos);
+        text += text_in.substr(pos);
         break;
       }
-      text += raw.substr(pos, s - pos);
-      const size_t e = raw.find(end, s + start.size());
+      text += text_in.substr(pos, s - pos);
+      const size_t e = text_in.find(end, s + start.size());
       if (e == std::string::npos) {
-        // Unclosed marker: keep the inner bytes as text, drop the marker.
-        text += raw.substr(s + start.size());
+        // Truncated tail (length-capped inside a call block): recover
+        // best-effort so a cut-off call still executes instead of leaking
+        // call markup into the display text. Unparseable tails stay text.
+        const std::string inner = text_in.substr(s + start.size());
+        bool recovered = false;
+        for (auto& c : parse_tool_call_block(inner)) {
+          r.calls.push_back(std::move(c));
+          recovered = true;
+        }
+        if (!recovered) text += inner;
         break;
       }
       for (auto& c :
-           parse_tool_call_block(raw.substr(s + start.size(),
-                                            e - s - start.size())))
+           parse_tool_call_block(text_in.substr(s + start.size(),
+                                                e - s - start.size())))
         r.calls.push_back(std::move(c));
       pos = e + end.size();
     }
-    // The turn terminator ends the turn; anything after it is not content.
-    const size_t stop = text.find(kEosToken);
+    // The turn ends at the first stop: anything from it onward is not
+    // content. The turn terminator is unioned in (see with_turn_terminator)
+    // so the flushed streaming tail agrees with the streamed deltas even
+    // when the caller passes custom stops; callers without stops get the
+    // plain turn-terminator cut.
+    const std::vector<std::string> eff = with_turn_terminator(stops);
+    const size_t stop = find_stop_string(text, eff);
     if (stop != std::string::npos) text.erase(stop);
     r.text = std::move(text);
   } catch (...) {
@@ -1594,94 +1726,381 @@ std::vector<int> encode_chatml_with_tools(
 
 ToolCallStreamParser::ToolCallStreamParser(
     const std::vector<std::string>& stop_strings)
-    : stops_(stop_strings) {
-  if (stops_.empty()) stops_ = default_stop_strings();
+    : stops_(with_turn_terminator(stop_strings)) {
+  // (The turn terminator is unioned in: it ends every turn even when the
+  // caller passes custom stops, so a complete <|im_end|> can never leak
+  // into content. Empty input therefore needs no special case.)
+  max_stop_len_ = 1;
+  for (const auto& s : stops_)
+    max_stop_len_ = std::max(max_stop_len_, s.size());
+}
+
+bool stream_gap_blank(const std::string& b, size_t pos, size_t end) {
+  for (size_t i = pos; i < end; ++i)
+    if (!std::isspace(static_cast<unsigned char>(b[i]))) return false;
+  return true;
+}
+
+// Length of the trailing incomplete UTF-8 sequence in the prefix ending at
+// end (end <= b.size(); 0 when character-complete). Mirrors
+// IncrementalDetokenizer policy; the _at form exists because the emission
+// frontier may lag the buffer end once a stop cut applies.
+size_t stream_trailing_partial_utf8(const std::string& b, size_t end) {
+  if (end == 0 || end > b.size()) return 0;
+  size_t cont = 0;
+  while (cont < end && cont < 4 &&
+         (static_cast<unsigned char>(b[end - 1 - cont]) & 0xC0u) == 0x80u)
+    ++cont;
+  if (cont >= 4 || cont == end) return 0;
+  const unsigned char lead = static_cast<unsigned char>(b[end - 1 - cont]);
+  size_t want = 1;
+  if (lead >= 0xC0u && lead < 0xE0u) want = 2;
+  else if (lead >= 0xE0u && lead < 0xF0u) want = 3;
+  else if (lead >= 0xF0u && lead < 0xF8u) want = 4;
+  else return 0;
+  return (1 + cont < want) ? 1 + cont : 0;
+}
+
+// Layer 1: settled delivery. raw_ is append-only; l1_delivered_ only moves
+// forward over fully scanned text and complete call blocks, so each byte
+// is scanned O(1) times. An unclosed <think> is deliberately NOT held:
+// thinking streams live as reasoning. Undecided trailing partial marker
+// heads stay in raw_ (l1_delivered_ lags) until they complete or are
+// disproven, so a chunk boundary never splits a marker across the layer.
+void ToolCallStreamParser::l1_drive() {
+  const std::string start = kToolCallStartToken;
+  const std::string end = kToolCallEndToken;
+  const size_t n = raw_.size();
+  while (true) {
+    if (l1_in_block_) {
+      const size_t e = raw_.find(end, l1_end_search_);
+      if (e == std::string::npos) {
+        // Keep a bounded overlap so an end marker split across the chunk
+        // boundary is still found next time; each byte is scanned O(1).
+        const size_t floor = (n >= end.size() - 1) ? n - (end.size() - 1) : 0;
+        l1_end_search_ = std::max(l1_end_search_, floor);
+        return;
+      }
+      // The block closed: deliver the held head bytes (if any) plus the
+      // whole block, in order, then keep scanning for what follows.
+      std::string piece = l1_prehold_;
+      l1_prehold_.clear();
+      piece += raw_.substr(l1_block_start_, e + end.size() - l1_block_start_);
+      l1_delivered_ = e + end.size();
+      l1_in_block_ = false;
+      l2_consume(piece);
+      continue;
+    }
+    const size_t s = raw_.find(start, l1_delivered_);
+    if (s == std::string::npos) {
+      // Block-free tail: deliver everything but the single trailing
+      // partial control-marker head (same single-head helper as the
+      // whole-text parse, so both views drop exactly the same bytes at a
+      // length-capped cut). Holding only the longest head keeps the
+      // undelivered tail bounded, so each push costs O(1).
+      std::string cand = raw_.substr(l1_delivered_);
+      if (const size_t hold = trailing_partial_marker(cand); hold > 0)
+        cand.erase(cand.size() - hold);
+      l1_delivered_ += cand.size();
+      l2_consume(cand);
+      return;
+    }
+    std::string text = raw_.substr(l1_delivered_, s - l1_delivered_);
+    if (const size_t hold = trailing_partial_marker(text); hold > 0)
+      text.erase(text.size() - hold);
+    // Heads adjacent to the block start are held (they may yet complete
+    // with bytes from inside or past the block) and delivered first when
+    // the block closes, preserving input order.
+    l1_prehold_ = raw_.substr(l1_delivered_ + text.size(),
+                              s - l1_delivered_ - text.size());
+    l2_consume(text);
+    l1_delivered_ = s;
+    l1_in_block_ = true;
+    l1_block_start_ = s;
+    l1_end_search_ = s + start.size();
+  }
+}
+
+// Layer 2: think split over the settled stream, mirroring
+// split_think_blocks stage-for-stage on the same bytes (complete blocks
+// included, so an opener inside call arguments behaves identically). Only
+// the newly delivered piece plus the bounded undecided tail is examined;
+// a marker starting before the firm frontier F is always complete, so
+// firm bytes are routed exactly once. Display bytes flow to layer 3,
+// reasoning bytes accumulate in out_r_ (both append-only).
+void ToolCallStreamParser::l2_consume(const std::string& piece) {
+  if (piece.empty()) return;
+  const std::string open = kThinkStartToken;
+  const std::string close = kThinkEndToken;
+  const std::string tool_start = kToolCallStartToken;
+  const std::string eos = kEosToken;
+  std::string buf = l2_pend_ + piece;
+  l2_pend_.clear();
+  // Firm frontier: everything before a trailing partial control-marker
+  // head is decided exactly as the whole-text split would (a marker
+  // starting before the frontier is always complete, so firm bytes are
+  // routed once and never revisited). The head itself is held until it
+  // completes or is disproven, so a chunk boundary never splits a marker
+  // across the layer. Marker-clean input therefore streams with no lag.
+  const size_t f = buf.size() - trailing_partial_marker(buf);
+  size_t pos = 0;
+  std::string disp;
+  disp.reserve(piece.size());
+  while (true) {
+    if (l2_in_think_) {
+      // Earliest of close / implicit terminators (same order and
+      // tie-break as the whole-text split).
+      size_t e = std::string::npos;
+      size_t e_kind = 0;
+      size_t e_len = 0;
+      for (const auto& cand :
+           {std::make_tuple(buf.find(close, pos), size_t(0), close.size()),
+            std::make_tuple(buf.find(tool_start, pos), size_t(1),
+                            tool_start.size()),
+            std::make_tuple(buf.find(eos, pos), size_t(1), eos.size())}) {
+        const size_t p = std::get<0>(cand);
+        if (p != std::string::npos && (e == std::string::npos || p < e)) {
+          e = p;
+          e_kind = std::get<1>(cand);
+          e_len = std::get<2>(cand);
+        }
+      }
+      if (e == std::string::npos || e >= f) {
+        // No terminator decided yet: everything before the frontier stays
+        // reasoning whatever follows (a later close only appends). pos may
+        // already lie past the frontier (opener just consumed); only the
+        // undecided tail is held.
+        if (f > pos) out_r_ += buf.substr(pos, f - pos);
+        pos = std::max(pos, f);
+        break;
+      }
+      out_r_ += buf.substr(pos, e - pos);
+      // A close tag is consumed; an implicit terminator is left in the
+      // display path for the tool/stop stages.
+      pos = (e_kind == 0) ? e + e_len : e;
+      l2_in_think_ = false;
+      continue;
+    }
+    const size_t s = buf.find(open, pos);
+    if (s == std::string::npos || s >= f) {
+      if (f > pos) {
+        const std::string seg = buf.substr(pos, f - pos);
+        disp += seg;
+        if (l2_ws_) l2_ws_ = stream_gap_blank(seg, 0, seg.size());
+      }
+      pos = std::max(pos, f);
+      break;
+    }
+    if (l2_ws_ && stream_gap_blank(buf, pos, s)) {
+      disp += buf.substr(pos, s - pos);
+      pos = s + open.size();
+      l2_in_think_ = true;
+      continue;
+    }
+    // Literal `<think>` inside content (or a tool-call argument): kept in
+    // the display, and thinking is over for this turn.
+    disp += buf.substr(pos, s - pos + open.size());
+    l2_ws_ = false;
+    pos = s + open.size();
+  }
+  l2_pend_ = buf.substr(pos);
+  l3_consume(disp);
+}
+
+// Layer 3: tool-call block excision over the display stream (same order as
+// the whole-text parse: excise first, stop-cut later in layer 4, so a stop
+// inside a call block cannot desync the streaming view from finish()).
+// In-block bytes are dropped firmly — whether the block later closes
+// (excised, as in the whole-text parse) or stays cut (recovered as calls
+// or backfilled as text by finish()) they never reach the display view.
+void ToolCallStreamParser::l3_consume(const std::string& piece) {
+  if (piece.empty()) return;
+  const std::string start = kToolCallStartToken;
+  const std::string end = kToolCallEndToken;
+  std::string buf = l3_pend_ + piece;
+  l3_pend_.clear();
+  // Firm frontier (same rule as layer 2): a block marker starting before
+  // it is always complete. In-block bytes are dropped firmly; the
+  // undecided head is held so a marker split across pieces still excises.
+  const size_t f = buf.size() - trailing_partial_marker(buf);
+  size_t pos = 0;
+  while (true) {
+    if (l3_in_call_) {
+      const size_t e = buf.find(end, pos);
+      if (e == std::string::npos || e >= f) {
+        pos = std::max(pos, f);
+        break;
+      }
+      pos = e + end.size();
+      l3_in_call_ = false;
+      continue;
+    }
+    const size_t s = buf.find(start, pos);
+    if (s == std::string::npos || s >= f) {
+      if (f > pos) out_e_ += buf.substr(pos, f - pos);
+      pos = std::max(pos, f);
+      break;
+    }
+    out_e_ += buf.substr(pos, s - pos);
+    pos = s + start.size();
+    l3_in_call_ = true;
+  }
+  l3_pend_ = buf.substr(pos);
+}
+
+StreamDeltas ToolCallStreamParser::feed(const std::string& raw_piece) {
+  raw_ += raw_piece;
+  l1_drive();
+  StreamDeltas d = emit_deltas();
+  // Robust to mixed use: anything stashed by earlier push() calls is older
+  // and goes first. (Server code uses either feed() or push()/poll()
+  // exclusively, so the stash is normally empty here.)
+  if (!stash_r_.empty()) {
+    d.reasoning = stash_r_ + d.reasoning;
+    stash_r_.clear();
+  }
+  return d;
 }
 
 std::string ToolCallStreamParser::push(const std::string& raw_piece) {
   raw_ += raw_piece;
-  // Settled region: everything before the first unclosed call marker.
-  const std::string start = kToolCallStartToken;
-  const std::string end = kToolCallEndToken;
-  size_t limit = raw_.size();
-  size_t p = 0;
-  while (true) {
-    const size_t s = raw_.find(start, p);
-    if (s == std::string::npos) break;
-    const size_t e = raw_.find(end, s + start.size());
-    if (e == std::string::npos) {
-      limit = s;
-      break;
+  l1_drive();
+  StreamDeltas d = emit_deltas();
+  stash_r_ += d.reasoning;
+  return d.display;
+}
+
+// Layer 4: the stop search advances a cursor over the append-only outside
+// stream (a stop starting before the cursor minus the longest stop is
+// already decided, so only the new tail plus a bounded overlap is
+// searched); emission then holds back trailing partial UTF-8,
+// control-marker heads, and partial custom stop heads, exactly as the
+// previous whole-region implementation did, but computed at the frontier
+// in bounded work instead of rescanning the turn.
+StreamDeltas ToolCallStreamParser::emit_deltas() {
+  StreamDeltas out;
+  if (!l4_stopped_) {
+    const size_t c =
+        find_stop_string(out_e_.substr(l4_stop_search_), stops_);
+    if (c != std::string::npos) {
+      l4_stopped_ = true;
+      l4_cut_ = l4_stop_search_ + c;
+    } else {
+      const size_t n = out_e_.size();
+      l4_stop_search_ = (max_stop_len_ > 0 && n >= max_stop_len_ - 1)
+                            ? n - (max_stop_len_ - 1)
+                            : 0;
     }
-    p = e + end.size();
   }
-  std::string region = raw_.substr(0, limit);
-  // Turn terminator / stop strings end the settled text.
-  size_t cut = std::string::npos;
-  for (const auto& s : stops_) {
-    if (s.empty()) continue;
-    const size_t f = region.find(s);
-    if (f != std::string::npos && (cut == std::string::npos || f < cut))
-      cut = f;
-  }
-  if (cut != std::string::npos) region.erase(cut);
-  // Strip complete call blocks from the settled region for display.
-  std::string outside;
+  // Display delta: cut at the earliest complete stop, then hold back what
+  // could still complete into something retractable. A completed stop only
+  // ever cuts held bytes, so the emitted view stays a prefix of the
+  // whole-text result.
   {
-    size_t q = 0;
-    while (true) {
-      const size_t s = region.find(start, q);
-      if (s == std::string::npos) {
-        outside += region.substr(q);
-        break;
-      }
-      outside += region.substr(q, s - q);
-      const size_t e = region.find(end, s + start.size());
-      if (e == std::string::npos) {
-        outside += region.substr(s);  // unreachable (settled); stay safe
-        break;
-      }
-      q = e + end.size();
-    }
-  }
-  // Hold back trailing partial UTF-8 and possible marker heads so a chunk
-  // boundary never splits a codepoint or a control marker.
-  static const char* kSensitive[] = {kToolCallStartToken, kToolCallEndToken,
-                                     kEosToken};
-  size_t safe = outside.size();
-  const size_t hold_utf8 = tool_trailing_partial_utf8(outside);
-  if (hold_utf8 > 0 && hold_utf8 <= safe) safe -= hold_utf8;
-  while (safe > emitted_) {
-    bool held = false;
-    for (const char* s : kSensitive) {
-      const size_t slen = std::string(s).size();
-      if (slen <= 1) continue;
-      const size_t max_k = std::min(safe - emitted_, slen - 1);
-      for (size_t k = 1; k <= max_k; ++k) {
-        if (outside.compare(safe - k, k, s, 0, k) == 0) {
-          safe -= k;
-          held = true;
-          break;
+    const size_t firm = l4_stopped_ ? l4_cut_ : out_e_.size();
+    size_t safe = firm;
+    const size_t hold_utf8 = stream_trailing_partial_utf8(out_e_, safe);
+    if (hold_utf8 > 0 && hold_utf8 <= safe) safe -= hold_utf8;
+    // Single longest hold-back (not a fixpoint): only the suffix ending at
+    // safe can still complete with future bytes. An earlier '<' followed
+    // by '<' is unambiguous content, so holding it would both drop
+    // content ("hello <<" -> "hello ") and rescan an unbounded run on
+    // every push (O(N^2)). Bounded by the longest marker/stop prefix.
+    size_t hold = 0;
+    if (safe > emitted_) {
+      for (const char* s : kHoldMarkers) {
+        const size_t slen = std::char_traits<char>::length(s);
+        if (slen <= 1) continue;
+        if (safe <= emitted_) break;
+        const size_t max_k = std::min({safe - emitted_, slen - 1, safe});
+        for (size_t k = max_k; k >= 1; --k) {
+          if (out_e_.compare(safe - k, k, s, 0, k) == 0) {
+            hold = std::max(hold, k);
+            break;
+          }
+          if (k == 1) break;
         }
       }
-      if (held) break;
+      // Same hold-back for caller stop strings (proper prefixes only; a
+      // complete stop was already cut above).
+      for (const auto& stop : stops_) {
+        if (stop.size() <= 1) continue;
+        if (safe <= emitted_) break;
+        const size_t max_k =
+            std::min({safe - emitted_, stop.size() - 1, safe});
+        for (size_t k = max_k; k >= 1; --k) {
+          if (out_e_.compare(safe - k, k, stop, 0, k) == 0) {
+            hold = std::max(hold, k);
+            break;
+          }
+          if (k == 1) break;
+        }
+      }
+      if (hold > 0 && hold <= safe - emitted_) safe -= hold;
     }
-    if (!held) break;
+    // Defensive rebase: never substr past the end, never emit backwards.
+    if (emitted_ > out_e_.size()) emitted_ = out_e_.size();
+    if (emitted_ > firm) emitted_ = firm;
+    if (safe < emitted_) safe = emitted_;
+    out.display = out_e_.substr(emitted_, safe - emitted_);
+    emitted_ = safe;
   }
-  if (safe < emitted_) safe = emitted_;  // stops_ changed mid-stream; guard
-  std::string delta = outside.substr(emitted_, safe - emitted_);
-  emitted_ = safe;
-  return delta;
+  // Reasoning delta: stops do not apply to the trace (as in the
+  // whole-text parse); only partial UTF-8 and control-marker heads are
+  // held, so an already-streamed prefix can never retract.
+  {
+    size_t safe = out_r_.size();
+    const size_t hold_utf8 = stream_trailing_partial_utf8(out_r_, safe);
+    if (hold_utf8 > 0 && hold_utf8 <= safe) safe -= hold_utf8;
+    // Single longest marker hold (same rationale as display): only the
+    // suffix ending at safe can still complete.
+    size_t hold = 0;
+    if (safe > emitted_r_) {
+      for (const char* m : kHoldMarkers) {
+        const std::string s(m);
+        if (s.size() <= 1) continue;
+        if (safe <= emitted_r_) break;
+        const size_t max_k = std::min({safe - emitted_r_, s.size() - 1, safe});
+        for (size_t k = max_k; k >= 1; --k) {
+          if (out_r_.compare(safe - k, k, s, 0, k) == 0) {
+            hold = std::max(hold, k);
+            break;
+          }
+          if (k == 1) break;
+        }
+      }
+      if (hold > 0 && hold <= safe - emitted_r_) safe -= hold;
+    }
+    // Defensive rebase (same rationale as display): never substr past size.
+    if (emitted_r_ > out_r_.size()) emitted_r_ = out_r_.size();
+    if (safe < emitted_r_) safe = emitted_r_;
+    out.reasoning = out_r_.substr(emitted_r_, safe - emitted_r_);
+    emitted_r_ = safe;
+  }
+  return out;
+}
+
+std::string ToolCallStreamParser::poll_reasoning() {
+  std::string d = std::move(stash_r_);
+  stash_r_.clear();
+  return d;
 }
 
 ToolParseResult ToolCallStreamParser::finish() {
-  ToolParseResult full = parse_tool_calls(raw_);
+  // Whole-text parse on the retained raw input (O(n) once); the streamed
+  // deltas are prefixes of it by construction, so the tail is whatever was
+  // held back. Same stop truncation as the streaming view.
+  ToolParseResult full = parse_tool_calls(raw_, stops_);
   ToolParseResult tail;
   tail.calls = std::move(full.calls);
-  // emitted_ counts chars of the untruncated outside text; the parsed text
-  // may additionally end at a stop marker, so clamp defensively.
+  // emitted_ counts chars of the outside text; the parsed text may
+  // additionally end at a stop marker, so clamp defensively. Same for
+  // reasoning: streamed live, the tail is whatever was held back.
   tail.text =
       (emitted_ <= full.text.size()) ? full.text.substr(emitted_) : "";
+  tail.reasoning = (emitted_r_ <= full.reasoning.size())
+                       ? full.reasoning.substr(emitted_r_)
+                       : "";
   return tail;
 }
 
