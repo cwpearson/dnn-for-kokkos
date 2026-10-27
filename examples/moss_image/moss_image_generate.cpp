@@ -272,6 +272,7 @@ std::string with_extension(const std::string& path, const std::string& ext) {
   return path.substr(0, dot) + ext;
 }
 
+#ifdef KOKKOSDNN_ENABLE_IMAGE
 // Output format follows the --out extension: ".jpg"/".jpeg" (case
 // insensitive) selects lossy JPEG, anything else selects lossless PNG.
 bool out_is_jpeg(const std::string& path) {
@@ -283,6 +284,7 @@ bool out_is_jpeg(const std::string& path) {
   for (char& ch : ext) ch = (char)std::tolower((unsigned char)ch);
   return ext == ".jpg" || ext == ".jpeg";
 }
+#endif
 
 bool file_exists(const std::string& path) {
   std::ifstream f(path, std::ios::binary);
