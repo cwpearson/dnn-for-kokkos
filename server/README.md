@@ -113,15 +113,24 @@ only its longest trailing partial marker head stripped (an earlier `<`
 followed by `<` is content).
 
 Thinking: LFM2.5-Instruct always reasons inside `<think>...</think>` first.
-The trace never appears in `content`: streaming sends it as
+The generation prompt ends with an open `<think>` (matching the upstream
+chat template), so raw completions normally open implicitly: the leading
+segment up to the first `</think>` / tool-call start / `<|im_end|>` is
+reasoning even with no explicit opener in the bytes. A turn that reaches
+none of those terminators (cut by `max_tokens`, or a model that never
+closes the trace) is reported entirely as reasoning, so `content` is
+empty for that turn rather than the trace leaking into it.
+The trace never
+appears in `content`: streaming sends it as
 `reasoning_content` deltas (the DeepSeek/OpenRouter convention, which Zed
 renders in its thinking trace), non-streaming as the message-level
 `reasoning_content` field (omitted when empty). History assistant turns
 accept `thinking` / `reasoning` / `reasoning_content` (first non-empty
 wins, matching the upstream chat template) and re-render them into the
 prompt's `<think>` block, so Zed's `interleaved_reasoning` replay keeps
-its trace. A `<think>` opener only counts before any non-whitespace
-content (the template emits thinking first); model text that merely
+its trace. An explicit `<think>` opener later in the turn only counts
+before any non-whitespace content (tool-call blocks excluded, so thinking
+after a tool call still counts); model text that merely
 mentions the tag stays in `content`.
 
 Unsupported (400 `invalid_request_error`, never silently ignored):

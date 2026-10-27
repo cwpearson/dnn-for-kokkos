@@ -1292,7 +1292,10 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
       // markers; any other special token stays raw in the parser display).
       // Without tools, parsed calls are
       // dropped — the client asked for text, not function calls.
-      ToolCallStreamParser tool_parser(resolved_stops(pr));
+      // The prompt ends with an open <think>, so the trace opens
+      // implicitly and its bytes carry no opener.
+      ToolCallStreamParser tool_parser(resolved_stops(pr),
+                                       /*start_in_reasoning=*/true);
       std::string tool_text, tool_reasoning;
       std::function<bool(const StepOutcome&)> on_step =
           [&](const StepOutcome& s) {
@@ -1396,7 +1399,8 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
             sink.done();
             return true;
           }
-          ToolCallStreamParser tool_parser(resolved_stops(p));
+          ToolCallStreamParser tool_parser(resolved_stops(p),
+                                           /*start_in_reasoning=*/true);
           GenResult r = run_session(
               st, full_ids, content_ids, p.opts, p.has_seed, p.seed,
               p.req_max_tokens,
@@ -1529,7 +1533,10 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
       // Legacy envelope has no reasoning/tool channels: the <think> trace
       // and any call blocks are stripped from the text (never leaked).
       // Only the display channel is consumed (no reasoning poll).
-      ToolCallStreamParser tool_parser(resolved_stops(pr));
+      // The prompt ends with an open <think>, so the trace opens
+      // implicitly and its bytes carry no opener.
+      ToolCallStreamParser tool_parser(resolved_stops(pr),
+                                       /*start_in_reasoning=*/true);
       std::string tool_text;
       std::function<bool(const StepOutcome&)> on_step =
           [&](const StepOutcome& s) {
@@ -1613,7 +1620,8 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
           bool sse_ok = true;
           // Legacy envelope has no reasoning/tool channels: stream display
           // text only (the <think> trace and call blocks never leak).
-          ToolCallStreamParser tool_parser(resolved_stops(p));
+          ToolCallStreamParser tool_parser(resolved_stops(p),
+                                           /*start_in_reasoning=*/true);
           GenResult r = run_session(
               st, full_ids, content_ids, p.opts, p.has_seed, p.seed,
               p.req_max_tokens,

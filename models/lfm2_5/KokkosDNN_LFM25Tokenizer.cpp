@@ -928,13 +928,12 @@ std::string render_lfm25_chatml(const std::vector<ChatMessage>& messages,
   for (const auto& m : messages) {
     out += std::string(kImStartToken) + m.role + "\n";
     if (preserve_thinking && m.role == "assistant" && !m.thinking.empty())
-      out += std::string(kThinkStartToken) + m.thinking + kThinkEndToken +
-             "\n";
+      out += std::string(kThinkStartToken) + m.thinking + kThinkEndToken;
     out += m.content;
     out += std::string(kEosToken) + "\n";
   }
   if (add_generation_prompt)
-    out += std::string(kImStartToken) + "assistant\n";
+    out += std::string(kImStartToken) + "assistant\n" + kThinkStartToken;
   return out;
 }
 
@@ -1407,44 +1406,119 @@ size_t trailing_partial_marker(const std::string& b) {
 // Think-block split: extracts the leading LFM2.5 <think>...</think>
 // reasoning trace from raw completion text (specials visible). display is
 // the input with think blocks removed (markers included); reasoning
-// concatenates the block contents in order. The Instruct template emits
-// the thinking trace first, so an opener only counts while no
-// non-whitespace display content precedes it; a later literal `<think>`
+// concatenates the block contents in order. The generation prompt ends
+// with an open <think>, so raw completions normally open implicitly: when
+// start_in_reasoning is true, the leading segment up to the first
+// </think> / tool-call start / turn terminator is reasoning even without
+// an explicit opener (a redundant leading opener is stripped). An
+// explicit opener later in the turn only counts while no non-whitespace
+// display content precedes it (tool-call blocks excluded, so thinking
+// after a tool call still counts); a later literal `<think>`
 // (e.g. the model discussing its own special tokens) stays display
 // content instead of swallowing the answer into reasoning. A block closes
 // at the first </think>; a tool call start or the turn terminator also
 // ends the block implicitly (the terminator itself is left in the display
 // for the tool/stop stages), so a turn cut or generated without a close
 // tag still separates reasoning from content. An unclosed trailing
-// <think> treats the rest as reasoning; a lone </think> without an opener
-// passes through into the display.
+// explicit <think> treats the rest as reasoning; a lone </think> without
+// an opener passes through into the display unless start_in_reasoning
+// covers the leading segment.
 struct SplitThink {
   std::string display;
   std::string reasoning;
 };
 
-SplitThink split_think_blocks(const std::string& raw) {
+// True when b[pos, end) holds no non-whitespace outside complete tool-call
+// blocks. Complete blocks are excised downstream, so they must not count as
+// display content (otherwise thinking after a tool call would look mid-turn
+// and leak into `content`). An unclosed block start counts as content, as
+// does a block whose end marker lies past `end`: from this window's point of
+// view it may still be plain text. Shared by the whole-text split and the
+// streaming layer so both classify a gap identically.
+bool blank_ignoring_tool_blocks(const std::string& b, size_t pos,
+                                size_t end) {
+  const std::string sl_s(kToolCallStartToken);
+  const std::string el_s(kToolCallEndToken);
+  const size_t sl = sl_s.size();
+  const size_t el = el_s.size();
+  while (pos < end) {
+    const size_t st = b.find(kToolCallStartToken, pos);
+    if (st == std::string::npos || st >= end) break;
+    for (size_t i = pos; i < st; ++i)
+      if (!std::isspace(static_cast<unsigned char>(b[i]))) return false;
+    const size_t en = b.find(kToolCallEndToken, st + sl);
+    if (en == std::string::npos || en + el > end) return false;
+    pos = en + el;
+  }
+  for (size_t i = pos; i < end; ++i)
+    if (!std::isspace(static_cast<unsigned char>(b[i]))) return false;
+  return true;
+}
+
+SplitThink split_think_blocks(const std::string& raw,
+                              bool start_in_reasoning) {
   SplitThink out;
   const std::string open = kThinkStartToken;
   const std::string close = kThinkEndToken;
   const std::string tool_start = kToolCallStartToken;
   const std::string eos = kEosToken;
-  // An opener only counts before any non-whitespace display content (the
-  // template emits thinking first); anything already emitted plus the gap
+  // An explicit opener only counts before any non-whitespace display
+  // content (tool blocks excluded); anything already emitted plus the gap
   // before the opener must be blank. Tracks incrementally: prior_out_ws is
-  // whether out.display so far is all whitespace.
+  // whether out.display so far is all whitespace ignoring tool blocks.
   bool prior_out_ws = true;
   size_t pos = 0;
+  // Prompt-provided open thinker: the leading segment is reasoning up to
+  // the first decided closer / tool-call start / turn terminator, even
+  // with no explicit opener in the raw text. A turn that never reaches a
+  // terminator is a completion cut mid-thought (length cap), so the whole
+  // remaining text is the trace — the streaming view cannot know at
+  // token time whether a terminator is still coming, so it commits to
+  // reasoning and the whole-text parse has to agree (otherwise the two
+  // views diverge on truncated turns). Leading whitespace belongs to the
+  // trace in every case: it precedes the (implicit or redundant) opener,
+  // so it must never reach `content` (a whitespace-only `content` would
+  // also suppress the null-content tool-call shape).
+  if (start_in_reasoning) {
+    size_t ws_end = 0;
+    while (ws_end < raw.size() &&
+           std::isspace(static_cast<unsigned char>(raw[ws_end])))
+      ++ws_end;
+    const bool had_opener = raw.compare(ws_end, open.size(), open) == 0;
+    const size_t seg = had_opener ? ws_end + open.size() : ws_end;
+    size_t term = std::string::npos;
+    size_t term_kind = 0;  // 0 = close tag, 1 = implicit terminator
+    for (const auto& cand :
+         {std::make_pair(raw.find(close, seg), size_t(0)),
+          std::make_pair(raw.find(tool_start, seg), size_t(1)),
+          std::make_pair(raw.find(eos, seg), size_t(1))}) {
+      if (cand.first != std::string::npos &&
+          (term == std::string::npos || cand.first < term)) {
+        term = cand.first;
+        term_kind = cand.second;
+      }
+    }
+    out.reasoning += raw.substr(0, ws_end);
+    if (term == std::string::npos) {
+      // No terminator: cut mid-thought (or a degenerate turn that never
+      // closed the prompt-opened trace). Everything after the opener is
+      // the trace.
+      out.reasoning += raw.substr(seg);
+      return out;
+    }
+    out.reasoning += raw.substr(seg, term - seg);
+    pos = (term_kind == 0) ? term + close.size() : term;
+  }
   while (true) {
     const size_t s = raw.find(open, pos);
     if (s == std::string::npos) {
       out.display += raw.substr(pos);
       break;
     }
-    // Gap blank (and nothing non-blank emitted yet)?
-    bool gap_ws = prior_out_ws;
-    for (size_t i = pos; gap_ws && i < s; ++i)
-      if (!std::isspace(static_cast<unsigned char>(raw[i]))) gap_ws = false;
+    // Gap blank (and nothing non-blank emitted yet), ignoring excised
+    // tool blocks?
+    bool gap_ws =
+        prior_out_ws && blank_ignoring_tool_blocks(raw, pos, s);
     if (!gap_ws) {
       // Literal `<think>` inside content (or a tool-call argument): keep
       // the marker and keep scanning after it.
@@ -1599,7 +1673,8 @@ std::vector<ToolCall> parse_tool_call_block(const std::string& block) {
 }
 
 ToolParseResult parse_tool_calls(const std::string& raw,
-                                 const std::vector<std::string>& stops) {
+                                 const std::vector<std::string>& stops,
+                                 bool start_in_reasoning) {
   ToolParseResult r;
   try {
     // Length-capped turns can end mid-marker; strip the single trailing
@@ -1611,7 +1686,7 @@ ToolParseResult parse_tool_calls(const std::string& raw,
     std::string input = raw;
     if (const size_t hold = trailing_partial_marker(input); hold > 0)
       input.erase(input.size() - hold);
-    const SplitThink th = split_think_blocks(input);
+    const SplitThink th = split_think_blocks(input, start_in_reasoning);
     r.reasoning = th.reasoning;
     const std::string start = kToolCallStartToken;
     const std::string end = kToolCallEndToken;
@@ -1688,11 +1763,9 @@ std::string render_lfm25_chatml_with_tools(
     const std::string role = (m.role == "tool") ? "tool" : m.role;
     out += std::string(kImStartToken) + role + "\n";
     if (preserve_thinking && m.role == "assistant" && !m.thinking.empty())
-      out += std::string(kThinkStartToken) + m.thinking + kThinkEndToken +
-             "\n";
+      out += std::string(kThinkStartToken) + m.thinking + kThinkEndToken;
     out += m.content;
     if (m.role == "assistant" && !m.tool_calls.empty()) {
-      if (!m.content.empty()) out += "\n";
       out += kToolCallStartToken;
       out += "[";
       bool first = true;
@@ -1708,7 +1781,7 @@ std::string render_lfm25_chatml_with_tools(
     out += std::string(kEosToken) + "\n";
   }
   if (add_generation_prompt)
-    out += std::string(kImStartToken) + "assistant\n";
+    out += std::string(kImStartToken) + "assistant\n" + kThinkStartToken;
   return out;
 }
 
@@ -1725,20 +1798,16 @@ std::vector<int> encode_chatml_with_tools(
 }
 
 ToolCallStreamParser::ToolCallStreamParser(
-    const std::vector<std::string>& stop_strings)
-    : stops_(with_turn_terminator(stop_strings)) {
+    const std::vector<std::string>& stop_strings, bool start_in_reasoning)
+    : l2_lead_(start_in_reasoning),
+      stops_(with_turn_terminator(stop_strings)),
+      start_in_reasoning_(start_in_reasoning) {
   // (The turn terminator is unioned in: it ends every turn even when the
   // caller passes custom stops, so a complete <|im_end|> can never leak
   // into content. Empty input therefore needs no special case.)
   max_stop_len_ = 1;
   for (const auto& s : stops_)
     max_stop_len_ = std::max(max_stop_len_, s.size());
-}
-
-bool stream_gap_blank(const std::string& b, size_t pos, size_t end) {
-  for (size_t i = pos; i < end; ++i)
-    if (!std::isspace(static_cast<unsigned char>(b[i]))) return false;
-  return true;
 }
 
 // Length of the trailing incomplete UTF-8 sequence in the prefix ending at
@@ -1846,6 +1915,66 @@ void ToolCallStreamParser::l2_consume(const std::string& piece) {
   size_t pos = 0;
   std::string disp;
   disp.reserve(piece.size());
+  // Prompt-provided open thinker (l2_lead_): the turn opens inside
+  // reasoning, so settled bytes stream live as reasoning until the first
+  // decided closer / tool-call start / turn terminator. A redundant
+  // leading opener is stripped. This mirrors the start_in_reasoning leg
+  // of split_think_blocks; the flag disambiguates immediately, so no
+  // holding is needed to keep the views monotone.
+  if (l2_lead_) {
+    size_t seg = 0;
+    // Fresh: nothing but whitespace has been routed to the trace so far,
+    // so one redundant opener may still be stripped (mirroring the
+    // whole-text leg, which only strips an opener preceded by whitespace).
+    // Once a non-whitespace byte or the opener itself is consumed, a later
+    // `<think>` is literal trace text exactly as in the whole-text pass.
+    if (l2_lead_fresh_) {
+      size_t ws_end = 0;
+      while (ws_end < f &&
+             std::isspace(static_cast<unsigned char>(buf[ws_end])))
+        ++ws_end;
+      out_r_ += buf.substr(0, ws_end);
+      seg = ws_end;
+      if (ws_end + open.size() <= f &&
+          buf.compare(ws_end, open.size(), open) == 0) {
+        seg = ws_end + open.size();
+        l2_lead_fresh_ = false;
+      } else if (ws_end < f) {
+        l2_lead_fresh_ = false;  // a non-blank byte: no opener can follow
+      } else {
+        // Only whitespace settled so far: hold the undecided head (which
+        // may be the opener) and wait for more bytes.
+        l2_pend_ = buf.substr(seg);
+        l3_consume(disp);
+        return;
+      }
+    }
+    size_t e = std::string::npos;
+    size_t e_kind = 0;
+    size_t e_len = 0;
+    for (const auto& cand :
+         {std::make_tuple(buf.find(close, seg), size_t(0), close.size()),
+          std::make_tuple(buf.find(tool_start, seg), size_t(1),
+                          tool_start.size()),
+          std::make_tuple(buf.find(eos, seg), size_t(1), eos.size())}) {
+      const size_t p = std::get<0>(cand);
+      if (p != std::string::npos && (e == std::string::npos || p < e)) {
+        e = p;
+        e_kind = std::get<1>(cand);
+        e_len = std::get<2>(cand);
+      }
+    }
+    if (e == std::string::npos || e >= f) {
+      if (f > seg) out_r_ += buf.substr(seg, f - seg);
+      // Undecided tail (possibly the terminator itself) is held.
+      l2_pend_ = buf.substr(std::max(seg, f));
+      l3_consume(disp);
+      return;
+    }
+    out_r_ += buf.substr(seg, e - seg);
+    pos = (e_kind == 0) ? e + e_len : e;
+    l2_lead_ = false;
+  }
   while (true) {
     if (l2_in_think_) {
       // Earliest of close / implicit terminators (same order and
@@ -1886,12 +2015,15 @@ void ToolCallStreamParser::l2_consume(const std::string& piece) {
       if (f > pos) {
         const std::string seg = buf.substr(pos, f - pos);
         disp += seg;
-        if (l2_ws_) l2_ws_ = stream_gap_blank(seg, 0, seg.size());
+        // Tool-call blocks are excised downstream, so they must not mark
+        // the display as non-blank (thinking after a tool call still
+        // counts as leading).
+        if (l2_ws_) l2_ws_ = blank_ignoring_tool_blocks(seg, 0, seg.size());
       }
       pos = std::max(pos, f);
       break;
     }
-    if (l2_ws_ && stream_gap_blank(buf, pos, s)) {
+    if (l2_ws_ && blank_ignoring_tool_blocks(buf, pos, s)) {
       disp += buf.substr(pos, s - pos);
       pos = s + open.size();
       l2_in_think_ = true;
@@ -2090,7 +2222,7 @@ ToolParseResult ToolCallStreamParser::finish() {
   // Whole-text parse on the retained raw input (O(n) once); the streamed
   // deltas are prefixes of it by construction, so the tail is whatever was
   // held back. Same stop truncation as the streaming view.
-  ToolParseResult full = parse_tool_calls(raw_, stops_);
+  ToolParseResult full = parse_tool_calls(raw_, stops_, start_in_reasoning_);
   ToolParseResult tail;
   tail.calls = std::move(full.calls);
   // emitted_ counts chars of the outside text; the parsed text may

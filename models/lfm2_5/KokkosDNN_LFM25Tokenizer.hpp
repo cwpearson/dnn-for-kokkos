@@ -132,8 +132,15 @@ class Tokenizer {
 //
 //   <|im_start|>system\n{system}<|im_end|>\n
 //   <|im_start|>user\n{user}<|im_end|>\n
-//   <|im_start|>assistant\n[<think>{thinking}</think>\n]{content}<|im_end|>\n
-//   <|im_start|>assistant\n            <- generation prompt
+//   <|im_start|>assistant\n[<think>{thinking}</think>]{content}<|im_end|>\n
+//   <|im_start|>assistant\n<think>   <- generation prompt (open thinker)
+//
+// The generation prompt carries the open <think> (matching the HF
+// chat_template.jinja, which appends "<|im_start|>assistant\n<think>") so
+// the model starts inside the thinking trace: raw completions normally
+// contain only the closing </think>, never the opener. History thinking
+// blocks render as "<think>{thinking}</think>" directly followed by the
+// content (no separating newline), also matching HF.
 //
 // A thinking block is emitted inside an assistant turn only when that
 // turn carries non-empty `thinking` AND `preserve_thinking` is true;
@@ -248,14 +255,26 @@ std::vector<int> encode_chatml_with_tools(
 // terminator always applies, independent of `stops`). A length-capped
 // input ending mid-marker has its trailing partial control-marker head
 // stripped up front, so fragments never leak into either view. <think>...</think> reasoning blocks (the LFM2.5-Instruct
-// thinking trace, always emitted at the start of a turn) are extracted into
+// thinking trace) are extracted into
 // `reasoning` and removed from the display text so OpenAI-compatible
 // clients can surface them as `reasoning_content` instead of leaking
-// literal <think> tags into `content`. An opener only counts before any
-// non-whitespace display content (the template emits thinking first), so
-// model text that merely mentions the tag stays content. An unclosed
-// trailing <think> treats the rest of the turn as reasoning; a lone
-// </think> without an opener passes through into the text. Unclosed
+// literal <think> tags into `content`. The generation prompt ends with an
+// open <think>, so raw completions normally open implicitly: when
+// `start_in_reasoning` is true, the leading segment up to the first
+// </think> / tool-call start / turn terminator is reasoning even without
+// an explicit <think> opener (a redundant leading opener is stripped and
+// leading whitespace belongs to the trace). A turn that reaches none of
+// those terminators is treated as cut mid-thought, so all of it is
+// reasoning and `text` is empty — the streaming view cannot wait for a
+// terminator that may never arrive, so the whole-text parse has to agree.
+// An explicit opener later in the turn only counts while no non-whitespace
+// display content precedes it (tool-call blocks excluded, so thinking
+// after a tool call still counts); model text that merely mentions the
+// tag stays content. A block closes at the first </think>; a tool call
+// start or the turn terminator also ends the block implicitly. An
+// unclosed trailing explicit <think> treats the rest as reasoning; a lone
+// </think> without an opener passes through into the text unless
+// `start_in_reasoning` covers the leading segment. Unclosed
 // trailing tool markers (a turn cut by
 // max_tokens/length inside or just before a call block) are recovered
 // best-effort: complete calls (closed parens) in the truncated list become
@@ -265,11 +284,12 @@ std::vector<int> encode_chatml_with_tools(
 // Never throws on model output (malformed blocks are skipped).
 struct ToolParseResult {
   std::string text;
-  std::string reasoning;  // concatenated <think> contents ("" when none)
+  std::string reasoning;  // trace contents, openers excluded ("" when none)
   std::vector<ToolCall> calls;
 };
 ToolParseResult parse_tool_calls(
-    const std::string& raw, const std::vector<std::string>& stops = {});
+    const std::string& raw, const std::vector<std::string>& stops = {},
+    bool start_in_reasoning = false);
 
 // Convert one native call-block body, e.g. `[f(a="1"), g(x=2)]` (brackets
 // optional), into calls. Arguments convert from the native pythonic form
@@ -292,8 +312,8 @@ std::vector<ToolCall> parse_tool_call_block(const std::string& block);
 // are disjoint views: total display text = concatenated display deltas +
 // finish().text, total reasoning = concatenated reasoning deltas +
 // finish().reasoning. Totaled streaming output agrees with the whole-text
-// parse_tool_calls() on the same input (with the same stops), including
-// the unclosed-trailing recovery.
+// parse_tool_calls() on the same input (with the same stops and the same
+// start_in_reasoning), including the unclosed-trailing recovery.
 //
 // Cost: the parser is a single-pass incremental machine. Each input byte
 // is classified once (think split, call excision, stop cut run on the
@@ -308,8 +328,12 @@ struct StreamDeltas {
 
 class ToolCallStreamParser {
  public:
+  // `start_in_reasoning` mirrors parse_tool_calls()'s third argument: set
+  // it when the generation prompt already opened the thinker, so the raw
+  // pieces are a bare trace followed by </think> (or cut mid-thought).
   explicit ToolCallStreamParser(
-      const std::vector<std::string>& stop_strings = {});
+      const std::vector<std::string>& stop_strings = {},
+      bool start_in_reasoning = false);
   // One parser step for one raw piece: returns display + reasoning deltas
   // newly safe to stream. A single call per token keeps the per-turn cost
   // linear; prefer this over push()+poll_reasoning() on hot paths.
@@ -346,8 +370,18 @@ class ToolCallStreamParser {
   size_t l1_end_search_ = 0;   // end-marker search cursor (while in block)
   std::string l1_prehold_;  // held head bytes preceding the open block
   // Layer 2 (think split) state.
+  // l2_lead_ covers the prompt-provided open thinker: the generation
+  // prompt ends with "<think>", so the turn opens inside reasoning and the
+  // raw completion normally carries no opener. While set, settled bytes
+  // stream live as reasoning until the first decided closer / tool-call
+  // start / turn terminator (a redundant leading opener is stripped once,
+  // while l2_lead_fresh_ holds).
+  bool l2_lead_ = false;
+  bool l2_lead_fresh_ = true;  // only whitespace routed to the trace so far
   bool l2_in_think_ = false;
   bool l2_ws_ = true;  // display emitted so far is all whitespace
+                       // (tool-call blocks excluded: thinking after a tool
+                       // call still counts as leading)
   std::string l2_pend_;  // undecided settled tail (bounded by marker lens)
   // Layer 3 (call excision) state.
   bool l3_in_call_ = false;
@@ -363,6 +397,7 @@ class ToolCallStreamParser {
   size_t emitted_r_ = 0;  // chars of reasoning text already returned
   std::vector<std::string> stops_;
   size_t max_stop_len_ = 1;
+  bool start_in_reasoning_ = false;
 };
 
 // Argument conversion between the native pythonic form and JSON.
