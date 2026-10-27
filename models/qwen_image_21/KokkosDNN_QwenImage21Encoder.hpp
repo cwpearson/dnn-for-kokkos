@@ -513,6 +513,55 @@ void qwen21_rope_inplace(const XView& x, const FView& inv_freq,
       });
 }
 
+// True M-RoPE apply for joint text+vision input: per-token (t, h, w)
+// positions select the frequency row by interleaved section (reference
+// recomposition: freqs_thw starts as the T row; H overwrites idx 1,4,...
+// up to 3*mrope_section[1], W overwrites idx 2,5,... up to
+// 3*mrope_section[2]; slots at/above the cutoffs stay T, so with
+// [24,20,20] the tail slots 60..63 all read T). Same half-rotation pairing
+// as qwen21_rope_inplace. x: [S, Hq, Hd]; pos: [3, S] int (t/h/w rows).
+template <class ExecSpace, class XView, class PView, class FView>
+void qwen21_mrope_inplace(const XView& x, const PView& pos,
+                          const FView& inv_freq,
+                          const std::array<int, 3>& sections,
+                          const std::string& label = "Qwen21Enc::mrope") {
+  const size_t S = x.extent(0), H = x.extent(1), D = x.extent(2);
+  if (D % 2 != 0)
+    throw std::invalid_argument("qwen21_mrope_inplace: head_dim must be even");
+  const size_t Rh = D / 2;
+  if (inv_freq.extent(0) != Rh)
+    throw std::invalid_argument("qwen21_mrope_inplace: inv_freq dim");
+  if (pos.extent(0) != 3 || pos.extent(1) != S)
+    throw std::invalid_argument("qwen21_mrope_inplace: pos must be [3, S]");
+  if (sections[0] + sections[1] + sections[2] != static_cast<int>(Rh))
+    throw std::invalid_argument("qwen21_mrope_inplace: sections must sum to "
+                                "head_dim/2");
+  if (S == 0 || H == 0) return;
+  using Scalar = std::remove_const_t<typename XView::value_type>;
+  const int s1 = sections[1];
+  const int s2 = sections[2];
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {S, H}),
+      KOKKOS_LAMBDA(size_t s, size_t h) {
+        for (size_t j = 0; j < Rh; ++j) {
+          const size_t m = j % 3;
+          const int jj = static_cast<int>(j);
+          size_t r = 0;
+          if (m == 1 && jj < 3 * s1)
+            r = 1;
+          else if (m == 2 && jj < 3 * s2)
+            r = 2;
+          const float p = static_cast<float>(pos(r, s));
+          const float ang = p * inv_freq(j);
+          const float c = cosf(ang), s_ = sinf(ang);
+          const float a = static_cast<float>(x(s, h, j));
+          const float b = static_cast<float>(x(s, h, j + Rh));
+          x(s, h, j) = static_cast<Scalar>(a * c - b * s_);
+          x(s, h, j + Rh) = static_cast<Scalar>(a * s_ + b * c);
+        }
+      });
+}
+
 // Torch-exact RMSNorm: replicates Qwen3VLTextRMSNorm.forward's bf16
 // intermediate rounding (hidden.to(bf16) BEFORE the weight multiply, i.e.
 // two roundings) instead of the single-FP32-rounding core op. For float
@@ -623,7 +672,9 @@ void qwen21_residual_add(const XView& x, const BView& branch,
 
 // Encoder model: owns Weights. forward() runs the 36-layer M-RoPE + GQA +
 // SwiGLU text tower over token ids (T2I path: no visual slots; the
-// image_pad mask is all-False and needs no plumbing here).
+// image_pad mask is all-False and needs no plumbing here). forward_joint()
+// below adds the edit path: vision-slot embedding replacement, true M-RoPE
+// positions, and DeepStack adds (Qwen3-VL joint text+vision conditioning).
 //
 // Reference math (modeling_qwen3_vl.py, Qwen3VLText*):
 //   h = embed[ids]
@@ -762,6 +813,185 @@ class QwenImage21EncoderModel {
           dst(hidden.data() + b * S * D, S, D);
       Kokkos::deep_copy(dst, h);
     }
+    Kokkos::fence();
+  }
+
+  // Joint text+vision forward for edit conditioning (B=1): token ids with
+  // Nv vision slots at vis_rows (ascending S positions, count == Nv) get
+  // their embeddings replaced by vis_embeds[0, k] in order; text layers
+  // 0..2 add deep_embeds[k][0, k] at the same rows (DeepStack,
+  // modeling_qwen3_vl.py _deepstack_process); positions are true M-RoPE
+  // (pos3 flattened row-major [3, S], caller-built per get_rope_index, B=1
+  // unpadded so every row is consumed as-is). Output is the pre-norm
+  // hidden states (pipeline hook parity); the caller drops the first
+  // drop_idx rows. The text-only forward() above is untouched (T2I path).
+  void forward_joint(const DNNHandle<ExecSpace>& handle, const I2& tokens,
+                     const I1& vis_rows, const V3& vis_embeds,
+                     const V3 deep_embeds[3], const I1& pos3_flat,
+                     const V3& hidden, int drop_idx) {
+    cfg_.validate();
+    const size_t B = tokens.extent(0), S = tokens.extent(1);
+    const size_t D = (size_t)cfg_.hidden_dim;
+    const size_t Nq = (size_t)cfg_.num_q_heads, Nk = (size_t)cfg_.num_kv_heads;
+    const size_t Hd = (size_t)cfg_.head_dim(), G = (size_t)cfg_.gate_dim();
+    if (B != 1)
+      throw std::invalid_argument(
+          "QwenImage21EncoderModel::forward_joint: batch must be 1");
+    const size_t Nv = vis_rows.extent(0);
+    if (vis_embeds.extent(0) != 1 || vis_embeds.extent(1) != Nv ||
+        vis_embeds.extent(2) != D)
+      throw std::invalid_argument(
+          "QwenImage21EncoderModel::forward_joint: vis_embeds must be "
+          "[1, Nv, D]");
+    for (int k = 0; k < 3; ++k)
+      if (deep_embeds[k].extent(0) != 1 || deep_embeds[k].extent(1) != Nv ||
+          deep_embeds[k].extent(2) != D)
+        throw std::invalid_argument(
+            "QwenImage21EncoderModel::forward_joint: deep_embeds must be "
+            "[1, Nv, D]");
+    if (pos3_flat.extent(0) != 3 * S)
+      throw std::invalid_argument(
+          "QwenImage21EncoderModel::forward_joint: pos3 must hold 3*S ints");
+    if (hidden.extent(0) != 1 || hidden.extent(1) != S ||
+        hidden.extent(2) != D)
+      throw std::invalid_argument(
+          "QwenImage21EncoderModel::forward_joint: hidden must be [1, S, D]");
+    if (drop_idx < 0 || (size_t)drop_idx > S)
+      throw std::invalid_argument(
+          "QwenImage21EncoderModel::forward_joint: drop_idx out of range");
+    if (weights_.embed.extent(0) == 0)
+      throw std::logic_error(
+          "QwenImage21EncoderModel::forward_joint: weights empty");
+    if (S == 0) return;
+    {
+      auto hm = Kokkos::create_mirror_view(tokens);
+      Kokkos::deep_copy(hm, tokens);
+      for (size_t s = 0; s < S; ++s)
+        if (hm(0, s) < 0 || hm(0, s) >= cfg_.vocab_size)
+          throw std::invalid_argument(
+              "QwenImage21EncoderModel::forward_joint: token id out of range");
+    }
+    // Vision-slot rows on host (one mirror; ascending order required so
+    // vis_embeds rows map in sequence).
+    std::vector<size_t> rows;
+    {
+      auto hr = Kokkos::create_mirror_view(vis_rows);
+      Kokkos::deep_copy(hr, vis_rows);
+      for (size_t k = 0; k < Nv; ++k) {
+        if ((size_t)hr(k) >= S)
+          throw std::invalid_argument(
+              "QwenImage21EncoderModel::forward_joint: vis row out of range");
+        if (k > 0 && (size_t)hr(k) <= rows.back())
+          throw std::invalid_argument(
+              "QwenImage21EncoderModel::forward_joint: vis rows must ascend");
+        rows.push_back((size_t)hr(k));
+      }
+    }
+    const float scale = 1.0f / std::sqrt(static_cast<float>(Hd));
+    const float eps = static_cast<float>(cfg_.norm_eps);
+    using UView3 = Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace,
+                                Kokkos::MemoryUnmanaged>;
+    using UView2 = Kokkos::View<int**, Kokkos::LayoutRight, ExecSpace,
+                                Kokkos::MemoryUnmanaged>;
+    UView2 pos3(const_cast<int*>(pos3_flat.data()), 3, S);
+    I1 row_ids("qwen21encj_ids", S);
+    V2 h("qwen21encj_h", S, D);
+    V2 n("qwen21encj_n", S, D);
+    V2 qf("qwen21encj_q", S, Nq * Hd);
+    V2 kf("qwen21encj_k", S, Nk * Hd);
+    V2 vf("qwen21encj_v", S, Nk * Hd);
+    V2 ao("qwen21encj_ao", S, D);
+    V2 o("qwen21encj_o", S, D);
+    V2 g("qwen21encj_g", S, G);
+    V2 u("qwen21encj_u", S, G);
+    V2 d("qwen21encj_d", S, D);
+    UView3 q3(qf.data(), S, Nq, Hd);
+    UView3 k3(kf.data(), S, Nk, Hd);
+    UView3 v3(vf.data(), S, Nk, Hd);
+    UView3 ao3(ao.data(), S, Nq, Hd);
+    {
+      Kokkos::View<int*, ExecSpace, Kokkos::MemoryUnmanaged> rowpre(
+          tokens.data(), S);
+      Kokkos::deep_copy(row_ids, rowpre);
+      KokkosDNN::embedding_gather<ExecSpace, Scalar>(weights_.embed, row_ids,
+                                                    h, "Qwen21EncJ::embed");
+      // Replace vision-slot embeddings with the merger output rows.
+      if (Nv > 0) {
+        I1 d_rows("qwen21encj_rows", Nv);
+        {
+          auto m = Kokkos::create_mirror_view(d_rows);
+          for (size_t k = 0; k < Nv; ++k) m(k) = (int)rows[k];
+          Kokkos::deep_copy(d_rows, m);
+        }
+        UView3 ve(const_cast<Scalar*>(vis_embeds.data()), 1, Nv, D);
+        Kokkos::parallel_for(
+            "Qwen21EncJ::vis_replace",
+            Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {Nv, D}),
+            KOKKOS_LAMBDA(size_t k, size_t c) {
+              h(d_rows(k), c) = ve(0, k, c);
+            });
+      }
+    }
+    for (int l = 0; l < cfg_.num_layers; ++l) {
+      const auto& L = weights_.layers[(size_t)l];
+      Impl::qwen21_rmsnorm<ExecSpace, Scalar>(h, L.in_norm, eps, n,
+                                             "Qwen21EncJ::in_norm");
+      KokkosDNN::gemm<ExecSpace, Scalar>(handle, Scalar(1), n, L.q_W,
+                                         Scalar(0), qf, "Qwen21EncJ::q");
+      KokkosDNN::gemm<ExecSpace, Scalar>(handle, Scalar(1), n, L.k_W,
+                                         Scalar(0), kf, "Qwen21EncJ::k");
+      KokkosDNN::gemm<ExecSpace, Scalar>(handle, Scalar(1), n, L.v_W,
+                                         Scalar(0), vf, "Qwen21EncJ::v");
+      Impl::qwen21_qk_rmsnorm<ExecSpace, Scalar>(qf, L.qn, eps, q3,
+                                                "Qwen21EncJ::q_norm");
+      Impl::qwen21_qk_rmsnorm<ExecSpace, Scalar>(kf, L.kn, eps, k3,
+                                                "Qwen21EncJ::k_norm");
+      Impl::qwen21_mrope_inplace<ExecSpace>(q3, pos3, rope_inv_,
+                                             cfg_.mrope_sections,
+                                             "Qwen21EncJ::rope_q");
+      Impl::qwen21_mrope_inplace<ExecSpace>(k3, pos3, rope_inv_,
+                                             cfg_.mrope_sections,
+                                             "Qwen21EncJ::rope_k");
+      KokkosDNN::attention_gqa_single<ExecSpace, Scalar>(
+          handle, q3, k3, v3, size_t{0}, ao3, scale, "Qwen21EncJ::attn");
+      KokkosDNN::gemm<ExecSpace, Scalar>(handle, Scalar(1), ao, L.o_W,
+                                         Scalar(0), o, "Qwen21EncJ::o");
+      Impl::qwen21_residual_add<ExecSpace>(h, o, "Qwen21EncJ::res1");
+      Impl::qwen21_rmsnorm<ExecSpace, Scalar>(h, L.post_norm, eps, n,
+                                             "Qwen21EncJ::post_norm");
+      KokkosDNN::gemm<ExecSpace, Scalar>(handle, Scalar(1), n, L.gate_W,
+                                         Scalar(0), g, "Qwen21EncJ::gate");
+      KokkosDNN::gemm<ExecSpace, Scalar>(handle, Scalar(1), n, L.up_W,
+                                         Scalar(0), u, "Qwen21EncJ::up");
+      Impl::qwen21_swiglu<ExecSpace, Scalar>(g, u, g, "Qwen21EncJ::swiglu");
+      KokkosDNN::gemm<ExecSpace, Scalar>(handle, Scalar(1), g, L.down_W,
+                                         Scalar(0), d, "Qwen21EncJ::down");
+      Impl::qwen21_residual_add<ExecSpace>(h, d, "Qwen21EncJ::res2");
+      // DeepStack: text layers 0..2 absorb the vision-tower taps at the
+      // vision rows at the end of the full decoder layer (attn + MLP),
+      // matching the reference (hidden = layer_outputs; layer_idx in
+      // range(len(deep)): hidden[mask] += embeds).
+      if (l < 3 && Nv > 0) {
+        UView3 de(const_cast<Scalar*>(deep_embeds[l].data()), 1, Nv, D);
+        Kokkos::View<int*, ExecSpace, Kokkos::MemoryUnmanaged> rr(
+            vis_rows.data(), Nv);
+        Kokkos::parallel_for(
+            "Qwen21EncJ::deepstack",
+            Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0},
+                                                             {Nv, D}),
+            KOKKOS_LAMBDA(size_t k, size_t c) {
+              const size_t s = (size_t)rr(k);
+              h(s, c) = static_cast<Scalar>(static_cast<float>(h(s, c)) +
+                                            static_cast<float>(de(0, k, c)));
+            });
+      }
+    }
+    // Final RMSNorm NEUTRALIZED (pipeline hook parity); drop_idx rows are
+    // left for the caller to drop.
+    Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace,
+                 Kokkos::MemoryUnmanaged>
+        dst(hidden.data(), S, D);
+    Kokkos::deep_copy(dst, h);
     Kokkos::fence();
   }
 

@@ -3,16 +3,41 @@
 #ifndef KOKKOSDNN_QWENIMAGE21VAE_HPP
 #define KOKKOSDNN_QWENIMAGE21VAE_HPP
 
-// AutoencoderKLQwenImage21 for Qwen-Image-2.1 (text-to-image decode path).
+// AutoencoderKLQwenImage21 for Qwen-Image-2.1 (encode + decode paths).
 // Ground truth (HF research): in/out 4 ch, z_dim 64, 16x compression,
 // base_dim 96 / decoder base 144, ch_mult [1, 2, 4, 8, 8]; per-channel
 // latents_mean / latents_std ([64] each) affine, read from vae/config.json
-// AT RUNTIME (never hardcoded); single-shard 675 MB bf16; decode -> RGBA
-// (4ch conv_out, scaled (x*0.5+0.5) by the pipeline, PNG alpha = ch 3).
+// AT RUNTIME (never hardcoded); single-shard 675 MB bf16; encode RGBA ->
+// normalized latents ((mode-mean)/std by the edit pipeline), decode ->
+// RGBA (4ch conv_out, scaled (x*0.5+0.5) by the pipeline, PNG alpha = ch 3).
+//
+// Encode math (diffusers autoencoder_kl_qwenimage21.py, T2I single-frame
+// path with feat_cache=None, i.e. every CausalConv3d is a plain 2D conv and
+// every 3D downsampler is ZeroPad-right/bottom-1 + stride-2 conv 3x3):
+//   x [B,4,H,W] (pipeline-preprocessed RGBA in [-1,1]) -> conv_in 3x3
+//   (4 -> 96) -> 5 ResidualDownBlocks, widths (96->96, 96->192, 192->384,
+//   384->768, 768->768), stride-2 downsamplers after the first four plus
+//   the AvgDown3D shortcut add (factor_t = 2 iff the stage is temporally
+//   downsampled, else 1; factor_s = 2 iff downsampled, else 1), no
+//   GroupNorm anywhere -> mid: ResNet(768) + single-head SDPA
+//   attention(768) + ResNet(768) -> RMSNorm(768) -> SiLU -> conv_out 3x3
+//   (768 -> 128) -> quant_conv 1x1 (128 -> 128) -> posterior mode (first
+//   64 channels; DiagonalGaussianDistribution chunk dim=1, mode = mean) ->
+//   latents [B,64,H/16,W/16] normalized as (mode-mean)/std by the caller.
+// Block details: ResNet = RMSNorm(in, eps-free, gamma-only) -> SiLU ->
+// conv3x3+bias -> RMSNorm(out) -> SiLU -> conv3x3+bias -> +shortcut (1x1
+// conv+bias iff in != out, else identity). Attention = RMSNorm(C, gamma
+// [C,1,1]) -> to_qkv 1x1 (C -> 3C, +bias) -> single-head SDPA with scale
+// 1/sqrt(C), FP32 softmax -> proj 1x1 (+bias) -> +residual. Downsample =
+// ZeroPad2d((0,1,0,1)) + stride-2 conv3x3+bias (the downsampler time_conv
+// 1x1s exist in the checkpoint but are provably untouched on this path:
+// only used with feat_cache != None, i.e. chunked video inference; they
+// are presence/shape-checked, never executed). The ResidualDownBlock
+// shortcut = AvgDown3D mean over (cin*factor/cout) expanded channels
+// (factor = ft*fs*fs; single-frame T2I pads ft-1 zero frames at the front
+// when temporally downsampled). Dropout is 0 at inference.
 //
 // Decode math (diffusers autoencoder_kl_qwenimage21.py, T2I single-frame
-// path with feat_cache=None, i.e. every CausalConv3d is a plain 2D conv and
-// every 3D upsampler is nearest-2x + conv 3x3):
 //   z [B,64,H,W] (pipeline-denormalized: z = raw*std + mean) ->
 //   post_quant_conv 1x1 -> conv_in 3x3 (64 -> 1152) ->
 //   mid: ResNet(1152) + single-head SDPA attention(1152) + ResNet(1152) ->
@@ -35,10 +60,14 @@
 // Dropout is 0 at inference.
 //
 // Dispatch contract (no hand-written cublas/cudnn calls anywhere here):
-//   * 1x1 convs (post-quant, conv shortcuts, attention qkv/proj) go through
-//     gemm_bias, which owns the cuBLAS ladder.
-//   * 3x3 convs go through conv3x3_forward (cuDNN ladder on CUDA, MIOpen
-//     on HIP, im2col + gemm_bias / skinny kernels elsewhere).
+//   * 1x1 convs (post-quant, quant, conv shortcuts, attention qkv/proj) go
+//     through gemm_bias, which owns the cuBLAS ladder.
+//   * stride-1 3x3 convs go through conv3x3_forward (cuDNN ladder on CUDA,
+//     MIOpen on HIP, im2col + gemm_bias / skinny kernels elsewhere).
+//   * stride-2 3x3 downsample convs go through the native
+//     qwen21vae_downsample_conv3x3_stride2 kernel below (no strided conv in
+//     the core conv API; the pad-right/bottom-1 + stride-2 pattern is VAE
+//     specific and small enough to own natively).
 //   * RMSNorm, SiLU, nearest upsample, DupUp add, denormalize, and the
 //   mid-block single-head SDPA (scores/softmax/AV) are native
 //   backend-portable parallel_for kernels (no TPL expresses them).
@@ -168,6 +197,35 @@ struct Config {
       throw std::invalid_argument(
           "QwenImage21Vae::Config::temporal_up: bad index");
     return temporal_downsample[(size_t)(n - 2 - i)];
+  }
+
+  // Encoder geometry derived from ch_mult (mirrors QwenImage21Encoder3d:
+  // dims = [base] + base*ch_mult, one down block per mult; the last block
+  // never downsamples and never temporally downsamples).
+  int num_down_blocks() const { return (int)ch_mult.size(); }
+  int resnets_per_down_block() const { return num_res_blocks; }
+  int enc_width_at(int i) const {
+    const int n = num_down_blocks();
+    if (n <= 0 || i < 0 || i > n)
+      throw std::invalid_argument(
+          "QwenImage21Vae::Config::enc_width_at: bad index");
+    if (i == 0) return base_dim;
+    return base_dim * ch_mult[(size_t)i - 1];
+  }
+  void enc_block_io(int i, int& in, int& out) const {
+    in = enc_width_at(i);
+    out = enc_width_at(i + 1);
+  }
+  bool enc_downsamples(int i) const { return i != num_down_blocks() - 1; }
+  // Encoder stage i temporally downsamples iff temporal_downsample[i] (the
+  // decoder consumes these reversed as temperal_upsample).
+  int enc_temporal_down(int i) const {
+    const int n = num_down_blocks();
+    if (n < 1 || i < 0 || i >= n)
+      throw std::invalid_argument(
+          "QwenImage21Vae::Config::enc_temporal_down: bad index");
+    if (i == n - 1) return 0;
+    return temporal_downsample[(size_t)i];
   }
 };
 
@@ -304,9 +362,78 @@ inline std::vector<Qwen21VaeTensorSpec> qwen21vae_expected_decoder_tensors(
   return out;
 }
 
+// Expected encoder-tensor inventory (diffusers key layout, F32/BF16).
+// Used by allocate_expected_encoder/randomize and fail-fast-checked by
+// encode(). Covers encoder.conv_in, all ResidualDownBlocks (num_res_blocks
+// resnets each, 1x1 shortcut iff in != out, stride-2 downsampler +
+// time_conv keys for the temporally-downsampled stages), the mid block
+// (2 resnets + 1 single-head attention), norm_out, conv_out and quant_conv.
+inline std::vector<Qwen21VaeTensorSpec> qwen21vae_expected_encoder_tensors(
+    const Config& cfg) {
+  cfg.validate();
+  std::vector<Qwen21VaeTensorSpec> out;
+  const size_t Z = (size_t)cfg.z_dim;
+  auto push = [&](const std::string& n, std::initializer_list<size_t> s) {
+    out.push_back(Qwen21VaeTensorSpec{n, std::vector<size_t>(s)});
+  };
+  auto res_keys = [&](const std::string& p, size_t cin, size_t cout) {
+    push(p + "norm1.gamma", {cin, 1, 1, 1});
+    push(p + "conv1.weight", {cout, cin, 3, 3});
+    push(p + "conv1.bias", {cout});
+    push(p + "norm2.gamma", {cout, 1, 1, 1});
+    push(p + "conv2.weight", {cout, cout, 3, 3});
+    push(p + "conv2.bias", {cout});
+    if (cin != cout) {
+      push(p + "conv_shortcut.weight", {cout, cin, 1, 1});
+      push(p + "conv_shortcut.bias", {cout});
+    }
+  };
+  const size_t E0 = (size_t)cfg.enc_width_at(0);
+  push("encoder.conv_in.weight", {E0, (size_t)cfg.in_channels, 3, 3});
+  push("encoder.conv_in.bias", {E0});
+  const int NB = cfg.num_down_blocks();
+  const int NR = cfg.resnets_per_down_block();
+  for (int i = 0; i < NB; ++i) {
+    int ein = 0, eout = 0;
+    cfg.enc_block_io(i, ein, eout);
+    const size_t uin = (size_t)ein, uout = (size_t)eout;
+    for (int j = 0; j < NR; ++j) {
+      const size_t cin = (j == 0) ? uin : uout;
+      res_keys("encoder.down_blocks." + std::to_string(i) + ".resnets." +
+                   std::to_string(j) + ".",
+               cin, uout);
+    }
+    if (cfg.enc_downsamples(i)) {
+      const std::string u =
+          "encoder.down_blocks." + std::to_string(i) + ".downsampler.";
+      push(u + "resample.1.weight", {uout, uout, 3, 3});
+      push(u + "resample.1.bias", {uout});
+      if (cfg.enc_temporal_down(i) != 0) {
+        push(u + "time_conv.weight", {uout, uout, 1, 1});
+        push(u + "time_conv.bias", {uout});
+      }
+    }
+  }
+  const size_t EL = (size_t)cfg.enc_width_at(NB);
+  res_keys("encoder.mid_block.resnets.0.", EL, EL);
+  push("encoder.mid_block.attentions.0.norm.gamma", {EL, 1, 1});
+  push("encoder.mid_block.attentions.0.to_qkv.weight", {3 * EL, EL, 1, 1});
+  push("encoder.mid_block.attentions.0.to_qkv.bias", {3 * EL});
+  push("encoder.mid_block.attentions.0.proj.weight", {EL, EL, 1, 1});
+  push("encoder.mid_block.attentions.0.proj.bias", {EL});
+  res_keys("encoder.mid_block.resnets.1.", EL, EL);
+  push("encoder.norm_out.gamma", {EL, 1, 1, 1});
+  push("encoder.conv_out.weight", {2 * Z, EL, 3, 3});
+  push("encoder.conv_out.bias", {2 * Z});
+  push("quant_conv.weight", {2 * Z, 2 * Z, 1, 1});
+  push("quant_conv.bias", {2 * Z});
+  return out;
+}
+
 // VAE weights: agnostic device blobs keyed by checkpoint tensor name
-// (conv / resnet / attn / norm tensors; exact AutoencoderKLQwenImage21 key
-// layout is a golden TODO). Single-shard 675 MB bf16 (F32 also accepted).
+// (encoder/decoder conv / resnet / attn / norm tensors; exact
+// AutoencoderKLQwenImage21 key layout verified against the 675 MB
+// single-shard checkpoint). Single-shard 675 MB bf16 (F32 also accepted).
 template <class ExecSpace, class Scalar>
 struct QwenImage21VaeWeights {
   using V1 = Kokkos::View<Scalar*, ExecSpace>;
@@ -338,9 +465,25 @@ struct QwenImage21VaeWeights {
 
   size_t num_tensors() const { return blobs.size(); }
 
+  // Shared spec allocator for allocate_expected / allocate_expected_encoder.
+  void allocate_specs(const std::vector<Qwen21VaeTensorSpec>& specs,
+                      const std::string& what) {
+    for (const Qwen21VaeTensorSpec& s : specs) {
+      size_t n = 1;
+      for (size_t d : s.shape) n *= d;
+      if (n == 0)
+        throw std::runtime_error(what + ": bad shape '" + s.name + "'");
+      blobs[s.name] = V1(s.name, n);
+      shapes[s.name] =
+          std::vector<int64_t>(s.shape.begin(), s.shape.end());
+      dtypes[s.name] =
+          std::is_same_v<Scalar, float> ? "F32" : "BF16";
+    }
+  }
+
   // Load every tensor found in the shard(s) into device blobs (F32/BF16
-  // file -> Scalar). Unknown-to-any-skeleton names are accepted here
-  // (the conv key layout is still TODO); dtype/shape/slice errors throw.
+  // file -> Scalar). Names outside both skeletons are accepted here;
+  // dtype/shape/slice errors throw.
   void load_safetensors(const std::vector<std::string>& shard_paths) {
     if (shard_paths.empty())
       throw std::invalid_argument(
@@ -398,20 +541,20 @@ struct QwenImage21VaeWeights {
     blobs.clear();
     shapes.clear();
     dtypes.clear();
-    for (const Qwen21VaeTensorSpec& s :
-         qwen21vae_expected_decoder_tensors(cfg)) {
-      size_t n = 1;
-      for (size_t d : s.shape) n *= d;
-      if (n == 0)
-        throw std::runtime_error(
-            "QwenImage21VaeWeights::allocate_expected: bad shape '" + s.name +
-            "'");
-      blobs[s.name] = V1(s.name, n);
-      shapes[s.name] =
-          std::vector<int64_t>(s.shape.begin(), s.shape.end());
-      dtypes[s.name] =
-          std::is_same_v<Scalar, float> ? "F32" : "BF16";
-    }
+    allocate_specs(qwen21vae_expected_decoder_tensors(cfg),
+                   "QwenImage21VaeWeights::allocate_expected");
+  }
+
+  // Allocate exactly the encoder tensors encode() consumes (see
+  // qwen21vae_expected_encoder_tensors), zero-initialized, WITHOUT
+  // clearing any decoder tensors already present (so one Weights can
+  // serve both paths). Call randomize() (or load_safetensors) before
+  // encoding.
+  void allocate_expected_encoder(const Config& c) {
+    c.validate();
+    if (blobs.empty()) cfg = c;
+    allocate_specs(qwen21vae_expected_encoder_tensors(c),
+                   "QwenImage21VaeWeights::allocate_expected_encoder");
   }
 
   // Fill every blob with small random values (smoke tests only, no
@@ -687,6 +830,104 @@ inline void qwen21vae_dupup_add(const V2& y, const V2& x, size_t H, size_t W,
       });
 }
 
+// Stride-2 3x3 downsample conv (encoder QwenImage21Resample downsample2d,
+// and downsample3d with feat_cache=None where the time_conv never runs):
+// ZeroPad2d((0,1,0,1)) then stride-2 conv3x3+bias. Padded H+1/W+1 read as
+// zero past the right/bottom edges; H and W must be even (H2 = H/2).
+template <class ExecSpace, class V2, class V4, class V1>
+inline void qwen21vae_downsample_conv3x3_stride2(
+    const V2& x, size_t H, size_t W, const V4& w, const V1& b, const V2& y,
+    const std::string& label) {
+  const size_t T = x.extent(0), Cin = x.extent(1);
+  const size_t Cout = y.extent(1);
+  if (H == 0 || W == 0 || (H % 2) != 0 || (W % 2) != 0)
+    throw std::invalid_argument(
+        "qwen21vae_downsample_conv3x3_stride2: H,W must be even and nonzero");
+  const size_t H2 = H / 2, W2 = W / 2;
+  if (T != H * W || y.extent(0) != H2 * W2 || w.extent(0) != Cout ||
+      w.extent(1) != Cin || w.extent(2) != 3 || w.extent(3) != 3 ||
+      b.extent(0) != Cout)
+    throw std::invalid_argument(
+        "qwen21vae_downsample_conv3x3_stride2: dimension mismatch");
+  if (T == 0 || Cout == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::RangePolicy<ExecSpace>(0, H2 * W2 * Cout),
+      KOKKOS_LAMBDA(size_t e) {
+        const size_t co = e / (H2 * W2), rem = e % (H2 * W2);
+        const size_t h2 = rem / W2, w2 = rem % W2;
+        float acc = static_cast<float>(b(co));
+        for (size_t ci = 0; ci < Cin; ++ci)
+          for (size_t kh = 0; kh < 3; ++kh)
+            for (size_t kw = 0; kw < 3; ++kw) {
+              const size_t ih = 2 * h2 + kh, iw = 2 * w2 + kw;
+              const float xv = (ih < H && iw < W)
+                                   ? static_cast<float>(x(ih * W + iw, ci))
+                                   : 0.0f;
+              acc += xv * static_cast<float>(w(co, ci, kh, kw));
+            }
+        y(h2 * W2 + w2, co) =
+            static_cast<typename V2::value_type>(acc);
+      });
+}
+
+// Fused AvgDown3D shortcut add for the single-frame encode path:
+// y [H2*W2,cout] += AvgDown(x [H*W,cin]) with factor_s = fs (1 or 2),
+// factor_t = ft (1 or 2). Single frame (T=1): temporal pad (ft-1 zero
+// frames at the FRONT, matching F.pad (pad_t,0) on dim T) means source
+// frame fti-pad_t is data only when it equals 0. Channel map mirrors
+// QwenImage21AvgDown3D: ci2 = co*group+g, c = ci2/factor, f = ci2%factor
+// with f = ((fti*fs)+fsh)*fs+fsw, averaged over the group.
+template <class ExecSpace, class V2>
+inline void qwen21vae_avgdown_add(const V2& y, const V2& x, size_t H, size_t W,
+                                  size_t cin, size_t cout, int factor_t,
+                                  int factor_s, const std::string& label) {
+  const size_t T = x.extent(0);
+  if (T != H * W || x.extent(1) != cin || factor_t < 1 || factor_t > 2 ||
+      (factor_s != 1 && factor_s != 2))
+    throw std::invalid_argument("qwen21vae_avgdown_add: dimension mismatch");
+  const size_t fs = (size_t)factor_s, ft = (size_t)factor_t;
+  const size_t H2 = H / fs, W2 = W / fs;
+  if (H % fs != 0 || W % fs != 0 || y.extent(0) != H2 * W2 ||
+      y.extent(1) != cout)
+    throw std::invalid_argument("qwen21vae_avgdown_add: dimension mismatch");
+  const size_t factor = ft * fs * fs;
+  if (cin * factor % cout != 0)
+    throw std::invalid_argument(
+        "qwen21vae_avgdown_add: cin*factor must divide cout");
+  const size_t repeats = cin * factor / cout;
+  if (repeats == 0) return;
+  // Padded-frame offset: the single-frame encode always has temporal T=1,
+  // so F.pad (pad_t,0) on dim T prepends pad_t = (ft-1%ft)%ft = ft-1 zero
+  // frames. (NOT a function of the H*W token count: an even token count
+  // would give pad_t=0 and swap zero/data across even/odd channels.)
+  const size_t pad_t = ft - 1;
+  Kokkos::parallel_for(
+      label, Kokkos::RangePolicy<ExecSpace>(0, H2 * W2 * cout),
+      KOKKOS_LAMBDA(size_t e) {
+        const size_t co = e / (H2 * W2), rem = e % (H2 * W2);
+        const size_t h2 = rem / W2, w2 = rem % W2;
+        double acc = 0.0;
+        for (size_t g = 0; g < repeats; ++g) {
+          const size_t ci2 = co * repeats + g;
+          const size_t c = ci2 / factor, f = ci2 % factor;
+          const size_t fti = f / (fs * fs);
+          const size_t fr = f % (fs * fs);
+          const size_t fsh = fr / fs, fsw = fr % fs;
+          const size_t src_frame = fti >= pad_t ? fti - pad_t : fs * fs;
+          const float xv =
+              (src_frame == 0 && c < cin)
+                  ? static_cast<float>(x((h2 * fs + fsh) * W + (w2 * fs + fsw),
+                                         c))
+                  : 0.0f;
+          acc += (double)xv;
+        }
+        const float mean = (float)(acc / (double)repeats);
+        const size_t r = h2 * W2 + w2;
+        y(r, co) = static_cast<typename V2::value_type>(
+            static_cast<float>(y(r, co)) + mean);
+      });
+}
+
 // qkv [T,3C] -> q/k/v [T,C] split.
 template <class ExecSpace, class V2>
 inline void qwen21vae_split_qkv(const V2& qkv, const V2& q, const V2& k,
@@ -810,6 +1051,48 @@ inline void qwen21vae_denormalize_inplace(const V4& x, const V1& mean,
       });
 }
 
+// Posterior mode + pipeline normalize, fused: the quant_conv output holds
+// 2*z_dim channels (DiagonalGaussianDistribution chunk dim=1: first half
+// mean, second half logvar); the edit pipeline conditions on the mode
+// (argmax) normalized as (mode-mean)/std per channel with the runtime
+// affine. y [T,Z] from x [T,2Z]. For bf16 storage reproduce the
+// reference's two-op lanes: constants cast to the latent dtype, then
+// sub (round to bf16), then div (round to bf16); fp32 is single-rounding.
+template <class ExecSpace, class V2, class V1>
+inline void qwen21vae_quant_mode_normalize(const V2& x, const V1& mean,
+                                           const V1& std, const V2& y,
+                                           const std::string& label) {
+  const size_t T = x.extent(0), Z = y.extent(1);
+  if (x.extent(1) != 2 * Z || y.extent(0) != T)
+    throw std::invalid_argument(
+        "qwen21vae_quant_mode_normalize: dimension mismatch");
+  if (mean.extent(0) != Z || std.extent(0) != Z)
+    throw std::invalid_argument(
+        "qwen21vae_quant_mode_normalize: affine dimension mismatch");
+  if (T == 0 || Z == 0) return;
+  using VScalar = typename V2::value_type;
+  constexpr bool kTwoOpBf16 =
+      std::is_same_v<VScalar, Kokkos::Experimental::bhalf_t>;
+  Kokkos::parallel_for(
+      label, Kokkos::RangePolicy<ExecSpace>(0, T * Z),
+      KOKKOS_LAMBDA(size_t e) {
+        const size_t t = e / Z, c = e % Z;
+        const float v = static_cast<float>(x(t, c));
+        // Keep all declarations outside the constexpr selection: NVCC's
+        // extended device lambda cannot first-capture a variable inside an
+        // if-constexpr context.
+        const VScalar m = static_cast<VScalar>(static_cast<float>(mean(c)));
+        const VScalar s = static_cast<VScalar>(static_cast<float>(std(c)));
+        const VScalar d = static_cast<VScalar>(v - static_cast<float>(m));
+        const VScalar single =
+            static_cast<VScalar>((v - static_cast<float>(mean(c))) /
+                                 static_cast<float>(std(c)));
+        y(t, c) = kTwoOpBf16 ? static_cast<VScalar>(static_cast<float>(d) /
+                                                    static_cast<float>(s))
+                             : single;
+      });
+}
+
 }  // namespace Impl
 
 // VAE model: owns Weights. decode() runs the full convolutional decoder:
@@ -817,6 +1100,10 @@ inline void qwen21vae_denormalize_inplace(const V4& x, const V1& mean,
 // S*w] with S = compression (16). The caller denormalizes raw DiT latents
 // first (z = raw * std + mean per channel, e.g. via denormalize_latents);
 // decode() requires the runtime latents affine (has_affine()).
+// encode() runs the full convolutional encoder: pipeline-preprocessed
+// RGBA [B, in_channels, H, W] in [-1,1] -> NORMALIZED latents
+// [B, z_dim, H/S, W/S] ((posterior-mode - mean)/std, the tensor the edit
+// pipeline conditions on); encode() requires the same runtime affine.
 template <class ExecSpace, class Scalar>
 class QwenImage21VaeModel {
  public:
@@ -949,6 +1236,111 @@ class QwenImage21VaeModel {
     }
   }
 
+  // VAE encode: pipeline-preprocessed RGBA image [B, in_channels, H, W] in
+  // [-1,1] -> NORMALIZED latents [B, z_dim, H/S, W/S] with S = compression
+  // (16), i.e. the (posterior-mode - mean)/std tensor the edit pipeline
+  // conditions on. H and W must be multiples of compression (the pipeline
+  // snaps them to /32). Requires the runtime latents affine (has_affine()).
+  V4 encode(const DNNHandle<ExecSpace>& handle, const V4& img) const {
+    cfg_.validate();
+    if (!cfg_.has_affine())
+      throw std::runtime_error(
+          "QwenImage21VaeModel::encode: latents affine not loaded "
+          "(qwen21_load_vae_config_json first)");
+    const size_t B = img.extent(0);
+    const size_t H = img.extent(2), W = img.extent(3);
+    if (img.extent(1) != (size_t)cfg_.in_channels)
+      throw std::invalid_argument(
+          "QwenImage21VaeModel::encode: img must have " +
+          std::to_string(cfg_.in_channels) + " channels");
+    if (H == 0 || W == 0)
+      throw std::invalid_argument(
+          "QwenImage21VaeModel::encode: H,W must be > 0");
+    const size_t S = (size_t)cfg_.compression;
+    if (H % S != 0 || W % S != 0)
+      throw std::invalid_argument(
+          "QwenImage21VaeModel::encode: H,W must tile compression");
+    if (B == 0) {
+      return V4("qwen21vae_enc_empty", 0, (size_t)cfg_.z_dim, 0, 0);
+    }
+    require_encoder_tensors();
+
+    // Scratch sizes: worst-case stage over the whole walk. All encode math
+    // runs in token layout [T=H*W, C]; f0/f1 ping-pong stage in/out, f2
+    // holds resnet temps (tA [T,cin], tB [T,cout], shortcut [T,cout]) plus
+    // the saved down-block input for the AvgDown add. Buffers are
+    // zero-initialized (NOT WithoutInitializing): the native Serial GEMM
+    // fallback folds beta into `beta * Y_old` without a beta==0 guard, so
+    // a dirty output buffer poisons the result (0 * garbage); one memset
+    // per encode is negligible next to the encode itself.
+    const size_t Z = (size_t)cfg_.z_dim;
+    const size_t E0 = (size_t)cfg_.enc_width_at(0);
+    const size_t IC = (size_t)cfg_.in_channels;
+    const int NB = cfg_.num_down_blocks();
+    size_t nmax = H * W * IC;
+    size_t s2max = 0, savemax = 0;
+    {
+      size_t t = H * W;
+      nmax = std::max(nmax, t * E0);
+      s2max = std::max(s2max, t * IC + 2 * t * E0);
+      for (int i = 0; i < NB; ++i) {
+        int ein = 0, eout = 0;
+        cfg_.enc_block_io(i, ein, eout);
+        const size_t uin = (size_t)ein, uout = (size_t)eout;
+        nmax = std::max(nmax, t * uin);
+        const int NR = cfg_.resnets_per_down_block();
+        for (int j = 0; j < NR; ++j) {
+          const size_t cin = (j == 0) ? uin : uout;
+          s2max = std::max(s2max, t * cin + 2 * t * uout);
+        }
+        savemax = std::max(savemax, t * uin);  // saved block input
+        nmax = std::max(nmax, t * uout);  // pre-downsample full-res stage
+        if (cfg_.enc_downsamples(i)) t /= 4;
+        nmax = std::max(nmax, t * uout);
+      }
+      nmax = std::max(nmax, t * 2 * Z);
+    }
+    V1 f0("qwen21vae_enc_f0", nmax);
+    V1 f1("qwen21vae_enc_f1", nmax);
+    V1 f2("qwen21vae_enc_f2", s2max + savemax);
+    // Mid-attention buffers (exact mid geometry).
+    size_t tmid = H * W;
+    for (int i = 0; i < NB; ++i)
+      if (cfg_.enc_downsamples(i)) tmid /= 4;
+    const size_t EL = (size_t)cfg_.enc_width_at(NB);
+    V2 qkv("qwen21vae_enc_qkv", tmid, 3 * EL);
+    V2 qq("qwen21vae_enc_q", tmid, EL);
+    V2 kk("qwen21vae_enc_k", tmid, EL);
+    V2 vv("qwen21vae_enc_v", tmid, EL);
+    V2 av("qwen21vae_enc_av", tmid, EL);
+    V2 scores("qwen21vae_enc_scores", tmid, tmid);
+
+    V1 mean("qwen21vae_enc_mean", Z);
+    V1 std("qwen21vae_enc_std", Z);
+    {
+      auto hm = Kokkos::create_mirror_view(mean);
+      auto hs = Kokkos::create_mirror_view(std);
+      for (size_t c = 0; c < Z; ++c) {
+        hm(c) = static_cast<Scalar>(cfg_.latents_mean[c]);
+        hs(c) = static_cast<Scalar>(cfg_.latents_std[c]);
+      }
+      Kokkos::deep_copy(mean, hm);
+      Kokkos::deep_copy(std, hs);
+    }
+
+    V4 lat(Kokkos::ViewAllocateWithoutInitializing("qwen21vae_enc_lat"), B,
+           Z, H / S, W / S);
+    for (size_t b = 0; b < B; ++b) {
+      auto img_b =
+          Kokkos::subview(img, b, Kokkos::ALL, Kokkos::ALL, Kokkos::ALL);
+      auto lat_b =
+          Kokkos::subview(lat, b, Kokkos::ALL, Kokkos::ALL, Kokkos::ALL);
+      encode_sample(handle, img_b, lat_b, f0, f1, f2, s2max, qkv, qq, kk, vv,
+                    av, scores, mean, std);
+    }
+    return lat;
+  }
+
  private:
   Config cfg_;
   Weights weights_;
@@ -994,6 +1386,52 @@ class QwenImage21VaeModel {
           weights_.blobs.find(u + "time_conv.bias") == weights_.blobs.end())
         throw std::runtime_error(
             "QwenImage21VaeModel::decode: missing tensor '" + u +
+            "time_conv'");
+    }
+  }
+
+  void require_encoder_tensors() const {
+    for (const Qwen21VaeTensorSpec& s :
+         qwen21vae_expected_encoder_tensors(cfg_)) {
+      const auto bit = weights_.blobs.find(s.name);
+      const auto sit = weights_.shapes.find(s.name);
+      if (bit == weights_.blobs.end() || sit == weights_.shapes.end())
+        throw std::runtime_error(
+            "QwenImage21VaeModel::encode: missing tensor '" + s.name + "'");
+      size_t numel = 1;
+      for (size_t d : s.shape) numel *= d;
+      size_t have = 1;
+      for (int64_t d : sit->second) {
+        if (d < 0)
+          throw std::runtime_error(
+              "QwenImage21VaeModel::encode: bad shape '" + s.name + "'");
+        have *= (size_t)d;
+      }
+      if (have != numel || bit->second.extent(0) != numel)
+        throw std::runtime_error(
+            "QwenImage21VaeModel::encode: tensor '" + s.name +
+            "' has wrong numel");
+    }
+    // Downsampler time_conv keys are never executed on this path (only
+    // touched with feat_cache != None, i.e. chunked video inference) but
+    // must be present (they are part of the encoder checkpoint).
+    const int NB = cfg_.num_down_blocks();
+    for (int i = 0; i < NB; ++i) {
+      if (!cfg_.enc_downsamples(i) || cfg_.enc_temporal_down(i) == 0) continue;
+      int ein = 0, eout = 0;
+      cfg_.enc_block_io(i, ein, eout);
+      const int64_t uo = (int64_t)eout;
+      const std::string u = "encoder.down_blocks." + std::to_string(i) +
+                            ".downsampler.";
+      Impl::qwen21vae_require_shape(weights_.shapes, u + "time_conv.weight",
+                                    {uo, uo, 1, 1});
+      Impl::qwen21vae_require_shape(weights_.shapes, u + "time_conv.bias",
+                                    {uo});
+      if (weights_.blobs.find(u + "time_conv.weight") ==
+              weights_.blobs.end() ||
+          weights_.blobs.find(u + "time_conv.bias") == weights_.blobs.end())
+        throw std::runtime_error(
+            "QwenImage21VaeModel::encode: missing tensor '" + u +
             "time_conv'");
     }
   }
@@ -1048,13 +1486,13 @@ class QwenImage21VaeModel {
   }
 
   // Mid-block single-head self-attention: x [T,C] -> y [T,C].
-  void attn_stage(const DNNHandle<ExecSpace>& handle, const UV2& x,
-                  const UV2& y, size_t H, size_t W, const V2& qkv, const V2& qq,
-                  const V2& kk, const V2& vv, const V2& av, const V2& scores,
-                  const std::string& tag) const {
+  void attn_stage(const DNNHandle<ExecSpace>& handle, const std::string& ap,
+                  const UV2& x, const UV2& y, size_t H, size_t W, const V2& qkv,
+                  const V2& qq, const V2& kk, const V2& vv, const V2& av,
+                  const V2& scores, const std::string& tag) const {
     const auto& blobs = weights_.blobs;
     const auto& shapes = weights_.shapes;
-    const std::string p("decoder.mid_block.attentions.0.");
+    const std::string p(ap);
     const size_t T = x.extent(0), C = x.extent(1);
     if (H * W != T || y.extent(0) != T || y.extent(1) != C)
       throw std::invalid_argument(
@@ -1138,8 +1576,9 @@ class QwenImage21VaeModel {
                  tmp_alias(T * D0, T, D0), tmp_alias(2 * T * D0, T, D0),
                  "qwen21vae_mid_a");
     cur = 1 - cur;
-    attn_stage(handle, stage(cur, T, D0), stage(1 - cur, T, D0), H, W, qkv,
-               qq, kk, vv, av, scores, "qwen21vae_mid_attn");
+    attn_stage(handle, "decoder.mid_block.attentions.0.", stage(cur, T, D0),
+               stage(1 - cur, T, D0), H, W, qkv, qq, kk, vv, av, scores,
+               "qwen21vae_mid_attn");
     cur = 1 - cur;
     resnet_stage(handle, mid_p + "1.", D0, D0, H, W, stage(cur, T, D0),
                  stage(1 - cur, T, D0), tmp_alias(0, T, D0),
@@ -1220,6 +1659,141 @@ class QwenImage21VaeModel {
                                             "qwen21vae_clamp");
     Impl::qwen21vae_tokens_to_nchw<ExecSpace>(stage(cur, T, OC), out_b,
                                               "qwen21vae_out");
+  }
+
+  template <class V3>
+  void encode_sample(const DNNHandle<ExecSpace>& handle, const V3& img_b,
+                     const V3& lat_b, const V1& f0, const V1& f1, const V1& f2,
+                     size_t s2max, const V2& qkv, const V2& qq, const V2& kk,
+                     const V2& vv, const V2& av, const V2& scores,
+                     const V1& mean, const V1& std) const {
+    const auto& blobs = weights_.blobs;
+    const auto& shapes = weights_.shapes;
+    const size_t Z = (size_t)cfg_.z_dim;
+    const size_t E0 = (size_t)cfg_.enc_width_at(0);
+    const size_t IC = (size_t)cfg_.in_channels;
+    const int NB = cfg_.num_down_blocks();
+    const int NR = cfg_.resnets_per_down_block();
+    size_t H = img_b.extent(1), W = img_b.extent(2);
+    size_t T = H * W;
+    const V1* F[2] = {&f0, &f1};
+    int cur = 0;
+    auto stage = [&](int which, size_t t, size_t c) {
+      return UV2(F[which]->data(), t, c);
+    };
+    // conv_in 3x3.
+    Impl::qwen21vae_nchw_to_tokens<ExecSpace>(img_b, stage(cur, T, IC),
+                                              "qwen21vae_enc_img");
+    KokkosDNN::conv3x3_forward<ExecSpace, Scalar>(
+        handle, stage(cur, T, IC),
+        Impl::qwen21vae_bind_conv<ExecSpace, Scalar>(
+            blobs, shapes, "encoder.conv_in.weight", E0, IC, 3),
+        Impl::qwen21vae_bind_vec<ExecSpace, Scalar>(blobs, shapes,
+                                                    "encoder.conv_in.bias",
+                                                    E0),
+        stage(1 - cur, T, E0), H, W, "qwen21vae_enc_conv_in");
+    cur = 1 - cur;
+    auto tmp_alias = [&](size_t off, size_t t, size_t c) {
+      return UV2(f2.data() + off, t, c);
+    };
+    // Down blocks: resnets, then the stride-2 downsample + AvgDown3D
+    // shortcut add when downsampling, else the plain AvgDown3D(ft=1,fs=1)
+    // residual add (the block-level shortcut exists even without a
+    // downsampler, mirroring QwenImage21ResidualDownBlock.forward).
+    for (int i = 0; i < NB; ++i) {
+      int ein = 0, eout = 0;
+      cfg_.enc_block_io(i, ein, eout);
+      const size_t uin = (size_t)ein, uout = (size_t)eout;
+      const bool down = cfg_.enc_downsamples(i);
+      UV2 saved = tmp_alias(s2max, T, uin);
+      Kokkos::deep_copy(saved, stage(cur, T, uin));
+      for (int j = 0; j < NR; ++j) {
+        const size_t cin = (j == 0) ? uin : uout;
+        const std::string p = "encoder.down_blocks." + std::to_string(i) +
+                              ".resnets." + std::to_string(j) + ".";
+        const std::string tag =
+            "qwen21vae_enc_d" + std::to_string(i) + "r" + std::to_string(j);
+        resnet_stage(handle, p, cin, uout, H, W, stage(cur, T, cin),
+                     stage(1 - cur, T, uout), tmp_alias(0, T, cin),
+                     tmp_alias(T * cin, T, uout),
+                     tmp_alias(T * cin + T * uout, T, uout), tag);
+        cur = 1 - cur;
+      }
+      if (down) {
+        const std::string u =
+            "encoder.down_blocks." + std::to_string(i) + ".downsampler.";
+        Impl::qwen21vae_downsample_conv3x3_stride2<ExecSpace>(
+            stage(cur, T, uout), H, W,
+            Impl::qwen21vae_bind_conv<ExecSpace, Scalar>(
+                blobs, shapes, u + "resample.1.weight", uout, uout, 3),
+            Impl::qwen21vae_bind_vec<ExecSpace, Scalar>(
+                blobs, shapes, u + "resample.1.bias", uout),
+            stage(1 - cur, T / 4, uout), "qwen21vae_enc_down" + std::to_string(i));
+        cur = 1 - cur;
+        H /= 2;
+        W /= 2;
+        T /= 4;
+        const int ft = (cfg_.enc_temporal_down(i) != 0) ? 2 : 1;
+        Impl::qwen21vae_avgdown_add<ExecSpace>(stage(cur, T, uout), saved, H * 2,
+                                              W * 2, uin, uout, ft, 2,
+                                              "qwen21vae_enc_avgdown" +
+                                                  std::to_string(i));
+      } else {
+        Impl::qwen21vae_avgdown_add<ExecSpace>(stage(cur, T, uout), saved, H, W,
+                                              uin, uout, 1, 1,
+                                              "qwen21vae_enc_avgdown" +
+                                                  std::to_string(i));
+      }
+    }
+    // Mid block.
+    const size_t EL = (size_t)cfg_.enc_width_at(NB);
+    const std::string mid_p("encoder.mid_block.resnets.");
+    resnet_stage(handle, mid_p + "0.", EL, EL, H, W, stage(cur, T, EL),
+                 stage(1 - cur, T, EL), tmp_alias(0, T, EL),
+                 tmp_alias(T * EL, T, EL), tmp_alias(2 * T * EL, T, EL),
+                 "qwen21vae_enc_mid_a");
+    cur = 1 - cur;
+    attn_stage(handle, "encoder.mid_block.attentions.0.", stage(cur, T, EL),
+               stage(1 - cur, T, EL), H, W, qkv, qq, kk, vv, av, scores,
+               "qwen21vae_enc_mid_attn");
+    cur = 1 - cur;
+    resnet_stage(handle, mid_p + "1.", EL, EL, H, W, stage(cur, T, EL),
+                 stage(1 - cur, T, EL), tmp_alias(0, T, EL),
+                 tmp_alias(T * EL, T, EL), tmp_alias(2 * T * EL, T, EL),
+                 "qwen21vae_enc_mid_b");
+    cur = 1 - cur;
+    // Head: RMSNorm -> SiLU -> conv_out 3x3 -> quant 1x1 -> mode+normalize.
+    Impl::qwen21vae_rmsnorm_inplace<ExecSpace>(
+        stage(cur, T, EL),
+        Impl::qwen21vae_bind_vec<ExecSpace, Scalar>(blobs, shapes,
+                                                    "encoder.norm_out.gamma",
+                                                    EL),
+        "qwen21vae_enc_norm_out");
+    Impl::qwen21vae_silu_inplace<ExecSpace>(stage(cur, T, EL),
+                                            "qwen21vae_enc_head_silu");
+    KokkosDNN::conv3x3_forward<ExecSpace, Scalar>(
+        handle, stage(cur, T, EL),
+        Impl::qwen21vae_bind_conv<ExecSpace, Scalar>(
+            blobs, shapes, "encoder.conv_out.weight", 2 * Z, EL, 3),
+        Impl::qwen21vae_bind_vec<ExecSpace, Scalar>(
+            blobs, shapes, "encoder.conv_out.bias", 2 * Z),
+        stage(1 - cur, T, 2 * Z), H, W, "qwen21vae_enc_conv_out");
+    cur = 1 - cur;
+    KokkosDNN::gemm_bias<ExecSpace, Scalar>(
+        handle, stage(cur, T, 2 * Z),
+        Impl::qwen21vae_bind_mat<ExecSpace, Scalar>(blobs, shapes,
+                                                    "quant_conv.weight", 2 * Z,
+                                                    2 * Z),
+        Impl::qwen21vae_bind_vec<ExecSpace, Scalar>(blobs, shapes,
+                                                    "quant_conv.bias", 2 * Z),
+        stage(1 - cur, T, 2 * Z), "qwen21vae_enc_quant");
+    cur = 1 - cur;
+    Impl::qwen21vae_quant_mode_normalize<ExecSpace>(
+        stage(cur, T, 2 * Z), mean, std, stage(1 - cur, T, Z),
+        "qwen21vae_enc_norm");
+    cur = 1 - cur;
+    Impl::qwen21vae_tokens_to_nchw<ExecSpace>(stage(cur, T, Z), lat_b,
+                                              "qwen21vae_enc_out");
   }
 };
 

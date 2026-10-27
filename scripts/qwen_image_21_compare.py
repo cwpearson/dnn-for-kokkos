@@ -7,6 +7,8 @@ compare every tensor both sides have:
 
     prompt_embeds.f32        [L, Cc]      exact DiT conditioning
     initial_latents.f32      [C, H, W]    initial noise (driver layout)
+    ref_latents.f32          [C, Hc, Wc]  edit-mode VAE condition latents
+    img_mask.f32             [V] 0/1      edit-mode image mask row
     step{ii}_noise_pred.f32  [C, H, W]    image tokens only (cfg=1 cond branch)
     step{ii}_latents.f32     [C, H, W]    post-Euler-step latents
     final latents            optional --final-golden/--final-actual
@@ -64,6 +66,28 @@ QWEN21_LATENT_CHANNELS = 64
 # Exact step tensor names: step00_noise_pred.f32, step01_latents.f32, ...
 STEP_RE = re.compile(r"^step(\d+)_(noise_pred|latents)\.f32$")
 CORE_FILES = ("prompt_embeds.f32", "initial_latents.f32")
+# Edit-mode reference tensors: present on both sides only for edit dumps
+# (the T2I golden/driver never write them); compared when shared, skipped
+# with a note otherwise, never fatal.
+EDIT_REF_FILES = ("ref_latents.f32", "img_mask.f32")
+PROMPT_EMBEDS = "prompt_embeds.f32"
+
+
+def parse_row_spec(spec: str, nrows: int) -> list[int]:
+    """Parse a --rows spec (e.g. "8:1034" or "0:8,1034:1059", end-exclusive)."""
+    indices: list[int] = []
+    for part in spec.split(","):
+        part = part.strip()
+        m = re.match(r"^(\d+):(\d+)$", part) if part else None
+        if m is None:
+            die(f"--rows: bad range {part!r}, want START:END[,START:END...]")
+        start, end = int(m.group(1)), int(m.group(2))
+        if not 0 <= start < end <= nrows:
+            die(f"--rows range {part!r} out of range for {nrows} rows")
+        indices.extend(range(start, end))
+    if not indices:
+        die("--rows selected no rows")
+    return indices
 
 
 def die(msg: str) -> NoReturn:
@@ -288,6 +312,16 @@ def collect_pairs(
         elif ae:
             skipped.append((name, "missing from the golden dir"))
 
+    for name in EDIT_REF_FILES:
+        gpath = os.path.join(golden_dir, name)
+        apath = os.path.join(actual_dir, name)
+        ge, ae = os.path.isfile(gpath), os.path.isfile(apath)
+        if ge and ae:
+            pairs.append((name, gpath, apath))
+        elif ge or ae:
+            skipped.append(
+                (name, "only on one side (edit dumps only; skipped)"))
+
     gnoise, glat = list_steps(golden_dir)
     anoise, alat = list_steps(actual_dir)
     for kind, gmap, amap in (
@@ -339,6 +373,8 @@ def compare_pair(
     glayout: str = "flat",
     alayout: str = "flat",
     row_cos_min: float | None = None,
+    row_cos_mean_min: float | None = None,
+    rows: str | None = None,
 ) -> dict:
     golden_flat, golden_shape = read_array(gpath)
     actual_flat, actual_shape = read_array(apath)
@@ -373,6 +409,20 @@ def compare_pair(
         gshape = ashape = None
     shown_shape = gshape or ashape
 
+    if rows is not None and name == PROMPT_EMBEDS:
+        if shown_shape is None or len(shown_shape) != 2:
+            die(f"{name}: --rows needs a 2-D prompt shape, got {shown_shape}")
+        nrows = shown_shape[0]
+        keep = parse_row_spec(rows, nrows)
+        gg = golden_flat.reshape(shown_shape)[keep, :]
+        aa = actual_flat.reshape(shown_shape)[keep, :]
+        shown_shape = (len(keep), shown_shape[1])
+        gshape = ashape = shown_shape
+        golden_flat = gg.reshape(-1).copy()
+        actual_flat = aa.reshape(-1).copy()
+        count = golden_flat.size
+        notes.append(f"rows {rows} selected ({len(keep)}/{nrows})")
+
     m = metrics(golden_flat, actual_flat)
 
     reasons: list[str] = []
@@ -387,18 +437,36 @@ def compare_pair(
         reasons.append(f"max|diff| {m['max_abs']:.3e} > atol {atol:.1e}")
 
     row_cos = None
-    if row_cos_min is not None and gshape is not None and len(gshape) == 2:
+    row_cos_mean = None
+    if (
+        (row_cos_min is not None or row_cos_mean_min is not None)
+        and gshape is not None
+        and len(gshape) == 2
+    ):
         # Row-wise cosine is the meaningful gate for prompt embeddings: bf16
         # device noise moves token rows almost rigidly, so a global rel-L2
-        # built from large row sums overstates the disagreement.
+        # built from large row sums overstates the disagreement. Both the
+        # minimum and the mean over rows are reported; the minimum gates
+        # localized corruption while the mean gates implementation-level
+        # drift (scattered low rows from input noise fail min but pass mean).
         gg = golden_flat.reshape(gshape)
         aa = actual_flat.reshape(gshape)
         num = np.sum(gg * aa, axis=1)
         den = np.linalg.norm(gg, axis=1) * np.linalg.norm(aa, axis=1)
         cos = np.divide(num, den, out=np.zeros_like(num), where=den > 0)
-        row_cos = float(np.min(cos)) if cos.size else None
-        if row_cos is not None and row_cos < row_cos_min:
+        if cos.size:
+            row_cos = float(np.min(cos))
+            row_cos_mean = float(np.mean(cos))
+        if row_cos_min is not None and row_cos is not None and row_cos < row_cos_min:
             reasons.append(f"min row cosine {row_cos:.6f} < {row_cos_min:g}")
+        if (
+            row_cos_mean_min is not None
+            and row_cos_mean is not None
+            and row_cos_mean < row_cos_mean_min
+        ):
+            reasons.append(
+                f"mean row cosine {row_cos_mean:.6f} < {row_cos_mean_min:g}"
+            )
 
     return {
         "name": name,
@@ -406,6 +474,7 @@ def compare_pair(
         "count": count,
         "notes": notes,
         "row_cos": row_cos,
+        "row_cos_mean": row_cos_mean,
         **m,
         "ok": not reasons,
         "reasons": reasons,
@@ -433,6 +502,8 @@ def print_table(rows: list[dict]) -> None:
     for row in rows:
         if row.get("row_cos") is not None:
             print(f"  {row['name']}: min row cosine {row['row_cos']:.6f}")
+        if row.get("row_cos_mean") is not None:
+            print(f"  {row['name']}: mean row cosine {row['row_cos_mean']:.6f}")
 
 
 def compare_images(gpath: str, apath: str, psnr_min: float) -> dict:
@@ -563,6 +634,23 @@ def main(argv: list[str] | None = None) -> int:
         help="optional minimum per-row cosine for 2-D tensors (e.g. 0.999 "
         "for prompt_embeds); the row length comes from the manifest shape",
     )
+    ap.add_argument(
+        "--row-cos-mean-min",
+        type=float,
+        default=None,
+        metavar="C",
+        help="optional minimum mean per-row cosine for 2-D tensors; gates "
+        "implementation drift instead of scattered input-noise rows "
+        "(e.g. 0.985 for vision rows)",
+    )
+    ap.add_argument(
+        "--rows",
+        metavar="RANGES",
+        default=None,
+        help="optional prompt_embeds row subset (e.g. 8:1034 or "
+        "0:8,1034:1059, end-exclusive); gates whole-tensor metrics and "
+        "per-row cosine on the subset only; default: all rows",
+    )
     args = ap.parse_args(argv)
 
     if args.rtol <= 0.0:
@@ -625,6 +713,8 @@ def main(argv: list[str] | None = None) -> int:
                     glayout=args.final_golden_layout if is_final else "flat",
                     alayout=args.final_actual_layout if is_final else "flat",
                     row_cos_min=args.row_cos_min,
+                    row_cos_mean_min=args.row_cos_mean_min,
+                    rows=args.rows,
                 )
             )
 

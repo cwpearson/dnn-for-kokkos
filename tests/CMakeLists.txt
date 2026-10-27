@@ -57,3 +57,13 @@ if(KokkosDNN_ENABLE_IMAGE)
   target_link_libraries(test_image PRIVATE KokkosDNN::image)
 endif()
 
+# Qwen-Image-2.1 vision tower unit test (random weights, no checkpoint).
+if(KokkosDNN_ENABLE_MODEL_QWEN_IMAGE_21)
+  kokkosdnn_add_test(test_qwen_image_21_vision Test_QwenImage21Vision.cpp)
+  target_include_directories(test_qwen_image_21_vision PRIVATE
+    ${CMAKE_SOURCE_DIR}/models/qwen_image_21)
+  kokkosdnn_add_test(test_qwen_image_21_vae Test_QwenImage21Vae.cpp)
+  target_include_directories(test_qwen_image_21_vae PRIVATE
+    ${CMAKE_SOURCE_DIR}/models/qwen_image_21)
+endif()
+
