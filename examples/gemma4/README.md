@@ -8,11 +8,27 @@ Scope: **text only** (`text_config`); vision/audio towers and MoE blocks are out
 
 ```bash
 # From repo root (/workspace). Needs CMake >= 3.22, C++20, installed Kokkos.
-cmake -S . -B build -DKokkos_ROOT=/path/to/kokkos-install -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel 8
 
+# 1. Build and install Kokkos once (Serial shown; for GPU add
+#    -DKokkos_ENABLE_CUDA=ON -DKokkos_ARCH_AMPERE80=ON and set
+#    CMAKE_CXX_COMPILER to kokkos-src/bin/nvcc_wrapper)
+git clone --branch 5.2.1 --recursive https://github.com/kokkos/kokkos.git kokkos-src
+cmake -S kokkos-src -B kokkos-build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX=/path/to/kokkos-install \
+  -DKokkos_ENABLE_SERIAL=ON \
+  -DKokkos_ENABLE_TESTS=OFF
+cmake --build kokkos-build --parallel 8
+cmake --install kokkos-build
+
+# 2. Configure and build the example target
+cmake -S . -B build -DKokkos_ROOT=/path/to/kokkos-install -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel 8 --target gemma4_generate
+
+# 3. Download the checkpoint with the `hf` CLI.
 # Gated repo: request access at https://huggingface.co/google/gemma-4-E2B-it,
 # then authenticate (needs read access to the repo).
+pip install -U "huggingface_hub[cli]"
 export HF_TOKEN=<your-token>   # or: hf auth login
 
 hf download google/gemma-4-E2B-it model.safetensors tokenizer.json \

@@ -13,6 +13,19 @@ works and is what CI/smoke uses.
 Run from repo root (`/workspace`):
 
 ```bash
+# 1. Build and install Kokkos once (Serial shown; for GPU add
+#    -DKokkos_ENABLE_CUDA=ON -DKokkos_ARCH_AMPERE80=ON and set
+#    CMAKE_CXX_COMPILER to kokkos-src/bin/nvcc_wrapper)
+git clone --branch 5.2.1 --recursive https://github.com/kokkos/kokkos.git kokkos-src
+cmake -S kokkos-src -B kokkos-build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX=/path/to/kokkos-install \
+  -DKokkos_ENABLE_SERIAL=ON \
+  -DKokkos_ENABLE_TESTS=OFF
+cmake --build kokkos-build --parallel 8
+cmake --install kokkos-build
+
+# 2. Configure and build the example target
 cmake -S . -B build \
   -DKokkos_ROOT=/path/to/kokkos-install \
   -DCMAKE_BUILD_TYPE=Release \
@@ -84,7 +97,7 @@ shards load with no conversion.
 | **total on disk** | | **~27.2 GB** |
 
 ```bash
-# huggingface_hub CLI (`pip install huggingface_hub`); dry-run strings only —
+# huggingface_hub CLI (`pip install -U "huggingface_hub[cli]"`); dry-run strings only —
 # do NOT run these on small disks, and never commit weights to the repo.
 hf download OpenMOSS-Team/MOSS-Image-SFT --include "transformer/*" \
   --local-dir moss-sft
@@ -104,8 +117,9 @@ latents) ever need to move between machines — never the 27 GB weights.
 ### (b) Build
 
 ```bash
+# See the Quickstart for the one-time Kokkos build; then:
 cmake -S . -B build \
-  -DKokkos_ROOT=/tmp/kokkos-install \
+  -DKokkos_ROOT=/path/to/kokkos-install \
   -DCMAKE_BUILD_TYPE=Release \
   -DKokkosDNN_ENABLE_IMAGE=ON
 cmake --build build --target moss_image_generate --parallel 8

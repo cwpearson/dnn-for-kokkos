@@ -7,20 +7,35 @@ C++20 Kokkos port of the NVlabs/Sana `SanaMS_600M_P1_D28` text-to-image stack (6
 Run from repo root (`/workspace`). Gemma is gated: accept the Terms of Use at <https://huggingface.co/google/gemma-2-2b-it> once, then export a granted token as `HF_TOKEN`.
 
 ```bash
+# 1. Build and install Kokkos once (Serial shown; for GPU add
+#    -DKokkos_ENABLE_CUDA=ON -DKokkos_ARCH_AMPERE80=ON and set
+#    CMAKE_CXX_COMPILER to kokkos-src/bin/nvcc_wrapper)
+git clone --branch 5.2.1 --recursive https://github.com/kokkos/kokkos.git kokkos-src
+cmake -S kokkos-src -B kokkos-build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX=/path/to/kokkos-install \
+  -DKokkos_ENABLE_SERIAL=ON \
+  -DKokkos_ENABLE_TESTS=OFF
+cmake --build kokkos-build --parallel 8
+cmake --install kokkos-build
+
+# 2. Configure and build the example target
 cmake -S . -B build \
   -DKokkos_ROOT=/path/to/kokkos-install \
   -DCMAKE_BUILD_TYPE=Release \
   -DKokkosDNN_ENABLE_IMAGE=ON
-cmake --build build --parallel 8
-pip install -U huggingface_hub
+cmake --build build --parallel 8 --target sana_generate
 
-# 1. DiT backbone (.pth)
+# 3. Download the checkpoint files with the `hf` CLI
+pip install -U "huggingface_hub[cli]"
+
+# DiT backbone (.pth)
 hf download Efficient-Large-Model/Sana_600M_1024px \
   --local-dir ./Sana_600M_1024px
-# 2. text encoder (gated)
+# text encoder (gated)
 hf download google/gemma-2-2b-it \
   --local-dir ./gemma-2-2b-it --token "$HF_TOKEN"
-# 3. VAE decoder (diffusers layout)
+# VAE decoder (diffusers layout)
 hf download mit-han-lab/dc-ae-f32c32-sana-1.0-diffusers \
   --local-dir ./dc-ae-f32c32-sana-1.0-diffusers
 
