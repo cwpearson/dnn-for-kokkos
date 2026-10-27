@@ -26,10 +26,10 @@
 // VAE decoding: with --vae-safetensors pointing at the diffusers-layout
 // DC-AE checkpoint (mit-han-lab/dc-ae-f32c32-sana-1.0-diffusers,
 // diffusion_pytorch_model.safetensors), latents [32,32,32] decode to true
-// 1024x1024 RGB via KokkosDNN::Sana::VAE. Without it the driver writes a
+// 1024x1024 RGB via KokkosDNN::Sana::VAE (on by default; pass
+// --no-vae-decode for the preview). Without it the driver writes a
 // decoded image *preview* (channel-mean -> grayscale, nearest-neighbor 32x
-// to 1024x1024; PNG, or JPEG when --out ends in .jpg/.jpeg) plus the raw
-// fp32 latents (<stem>.f32, [C,H,W] row-major).
+// to 1024x1024; PNG, or JPEG when --out ends in .jpg/.jpeg).
 //
 // --tiny runs a random-weights smoke model on 4x4 latents (no downloads).
 #include <Kokkos_Core.hpp>
@@ -79,12 +79,13 @@ std::vector<float> mat_to_host(
   return out;
 }
 
-void save_raw_f32(const std::string& path, const std::vector<float>& v) {
-  std::ofstream f(path, std::ios::binary);
-  if (!f) throw std::runtime_error("cannot open '" + path + "' for writing");
-  f.write(reinterpret_cast<const char*>(v.data()),
-          (long long)(v.size() * sizeof(float)));
-  if (!f) throw std::runtime_error("short write to '" + path + "'");
+[[maybe_unused]] std::string with_extension(const std::string& path,
+    const std::string& ext) {
+  const size_t dot = path.find_last_of('.');
+  const size_t sep = path.find_last_of("/\\");
+  if (dot == std::string::npos || (sep != std::string::npos && dot < sep))
+    return path + ext;
+  return path.substr(0, dot) + ext;
 }
 
 // Grayscale preview: channel-mean -> min/max normalize -> u8 -> nearest 32x.
@@ -142,14 +143,6 @@ void save_ppm(const std::string& path, const std::vector<unsigned char>& gray,
 }
 #endif
 
-std::string with_extension(const std::string& path, const std::string& ext) {
-  const size_t dot = path.find_last_of('.');
-  const size_t sep = path.find_last_of("/\\");
-  if (dot == std::string::npos || (sep != std::string::npos && dot < sep))
-    return path + ext;
-  return path.substr(0, dot) + ext;
-}
-
 #ifdef KOKKOSDNN_ENABLE_IMAGE
 // Output format follows the --out extension: ".jpg"/".jpeg" (case
 // insensitive) selects lossy JPEG, anything else selects lossless PNG.
@@ -201,8 +194,10 @@ void usage() {
        "  --chi-prompt   complex-human-instruction prefix (Sana chi_prompt)\n"
        "  --vae-safetensors <f>  DC-AE decoder weights (diffusers layout:\n"
        "                 mit-han-lab/dc-ae-f32c32-sana-1.0-diffusers/\n"
-       "                 diffusion_pytorch_model.safetensors); without it a\n"
-       "                 grayscale preview is written instead\n");
+       "                 diffusion_pytorch_model.safetensors)\n"
+       "  --vae-decode   (default ON) run the real VAE decode when\n"
+       "                 --vae-safetensors is given (else a grayscale preview).\n"
+       "                 Pass --no-vae-decode for the preview\n");
 }
 
 }  // namespace
@@ -217,6 +212,7 @@ int main(int argc, char** argv) {
   float guidance = 5.0f, flow_shift = 4.0f;
   uint64_t seed = 42;
   bool tiny = false;
+  bool vae_decode = true;
   // --fp32 is accepted for forward compatibility; float is the only (and
   // checkpoint-native) dtype, so the flag is currently a no-op.
   [[maybe_unused]] bool fp32 = false;
@@ -260,6 +256,10 @@ int main(int argc, char** argv) {
       seed = (uint64_t)std::stoull(argv[++i]);
     } else if (a == "--vae-safetensors" && i + 1 < argc) {
       vae_path = argv[++i];
+    } else if (a == "--vae-decode") {
+      vae_decode = true;
+    } else if (a == "--no-vae-decode") {
+      vae_decode = false;
     } else if (a == "--tiny") {
       tiny = true;
     } else if (a == "--fp32") {
@@ -397,11 +397,14 @@ int main(int argc, char** argv) {
     std::printf("[latents %zux%zux%zu] mean=%.6f std=%.6f min=%.4f max=%.4f\n",
                 C, (size_t)H, (size_t)W, mean, std::sqrt(var), mn, mx);
 
-    const std::string lat_path = with_extension(out, ".f32");
-    save_raw_f32(lat_path, lat);
-    std::printf("[wrote %s] raw fp32 latents\n", lat_path.c_str());
-
-    if (!vae_path.empty()) {
+    if (!vae_decode && !vae_path.empty())
+      std::printf("[vae] preview requested (--no-vae-decode); skipping the "
+                  "real VAE decode of %s\n",
+                  vae_path.c_str());
+    else if (vae_decode && vae_path.empty())
+      std::printf("[vae] VAE decode needs --vae-safetensors (else grayscale "
+                  "preview); writing a preview for this run\n");
+    if (!vae_path.empty() && vae_decode) {
       // True DC-AE decode: latents [32,H,W] -> RGB 32x (1024x1024 full).
       if (tiny)
         throw std::runtime_error(

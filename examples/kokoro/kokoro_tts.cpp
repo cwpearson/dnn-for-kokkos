@@ -11,7 +11,7 @@
 // kokoro KPipeline with model=False, or espeak-ng -v en --ipa). --text is
 // a demo-quality fallback that maps characters present in the vocab
 // directly (no G2P; unmapped characters are skipped). WAV is peak-
-// normalized PCM16; raw float32 is always written to <stem>.f32.
+// normalized PCM16.
 //
 // --tiny runs a random-weights smoke model (no downloads).
 
@@ -136,22 +136,6 @@ void save_wav16(const std::string& path, const std::vector<float>& x,
   if (!f) throw std::runtime_error("short write to '" + path + "'");
 }
 
-void save_raw_f32(const std::string& path, const std::vector<float>& v) {
-  std::ofstream f(path, std::ios::binary);
-  if (!f) throw std::runtime_error("cannot open '" + path + "'");
-  f.write(reinterpret_cast<const char*>(v.data()),
-          (long long)(v.size() * sizeof(float)));
-  if (!f) throw std::runtime_error("short write to '" + path + "'");
-}
-
-std::string with_extension(const std::string& path, const std::string& ext) {
-  const size_t dot = path.find_last_of('.');
-  const size_t sep = path.find_last_of("/\\");
-  if (dot == std::string::npos || (sep != std::string::npos && dot < sep))
-    return path + ext;
-  return path.substr(0, dot) + ext;
-}
-
 void usage() {
   std::printf(
       "usage: kokoro_tts [--weights kokoro-v1_0.pth] [--voice af_heart.pt]\n"
@@ -168,7 +152,7 @@ void usage() {
       "  --speed    duration divisor (default 1.0)\n"
       "  --seed     SineGen RNG seed (default 42; audio differs from torch\n"
       "             by RNG stream, deterministic given seed)\n"
-      "  --out      WAV path (PCM16 peak-normalized; raw F32 to <stem>.f32)\n"
+      "  --out      WAV path (PCM16 peak-normalized)\n"
       "  --tiny     random-weights smoke model (no files)\n");
 }
 
@@ -304,9 +288,6 @@ int main(int argc, char** argv) {
     save_wav16(out, audio, 24000, peak);
     std::printf("[wrote %s] peak=%.4f (peak-normalized PCM16)\n", out.c_str(),
                 (double)peak);
-    const std::string f32 = with_extension(out, ".f32");
-    save_raw_f32(f32, audio);
-    std::printf("[wrote %s] raw float32\n", f32.c_str());
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());
     rc = 1;

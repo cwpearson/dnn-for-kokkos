@@ -69,8 +69,7 @@
 // --vae-weights is validated whenever given; VAE decode runs by default
 // (latents denormalized by the runtime vae/config.json affine, then
 // QwenImage21VaeModel::decode to RGBA; pass --no-vae-decode for the
-// channel-mean grayscale preview). Raw fp32
-// latents (<stem>.f32, [C,H,W] row-major) are always written.
+// channel-mean grayscale preview).
 //
 // Staged execution (24GB fit, default): encode -> releases the encoder
 // weights (the MiB-scale embeds stay resident on the device) ->
@@ -91,9 +90,8 @@
 // (no downloads).
 //
 // --dump-steps DIR writes golden-parity tensors as raw little-endian float32
-// (driver layout: latents [C,H,W] row-major C-major lat[(c*H+h)*W+w],
-// prompt embeds [L,Cc] row-major) plus manifest.json: prompt_embeds.f32
-// (and prompt_embeds_neg.f32 when --cfg != 1), initial_latents.f32, then
+// (driver layout: latents [C,H,W] row-major C-major lat[(c*H+h)*W+w])
+// plus manifest.json: initial_latents.f32, then
 // stepNN_noise_pred.f32 / stepNN_latents.f32 per step (with
 // stepNN_noise_pred_cond.f32 / _uncond.f32 when the CFG branch runs), each
 // logged with its f64 sum. Off by default: the sample loop only takes the
@@ -359,11 +357,9 @@ void usage() {
       "  --decode-latents-layout 'chw' (default: lat[(c*H+h)*W+w]) or\n"
       "                 'token' (torch packed [H*W,C], golden final latents)\n"
       "  --decode-out-f32 also write the post-clamp RGBA decode as raw f32\n"
-      "  --out          PNG with KokkosDNN_ENABLE_IMAGE=ON, else PPM;\n"
-      "                 raw F32 latents always written to <stem>.f32\n"
+      "  --out          PNG with KokkosDNN_ENABLE_IMAGE=ON, else PPM\n"
       "  --dump-steps   write golden-parity tensors (raw float32 LE + f64\n"
-      "                 sums + manifest.json) into DIR: prompt_embeds\n"
-      "                 (+ _neg when --cfg != 1), initial_latents, then\n"
+      "                 sums + manifest.json) into DIR: initial_latents, then\n"
       "                 stepNN_noise_pred / stepNN_latents per Euler step;\n"
       "                 off by default (no extra device->host copies)\n");
 }
@@ -782,10 +778,6 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
     std::printf("[latents %zux%zux%zu] mean=%.6f std=%.6f min=%.4f max=%.4f\n",
                 C, (size_t)H, (size_t)W, mean, std::sqrt(var), mn, mx);
 
-    const std::string lat_path = with_extension(cur_out, ".f32");
-    save_raw_f32(lat_path, lat);
-    std::printf("[wrote %s] raw fp32 latents\n", lat_path.c_str());
-
     // Captions are no longer needed: drop host + device copies before decode.
     enc.release();
     // ---- Phase 3: decode (the DiT device copy is released first) ----
@@ -1151,7 +1143,7 @@ int main(int argc, char** argv) {
       // --init-latents-in: raw float32 LE initial latents in the driver's
       // native layout ([C,H,W] row-major, flattened C-major as
       // lat[(c*H+h)*W+w], the same order the sampler packs into
-      // x_d(0,c,h,w) and the <stem>.f32 files it writes). Values are
+      // x_d(0,c,h,w)). Values are
       // PRE-denormalization latent noise (no mean/std applied); validated
       // against C*H*W, deep-copied to device by the sample loop, and used
       // in place of the mt19937 sample.
@@ -1201,26 +1193,6 @@ int main(int argc, char** argv) {
       dump_sigmas = (sigmas_mode == "turbo")
                         ? turbo_sigmas
                         : build_sigmas_nearest_grid(steps_eff, flow_shift);
-      // Conditioning exactly as staged for the DiT ([L,Cc] row-major).
-      {
-        auto hc = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(),
-                                                      enc.device);
-        const size_t L = enc.device.extent(0), Cc = enc.device.extent(1);
-        std::vector<float> pe(L * Cc);
-        size_t k = 0;
-        for (size_t l = 0; l < L; ++l)
-          for (size_t c = 0; c < Cc; ++c) pe[k++] = (float)hc(l, c);
-        dump.write("prompt_embeds", pe);
-        if (guidance != 1.0f) {
-          auto hu = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(),
-                                                        enc.device_neg);
-          std::vector<float> ne(L * Cc);
-          k = 0;
-          for (size_t l = 0; l < L; ++l)
-            for (size_t c = 0; c < Cc; ++c) ne[k++] = (float)hu(l, c);
-          dump.write("prompt_embeds_neg", ne);
-        }
-      }
       // The sampler's starting latents, exactly as handed to it (no
       // additional scaling).
       dump.write("initial_latents", x_init);
@@ -1289,10 +1261,6 @@ int main(int argc, char** argv) {
     var /= (double)lat.size();
     std::printf("[latents %zux%zux%zu] mean=%.6f std=%.6f min=%.4f max=%.4f\n",
                 C, (size_t)H, (size_t)W, mean, std::sqrt(var), mn, mx);
-
-    std::string lat_path = with_extension(out, ".f32");
-    save_raw_f32(lat_path, lat);
-    std::printf("[wrote %s] raw fp32 latents\n", lat_path.c_str());
 
     if (dump.active()) {
       DumpManifest dm;

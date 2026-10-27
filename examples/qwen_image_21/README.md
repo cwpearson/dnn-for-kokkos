@@ -10,8 +10,8 @@ device-resident embeds -> release DiT -> fence -> VAE decode (or preview)
 so the text encoder, the DiT, and the VAE are never resident at once.
 No disk round-trip and no second process: the MiB-scale embeds are separate
 device allocations from the GiB-scale encoder weights and stay resident
-across the DiT load. Raw fp32 latents (`<stem>.f32`, `[C,H,W]` row-major)
-are always written; `--out` holds a VAE RGB image or a grayscale preview.
+across the DiT load. `--out` holds a VAE RGB image (decoded by default
+when `--vae-weights` is given) or a grayscale preview.
 
 `qwen_image_21_edit` is the one-shot reference-image editing companion
 (Turbo `image=...` pipeline, no REPL): it loads one RGBA condition image,
@@ -64,8 +64,7 @@ header):
   (`chw`, or torch `[H*W,C]` with `--ref-latents-layout token`),
   validated against the condition grid; else zeros. Either way the latents
   are staged as packed cond tokens (`[cond|target]` order) and dumped as
-  `ref_latents.f32` under `--dump-steps` (reported, saved to
-  `<stem>.ref.f32` when file- or encode-sourced).
+  `ref_latents.f32` under `--dump-steps`.
 - The DiT image-condition path is wired (`Dit::forward_cond` with
   per-block RoPE, segment attention, and modulation; staged as
   `[cond|target]` + `img_shapes`/`img_mask` via `DitForward::cond_tok`).
@@ -205,16 +204,15 @@ hf download Qwen/Qwen-Image-2.1-Turbo \
 ```
 
 Subset guide: VAE-only parity (`--decode-latents-in`) needs just `vae/`;
-encoder-only (`--encoder` gate in `scripts/qwen_image_21_verify.sh`) needs
-`text_encoder/` + `processor/`; the strict end-to-end gate needs
-`transformer/` plus the golden artifacts (see below).
+the strict end-to-end gate needs `transformer/` plus the golden artifacts
+(see below).
 
 Flag mapping: `--weights` = `<ckpt>/transformer` (shard dir or single
 `.safetensors`); `--text-encoder` = `<ckpt>/text_encoder` (single-shard
 `model.safetensors`); `--tokenizer` = `<ckpt>/processor` (dir holding
 `tokenizer.json`); `--vae-weights` =
 `<ckpt>/vae/diffusion_pytorch_model.safetensors` (validated whenever
-given, decoded only with `--vae-decode`). Only the MiB-scale `.f32`
+given, decoded by default; pass `--no-vae-decode` for the preview). Only the MiB-scale `.f32`
 handoff files (`[L,Cc]` embeds, `[C,H,W]` latents) ever need to move
 between machines — never the 32 GB weights.
 
@@ -269,7 +267,7 @@ grayscale preview with a logged reason instead of failing.
 | `--decode-latents-in` | — | raw fp32 LE latents to decode directly (skips encode/DiT/sampling; needs `--vae-weights`); H/W are the output pixels |
 | `--decode-latents-layout` | `chw` | `chw` = driver layout `lat[(c*H+h)*W+w]`; `token` = torch packed `[H*W,C]` (golden final latents) |
 | `--decode-out-f32` | — | also write the post-clamp RGBA decode as raw f32 `[H,W,4]` (VAE-only parity) |
-| `--out` | `qwen_image_21_out.png` | PNG with `KokkosDNN_ENABLE_IMAGE=ON`, else PPM; raw `.f32` latents always written |
+| `--out` | `qwen_image_21_out.png` | PNG with `KokkosDNN_ENABLE_IMAGE=ON`, else PPM |
 | `--staged` | on (`--no-staged` for single-phase) | fenced staged release between phases (see below) |
 | `--dump-steps` | — | `DIR`: write golden-parity tensors (raw float32 LE) + `manifest.json`, then exit normally |
 | `--image` | — (edit only) | condition image path (required; exactly one in v1; synthesized test card under `--tiny`) |
@@ -285,12 +283,10 @@ Conditioning precedence: in-process Qwen (`--tokenizer` + `--text-encoder`)
 
 Golden-parity work needs per-step tensors, so `--dump-steps DIR` writes them
 (raw little-endian float32, driver layout: latents `[C,H,W]` row-major
-C-major `lat[(c*H+h)*W+w]`, prompt embeds `[L,Cc]` row-major):
+C-major `lat[(c*H+h)*W+w]`):
 
 | File | Content |
 | ---- | ------- |
-| `prompt_embeds.f32` | cond conditioning exactly as staged for the DiT |
-| `prompt_embeds_neg.f32` | uncond view (only when `--cfg != 1`) |
 | `initial_latents.f32` | the sampler's `x_init`, no extra scaling |
 | `stepNN_noise_pred.f32` | model output `v` used for step NN (CFG-combined when CFG runs) |
 | `stepNN_noise_pred_cond.f32`, `_uncond.f32` | per-branch outputs (only under CFG) |
@@ -301,7 +297,7 @@ Each tensor is also logged as `[dump] <name> <numel> floats f64sum=<%.17g>`,
 followed by `[dump] wrote <n> tensors to DIR`. The extra device-to-host
 copies only happen when the flag is set, so the default sample path is
 unchanged. Works under `--tiny` (`--tiny --steps 2 --dump-steps /tmp/q21`
-dumps 512x16 zero embeds, 4x4 latents, and two steps).
+dumps 4x4 latents and two steps).
 
 ## VAE-only parity
 
@@ -389,7 +385,7 @@ checksums in `scripts/qwen_image_21_golden_checksums.txt` bit-for-bit.
 `qwen_image_21_compare.py` reports per-tensor max/mean/RMS/relative-L2/
 cosine/sums and image PSNR.
 
-The harness runs three gates:
+The harness runs two gates:
 
 1. **Strict end-to-end (identical inputs).** Feeds the torch prompt
    embeddings and torch seed-42 latents to the driver, samples 8 Turbo
@@ -398,23 +394,16 @@ The harness runs three gates:
 2. **VAE-only.** Decodes the golden final latents through
    `--decode-latents-in` (no encoder, no DiT, no sampler). Gate: PSNR
    >= 45 dB, the ceiling for a bf16-decoded golden PNG.
-3. **Encoder-only (`--encoder`).** Runs the in-process GPU Qwen forward and
-   one sigma=1.0 forward on the golden latents; gates `prompt_embeds` at
-   relative L2 <= 3e-2 and per-row cosine >= 0.999 (bf16 device noise, see
-   below).
 
 Measured on an RTX 3090 (2026-10-24; native Kokkos GEMM/attention, bf16):
 
 | Check | Result |
 | ----- | ------ |
-| prompt_embeds / initial_latents (strict) | exact, relative L2 0 |
+| initial_latents (strict) | exact, relative L2 0 |
 | per-step `noise_pred` | relative L2 0.78% - 1.34% |
 | final latents | relative L2 **1.04%**, cosine 0.99995 |
 | decoded image | **41.54 dB** PSNR vs the golden PNG |
 | VAE-only decode of golden latents | **48.24 dB** PSNR (>= 45 dB gate) |
-| in-process encoder `prompt_embeds` | relative L2 2.34%, min row cosine 0.99917 |
-| step-0 `noise_pred` with in-process embeds | relative L2 0.88% (same as strict) |
-| end-to-end with in-process GPU encode | relative L2 ~1.9% (encoder noise dominates) |
 
 The strict gate deliberately uses the golden prompt embeddings: the
 reference encodes on CPU and the example encodes on GPU, and bf16

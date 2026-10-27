@@ -565,7 +565,7 @@ void save_raw_f32(const std::string& path, const std::vector<float>& v) {
 
 // Raw fp32 LE initial latents [C,H,W] row-major, flattened C-major as
 // lat[(c*H+h)*W+w] (the driver's native layout: matches the sampler's
-// x_init pack/unpack order and the <stem>.f32 files it writes).
+// x_init pack/unpack order).
 inline std::vector<float> load_init_latents_raw(const std::string& path,
                                                 size_t C, size_t H,
                                                 size_t W) {
@@ -711,7 +711,7 @@ inline void write_dump_manifest(const DumpWriter& dw, const DumpManifest& m) {
   f << "  \"staged\": " << (m.staged ? "true" : "false") << ",\n";
   f << "  \"sigmas_mode\": \"" << json_escape(m.sigmas_mode) << "\",\n";
   f << "  \"layout\": \"float32 little-endian: latents [C,H,W] row-major "
-       "C-major lat[(c*H+h)*W+w]; prompt_embeds [L,Cc] row-major\",\n";
+       "C-major lat[(c*H+h)*W+w]\",\n";
   if (!m.img_shapes.empty()) {
     f << "  \"img_shapes\": \"" << json_escape(m.img_shapes) << "\",\n";
     f << "  \"img_mask_len\": " << m.img_mask_len << ",\n";
@@ -811,7 +811,8 @@ void save_ppm(const std::string& path, const std::vector<unsigned char>& gray,
 }
 #endif
 
-std::string with_extension(const std::string& path, const std::string& ext) {
+[[maybe_unused]] std::string with_extension(const std::string& path,
+    const std::string& ext) {
   const size_t dot = path.find_last_of('.');
   const size_t sep = path.find_last_of("/\\");
   if (dot == std::string::npos || (sep != std::string::npos && dot < sep))
