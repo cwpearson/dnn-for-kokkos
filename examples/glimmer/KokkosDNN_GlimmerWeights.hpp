@@ -1,0 +1,139 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
+#ifndef KOKKOSDNN_GLIMMER_WEIGHTS_HPP
+#define KOKKOSDNN_GLIMMER_WEIGHTS_HPP
+
+#include <Kokkos_Core.hpp>
+#include <Kokkos_Half.hpp>
+#include <cstdint>
+#include <map>
+#include <string>
+#include <vector>
+#include "KokkosDNN_GlimmerConfig.hpp"
+
+namespace KokkosDNN {
+namespace Glimmer {
+
+// Default compute/storage scalar for the Glimmer example: bfloat16, the
+// Muse-Glimmer-30B-heretic checkpoint dtype
+// (Kokkos::Experimental::bhalf_t).
+using DefaultScalar = Kokkos::Experimental::bhalf_t;
+
+// One transformer block's weights (all row-major, device views).
+//
+// Glimmer differences vs the Llama block: explicit head_dim 128 (q/k/v/o
+// shapes derive from it, not from dim / n_heads), a per-layer attention
+// output gate (self_attn.gate_proj), a scaleless per-head QK RMSNorm (no
+// stored weight: with_scale=False in the HF module), and four RMSNorms —
+// input / post-attention (post eps) / pre-FFN / post-FFN (post eps) — all of
+// the Centered (1 + w) form with zero-initialized raw weights. The v
+// projection carries no norm.
+template <class ExecSpace, class Scalar = DefaultScalar>
+struct BlockWeights {
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> wq, wk, wv, wo;
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> wgate_attn;
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> wgate, wup, wdown;
+  Kokkos::View<Scalar*, ExecSpace> input_norm, post_attn_norm, pre_ffn_norm,
+      post_ffn_norm;
+};
+
+// Full model weights. Device views in Scalar; the safetensors loader
+// converts on-disk BF16/FP16/F32 to Scalar automatically. The lm_head is
+// untied (tie_word_embeddings=false): the checkpoint carries a separate
+// lm_head tensor and the loader must NOT alias the embedding table.
+template <class ExecSpace, class Scalar = DefaultScalar>
+struct Weights {
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> embed, lm_head;
+  Kokkos::View<Scalar*, ExecSpace> final_norm;
+  std::vector<BlockWeights<ExecSpace, Scalar>> blocks;
+
+  void allocate(const Config& cfg);
+};
+
+// Allocate all views for a config (uninitialized contents).
+template <class ExecSpace, class Scalar>
+void Weights<ExecSpace, Scalar>::allocate(const Config& cfg) {
+  embed = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>(
+      "embed", cfg.vocab_size, cfg.dim);
+  lm_head = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>(
+      "lm_head", cfg.vocab_size, cfg.dim);
+  final_norm = Kokkos::View<Scalar*, ExecSpace>("final_norm", cfg.dim);
+  blocks.resize((size_t)cfg.n_layers);
+  const int hq  = cfg.n_heads * cfg.head_dim;
+  const int hkv = cfg.n_kv_heads * cfg.head_dim;
+  for (int l = 0; l < cfg.n_layers; ++l) {
+    auto& b   = blocks[(size_t)l];
+    b.wq      = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>(
+        "wq", hq, cfg.dim);
+    b.wk = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>("wk", hkv,
+                                                                 cfg.dim);
+    b.wv = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>("wv", hkv,
+                                                                 cfg.dim);
+    b.wo = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>("wo",
+                                                                  cfg.dim, hq);
+    b.wgate_attn = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>(
+        "wgate_attn", hq, cfg.dim);
+    b.wgate = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>(
+        "wgate", cfg.ffn_dim, cfg.dim);
+    b.wup = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>(
+        "wup", cfg.ffn_dim, cfg.dim);
+    b.wdown = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>(
+        "wdown", cfg.dim, cfg.ffn_dim);
+    b.input_norm      = Kokkos::View<Scalar*, ExecSpace>("input_norm", cfg.dim);
+    b.post_attn_norm  = Kokkos::View<Scalar*, ExecSpace>("post_attn_norm", cfg.dim);
+    b.pre_ffn_norm    = Kokkos::View<Scalar*, ExecSpace>("pre_ffn_norm", cfg.dim);
+    b.post_ffn_norm   = Kokkos::View<Scalar*, ExecSpace>("post_ffn_norm", cfg.dim);
+  }
+}
+
+// Fill with small random values (for shape/forward tests without weights).
+// Centered norms are filled with 1.0 (the stored (1 + w) value matching a
+// raw zero init); the scaleless norms (embed/QK) store no weight.
+template <class ExecSpace, class Scalar = DefaultScalar>
+void random_init(const Config& cfg, Weights<ExecSpace, Scalar>& w,
+                 uint64_t seed = 42);
+
+// Load HF safetensors checkpoint(s) into device views.
+//   files : one or more .safetensors shards (tensors are looked up across
+//           shards; later shards win on duplicate names).
+// On-disk dtypes BF16/FP16/F32 are all converted to Scalar. Shards are
+// mapped read-only (mmap; bounded chunked reads where mmap is unavailable)
+// and each tensor streams from the mapping through a small (~1 MiB) host
+// staging buffer — no full-tensor/host-F32 expansion. Loading is lazy
+// per-tensor in call order (each tensor converts/copies once, shards stay
+// mapped for the call). Throws on missing tensors or shape mismatch.
+//
+// Expected HF names (prefix `model.language_model.`, ASSUMPTION confirmed
+// against modeling_muse_glimmer.py module paths up to the checkpoint root;
+// the `model.language_model.` root itself follows the Gemma4 layout and the
+// scaffold DESIGN.md):
+//   model.language_model.embed_tokens.weight,
+//   model.language_model.norm.weight, lm_head.weight
+//   (also accepted: model.language_model.lm_head.weight),
+//   model.language_model.layers.{l}.{input_layernorm,
+//   self_attn.{q,k,v,o,gate}_proj, post_attention_layernorm,
+//   pre_feedforward_layernorm, post_feedforward_layernorm,
+//   mlp.{gate,up,down}_proj}.weight
+// The scaleless norms (embed_norm, self_attn.qk_norm) carry no weight tensor
+// (with_scale=False upstream) and are never looked up. With
+// tie_word_embeddings=false a missing lm_head tensor is an error (never
+// aliased). Use list_checkpoint_tensors() to inspect a partial download.
+template <class ExecSpace, class Scalar = DefaultScalar>
+void load_safetensors(const Config& cfg, const std::vector<std::string>& files,
+                      Weights<ExecSpace, Scalar>& w);
+
+// List all tensor names stored across checkpoint file(s) (header only, no
+// tensor data is read). Useful to inspect partial/sharded downloads.
+std::vector<std::string> list_checkpoint_tensors(
+    const std::vector<std::string>& files);
+
+// Raw FP32 host buffer (row-major) converted into a device matrix view.
+template <class ExecSpace, class Scalar>
+void copy_host_to_device(
+    const std::vector<float>& host, size_t rows, size_t cols,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& dst);
+
+}  // namespace Glimmer
+}  // namespace KokkosDNN
+
+#endif
