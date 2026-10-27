@@ -475,6 +475,28 @@ int test_tool_wire() {
     CHECK(acc == r.text);
     CHECK(racc == r.reasoning);
   }
+  // Implicit leading trace: the generation prompt already opened the
+  // thinker, so a turn-2 completion (after a tool result) carries only
+  // "</think>" and would otherwise leak the whole trace into `content`.
+  // The server constructs every parser with start_in_reasoning=true.
+  {
+    const std::string raw =
+        std::string("second thoughts") + KokkosDNN::LFM25::kThinkEndToken +
+        KokkosDNN::LFM25::kToolCallStartToken + "[g(y=2)]" +
+        KokkosDNN::LFM25::kToolCallEndToken;
+    ToolCallStreamParser fed({}, /*start_in_reasoning=*/true);
+    std::string acc, racc;
+    for (char ch : raw) {
+      acc += fed.push(std::string(1, ch));
+      racc += fed.poll_reasoning();
+    }
+    ToolParseResult tail = fed.finish();
+    acc += tail.text;
+    racc += tail.reasoning;
+    CHECK(racc == "second thoughts");
+    CHECK(acc.empty());
+    CHECK(tail.calls.size() == 1 && tail.calls[0].name == "g");
+  }
   // A mid-turn <think> is literal content (the template emits thinking
   // first), so answers that merely mention the tag are never swallowed.
   {

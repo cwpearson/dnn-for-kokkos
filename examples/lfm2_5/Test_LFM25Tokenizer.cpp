@@ -176,13 +176,15 @@ TEST(LFM25Tokenizer, ChatRenderGolden) {
                                 true),
             "<|im_start|>system\nBe brief.<|im_end|>\n"
             "<|im_start|>user\nHi<|im_end|>\n"
-            "<|im_start|>assistant\n");
+            "<|im_start|>assistant\n<think>");
 
   // Thinking block: emitted inside an assistant turn only when that turn
-  // carries non-empty thinking and preserve_thinking is true.
+  // carries non-empty thinking and preserve_thinking is true. History
+  // matches the HF chat template: no separator between </think> and the
+  // content.
   std::vector<ChatMessage> think = {{"assistant", "reply", "plan", {}, ""}};
   EXPECT_EQ(render_lfm25_chatml(think, false, true),
-            "<|im_start|>assistant\n<think>plan</think>\nreply<|im_end|>\n");
+            "<|im_start|>assistant\n<think>plan</think>reply<|im_end|>\n");
   // preserve_thinking=false drops the trace but keeps the content.
   EXPECT_EQ(render_lfm25_chatml(think, false, false),
             "<|im_start|>assistant\nreply<|im_end|>\n");
@@ -197,7 +199,7 @@ TEST(LFM25Tokenizer, ChatRenderGolden) {
             "<|im_start|>user\nHi<|im_end|>\n");
   // Empty default disables injection.
   EXPECT_EQ(render_lfm25_chatml({}, true),
-            "<|im_start|>assistant\n");
+            "<|im_start|>assistant\n<think>");
 }
 
 TEST(LFM25Tokenizer, ChatEncodeRoundtrip) {
@@ -269,7 +271,7 @@ TEST(LFM25Tokenizer, ToolRenderGolden) {
             "<|im_start|>system\nList of tools: " + tools +
                 "<|im_end|>\n"
                 "<|im_start|>user\nHi<|im_end|>\n"
-                "<|im_start|>assistant\n");
+                "<|im_start|>assistant\n<think>");
   const std::vector<ChatMessage> sys_user = {{"system", "Sys.", "", {}, ""},
                                                   {"user", "Hi", "", {}, ""}};
   EXPECT_EQ(render_lfm25_chatml_with_tools(sys_user, tools, "Do X.", true,
@@ -277,7 +279,7 @@ TEST(LFM25Tokenizer, ToolRenderGolden) {
       "<|im_start|>system\nSys.\nList of tools: " + tools +
           "\nDo X.<|im_end|>\n"
           "<|im_start|>user\nHi<|im_end|>\n"
-          "<|im_start|>assistant\n");
+          "<|im_start|>assistant\n<think>");
 
   // Assistant history tool_calls reconstruct natively; tool results
   // render as tool turns.
@@ -293,7 +295,7 @@ TEST(LFM25Tokenizer, ToolRenderGolden) {
   tool_msg.content = "{\"temp\": 72}";
   EXPECT_EQ(
       render_lfm25_chatml_with_tools({a, tool_msg}, "", "", false, true),
-      "<|im_start|>assistant\nChecking.\n"
+      "<|im_start|>assistant\nChecking."
       "<|tool_call_start|>[get_weather(location=\"SF\")]"
       "<|tool_call_end|><|im_end|>\n"
       "<|im_start|>tool\n{\"temp\": 72}<|im_end|>\n");
@@ -460,6 +462,49 @@ TEST(LFM25Tokenizer, ToolParse) {  using KokkosDNN::LFM25::kEosToken;
   EXPECT_EQ(parse_tool_calls("hello <<").text, "hello <");
   EXPECT_EQ(parse_tool_calls("hello <<<").text, "hello <<");
   EXPECT_EQ(parse_tool_calls("<think>abc<<").reasoning, "abc<");
+
+  // Prompt-provided open thinker (generation prompt ends with "<think>"):
+  // the leading segment is reasoning even with no explicit opener.
+  ToolParseResult th_impl = parse_tool_calls(
+      std::string("r1</think>") + kToolCallStartToken + "[f(x=1)]" +
+          kToolCallEndToken,
+      {}, true);
+  EXPECT_EQ(th_impl.reasoning, "r1");
+  EXPECT_EQ(th_impl.text, "");
+  ASSERT_EQ(th_impl.calls.size(), 1u);
+  EXPECT_EQ(th_impl.calls[0].name, "f");
+  // Redundant leading opener is stripped under the flag, and leading
+  // whitespace belongs to the trace (never to `content`).
+  ToolParseResult th_red = parse_tool_calls(
+      std::string(" <think>r1</think>") + kToolCallStartToken + "[f(x=1)]" +
+          kToolCallEndToken,
+      {}, true);
+  EXPECT_EQ(th_red.reasoning, " r1");
+  EXPECT_EQ(th_red.text, "");
+  // Without the flag, the same bytes stay display (plain-answer path).
+  ToolParseResult th_noflag = parse_tool_calls(
+      std::string("r1</think>") + kToolCallStartToken + "[f(x=1)]" +
+      kToolCallEndToken);
+  EXPECT_TRUE(th_noflag.reasoning.empty());
+  // A turn cut before any terminator is all trace (the streaming view
+  // cannot wait for a terminator that may never come), never content.
+  ToolParseResult th_cut = parse_tool_calls("r1 still thinking", {}, true);
+  EXPECT_EQ(th_cut.reasoning, "r1 still thinking");
+  EXPECT_EQ(th_cut.text, "");
+  // Only the leading opener is structural: a later literal <think> is
+  // trace text.
+  EXPECT_EQ(parse_tool_calls("r <think> r2", {}, true).reasoning,
+            "r <think> r2");
+  // Thinking after a tool call counts: the excised call block is not
+  // display content, so the second opener still leads.
+  ToolParseResult th_two = parse_tool_calls(
+      std::string("<think>r1</think>") + kToolCallStartToken + "[f(a=1)]" +
+      kToolCallEndToken + "<think>r2</think>" + kToolCallStartToken +
+          "[g(b=2)]" + kToolCallEndToken);
+  EXPECT_EQ(th_two.reasoning, "r1r2");
+  EXPECT_EQ(th_two.text, "");
+  ASSERT_EQ(th_two.calls.size(), 2u);
+  EXPECT_EQ(th_two.calls[1].name, "g");
 }
 
 TEST(LFM25Tokenizer, ToolArgsConvert) {
@@ -513,6 +558,84 @@ TEST(LFM25Tokenizer, ToolStreamParser) {
   for (size_t i = 0; i < snow.size(); ++i) out += plain.push(snow.substr(i, 1));
   out += plain.finish().text;
   EXPECT_EQ(out, snow);
+}
+
+TEST(LFM25Tokenizer, ToolStreamImplicitLead) {
+  using KokkosDNN::LFM25::kToolCallEndToken;
+  using KokkosDNN::LFM25::kToolCallStartToken;
+  using KokkosDNN::LFM25::parse_tool_calls;
+  using KokkosDNN::LFM25::ToolCallStreamParser;
+  using KokkosDNN::LFM25::ToolParseResult;
+  // Prompt-provided opener: leading reasoning streams live as reasoning
+  // even with no explicit <think> in the bytes.
+  const std::string raw = std::string("r1</think>answer") +
+                          kToolCallStartToken + "[f(x=1)]" + kToolCallEndToken;
+  const ToolParseResult whole = parse_tool_calls(raw, {}, true);
+  EXPECT_EQ(whole.reasoning, "r1");
+  ToolCallStreamParser fed({}, true);
+  std::string acc, racc;
+  for (char ch : raw) {
+    acc += fed.push(std::string(1, ch));
+    racc += fed.poll_reasoning();
+    // Monotone: streamed prefixes stay prefixes of the whole-text result.
+    EXPECT_TRUE(whole.text.find(acc) == 0);
+    EXPECT_TRUE(whole.reasoning.find(racc) == 0);
+  }
+  ToolParseResult tail = fed.finish();
+  acc += tail.text;
+  racc += tail.reasoning;
+  EXPECT_EQ(acc, whole.text);
+  EXPECT_EQ(racc, whole.reasoning);
+  ASSERT_EQ(tail.calls.size(), 1u);
+  // Second opener after a tool call still leads (tool-aware blank).
+  const std::string raw2 =
+      std::string("<think>r1</think>") + kToolCallStartToken + "[f(a=1)]" +
+      kToolCallEndToken + "<think>r2</think>" + kToolCallStartToken +
+      "[g(b=2)]" + kToolCallEndToken;
+  const ToolParseResult whole2 = parse_tool_calls(raw2);
+  ToolCallStreamParser fed2;
+  std::string acc2, racc2;
+  for (char ch : raw2) {
+    acc2 += fed2.push(std::string(1, ch));
+    racc2 += fed2.poll_reasoning();
+    EXPECT_TRUE(whole2.text.find(acc2) == 0);
+    EXPECT_TRUE(whole2.reasoning.find(racc2) == 0);
+  }
+  ToolParseResult tail2 = fed2.finish();
+  acc2 += tail2.text;
+  racc2 += tail2.reasoning;
+  EXPECT_EQ(acc2, whole2.text);
+  EXPECT_EQ(racc2, whole2.reasoning);
+  EXPECT_EQ(racc2, "r1r2");
+
+  // Chunk boundaries must not change the split: leading whitespace before
+  // a redundant opener, a literal <think> inside the trace, and a turn cut
+  // before any terminator all match the whole-text parse byte-for-byte.
+  const std::vector<std::string> tricky = {
+      std::string(" <think>r1</think>hi"),
+      std::string("r <think> r2"),
+      std::string("r1 still thinking"),
+      std::string("\n\n<think>r</think>"),
+      std::string("r1</think>") + kToolCallStartToken + "[f(x=1)]" +
+          kToolCallEndToken};
+  for (const std::string& raw : tricky) {
+    const ToolParseResult w = parse_tool_calls(raw, {}, true);
+    for (size_t chunk = 1; chunk <= 3; ++chunk) {
+      ToolCallStreamParser s({}, true);
+      std::string a, r;
+      for (size_t p = 0; p < raw.size(); p += chunk) {
+        a += s.push(raw.substr(p, chunk));
+        r += s.poll_reasoning();
+        EXPECT_TRUE(w.text.find(a) == 0) << "raw=" << raw;
+        EXPECT_TRUE(w.reasoning.find(r) == 0) << "raw=" << raw;
+      }
+      ToolParseResult t = s.finish();
+      a += t.text;
+      r += t.reasoning;
+      EXPECT_EQ(a, w.text) << "raw=" << raw << " chunk=" << chunk;
+      EXPECT_EQ(r, w.reasoning) << "raw=" << raw << " chunk=" << chunk;
+    }
+  }
 }
 
 TEST(LFM25Tokenizer, ToolStreamCustomStop) {
