@@ -16,7 +16,25 @@ if(KokkosDNN_ENABLE_READLINE)
   find_path(KOKKOSDNN_READLINE_INCLUDE_DIR readline/readline.h QUIET)
   find_library(KOKKOSDNN_READLINE_LIBRARY readline QUIET)
   if(KOKKOSDNN_READLINE_INCLUDE_DIR AND KOKKOSDNN_READLINE_LIBRARY)
-    set(_KOKKOSDNN_HAVE_READLINE ON)
+    # macOS ships an editline (libedit) shim as readline/readline.h +
+    # libreadline that lacks the GNU extensions used here (rl_bind_keyseq,
+    # rl_done, GNU rl_startup_hook signature). Accept the dependency only
+    # when the headers/library actually provide the GNU API; otherwise fall
+    # back to the dependency-free editor.
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_INCLUDES "${KOKKOSDNN_READLINE_INCLUDE_DIR}")
+    set(CMAKE_REQUIRED_LIBRARIES "${KOKKOSDNN_READLINE_LIBRARY}")
+    check_cxx_source_compiles(
+      "#include <readline/readline.h>\n#include <readline/history.h>\nstatic int hook() { return 0; }\nstatic int cmd(int, int) { return 0; }\nint main() {\n  rl_startup_hook = hook;\n  (void)::rl_bind_keyseq(\"x\", cmd);\n  rl_done = 0;\n  (void)::rl_insert_text(\"x\");\n  return 0;\n}\n"
+      _KOKKOSDNN_READLINE_IS_GNU
+    )
+    unset(CMAKE_REQUIRED_INCLUDES)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+    if(_KOKKOSDNN_READLINE_IS_GNU)
+      set(_KOKKOSDNN_HAVE_READLINE ON)
+    else()
+      message(STATUS "KokkosDNN examples: readline found but without GNU extensions; REPL uses std::getline fallback")
+    endif()
   endif()
 endif()
 
