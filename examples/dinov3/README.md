@@ -9,13 +9,28 @@ ViT-B/16 (`vitb16_lvd1689m`, `facebook/dinov3-vitb16-pretrain-lvd1689m`) image-e
 # without it --image is ignored (with a warning) and synthetic pixels are used.
 # Accept the gated-repo conditions once at
 # https://huggingface.co/facebook/dinov3-vitb16-pretrain-lvd1689m, then:
-pip install -U huggingface_hub  # plus torch transformers safetensors Pillow for the golden test
 
+# 1. Build and install Kokkos once (Serial shown; for GPU add
+#    -DKokkos_ENABLE_CUDA=ON -DKokkos_ARCH_AMPERE80=ON and set
+#    CMAKE_CXX_COMPILER to kokkos-src/bin/nvcc_wrapper)
+git clone --branch 5.2.1 --recursive https://github.com/kokkos/kokkos.git kokkos-src
+cmake -S kokkos-src -B kokkos-build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX=/path/to/kokkos-install \
+  -DKokkos_ENABLE_SERIAL=ON \
+  -DKokkos_ENABLE_TESTS=OFF
+cmake --build kokkos-build --parallel 8
+cmake --install kokkos-build
+
+# 2. Configure and build the example target
 cmake -S . -B build \
   -DKokkos_ROOT=/path/to/kokkos-install \
   -DCMAKE_BUILD_TYPE=Release \
   -DKokkosDNN_ENABLE_IMAGE=ON
-cmake --build build --parallel 8
+cmake --build build --parallel 8 --target dinov3_encode
+
+# 3. Download the checkpoint with the `hf` CLI
+pip install -U "huggingface_hub[cli]"  # plus torch transformers safetensors Pillow for the golden test
 
 hf download facebook/dinov3-vitb16-pretrain-lvd1689m \
   --local-dir ./weights/dinov3-vitb16-pretrain-lvd1689m \

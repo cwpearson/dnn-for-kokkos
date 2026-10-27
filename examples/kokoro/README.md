@@ -10,6 +10,21 @@ stack (82M params, FP32, 24 kHz output). Reference: the `kokoro` pip package
 Run from the repo root.
 
 ```bash
+# 1. Build and install Kokkos once (CUDA shown: this example targets GPU builds;
+#    for Serial-only use -DKokkos_ENABLE_SERIAL=ON instead)
+git clone --branch 5.2.1 --recursive https://github.com/kokkos/kokkos.git kokkos-src
+cmake -S kokkos-src -B kokkos-build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX=<path-to>/kokkos-install \
+  -DCMAKE_CXX_COMPILER=<path-to>/kokkos-src/bin/nvcc_wrapper \
+  -DKokkos_ENABLE_CUDA=ON \
+  -DKokkos_ENABLE_SERIAL=ON \
+  -DKokkos_ARCH_AMPERE80=ON \
+  -DKokkos_ENABLE_TESTS=OFF
+cmake --build kokkos-build --parallel 16
+cmake --install kokkos-build
+
+# 2. Configure and build the example target
 cmake -S . -B build-cuda \
   -DCMAKE_CXX_COMPILER=<path-to>/kokkos/bin/nvcc_wrapper \
   -DKokkos_ROOT=<path-to>/kokkos-install \
@@ -17,6 +32,8 @@ cmake -S . -B build-cuda \
 cmake --build build-cuda --parallel 16 \
   --target kokoro_tts test_kokoro_smoke test_kokoro_pth test_kokoro_golden
 
+# 3. Download the checkpoint files with the `hf` CLI
+pip install -U "huggingface_hub[cli]"
 # working run: no downloads needed (random weights, tiny channels)
 ./build-cuda/examples/kokoro/kokoro_tts --tiny --out tiny.wav
 
