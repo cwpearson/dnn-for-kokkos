@@ -8,7 +8,7 @@
 //                 [--text-weights gemma-2-2b-it/model.safetensors]
 //                 [--tokenizer tokenizer.json] [--text-config config.json]
 //                 [--steps 18] [--guidance 5.0] [--flow-shift 4.0]
-//                 [--seed 42] [--out sana_out.png] [--fp32]
+//                 [--seed 42] [--out sana_out.png | sana_out.jpg] [--fp32]
 //
 // Text encoding: --prompt is encoded with the native Gemma-2-2B-IT text
 // encoder (KokkosDNN_SanaTextEncoder.{hpp,cpp}) when --text-weights points
@@ -27,12 +27,14 @@
 // DC-AE checkpoint (mit-han-lab/dc-ae-f32c32-sana-1.0-diffusers,
 // diffusion_pytorch_model.safetensors), latents [32,32,32] decode to true
 // 1024x1024 RGB via KokkosDNN::Sana::VAE. Without it the driver writes a
-// decoded PNG *preview* (channel-mean -> grayscale, nearest-neighbor 32x
-// to 1024x1024) plus the raw fp32 latents (<stem>.f32, [C,H,W] row-major).
+// decoded image *preview* (channel-mean -> grayscale, nearest-neighbor 32x
+// to 1024x1024; PNG, or JPEG when --out ends in .jpg/.jpeg) plus the raw
+// fp32 latents (<stem>.f32, [C,H,W] row-major).
 //
 // --tiny runs a random-weights smoke model on 4x4 latents (no downloads).
 #include <Kokkos_Core.hpp>
 
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -148,6 +150,20 @@ std::string with_extension(const std::string& path, const std::string& ext) {
   return path.substr(0, dot) + ext;
 }
 
+#ifdef KOKKOSDNN_ENABLE_IMAGE
+// Output format follows the --out extension: ".jpg"/".jpeg" (case
+// insensitive) selects lossy JPEG, anything else selects lossless PNG.
+bool out_is_jpeg(const std::string& path) {
+  const size_t dot = path.find_last_of('.');
+  const size_t sep = path.find_last_of("/\\");
+  if (dot == std::string::npos || (sep != std::string::npos && dot < sep))
+    return false;
+  std::string ext = path.substr(dot);
+  for (char& ch : ext) ch = (char)std::tolower((unsigned char)ch);
+  return ext == ".jpg" || ext == ".jpeg";
+}
+#endif
+
 std::vector<float> read_raw_f32(const std::string& path) {
   std::ifstream f(path, std::ios::binary | std::ios::ate);
   if (!f) throw std::runtime_error("cannot open '" + path + "'");
@@ -168,7 +184,7 @@ void usage() {
       "                    [--text-weights gemma.safetensors]\n"
       "                    [--tokenizer tok.json] [--text-config cfg.json]\n"
       "                    [--steps N] [--guidance G] [--flow-shift S]\n"
-       "                    [--seed N] [--out img.png] [--fp32]\n"
+       "                    [--seed N] [--out img.png|img.jpg] [--fp32]\n"
        "                    [--vae-safetensors dc-ae.safetensors]\n"
        "\n"
        "  --tiny         random-weights smoke model, 4x4 latents (no files)\n"
@@ -420,15 +436,20 @@ int main(int argc, char** argv) {
           for (size_t ww = 0; ww < oW; ++ww)
             for (size_t c = 0; c < 3; ++c)
               img(h, ww, c) = hwc[(h * oW + ww) * 3 + c];
-        KokkosDNN::Image::save_image_png(out, img);
-        std::printf("[wrote %s] %zux%zu RGB (PNG)\n", out.c_str(), oH, oW);
+        if (out_is_jpeg(out)) {
+          KokkosDNN::Image::save_image_jpg(out, img);
+          std::printf("[wrote %s] %zux%zu RGB (JPEG)\n", out.c_str(), oH, oW);
+        } else {
+          KokkosDNN::Image::save_image_png(out, img);
+          std::printf("[wrote %s] %zux%zu RGB (PNG)\n", out.c_str(), oH, oW);
+        }
       }
 #else
       {
         const std::string ppm = with_extension(out, ".ppm");
         if (ppm != out)
           std::printf("[note] built without KokkosDNN_ENABLE_IMAGE: writing "
-                      "PPM to %s instead of PNG %s\n",
+                      "PPM to %s instead of %s\n",
                       ppm.c_str(), out.c_str());
         save_ppm_rgb(ppm, hwc, oH, oW);
         std::printf("[wrote %s] %zux%zu RGB (PPM)\n", ppm.c_str(), oH, oW);
@@ -444,16 +465,22 @@ int main(int argc, char** argv) {
           img("sana_preview", oH, oW, 1);
       for (size_t h = 0; h < oH; ++h)
         for (size_t ww = 0; ww < oW; ++ww) img(h, ww, 0) = preview[h * oW + ww];
-      KokkosDNN::Image::save_image_png(out, img);
-      std::printf("[wrote %s] %zux%zu grayscale preview (PNG)\n", out.c_str(),
-                  oH, oW);
+      if (out_is_jpeg(out)) {
+        KokkosDNN::Image::save_image_jpg(out, img);
+        std::printf("[wrote %s] %zux%zu grayscale preview (JPEG)\n", out.c_str(),
+                    oH, oW);
+      } else {
+        KokkosDNN::Image::save_image_png(out, img);
+        std::printf("[wrote %s] %zux%zu grayscale preview (PNG)\n", out.c_str(),
+                    oH, oW);
+      }
     }
 #else
     {
       const std::string ppm = with_extension(out, ".ppm");
       if (ppm != out)
-        std::printf("[note] built without KokkosDNN_ENABLE_IMAGE: writing PPM "
-                    "to %s instead of PNG %s\n",
+        std::printf("[note] built without KokkosDNN_ENABLE_IMAGE: writing PPM to %s "
+                    "instead of %s\n",
                     ppm.c_str(), out.c_str());
       save_ppm(ppm, preview, oH, oW);
       std::printf("[wrote %s] %zux%zu grayscale preview (PPM)\n", ppm.c_str(),
