@@ -262,7 +262,7 @@ last block wins); `--vae-weights` = FLUX.2 VAE `.safetensors` (single
 | `--seed` | 42 | latent init seed |
 | `--vae-weights` | — | VAE checkpoint (validated whenever given) |
 | `--vae-decode` | off | real VAE decode when the VAE header + weights are present (else grayscale preview with a logged reason) |
-| `--out` | `moss_out.png` | PNG with `KokkosDNN_ENABLE_IMAGE=ON`, else `.ppm`; raw F32 latents always written to `<stem>.f32` (`[C,H,W]`) |
+| `--out` | `moss_out.png` | PNG (`.jpg`/`.jpeg` writes JPEG) with `KokkosDNN_ENABLE_IMAGE=ON`, else `.ppm`; raw F32 latents always written to `<stem>.f32` (`[C,H,W]`) |
 
 ## Notes
 

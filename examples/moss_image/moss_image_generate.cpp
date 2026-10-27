@@ -27,7 +27,7 @@
 //                        --slg-start 0.0 --slg-stop 1.0]
 //                       [--seed 42]
 //                       [--vae-weights vae.safetensors [--no-vae-decode]]
-//                       [--out img.png]
+//                       [--out img.png | img.jpg]
 //                       [--no-staged]
 //
 // Text conditioning precedence: in-process Qwen forward (--tokenizer dir
@@ -60,6 +60,7 @@
 #include <Kokkos_Half.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -269,6 +270,18 @@ std::string with_extension(const std::string& path, const std::string& ext) {
   if (dot == std::string::npos || (sep != std::string::npos && dot < sep))
     return path + ext;
   return path.substr(0, dot) + ext;
+}
+
+// Output format follows the --out extension: ".jpg"/".jpeg" (case
+// insensitive) selects lossy JPEG, anything else selects lossless PNG.
+bool out_is_jpeg(const std::string& path) {
+  const size_t dot = path.find_last_of('.');
+  const size_t sep = path.find_last_of("/\\");
+  if (dot == std::string::npos || (sep != std::string::npos && dot < sep))
+    return false;
+  std::string ext = path.substr(dot);
+  for (char& ch : ext) ch = (char)std::tolower((unsigned char)ch);
+  return ext == ".jpg" || ext == ".jpeg";
 }
 
 bool file_exists(const std::string& path) {
@@ -976,7 +989,7 @@ void usage() {
       "                     --slg-start F --slg-stop F]\n"
       "                    [--seed N]\n"
       "                    [--vae-weights vae.safetensors [--no-vae-decode]]\n"
-      "                    [--out img.png]\n"
+      "                    [--out img.png|img.jpg]\n"
       "                    [--no-staged]\n"
       "\n"
       "  --tiny         random-weights smoke model, 4x4 latents (no files)\n"
@@ -1017,7 +1030,8 @@ void usage() {
       "  --vae-decode   (default ON) run the real VAE decode when the VAE\n"
       "                 header + weights are present (else grayscale preview).\n"
       "                 Pass --no-vae-decode for the preview\n"
-      "  --out          PNG with KokkosDNN_ENABLE_IMAGE=ON, else PPM;\n"
+      "  --out          PNG (.jpg/.jpeg writes JPEG) with "
+      "KokkosDNN_ENABLE_IMAGE=ON, else PPM;\n"
       "                 raw F32 latents always written to <stem>.f32\n");
 }
 
@@ -1478,23 +1492,29 @@ int main(int argc, char** argv) {
         for (size_t ww = 0; ww < oW; ++ww)
           for (int c = 0; c < oCh; ++c)
             img(h, ww, (size_t)c) = pix[(h * oW + ww) * (size_t)oCh + (size_t)c];
-      KokkosDNN::Image::save_image_png(out, img);
-      std::printf("[wrote %s] %zux%zu %s (PNG)\n", out.c_str(), oH, oW,
-                  decoded ? "VAE RGB" : "grayscale preview");
+      if (out_is_jpeg(out)) {
+        KokkosDNN::Image::save_image_jpg(out, img);
+        std::printf("[wrote %s] %zux%zu %s (JPEG)\n", out.c_str(), oH, oW,
+                    decoded ? "VAE RGB" : "grayscale preview");
+      } else {
+        KokkosDNN::Image::save_image_png(out, img);
+        std::printf("[wrote %s] %zux%zu %s (PNG)\n", out.c_str(), oH, oW,
+                    decoded ? "VAE RGB" : "grayscale preview");
+      }
     }
 #else
     {
       const std::string ppm = with_extension(out, ".ppm");
       if (ppm != out)
         std::printf("[note] built without KokkosDNN_ENABLE_IMAGE: writing PPM "
-                    "to %s instead of PNG %s\n",
+                    "to %s instead of %s\n",
                     ppm.c_str(), out.c_str());
       if (decoded) {
         save_ppm_rgb(ppm, pix, oH, oW);
       } else {
         save_ppm(ppm, pix, oH, oW);
       }
-      // oCh is only consumed by the PNG path above.
+      // oCh is only consumed by the image path above.
       std::printf("[wrote %s] %zux%zu %s (PPM)\n", ppm.c_str(), oH, oW,
                   decoded ? "VAE RGB" : "grayscale preview");
     }
