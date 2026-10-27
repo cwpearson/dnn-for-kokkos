@@ -4,7 +4,7 @@
 #
 # Component headers (all present):
 #   KokkosDNN_ImageTypes.hpp      - ImageInfo + host HWC view aliases
-#   KokkosDNN_ImageIO.hpp         - stb-based JPEG/PNG/BMP decode/encode to Kokkos Views
+#   KokkosDNN_ImageIO.hpp         - stb-based JPEG/PNG/BMP decode, PNG/JPEG encode to Kokkos Views
 #   KokkosDNN_ImagePreprocess.hpp - resize/crop/normalize, HWC->CHW, batching (DINOv3 path)
 #   KokkosDNN_Image.hpp           - umbrella header including the above
 #

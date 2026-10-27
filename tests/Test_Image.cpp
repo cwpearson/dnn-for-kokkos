@@ -10,7 +10,9 @@
 
 #include <Kokkos_Core.hpp>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -59,6 +61,58 @@ TEST(ImageIO, PngRoundTripU8) {
 
   std::error_code ec;
   std::filesystem::remove(path, ec);
+}
+
+TEST(ImageIO, JpgRoundTripDims) {
+  namespace Img = KokkosDNN::Image;
+  const std::string path = tmp_png("roundtrip.jpg");
+  // MCU-aligned constant image: JPEG is lossy, so a flat field keeps the
+  // roundtrip error tiny while still exercising the encode/decode path.
+  HostImageU8 src("jpg_src", 16, 16, 3);
+  for (size_t y = 0; y < 16; ++y)
+    for (size_t x = 0; x < 16; ++x)
+      for (size_t c = 0; c < 3; ++c) src(y, x, c) = 128;
+  ASSERT_NO_THROW(Img::save_image_jpg(path, src, 100));
+
+  Img::ImageInfo info = Img::load_image_info(path);
+  EXPECT_EQ(info.width, 16);
+  EXPECT_EQ(info.height, 16);
+  EXPECT_EQ(info.channels, 3);
+
+  HostImageU8 got = Img::load_image_u8(path, 3);
+  EXPECT_EQ(got.extent(0), 16u);
+  EXPECT_EQ(got.extent(1), 16u);
+  EXPECT_EQ(got.extent(2), 3u);
+  int max_abs_err = 0;
+  for (size_t y = 0; y < 16; ++y)
+    for (size_t x = 0; x < 16; ++x)
+      for (size_t c = 0; c < 3; ++c)
+        max_abs_err = std::max(max_abs_err, std::abs(static_cast<int>(got(y, x, c)) -
+                                                     static_cast<int>(src(y, x, c))));
+  EXPECT_LE(max_abs_err, 8);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST(ImageIO, JpgGrayAndQualityValidation) {
+  namespace Img = KokkosDNN::Image;
+  HostImageU8 gray("jpg_gray", 8, 8, 1);
+  for (size_t y = 0; y < 8; ++y)
+    for (size_t x = 0; x < 8; ++x) gray(y, x, 0) = 200;
+  const std::string path = tmp_png("gray.jpg");
+  ASSERT_NO_THROW(Img::save_image_jpg(path, gray));
+  HostImageU8 got = Img::load_image_u8(path, 1);
+  EXPECT_EQ(got.extent(0), 8u);
+  EXPECT_EQ(got.extent(1), 8u);
+  EXPECT_EQ(got.extent(2), 1u);
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+
+  EXPECT_THROW(Img::save_image_jpg(path, gray, 0), std::invalid_argument);
+  EXPECT_THROW(Img::save_image_jpg(path, gray, 101), std::invalid_argument);
+  HostImageU8 empty("jpg_empty", 0, 0, 0);
+  EXPECT_THROW(Img::save_image_jpg(path, empty), std::invalid_argument);
 }
 
 TEST(ImageIO, F32Scaling) {

@@ -23,7 +23,7 @@ option(KokkosDNN_ENABLE_CUDNN "Dispatch attention to cuDNN SDPA when ExecSpace i
 option(KokkosDNN_ENABLE_HIPBLAS "Dispatch GEMM to hipBLAS when ExecSpace is HIP" OFF)
 option(KokkosDNN_ENABLE_MIOPEN "Dispatch conv/attention-helpers to MIOpen when ExecSpace is HIP" OFF)
 option(KokkosDNN_ENABLE_ACCELERATE "Dispatch GEMM to Apple Accelerate (vecLib cblas_sgemm) on host execution spaces" OFF)
-option(KokkosDNN_ENABLE_IMAGE "Build optional image I/O component (stb-based decode, JPEG/PNG/BMP)" OFF)
+option(KokkosDNN_ENABLE_IMAGE "Build optional image I/O component (stb-based decode/encode, JPEG/PNG/BMP)" OFF)
 option(KokkosDNN_ENABLE_MODEL_LFM25 "Build LFM2.5 model component (KokkosDNN::lfm25)" ON)
 option(KokkosDNN_ENABLE_MODEL_MOSS "Build MOSS-Image model component (KokkosDNN::moss)" ON)
 option(KokkosDNN_ENABLE_MODEL_QWEN_IMAGE_21 "Build Qwen-Image-2.1 model component (KokkosDNN::qwen_image_21)" ON)

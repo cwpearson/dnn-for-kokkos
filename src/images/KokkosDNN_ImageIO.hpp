@@ -4,7 +4,7 @@
 #define KOKKOSDNN_IMAGE_IO_HPP
 
 // stb-based image I/O to Kokkos host views (JPEG/PNG/BMP/GIF/etc. for
-// decode; PNG for encode). All returned views are owning, deep copies in
+// decode; PNG/JPEG for encode). All returned views are owning, deep copies in
 // host space with HWC layout [H,W,C]. Decoding itself is third-party only
 // (stb); no hand-rolled decoders here. The stb implementation lives in the
 // single translation unit KokkosDNN_Image.cpp.
@@ -153,6 +153,41 @@ inline void save_image_png(const std::string& path, const HostImageU8& img) {
   if (stbi_write_png(path.c_str(), static_cast<int>(w), static_cast<int>(h),
                      static_cast<int>(c), buf.data(), stride) == 0) {
     throw std::runtime_error("KokkosDNN::Image::save_image_png: failed to write '" + path +
+                             "'");
+  }
+}
+
+// Encode a host HWC uint8 view as JPEG. Channels must be 1..4 (alpha, if
+// present, is ignored by the encoder). The view may be strided; pixels are
+// packed to a contiguous row-major buffer first. Quality is the stb JPEG
+// quality 1..100 (higher looks better but yields a bigger file); the default
+// of 90 matches common encoder practice for a good size/quality tradeoff.
+// JPEG is lossy: even at quality 100 a decode of the written file may differ
+// slightly from the input. Throws std::invalid_argument on bad extents or
+// out-of-range quality, std::runtime_error on write failure.
+inline void save_image_jpg(const std::string& path, const HostImageU8& img,
+                           int quality = 90) {
+  const size_t h = img.extent(0), w = img.extent(1), c = img.extent(2);
+  if (w == 0 || h == 0 || c == 0) {
+    throw std::invalid_argument("KokkosDNN::Image::save_image_jpg: empty image view");
+  }
+  if (c < 1 || c > 4) {
+    throw std::invalid_argument("KokkosDNN::Image::save_image_jpg: channels must be 1..4");
+  }
+  if (w > static_cast<size_t>((std::numeric_limits<int>::max)()) ||
+      h > static_cast<size_t>((std::numeric_limits<int>::max)())) {
+    throw std::invalid_argument("KokkosDNN::Image::save_image_jpg: image too large");
+  }
+  if (quality < 1 || quality > 100) {
+    throw std::invalid_argument("KokkosDNN::Image::save_image_jpg: quality must be 1..100");
+  }
+  std::vector<unsigned char> buf(w * h * c);
+  for (size_t y = 0; y < h; ++y)
+    for (size_t x = 0; x < w; ++x)
+      for (size_t cc = 0; cc < c; ++cc) buf[(y * w + x) * c + cc] = img(y, x, cc);
+  if (stbi_write_jpg(path.c_str(), static_cast<int>(w), static_cast<int>(h),
+                     static_cast<int>(c), buf.data(), quality) == 0) {
+    throw std::runtime_error("KokkosDNN::Image::save_image_jpg: failed to write '" + path +
                              "'");
   }
 }
