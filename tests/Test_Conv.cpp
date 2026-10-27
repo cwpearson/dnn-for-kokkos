@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 // SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
-// Promoted spatial convolutions: dense 3x3, depthwise KxK, grouped 1x1.
+// Promoted spatial convolutions: dense 3x3 (stride 1 and stride 2),
+// depthwise KxK, grouped 1x1.
 // Native correctness vs host references (biased/unbiased, argument
-// validation). The dense 3x3 runs the im2col + gemm_bias lowering (so on
+// validation). The dense 3x3s run the im2col + gemm_bias lowering (so on
 // TPL builds this also exercises the dispatched GEMM path); depthwise and
 // grouped are native-only (see the TPL-status note in
 // src/KokkosDNN_Conv.hpp). Dispatched-vs-native agreement is covered by
@@ -49,6 +50,34 @@ void host_conv3x3_ref(
           }
         }
       y(t, o) = static_cast<float>(acc);
+    }
+}
+
+// Naive host stride-2 3x3 (double accumulation, ZeroPad(0,1,0,1): zero
+// past the right/bottom edges only).
+void host_conv3x3_stride2_ref(
+    const Kokkos::View<float**, Kokkos::LayoutRight, Host>& x,
+    const Kokkos::View<float****, Kokkos::LayoutRight, Host>& w,
+    const Kokkos::View<float*, Host>& b, bool biased,
+    const Kokkos::View<float**, Kokkos::LayoutRight, Host>& y, size_t H,
+    size_t W) {
+  const size_t H2 = H / 2, W2 = W / 2, Cin = x.extent(1), Cout = w.extent(0);
+  const size_t T2 = H2 * W2;
+  for (size_t t2 = 0; t2 < T2; ++t2)
+    for (size_t o = 0; o < Cout; ++o) {
+      double acc = biased ? b(o) : 0.0;
+      const size_t h2 = t2 / W2, ww2 = t2 % W2;
+      for (size_t i = 0; i < Cin; ++i)
+        for (size_t kh = 0; kh < 3; ++kh) {
+          const size_t ih = 2 * h2 + kh;
+          if (ih >= H) continue;
+          for (size_t kw = 0; kw < 3; ++kw) {
+            const size_t iw = 2 * ww2 + kw;
+            if (iw >= W) continue;
+            acc += (double)x(ih * W + iw, i) * (double)w(o, i, kh, kw);
+          }
+        }
+      y(t2, o) = static_cast<float>(acc);
     }
 }
 
@@ -227,6 +256,103 @@ TEST(Conv3x3, RejectsBadArgs) {
                std::invalid_argument);
   Kokkos::View<float*, Exec> bad_b("bad_b", Cout + 1);
   EXPECT_THROW(KokkosDNN::conv3x3_forward(h, x, w, bad_b, y, H, W),
+               std::invalid_argument);
+}
+
+TEST(Conv3x3Stride2, MatchesHostReferenceBiased) {
+  KokkosDNN::DNNHandle<Exec> h;
+  const size_t H = 6, W = 4, H2 = H / 2, W2 = W / 2, T = H * W, T2 = H2 * W2;
+  const size_t Cin = 3, Cout = 4;
+  Kokkos::View<float**, Kokkos::LayoutRight, Host> hx("hx", T, Cin),
+      href("href", T2, Cout), hgot("hgot", T2, Cout);
+  Kokkos::View<float****, Kokkos::LayoutRight, Host> hw("hw", Cout, Cin, 3, 3);
+  Kokkos::View<float*, Host> hb("hb", Cout);
+  for (size_t t = 0; t < T; ++t)
+    for (size_t i = 0; i < Cin; ++i) hx(t, i) = probe(t, i, 2);
+  for (size_t o = 0; o < Cout; ++o) {
+    for (size_t i = 0; i < Cin; ++i)
+      for (size_t kh = 0; kh < 3; ++kh)
+        for (size_t kw = 0; kw < 3; ++kw)
+          hw(o, i, kh, kw) = 0.5f * probe(o, i, kh * 3 + kw);
+    hb(o) = 0.1f * (float)o - 0.2f;
+  }
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> x("x", T, Cin),
+      y("y", T2, Cout);
+  Kokkos::View<float****, Kokkos::LayoutRight, Exec> w("w", Cout, Cin, 3, 3);
+  Kokkos::View<float*, Exec> b("b", Cout), no_bias;
+  Kokkos::deep_copy(x, hx);
+  Kokkos::deep_copy(w, hw);
+  Kokkos::deep_copy(b, hb);
+  KokkosDNN::conv3x3_stride2_forward(h, x, w, b, y, H, W);
+  Kokkos::fence();
+  Kokkos::deep_copy(hgot, y);
+  host_conv3x3_stride2_ref(hx, hw, hb, true, href, H, W);
+  expect_near_2d(hgot, href, 1e-4f);
+  KokkosDNN::conv3x3_stride2_forward(h, x, w, no_bias, y, H, W);
+  Kokkos::fence();
+  Kokkos::deep_copy(hgot, y);
+  host_conv3x3_stride2_ref(hx, hw, hb, false, href, H, W);
+  expect_near_2d(hgot, href, 1e-4f);
+}
+
+TEST(Conv3x3Stride2, LoweredPathMatchesHostReference) {
+  // Wide-output shape (Cout > ConvSkinnyMaxCout) exercising the
+  // stride-2 im2col + gemm_bias lowering rather than the skinny kernel.
+  KokkosDNN::DNNHandle<Exec> h;
+  const size_t H = 8, W = 8, H2 = H / 2, W2 = W / 2, T = H * W, T2 = H2 * W2;
+  const size_t Cin = 8, Cout = 40;
+  Kokkos::View<float**, Kokkos::LayoutRight, Host> hx("hx", T, Cin),
+      href("href", T2, Cout), hgot("hgot", T2, Cout);
+  Kokkos::View<float****, Kokkos::LayoutRight, Host> hw("hw", Cout, Cin, 3, 3);
+  Kokkos::View<float*, Host> hb("hb", Cout);
+  for (size_t t = 0; t < T; ++t)
+    for (size_t i = 0; i < Cin; ++i) hx(t, i) = probe(t, i, 13);
+  for (size_t o = 0; o < Cout; ++o) {
+    for (size_t i = 0; i < Cin; ++i)
+      for (size_t kh = 0; kh < 3; ++kh)
+        for (size_t kw = 0; kw < 3; ++kw)
+          hw(o, i, kh, kw) = 0.5f * probe(o, i, kh * 3 + kw);
+    hb(o) = 0.1f * (float)(o % 5) - 0.2f;
+  }
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> x("x", T, Cin),
+      y("y", T2, Cout);
+  Kokkos::View<float****, Kokkos::LayoutRight, Exec> w("w", Cout, Cin, 3, 3);
+  Kokkos::View<float*, Exec> b("b", Cout);
+  Kokkos::deep_copy(x, hx);
+  Kokkos::deep_copy(w, hw);
+  Kokkos::deep_copy(b, hb);
+  KokkosDNN::conv3x3_stride2_forward(h, x, w, b, y, H, W);
+  Kokkos::fence();
+  Kokkos::deep_copy(hgot, y);
+  host_conv3x3_stride2_ref(hx, hw, hb, true, href, H, W);
+  expect_near_2d(hgot, href, 1e-4f);
+}
+
+TEST(Conv3x3Stride2, RejectsBadArgs) {
+  KokkosDNN::DNNHandle<Exec> h;
+  const size_t H = 4, W = 6, T = H * W, T2 = (H / 2) * (W / 2);
+  const size_t Cin = 3, Cout = 5;
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> x("x", T, Cin),
+      y("y", T2, Cout);
+  Kokkos::View<float****, Kokkos::LayoutRight, Exec> w("w", Cout, Cin, 3, 3);
+  Kokkos::View<float*, Exec> b("b", Cout), empty_b;
+  EXPECT_NO_THROW(KokkosDNN::conv3x3_stride2_forward(h, x, w, b, y, H, W));
+  EXPECT_NO_THROW(KokkosDNN::conv3x3_stride2_forward(h, x, w, empty_b, y, H, W));
+  EXPECT_THROW(KokkosDNN::conv3x3_stride2_forward(h, x, w, b, y, H - 1, W),
+               std::invalid_argument);  // odd H
+  EXPECT_THROW(KokkosDNN::conv3x3_stride2_forward(h, x, w, b, y, H, W + 1),
+               std::invalid_argument);  // odd W (and T != H*W)
+  EXPECT_THROW(KokkosDNN::conv3x3_stride2_forward(h, x, w, b, y, 0, W),
+               std::invalid_argument);  // zero H
+  Kokkos::View<float****, Kokkos::LayoutRight, Exec> bad_w("bad_w", Cout,
+                                                           Cin + 1, 3, 3);
+  EXPECT_THROW(KokkosDNN::conv3x3_stride2_forward(h, x, bad_w, empty_b, y, H, W),
+               std::invalid_argument);
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> bad_y("bad_y", T2, Cout + 1);
+  EXPECT_THROW(KokkosDNN::conv3x3_stride2_forward(h, x, w, empty_b, bad_y, H, W),
+               std::invalid_argument);
+  Kokkos::View<float*, Exec> bad_b("bad_b", Cout + 1);
+  EXPECT_THROW(KokkosDNN::conv3x3_stride2_forward(h, x, w, bad_b, y, H, W),
                std::invalid_argument);
 }
 

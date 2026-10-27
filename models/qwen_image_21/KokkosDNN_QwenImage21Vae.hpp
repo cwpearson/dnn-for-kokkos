@@ -64,13 +64,19 @@
 //     through gemm_bias, which owns the cuBLAS ladder.
 //   * stride-1 3x3 convs go through conv3x3_forward (cuDNN ladder on CUDA,
 //     MIOpen on HIP, im2col + gemm_bias / skinny kernels elsewhere).
-//   * stride-2 3x3 downsample convs go through the native
-//     qwen21vae_downsample_conv3x3_stride2 kernel below (no strided conv in
-//     the core conv API; the pad-right/bottom-1 + stride-2 pattern is VAE
-//     specific and small enough to own natively).
-//   * RMSNorm, SiLU, nearest upsample, DupUp add, denormalize, and the
-//   mid-block single-head SDPA (scores/softmax/AV) are native
-//   backend-portable parallel_for kernels (no TPL expresses them).
+//   * stride-2 3x3 downsample convs go through conv3x3_stride2_forward (the
+//     core strided conv op; ZeroPad(0,1,0,1) + stride-2 conv3x3+bias). The
+//     core op has no TPL convolution dispatch by construction (legacy
+//     cuDNN/MIOpen descriptors only express symmetric padding, so the
+//     asymmetric right/bottom-only pad is not expressible there); its
+//     im2col + gemm_bias lowering still rides the cuBLAS/hipBLAS ladder.
+//   * The mid-block single-head SDPA goes through
+//     attention_mha_bidirectional, which owns the cuDNN SDPA ladder (float
+//     path: fused SDPA graph, TPL math fallback past the graph's head-dim
+//     limit, native streaming kernel otherwise / on failure).
+//   * RMSNorm, SiLU, nearest upsample, DupUp add, AvgDown3D shortcut add,
+//   denormalize, and the qkv split are native backend-portable
+//   parallel_for kernels (no TPL expresses them).
 // All Impl helpers are backend-portable parallel_for only. No backend
 // #ifdefs in native paths.
 #include <Kokkos_Core.hpp>
@@ -89,6 +95,7 @@
 
 #include "KokkosDNN_Handle.hpp"
 
+#include "KokkosDNN_Attention.hpp"
 #include "KokkosDNN_Conv.hpp"
 #include "KokkosDNN_GemmBias.hpp"
 
@@ -832,42 +839,18 @@ inline void qwen21vae_dupup_add(const V2& y, const V2& x, size_t H, size_t W,
 
 // Stride-2 3x3 downsample conv (encoder QwenImage21Resample downsample2d,
 // and downsample3d with feat_cache=None where the time_conv never runs):
-// ZeroPad2d((0,1,0,1)) then stride-2 conv3x3+bias. Padded H+1/W+1 read as
-// zero past the right/bottom edges; H and W must be even (H2 = H/2).
+// ZeroPad2d((0,1,0,1)) then stride-2 conv3x3+bias. Thin wrapper over the
+// core conv3x3_stride2_forward op (same token-row layout, same FP32
+// numerics contract); H and W must be even (H2 = H/2). The pooling /
+// layout / elementwise neighbors (avgdown/dupup adds, nearest upsample,
+// depth-to-space, denormalize) stay native: no single cuDNN convolution
+// equivalent covers them.
 template <class ExecSpace, class V2, class V4, class V1>
 inline void qwen21vae_downsample_conv3x3_stride2(
-    const V2& x, size_t H, size_t W, const V4& w, const V1& b, const V2& y,
-    const std::string& label) {
-  const size_t T = x.extent(0), Cin = x.extent(1);
-  const size_t Cout = y.extent(1);
-  if (H == 0 || W == 0 || (H % 2) != 0 || (W % 2) != 0)
-    throw std::invalid_argument(
-        "qwen21vae_downsample_conv3x3_stride2: H,W must be even and nonzero");
-  const size_t H2 = H / 2, W2 = W / 2;
-  if (T != H * W || y.extent(0) != H2 * W2 || w.extent(0) != Cout ||
-      w.extent(1) != Cin || w.extent(2) != 3 || w.extent(3) != 3 ||
-      b.extent(0) != Cout)
-    throw std::invalid_argument(
-        "qwen21vae_downsample_conv3x3_stride2: dimension mismatch");
-  if (T == 0 || Cout == 0) return;
-  Kokkos::parallel_for(
-      label, Kokkos::RangePolicy<ExecSpace>(0, H2 * W2 * Cout),
-      KOKKOS_LAMBDA(size_t e) {
-        const size_t co = e / (H2 * W2), rem = e % (H2 * W2);
-        const size_t h2 = rem / W2, w2 = rem % W2;
-        float acc = static_cast<float>(b(co));
-        for (size_t ci = 0; ci < Cin; ++ci)
-          for (size_t kh = 0; kh < 3; ++kh)
-            for (size_t kw = 0; kw < 3; ++kw) {
-              const size_t ih = 2 * h2 + kh, iw = 2 * w2 + kw;
-              const float xv = (ih < H && iw < W)
-                                   ? static_cast<float>(x(ih * W + iw, ci))
-                                   : 0.0f;
-              acc += xv * static_cast<float>(w(co, ci, kh, kw));
-            }
-        y(h2 * W2 + w2, co) =
-            static_cast<typename V2::value_type>(acc);
-      });
+    const DNNHandle<ExecSpace>& handle, const V2& x, size_t H, size_t W,
+    const V4& w, const V1& b, const V2& y, const std::string& label) {
+  ::KokkosDNN::conv3x3_stride2_forward<ExecSpace, typename V2::value_type>(
+      handle, x, w, b, y, H, W, label);
 }
 
 // Fused AvgDown3D shortcut add for the single-frame encode path:
@@ -944,70 +927,6 @@ inline void qwen21vae_split_qkv(const V2& qkv, const V2& q, const V2& k,
         q(r, c) = qkv(r, c);
         k(r, c) = qkv(r, c + C);
         v(r, c) = qkv(r, c + 2 * C);
-      });
-}
-
-// Single-head SDPA pieces: s[i,j] = scale * <q_i, k_j>; row softmax; o = p v.
-template <class ExecSpace, class V2>
-inline void qwen21vae_attn_scores(const V2& q, const V2& k, float scale,
-                                  const V2& s, const std::string& label) {
-  const size_t T = q.extent(0), C = q.extent(1);
-  if (k.extent(0) != T || k.extent(1) != C || s.extent(0) != T ||
-      s.extent(1) != T)
-    throw std::invalid_argument("qwen21vae_attn_scores: dimension mismatch");
-  if (T == 0 || C == 0) return;
-  Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, T}),
-      KOKKOS_LAMBDA(size_t i, size_t j) {
-        float acc = 0.0f;
-        for (size_t c = 0; c < C; ++c)
-          acc += static_cast<float>(q(i, c)) * static_cast<float>(k(j, c));
-        s(i, j) =
-            static_cast<typename V2::value_type>(static_cast<float>(scale) * acc);
-      });
-}
-
-template <class ExecSpace, class V2>
-inline void qwen21vae_softmax_rows_inplace(const V2& s,
-                                           const std::string& label) {
-  const size_t T = s.extent(0), N = s.extent(1);
-  if (T == 0 || N == 0) return;
-  Kokkos::parallel_for(
-      label, Kokkos::RangePolicy<ExecSpace>(0, T),
-      KOKKOS_LAMBDA(size_t i) {
-        float mx = static_cast<float>(s(i, 0));
-        for (size_t j = 1; j < N; ++j) {
-          const float v = static_cast<float>(s(i, j));
-          mx = v > mx ? v : mx;
-        }
-        float sum = 0.0f;
-        for (size_t j = 0; j < N; ++j) {
-          const float e = expf(static_cast<float>(s(i, j)) - mx);
-          s(i, j) = static_cast<typename V2::value_type>(e);
-          sum += e;
-        }
-        const float inv = 1.0f / sum;
-        for (size_t j = 0; j < N; ++j)
-          s(i, j) = static_cast<typename V2::value_type>(
-              static_cast<float>(s(i, j)) * inv);
-      });
-}
-
-template <class ExecSpace, class V2>
-inline void qwen21vae_attn_av(const V2& p, const V2& v, const V2& o,
-                              const std::string& label) {
-  const size_t T = p.extent(0), C = v.extent(1);
-  if (p.extent(1) != T || v.extent(0) != T || o.extent(0) != T ||
-      o.extent(1) != C)
-    throw std::invalid_argument("qwen21vae_attn_av: dimension mismatch");
-  if (T == 0 || C == 0) return;
-  Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, C}),
-      KOKKOS_LAMBDA(size_t i, size_t c) {
-        float acc = 0.0f;
-        for (size_t j = 0; j < T; ++j)
-          acc += static_cast<float>(p(i, j)) * static_cast<float>(v(j, c));
-        o(i, c) = static_cast<typename V2::value_type>(acc);
       });
 }
 
@@ -1224,7 +1143,6 @@ class QwenImage21VaeModel {
     V2 kk("qwen21vae_k", Tmid, D0);
     V2 vv("qwen21vae_v", Tmid, D0);
     V2 av("qwen21vae_av", Tmid, D0);
-    V2 scores("qwen21vae_scores", Tmid, Tmid);
 
     for (size_t b = 0; b < B; ++b) {
       auto lat_b = Kokkos::subview(latents, b, Kokkos::ALL, Kokkos::ALL,
@@ -1232,7 +1150,7 @@ class QwenImage21VaeModel {
       auto out_b = Kokkos::subview(rgba, b, Kokkos::ALL, Kokkos::ALL,
                                    Kokkos::ALL);
       decode_sample(handle, lat_b, out_b, f0, f1, f2, s2max, qkv, qq, kk, vv,
-                    av, scores);
+                    av);
     }
   }
 
@@ -1313,7 +1231,6 @@ class QwenImage21VaeModel {
     V2 kk("qwen21vae_enc_k", tmid, EL);
     V2 vv("qwen21vae_enc_v", tmid, EL);
     V2 av("qwen21vae_enc_av", tmid, EL);
-    V2 scores("qwen21vae_enc_scores", tmid, tmid);
 
     V1 mean("qwen21vae_enc_mean", Z);
     V1 std("qwen21vae_enc_std", Z);
@@ -1336,7 +1253,7 @@ class QwenImage21VaeModel {
       auto lat_b =
           Kokkos::subview(lat, b, Kokkos::ALL, Kokkos::ALL, Kokkos::ALL);
       encode_sample(handle, img_b, lat_b, f0, f1, f2, s2max, qkv, qq, kk, vv,
-                    av, scores, mean, std);
+                    av, mean, std);
     }
     return lat;
   }
@@ -1485,11 +1402,13 @@ class QwenImage21VaeModel {
     Impl::qwen21vae_add_inplace<ExecSpace>(y, tS, tag + "_add");
   }
 
-  // Mid-block single-head self-attention: x [T,C] -> y [T,C].
+  // Mid-block single-head self-attention: x [T,C] -> y [T,C]. The SDPA
+  // itself runs through ::KokkosDNN::attention_mha_bidirectional (cuDNN
+  // ladder intact); only the qkv split stays native (no TPL expresses it).
   void attn_stage(const DNNHandle<ExecSpace>& handle, const std::string& ap,
                   const UV2& x, const UV2& y, size_t H, size_t W, const V2& qkv,
                   const V2& qq, const V2& kk, const V2& vv, const V2& av,
-                  const V2& scores, const std::string& tag) const {
+                  const std::string& tag) const {
     const auto& blobs = weights_.blobs;
     const auto& shapes = weights_.shapes;
     const std::string p(ap);
@@ -1514,10 +1433,15 @@ class QwenImage21VaeModel {
                                                    p + "to_qkv.bias", 3 * C),
         qkv, tag + "_qkv");
     Impl::qwen21vae_split_qkv<ExecSpace>(qkv, qq, kk, vv, tag + "_split");
-    Impl::qwen21vae_attn_scores<ExecSpace>(qq, kk, 1.0f / sqrtf((float)C),
-                                           scores, tag + "_scores");
-    Impl::qwen21vae_softmax_rows_inplace<ExecSpace>(scores, tag + "_softmax");
-    Impl::qwen21vae_attn_av<ExecSpace>(scores, vv, av, tag + "_av");
+    // Single head: reinterpret [T,C] token rows as [T,1,C] triples (same
+    // memory; LayoutRight keeps D contiguous, as the op requires).
+    using V3u = Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace,
+                             Kokkos::MemoryUnmanaged>;
+    V3u qu(qq.data(), T, 1, C), ku(kk.data(), T, 1, C),
+        vu(vv.data(), T, 1, C);
+    V3u ou(av.data(), T, 1, C);
+    ::KokkosDNN::attention_mha_bidirectional<ExecSpace, Scalar>(
+        handle, qu, ku, vu, ou, 1.0f / sqrtf((float)C), tag + "_attn");
     KokkosDNN::gemm_bias<ExecSpace, Scalar>(
         handle, av,
         Impl::qwen21vae_bind_mat<ExecSpace, Scalar>(blobs, shapes,
@@ -1532,7 +1456,7 @@ class QwenImage21VaeModel {
   void decode_sample(const DNNHandle<ExecSpace>& handle, const V3& lat_b,
                      const V3& out_b, const V1& f0, const V1& f1, const V1& f2,
                      size_t s2max, const V2& qkv, const V2& qq, const V2& kk,
-                     const V2& vv, const V2& av, const V2& scores) const {
+                     const V2& vv, const V2& av) const {
     const auto& blobs = weights_.blobs;
     const auto& shapes = weights_.shapes;
     const size_t Z = (size_t)cfg_.z_dim;
@@ -1577,7 +1501,7 @@ class QwenImage21VaeModel {
                  "qwen21vae_mid_a");
     cur = 1 - cur;
     attn_stage(handle, "decoder.mid_block.attentions.0.", stage(cur, T, D0),
-               stage(1 - cur, T, D0), H, W, qkv, qq, kk, vv, av, scores,
+               stage(1 - cur, T, D0), H, W, qkv, qq, kk, vv, av,
                "qwen21vae_mid_attn");
     cur = 1 - cur;
     resnet_stage(handle, mid_p + "1.", D0, D0, H, W, stage(cur, T, D0),
@@ -1665,8 +1589,8 @@ class QwenImage21VaeModel {
   void encode_sample(const DNNHandle<ExecSpace>& handle, const V3& img_b,
                      const V3& lat_b, const V1& f0, const V1& f1, const V1& f2,
                      size_t s2max, const V2& qkv, const V2& qq, const V2& kk,
-                     const V2& vv, const V2& av, const V2& scores,
-                     const V1& mean, const V1& std) const {
+                     const V2& vv, const V2& av, const V1& mean,
+                     const V1& std) const {
     const auto& blobs = weights_.blobs;
     const auto& shapes = weights_.shapes;
     const size_t Z = (size_t)cfg_.z_dim;
@@ -1723,7 +1647,7 @@ class QwenImage21VaeModel {
         const std::string u =
             "encoder.down_blocks." + std::to_string(i) + ".downsampler.";
         Impl::qwen21vae_downsample_conv3x3_stride2<ExecSpace>(
-            stage(cur, T, uout), H, W,
+            handle, stage(cur, T, uout), H, W,
             Impl::qwen21vae_bind_conv<ExecSpace, Scalar>(
                 blobs, shapes, u + "resample.1.weight", uout, uout, 3),
             Impl::qwen21vae_bind_vec<ExecSpace, Scalar>(
@@ -1754,7 +1678,7 @@ class QwenImage21VaeModel {
                  "qwen21vae_enc_mid_a");
     cur = 1 - cur;
     attn_stage(handle, "encoder.mid_block.attentions.0.", stage(cur, T, EL),
-               stage(1 - cur, T, EL), H, W, qkv, qq, kk, vv, av, scores,
+               stage(1 - cur, T, EL), H, W, qkv, qq, kk, vv, av,
                "qwen21vae_enc_mid_attn");
     cur = 1 - cur;
     resnet_stage(handle, mid_p + "1.", EL, EL, H, W, stage(cur, T, EL),
