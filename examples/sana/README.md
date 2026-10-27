@@ -7,22 +7,26 @@ C++20 Kokkos port of the NVlabs/Sana `SanaMS_600M_P1_D28` text-to-image stack (6
 Run from repo root (`/workspace`). Gemma is gated: accept the Terms of Use at <https://huggingface.co/google/gemma-2-2b-it> once, then export a granted token as `HF_TOKEN`.
 
 ```bash
-# 1. Build and install Kokkos once (Serial shown; for GPU add
-#    -DKokkos_ENABLE_CUDA=ON -DKokkos_ARCH_AMPERE80=ON and set
-#    CMAKE_CXX_COMPILER to kokkos-src/bin/nvcc_wrapper)
+# 1. Build and install Kokkos once (CUDA, AMPERE86)
 git clone --branch 5.2.1 --recursive https://github.com/kokkos/kokkos.git kokkos-src
 cmake -S kokkos-src -B kokkos-build \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX=/path/to/kokkos-install \
+  -DCMAKE_CXX_COMPILER=/path/to/kokkos-src/bin/nvcc_wrapper \
+  -DKokkos_ENABLE_CUDA=ON \
   -DKokkos_ENABLE_SERIAL=ON \
+  -DKokkos_ARCH_AMPERE86=ON \
   -DKokkos_ENABLE_TESTS=OFF
 cmake --build kokkos-build --parallel 8
 cmake --install kokkos-build
 
-# 2. Configure and build the example target
+# 2. Configure and build the example target (CUDA, cuBLAS + cuDNN)
 cmake -S . -B build \
+  -DCMAKE_CXX_COMPILER=/path/to/kokkos-src/bin/nvcc_wrapper \
   -DKokkos_ROOT=/path/to/kokkos-install \
   -DCMAKE_BUILD_TYPE=Release \
+  -DKokkosDNN_ENABLE_CUBLAS=ON \
+  -DKokkosDNN_ENABLE_CUDNN=ON \
   -DKokkosDNN_ENABLE_IMAGE=ON
 cmake --build build --parallel 8 --target sana_generate
 
@@ -56,7 +60,7 @@ Checkpoint → flag mapping: `--weights` = DiT `.pth`; `--text-weights` (alias `
 ```bash
 # tiny smoke: random weights, 4x4 latents, 2 Euler steps (no downloads)
 ./build/examples/sana/sana_generate --tiny --steps 2
-# real DiT, null conditioning (prompt logged only; SLOW on serial CPU)
+# real DiT, null conditioning (prompt logged only)
 ./build/examples/sana/sana_generate \
   --weights Sana_600M_1024px/checkpoints/Sana_600M_1024px_MultiLing.pth \
   --steps 18 --guidance 5.0 --seed 42 --out sana_out.png

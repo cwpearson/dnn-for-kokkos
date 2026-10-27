@@ -11,20 +11,21 @@ LFM2.5-24B-A2B hybrid-MoE text inference built on the core library: 40 blocks (1
 From repo root `/workspace` — build Kokkos once, build the example target, fetch checkpoint files, run:
 
 ```bash
-# 1. Build and install Kokkos once (Serial shown; for GPU add
-#    -DKokkos_ENABLE_CUDA=ON -DKokkos_ARCH_AMPERE80=ON and set
-#    CMAKE_CXX_COMPILER to kokkos-src/bin/nvcc_wrapper)
+# 1. Build and install Kokkos once (CUDA, AMPERE86)
 git clone --branch 5.2.1 --recursive https://github.com/kokkos/kokkos.git kokkos-src
 cmake -S kokkos-src -B kokkos-build \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX=/path/to/kokkos-install \
+  -DCMAKE_CXX_COMPILER=/path/to/kokkos-src/bin/nvcc_wrapper \
+  -DKokkos_ENABLE_CUDA=ON \
   -DKokkos_ENABLE_SERIAL=ON \
+  -DKokkos_ARCH_AMPERE86=ON \
   -DKokkos_ENABLE_TESTS=OFF
 cmake --build kokkos-build --parallel 8
 cmake --install kokkos-build
 
-# 2. Configure and build the example target
-cmake -S . -B build -DKokkos_ROOT=/path/to/kokkos-install -DCMAKE_BUILD_TYPE=Release
+# 2. Configure and build the example target (CUDA, cuBLAS + cuDNN)
+cmake -S . -B build -DCMAKE_CXX_COMPILER=/path/to/kokkos-src/bin/nvcc_wrapper -DKokkos_ROOT=/path/to/kokkos-install -DCMAKE_BUILD_TYPE=Release -DKokkosDNN_ENABLE_CUBLAS=ON -DKokkosDNN_ENABLE_CUDNN=ON
 cmake --build build --parallel 8 --target lfm2_5_generate
 
 # 3. Download the checkpoint files with the `hf` CLI.
