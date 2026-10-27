@@ -531,8 +531,7 @@ void edit_usage() {
       "  --seed N                default 42\n"
       "  --vae-weights F         VAE checkpoint (encode + decode need it)\n"
       "  --vae-decode / --no-vae-decode  real decode (default) vs preview\n"
-      "  --out F                 default qwen_image_21_edit.png (+ "
-      "<stem>.f32 latents)\n"
+      "  --out F                 default qwen_image_21_edit.png\n"
       "  --staged / --no-staged  fenced staged release (default on)\n"
       "  --dump-steps DIR        parity tensors + manifest.json\n"
       "  --tiny                  4x4 smoke latents, 2 steps, random weights\n"
@@ -982,7 +981,6 @@ int main(int argc, char** argv) {
     // img_shapes/img_mask); without vision-slot rows the run falls back
     // to target-only sampling (still dumped + reported).
     std::vector<float> ref_lat;
-    bool have_ref = false;
     if (!ref_latents_in.empty()) {
       if (tiny)
         throw std::runtime_error(
@@ -990,7 +988,6 @@ int main(int argc, char** argv) {
       ref_lat = load_decode_latents(ref_latents_in, C, (size_t)in_lat_h,
                                     (size_t)in_lat_w,
                                     ref_latents_layout == "token");
-      have_ref = true;
       std::printf("[ref-latents file %s] %zux%dx%d floats (%s layout)\n",
                   ref_latents_in.c_str(), C, in_lat_h, in_lat_w,
                   ref_latents_layout.c_str());
@@ -999,7 +996,6 @@ int main(int argc, char** argv) {
       try {
         ref_lat = try_vae_encode_image(vae_chw, (size_t)cond_h, (size_t)cond_w,
                                        vae_weights);
-        have_ref = true;
         std::printf("[ref-latents vae-encode] %zux%dx%d floats (in-process "
                     "RGBA [-1,1] -> (mode-mean)/std)\n",
                     C, in_lat_h, in_lat_w);
@@ -1281,25 +1277,6 @@ int main(int argc, char** argv) {
       dump_sigmas = (sigmas_mode == "turbo")
                         ? turbo_sigmas
                         : build_sigmas_nearest_grid(steps_eff, flow_shift);
-      {
-        auto hc = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(),
-                                                      enc.device);
-        const size_t L = enc.device.extent(0), Cc = enc.device.extent(1);
-        std::vector<float> pe(L * Cc);
-        size_t k = 0;
-        for (size_t l = 0; l < L; ++l)
-          for (size_t c = 0; c < Cc; ++c) pe[k++] = (float)hc(l, c);
-        dump.write("prompt_embeds", pe);
-        if (guidance != 1.0f) {
-          auto hu = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(),
-                                                        enc.device_neg);
-          std::vector<float> ne(L * Cc);
-          k = 0;
-          for (size_t l = 0; l < L; ++l)
-            for (size_t c = 0; c < Cc; ++c) ne[k++] = (float)hu(l, c);
-          dump.write("prompt_embeds_neg", ne);
-        }
-      }
       dump.write("initial_latents", x_init);
       // Reference latents exactly as staged (zeros when --ref-latents-in
       // was absent): the packed tensor the cond DiT path consumes.
@@ -1374,18 +1351,6 @@ int main(int argc, char** argv) {
     var /= (double)lat.size();
     std::printf("[latents %zux%zux%zu] mean=%.6f std=%.6f min=%.4f max=%.4f\n",
                 C, (size_t)H, (size_t)W, mean, std::sqrt(var), mn, mx);
-
-    std::string lat_path = with_extension(out, ".f32");
-    save_raw_f32(lat_path, lat);
-    std::printf("[wrote %s] raw fp32 target latents\n", lat_path.c_str());
-    if (have_ref) {
-      const std::string ref_path = with_extension(out, ".ref.f32");
-      save_raw_f32(ref_path, ref_lat);
-      std::printf("[wrote %s] reference latents (%s by the DiT)\n",
-                  ref_path.c_str(),
-                  cond_tok.is_allocated() ? "consumed as cond tokens"
-                                          : "target-only run, not consumed");
-    }
 
     if (dump.active()) {
       DumpManifest dm;

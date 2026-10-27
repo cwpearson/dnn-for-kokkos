@@ -192,7 +192,7 @@ python3 scripts/moss_encode.py --null \
 | `--slg-layers` | — | comma-separated block ids for a positive-branch skipped forward (e.g. `24`; empty disables) |
 | `--slg-scale` | 0.0 | SLG correction scale (`>0` + non-empty `--slg-layers` enables the third forward) |
 | `--slg-start`/`--slg-stop` | 0.0/1.0 | window gating uncond skipping AND SLG, as a fraction of steps in denoising order |
-| `--vae-decode` | off | run the real VAE decode when the VAE header + `--vae-weights` are present (else grayscale preview with a logged reason) |
+| `--vae-decode` | on (`--no-vae-decode` for preview) | run the real VAE decode when the VAE header + `--vae-weights` are present (else grayscale preview with a logged reason) |
 
 Reference-parity semantics (verified against
 `pipeline_moss_image.py::__call__` / `MOSSImageScheduler::set_timesteps`):
@@ -220,8 +220,8 @@ Staged peaks (from `STAGED_MEMORY_BUDGET.md` §3, 24 GiB budget):
 Landed in this tree: all three true-pipeline headers are present, so runs
 print `[backend dit=moss-image-dit encoder=qwen vae=moss-image-vae]` —
 sampling runs the true 42x3072 MMDiT (per-sample text mask, 4D RoPE, SiTU),
-decode runs the FLUX.2-small VAE when `--vae-weights --vae-decode` are
-given (else grayscale preview). Encode runs fully in-process: the repo's
+decode runs the FLUX.2-small VAE when `--vae-weights` is given (decode is
+on by default; pass `--no-vae-decode` for the grayscale preview). Encode runs fully in-process: the repo's
 byte-level BPE (`models/moss_image/KokkosDNN_QwenTokenizer.hpp`, NFC + pre-tokenizer +
 merges verified id-for-id against transformers 5.12.1) tokenizes the
 prompt, and the on-device Qwen35::EncoderModel (full + Gated-DeltaNet
@@ -257,7 +257,8 @@ holding `tokenizer.json` (the HF `tokenizer/` dir works as-is);
 `[L,Cc]` (produce with `scripts/moss_encode_qwen.py` or
 `scripts/moss_encode.py`; `[1,L,Cc]`/`[1,1,L,Cc]` flattened also accepted,
 last block wins); `--vae-weights` = FLUX.2 VAE `.safetensors` (single
-250MB file), decoded only with `--vae-decode`.
+250MB file), decoded by default with `--vae-weights` (pass
+`--no-vae-decode` for the grayscale preview).
 
 ## Driver flags (`moss_image_generate`)
 
@@ -271,7 +272,7 @@ last block wins); `--vae-weights` = FLUX.2 VAE `.safetensors` (single
 | `--text-encoder` | — | Qwen text-encoder weights: `text_encoder/` shard dir or single `.safetensors` |
 | `--text-weights` | — | raw F32 caption features `[L,Cc]` |
 | `--prompt-embeds-in` | — | alias of `--text-weights` (wins if both differ) |
-| `--staged` | off | encode → release encoder weights (MiB embeds stay resident on device) → fence → load DiT → sample (encoder/DiT never co-resident, no disk round-trip) |
+| `--staged` | on (`--no-staged` for single-phase) | encode → release encoder weights (MiB embeds stay resident on device) → fence → load DiT → sample (encoder/DiT never co-resident, no disk round-trip) |
 | `--height`/`--width` | 64 | latent H/W (x16 = pixels, so 64 means 1024px; placeholder path needs multiples of 16, must tile `patch_size`) |
 | `--steps` | 50 | Euler steps (nearest-grid schedule; count may shrink via `unique_consecutive`) |
 | `--cfg` (`--guidance`) | 3.0 | CFG scale (`!=1` takes the CFG branch, matching the reference) |
@@ -282,8 +283,8 @@ last block wins); `--vae-weights` = FLUX.2 VAE `.safetensors` (single
 | `--slg-start`/`--slg-stop` | 0.0/1.0 | window gating uncond skipping and SLG, as a fraction of steps (`0 <= start <= stop <= 1`) |
 | `--seed` | 42 | latent init seed |
 | `--vae-weights` | — | VAE checkpoint (validated whenever given) |
-| `--vae-decode` | off | real VAE decode when the VAE header + weights are present (else grayscale preview with a logged reason) |
-| `--out` | `moss_out.png` | PNG (`.jpg`/`.jpeg` writes JPEG) with `KokkosDNN_ENABLE_IMAGE=ON`, else `.ppm`; raw F32 latents always written to `<stem>.f32` (`[C,H,W]`) |
+| `--vae-decode` | on (`--no-vae-decode` for preview) | real VAE decode when the VAE header + weights are present (else grayscale preview with a logged reason) |
+| `--out` | `moss_out.png` | PNG (`.jpg`/`.jpeg` writes JPEG) with `KokkosDNN_ENABLE_IMAGE=ON`, else `.ppm` |
 
 ## Notes
 
@@ -379,7 +380,7 @@ KOKKOSDNN_QWEN_TOKENIZER_JSON=/path/to/tokenizer.json ctest -R "wen|Moss"
 ```
 
 exercises config → random init → model forward → FlowEuler + CFG/SLG loop
-→ preview + `.f32` dump with no downloads, plus `Test_MossImageOps`,
+→ preview with no downloads, plus `Test_MossImageOps`,
 `Test_MossImageDit`, `Test_MossImageEncoder` (incl. tiny forward goldens
 and the safetensors round-trip) and `Test_QwenTokenizer` (10 golden
 id-sequences vs transformers 5.12.1, NFC/pre-tokenizer edge cases).

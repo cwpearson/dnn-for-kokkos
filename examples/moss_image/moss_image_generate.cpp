@@ -39,8 +39,7 @@
 // --vae-weights is validated whenever given; VAE decode runs by default
 // (the real VAE decode when the VAE header + weights are present, else a
 // channel-mean grayscale preview with a clear log; pass --no-vae-decode
-// for the preview). Raw fp32
-// latents (<stem>.f32, [C,H,W] row-major) are always written.
+// for the preview).
 //
 // Staged execution (24GB fit, default): encode -> releases the encoder
 // weights (the MiB-scale embeds stay resident on the device) ->
@@ -201,14 +200,6 @@ inline std::vector<int> check_skip_layers(const std::vector<int>& layers,
   return layers;
 }
 
-void save_raw_f32(const std::string& path, const std::vector<float>& v) {
-  std::ofstream f(path, std::ios::binary);
-  if (!f) throw std::runtime_error("cannot open '" + path + "' for writing");
-  f.write(reinterpret_cast<const char*>(v.data()),
-          (long long)(v.size() * sizeof(float)));
-  if (!f) throw std::runtime_error("short write to '" + path + "'");
-}
-
 // Grayscale preview: channel-mean -> min/max normalize -> u8 -> nearest 8x.
 std::vector<unsigned char> render_preview(const std::vector<float>& lat,
                                           size_t C, size_t H, size_t W,
@@ -264,7 +255,8 @@ void save_ppm(const std::string& path, const std::vector<unsigned char>& gray,
 }
 #endif
 
-std::string with_extension(const std::string& path, const std::string& ext) {
+[[maybe_unused]] std::string with_extension(const std::string& path,
+    const std::string& ext) {
   const size_t dot = path.find_last_of('.');
   const size_t sep = path.find_last_of("/\\");
   if (dot == std::string::npos || (sep != std::string::npos && dot < sep))
@@ -1033,8 +1025,7 @@ void usage() {
       "                 header + weights are present (else grayscale preview).\n"
       "                 Pass --no-vae-decode for the preview\n"
       "  --out          PNG (.jpg/.jpeg writes JPEG) with "
-      "KokkosDNN_ENABLE_IMAGE=ON, else PPM;\n"
-      "                 raw F32 latents always written to <stem>.f32\n");
+      "KokkosDNN_ENABLE_IMAGE=ON, else PPM\n");
 }
 
 }  // namespace
@@ -1395,10 +1386,6 @@ int main(int argc, char** argv) {
     var /= (double)lat.size();
     std::printf("[latents %zux%zux%zu] mean=%.6f std=%.6f min=%.4f max=%.4f\n",
                 C, (size_t)H, (size_t)W, mean, std::sqrt(var), mn, mx);
-
-    std::string lat_path = with_extension(out, ".f32");
-    save_raw_f32(lat_path, lat);
-    std::printf("[wrote %s] raw fp32 latents\n", lat_path.c_str());
 
     // Captions are no longer needed: drop host + device copies before decode.
     enc.release();

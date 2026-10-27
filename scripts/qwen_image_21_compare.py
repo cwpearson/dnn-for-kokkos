@@ -5,7 +5,6 @@ Given a golden dir (from ``scripts/qwen_image_21_golden.py``) and an actual
 dir (from ``examples/qwen_image_21/qwen_image_21_generate.cpp --dump-steps``),
 compare every tensor both sides have:
 
-    prompt_embeds.f32        [L, Cc]      exact DiT conditioning
     initial_latents.f32      [C, H, W]    initial noise (driver layout)
     ref_latents.f32          [C, Hc, Wc]  edit-mode VAE condition latents
     img_mask.f32             [V] 0/1      edit-mode image mask row
@@ -65,7 +64,7 @@ QWEN21_CONTEXT_DIM = 4096
 QWEN21_LATENT_CHANNELS = 64
 # Exact step tensor names: step00_noise_pred.f32, step01_latents.f32, ...
 STEP_RE = re.compile(r"^step(\d+)_(noise_pred|latents)\.f32$")
-CORE_FILES = ("prompt_embeds.f32", "initial_latents.f32")
+CORE_FILES = ("initial_latents.f32",)
 # Edit-mode reference tensors: present on both sides only for edit dumps
 # (the T2I golden/driver never write them); compared when shared, skipped
 # with a note otherwise, never fatal.
@@ -720,8 +719,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if not rows:
             die(
-                "no comparable tensors found (no prompt_embeds.f32 / "
-                "initial_latents.f32 / step{ii}_*.f32 in both dirs)"
+                "no comparable tensors found (no initial_latents.f32 / "
+                "step{ii}_*.f32 in both dirs)"
             )
         print_table(rows)
         for row in rows:

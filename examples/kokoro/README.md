@@ -51,7 +51,7 @@ hf download hexgrad/Kokoro-82M --local-dir ./kokoro-weights \
 phoneme symbols, not graphemes (produce them with the `kokoro` KPipeline in
 quiet mode, or `espeak-ng -v en --ipa`). `--text` maps characters present in
 the vocab directly (no G2P; unmapped characters are skipped) — demo quality
-only. WAV is peak-normalized PCM16; raw float32 always lands at `<stem>.f32`.
+only. WAV is peak-normalized PCM16.
 
 Driver flags (`kokoro_tts`):
 
@@ -63,7 +63,7 @@ Driver flags (`kokoro_tts`):
 | `--text` | — | naive fallback: vocab chars mapped directly, no G2P |
 | `--speed` | `1.0` | duration divisor |
 | `--seed` | `42` | SineGen RNG seed (see Notes) |
-| `--out` | `kokoro_out.wav` | WAV path (PCM16 peak-normalized; raw F32 to `<stem>.f32`) |
+| `--out` | `kokoro_out.wav` | WAV path (PCM16 peak-normalized) |
 | `--tiny` | off | random-weights smoke model (no files) |
 
 ## Notes

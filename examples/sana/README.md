@@ -90,8 +90,9 @@ Driver flags (`sana_generate`; verified against `sana_generate.cpp`):
 | `--tokenizer` (`--gemma-tokenizer`) / `--text-config` | — | `tokenizer.json` / `config.json` overrides |
 | `--chi-prompt` | — | complex-human-instruction prefix |
 | `--steps` / `--guidance` / `--flow-shift` / `--seed` | 18 / 5.0 / 4.0 / 42 | Euler steps / CFG scale (`<=1` disables) / sigma shift / latent seed |
-| `--out` | `sana_out.png` | PNG (`.jpg`/`.jpeg` writes JPEG) with `KokkosDNN_ENABLE_IMAGE=ON`, else `.ppm`; raw F32 latents always written to `<stem>.f32` (`[C,H,W]`) |
+| `--out` | `sana_out.png` | PNG (`.jpg`/`.jpeg` writes JPEG) with `KokkosDNN_ENABLE_IMAGE=ON`, else `.ppm` |
 | `--vae-safetensors` | — | DC-AE decoder weights; without it a channel-mean grayscale preview (32x nearest) is written |
+| `--vae-decode` | on (`--no-vae-decode` for preview) | real VAE decode when `--vae-safetensors` is given, else grayscale preview |
 | `--fp32` | — | accepted no-op (float is the checkpoint dtype) |
 
 ## Notes
