@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 // SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Qwen-Image-2.1 model library: installable component (KokkosDNN::qwen_image_21).
-// Header-only pipeline (KokkosDNN_QwenImage21{Config,Dit,Encoder,Vae}.hpp);
-// there are no .cpp sources, hence INTERFACE. TEXT-TO-IMAGE ONLY: no image
-// editing (no image-condition input path) is implemented anywhere here.
+// Header-only pipeline (KokkosDNN_QwenImage21{Config,Dit,Encoder,Vae,Vision}.hpp);
+// there are no .cpp sources, hence INTERFACE. Edit conditioning is wired at
+// the encoder level (joint text+vision encode) and in the DiT forward_cond
+// path ([cond|target] + img_shapes/img_mask); the VAE is decode-only
+// (see those headers).
 #ifndef KOKKOSDNN_QWENIMAGE21CONFIG_HPP
 #define KOKKOSDNN_QWENIMAGE21CONFIG_HPP
 

@@ -155,6 +155,30 @@ def main() -> None:
         "step00_noise_pred_full.f32, manifest.json) next to the PNG "
         "(default: on; --no-dump-artifacts keeps only the final latents/PNG)",
     )
+    ap.add_argument(
+        "--edit-image",
+        default=None,
+        help="condition image for edit mode (e.g. the Turbo boat sketch). "
+        "When given, runs the image-conditioned edit pipeline with "
+        "--edit-prompt and dumps the joint text+vision prompt_embeds plus "
+        "edit metadata (vision grid/token counts, vision-slot rows) for "
+        "the C++ edit driver.",
+    )
+    ap.add_argument(
+        "--edit-prompt",
+        default="Create a photorealistic photograph of the motor yacht from "
+        "the input sketch, sailing on open sea",
+        help="edit instruction for --edit-image mode",
+    )
+    ap.add_argument(
+        "--output-resolution",
+        type=int,
+        default=1024,
+        help="reference area side for --edit-image mode (default 1024): the "
+        "condition image resize and the default output size derive from it, "
+        "matching the C++ edit driver --output-resolution default. "
+        "Text-to-image runs ignore it.",
+    )
     args = ap.parse_args()
 
     import os
@@ -166,14 +190,30 @@ def main() -> None:
     )
     os.makedirs(outdir, exist_ok=True)
 
+    # Edit mode: image-conditioned run (QwenImage21Pipeline with image=...).
+    # Output size is left to the pipeline (derived from the condition image
+    # at output_resolution=1024) so the golden matches the C++ edit driver
+    # default; WIDTH/HEIGHT below are only the T2I constants.
+    edit_mode = args.edit_image is not None
+    PROMPT_EFF = args.edit_prompt if edit_mode else PROMPT
+    edit_images = None
+    if edit_mode:
+        from diffusers.utils import load_image as _load_image
+
+        edit_images = [_load_image(args.edit_image).convert("RGBA")]
+        print(f"edit_image: {args.edit_image} (size {edit_images[0].size})")
+
     if args.device == "cuda" and not torch.cuda.is_available():
         die("no CUDA device found; rerun with --device cpu (slow) or install CUDA torch.")
 
     print(f"weights : {args.weights}")
     print(f"outdir  : {outdir}")
     print(f"device  : {args.device}")
-    print(f"prompt  : {PROMPT!r}")
-    print(f"size    : {WIDTH}x{HEIGHT}, seed {args.seed}")
+    print(f"prompt  : {PROMPT_EFF!r}")
+    if edit_mode:
+        print(f"size    : derived from edit image, seed {args.seed}")
+    else:
+        print(f"size    : {WIDTH}x{HEIGHT}, seed {args.seed}")
     print(f"torch   : {torch.__version__}")
     import diffusers
 
@@ -197,6 +237,27 @@ def main() -> None:
         pass
     pipe.set_progress_bar_config(disable=True)
 
+    edit_image_orig_size = None
+    if edit_mode:
+        # Mirror __call__'s condition-image resize so the section-(a)
+        # encode sees exactly the image the pipeline uses for both the
+        # text encoder and the VAE. Encoding the raw file (here 3200x1120)
+        # yields a longer vision-token span than the latents/img_shapes
+        # __call__ derives from the 1024-px fit, breaking the DiT join.
+        from diffusers.pipelines.qwenimage21.pipeline_qwenimage21 import (
+            calculate_dimensions as _calc_dims,
+        )
+
+        edit_image_orig_size = [int(v) for v in edit_images[0].size]
+        _iw, _ih = edit_images[0].size
+        _res = int(args.output_resolution)
+        _rw, _rh, _ = _calc_dims(_res * _res, _iw / _ih)
+        print(f"output_resolution: {_res} (condition + default output fit)")
+        edit_images = [
+            pipe.image_processor.resize(edit_images[0], width=_rw, height=_rh)
+        ]
+        print(f"edit_image resized: {edit_images[0].size} (pipeline {_res}-px fit)")
+
     # ---- (a) prompt embeds -------------------------------------------------
     # Prefer the pipeline's own encoder helper; fall back to a forward hook
     # on the text encoder for forwards-compatibility across diffusers revs.
@@ -205,17 +266,21 @@ def main() -> None:
         import inspect
 
         sig = inspect.signature(pipe.encode_prompt)  # device/dtype-agnostic call
-        kwargs: dict = {"prompt": PROMPT}
+        kwargs: dict = {"prompt": PROMPT_EFF}
         if "device" in sig.parameters:
             kwargs["device"] = pipe.device
+        if edit_images is not None and "image" in sig.parameters:
+            kwargs["image"] = edit_images
         result = pipe.encode_prompt(**kwargs)
         # Arity varies across diffusers revs (2- or 3-tuple); we need the
         # first two entries: (prompt_embeds, prompt_embeds_mask).
         if isinstance(result, (tuple, list)):
             prompt_embeds = result[0]
             prompt_embeds_mask = result[1] if len(result) > 1 else None
+            image_pad_mask = result[2] if len(result) > 2 else None
         else:
             prompt_embeds, prompt_embeds_mask = result, None
+            image_pad_mask = None
     else:  # hook-based fallback
         handles = [
             pipe.text_encoder.register_forward_hook(
@@ -225,7 +290,15 @@ def main() -> None:
             )
         ]
         try:
-            pipe(prompt=PROMPT, width=64, height=64, use_kv_cache=False)
+            fb_kwargs: dict = {
+                "prompt": PROMPT_EFF,
+                "width": 64,
+                "height": 64,
+                "use_kv_cache": False,
+            }
+            if edit_images is not None:
+                fb_kwargs["image"] = edit_images
+            pipe(**fb_kwargs)
         finally:
             for h in handles:
                 h.remove()
@@ -254,6 +327,29 @@ def main() -> None:
         pipe.transformer.to(args.device)
         pipe.vae.to(args.device)
         torch.cuda.empty_cache()
+        if edit_mode:
+            # The 1728x608 edit output's full-frame VAE decode does not fit
+            # in 24 GB next to the transformer. Tile the decode ONLY: VAE
+            # tiling is a global use_tiling flag that also re-routes ENCODE
+            # through the tiled path, so it must stay DISABLED while the
+            # pipeline encodes the condition image (prepare_latents /
+            # _encode_vae_image) -- the C++ driver implements the untiled
+            # encode. Enable tiling only around the final decode, and park
+            # the transformer on CPU first: it is not needed after the
+            # last denoising step.
+            pipe.vae.disable_tiling()
+            _orig_vae_decode = pipe.vae.decode
+
+            def _decode_after_transformer_offload(*d_args, **d_kwargs):
+                pipe.transformer.to("cpu")
+                torch.cuda.empty_cache()
+                pipe.vae.enable_tiling()
+                try:
+                    return _orig_vae_decode(*d_args, **d_kwargs)
+                finally:
+                    pipe.vae.disable_tiling()
+
+            pipe.vae.decode = _decode_after_transformer_offload  # type: ignore[method-assign]
 
     # ---- hooks for latents trajectory + per-step noise_pred ---------------
     latents_traj: list[torch.Tensor] = []  # post-step latents, one entry per step
@@ -274,6 +370,7 @@ def main() -> None:
 
     # Initial latents: wrap prepare_latents when the pipeline exposes it.
     initial_latents: list[torch.Tensor] = []
+    cond_latents: list[torch.Tensor] = []  # edit-mode VAE condition tokens
     if hasattr(pipe, "prepare_latents"):
         orig_prep = pipe.prepare_latents
 
@@ -281,6 +378,9 @@ def main() -> None:
             out = orig_prep(*p_args, **p_kwargs)
             lat0 = out[0] if isinstance(out, tuple) else out
             initial_latents.append(lat0.detach().cpu())
+            if edit_mode and isinstance(out, tuple) and len(out) > 1:
+                if out[1] is not None:
+                    cond_latents.append(out[1].detach().cpu())
             return out
 
         pipe.prepare_latents = recording_prepare  # type: ignore[method-assign]
@@ -300,23 +400,55 @@ def main() -> None:
         None,
     )
     call_kwargs = dict(
-        width=WIDTH,
-        height=HEIGHT,
         use_kv_cache=True,
         generator=generator,
         callback_on_step_end=on_step_end,
     )
+    if not edit_mode:
+        # Edit mode leaves width/height to the pipeline (derived from the
+        # condition image, matching the C++ edit driver default).
+        call_kwargs["width"] = WIDTH
+        call_kwargs["height"] = HEIGHT
+    if edit_images is not None:
+        call_kwargs["image"] = edit_images
+        # Match the C++ edit driver default (1024); the pipeline default is
+        # the same, but pin it so the golden records the exact contract.
+        call_kwargs["output_resolution"] = int(args.output_resolution)
     if "prompt_embeds" in call_params:
         # Bypass the text encoder (it stays on CPU in manual placement).
         call_kwargs["prompt_embeds"] = prompt_embeds
         if prompt_embeds_mask is not None and "prompt_embeds_mask" in call_params:
             call_kwargs["prompt_embeds_mask"] = prompt_embeds_mask
     else:
-        call_kwargs["prompt"] = PROMPT
+        call_kwargs["prompt"] = PROMPT_EFF
     if tensor_inputs_kw is not None:
         call_kwargs[tensor_inputs_kw] = ["latents"]
     pipeline_arg = "prompt_embeds" if "prompt_embeds" in call_kwargs else "prompt"
-    result = pipe(**call_kwargs)
+    if edit_mode and "prompt_embeds" in call_kwargs:
+        # QwenImage21 __call__ has no image_pad_mask arg: it re-invokes
+        # encode_prompt(image=...) which rejects prompt_embeds covering
+        # condition images unless the pad mask rides along. Serve the
+        # section-(a) tensors (encoded on CPU, moved to CUDA above) as-is
+        # instead of re-running the CPU-resident text encoder. Valid for
+        # the script's cfg=1 (single cond branch, no negative encode).
+        _cached = (prompt_embeds, prompt_embeds_mask, image_pad_mask)
+        if args.placement == "manual":
+            _cached = tuple(
+                t.to(torch.device(args.device)) if t is not None else None
+                for t in _cached
+            )
+
+        def _encode_with_cached_pad(*e_args, **e_kwargs):
+            return _cached
+
+        _orig_encode_prompt = pipe.encode_prompt
+        pipe.encode_prompt = _encode_with_cached_pad  # type: ignore[method-assign]
+        try:
+            result = pipe(**call_kwargs)
+        finally:
+            pipe.encode_prompt = _orig_encode_prompt  # type: ignore[method-assign]
+    else:
+        result = pipe(**call_kwargs)
     image = result.images[0]
 
     # ---- (b) initial latents ----------------------------------------------
@@ -348,7 +480,10 @@ def main() -> None:
           f"raw float32, shape {lat_f32.shape})")
 
     # ---- (e) decoded PNG ----------------------------------------------------
-    png_path = os.path.join(outdir, "qwen_image_21_turbo_capybara.png")
+    if edit_mode:
+        png_path = os.path.join(outdir, "qwen_image_21_turbo_edit.png")
+    else:
+        png_path = os.path.join(outdir, "qwen_image_21_turbo_capybara.png")
     image.save(png_path)
     print(f"[e] wrote {png_path} (size {image.size})")
 
@@ -358,8 +493,14 @@ def main() -> None:
     if args.dump_artifacts:
         steps = len(latents_traj)
         channels = int(final_lat.shape[-1])
-        lat_h = HEIGHT // LATENT_SCALE
-        lat_w = WIDTH // LATENT_SCALE
+        if edit_mode:
+            # Actual output size (derived from the condition image when the
+            # call omits width/height); the driver derives the same default.
+            eff_w, eff_h = int(image.size[0]), int(image.size[1])
+        else:
+            eff_w, eff_h = WIDTH, HEIGHT
+        lat_h = eff_h // LATENT_SCALE
+        lat_w = eff_w // LATENT_SCALE
         ntok = lat_h * lat_w
         if int(final_lat.shape[1]) != ntok:
             die(
@@ -371,6 +512,79 @@ def main() -> None:
         pe_f32 = to_f32(pe[0])
         prompt_len = int(pe_f32.shape[0])
         write_f32(os.path.join(outdir, "prompt_embeds.f32"), pe_f32)
+
+        edit_meta: dict = {}
+        if edit_mode:
+            # Vision-slot rows of the joint sequence (compare against the
+            # driver's vis_rows) + patch grid for the reference-latent
+            # layout. image_pad_mask is post-drop, like prompt_embeds.
+            if image_pad_mask is None:
+                die("edit mode needs image_pad_mask from encode_prompt")
+            ipm = image_pad_mask.detach().to(device="cpu", dtype=torch.bool)
+            vis_rows = torch.nonzero(ipm[0], as_tuple=False).reshape(-1)
+            np.save(os.path.join(outdir, "image_pad_rows.npy"),
+                    vis_rows.numpy())
+            nv = int(vis_rows.numel())
+            print(f"[f] edit vision tokens: Nv={nv} "
+                  f"(rows {int(vis_rows[0])}..{int(vis_rows[-1])})")
+            # VAE condition latents: prepare_latents already ran the
+            # pipeline's own _encode_vae_image ((mode-mean)/std, argmax) on
+            # the resized condition image; repack torch [Nc, C] rows to the
+            # driver [C, Hc, Wc] chw layout (same convention as target
+            # latents) for --ref-latents-in.
+            if not cond_latents:
+                die("edit mode needs condition latents from prepare_latents")
+            _cw, _ch = edit_images[0].size
+            cond_h, cond_w = _ch // LATENT_SCALE, _cw // LATENT_SCALE
+            ref_chw = tokens_to_chw(cond_latents[0][0], cond_h, cond_w)
+            write_f32(os.path.join(outdir, "ref_latents.f32"), ref_chw)
+            print(f"[f] edit condition grid: {cond_h}x{cond_w} "
+                  f"(target grid {lat_h}x{lat_w})")
+            # img_shapes / img_mask exactly as the pipeline feeds the
+            # transformer: [[(1,Hc,Wc),(1,H,W)]] blocks, and image_pad_mask
+            # with one slot per 2x2 target-latent group appended
+            # (append_target_slots). img_mask.f32 is float32 0/1 like the
+            # driver --dump-steps img_mask dump.
+            img_shapes = [[[1, cond_h, cond_w], [1, lat_h, lat_w]]]
+            n_target_slots = ntok // 4
+            if int(ipm.shape[1]) != prompt_len:
+                die(
+                    f"edit image_pad_mask width {int(ipm.shape[1])} != "
+                    f"prompt length {prompt_len}"
+                )
+            img_mask = torch.cat(
+                [ipm, torch.ones(1, n_target_slots, dtype=torch.bool)], dim=1
+            )
+            img_mask_f32 = np.ascontiguousarray(
+                img_mask.to(torch.float32).numpy()
+            )
+            write_f32(os.path.join(outdir, "img_mask.f32"), img_mask_f32)
+            print(f"[f] edit img_mask: V={int(img_mask.shape[1])} "
+                  f"(S={prompt_len} + N/4={n_target_slots}), "
+                  f"ones={int(img_mask.sum())}")
+            edit_meta = {
+                "edit_image": args.edit_image,
+                "edit_image_size": [int(v) for v in edit_images[0].size],
+                "edit_image_file_size": edit_image_orig_size,
+                "output_resolution": int(args.output_resolution),
+                "vision_tokens": nv,
+                "vision_grid_hw": [eff_h // LATENT_SCALE,
+                                   eff_w // LATENT_SCALE],
+                "image_pad_rows_file": "image_pad_rows.npy",
+                "vision_row_range": [int(vis_rows[0]), int(vis_rows[-1])],
+                "condition_latent_hw": [cond_h, cond_w],
+                "ref_latents_file": "ref_latents.f32",
+                "ref_latents_shape": [channels, cond_h, cond_w],
+                "ref_latents_f64sum": float(
+                    np.sum(ref_chw, dtype=np.float64)
+                ),
+                "img_shapes": img_shapes,
+                "img_mask_file": "img_mask.f32",
+                "img_mask_shape": [1, int(img_mask.shape[1])],
+                "img_mask_f64sum": float(
+                    np.sum(img_mask_f32, dtype=np.float64)
+                ),
+            }
 
         # Initial latents were captured packed as torch rows [1, N, C].
         if not initial_latents:
@@ -388,10 +602,16 @@ def main() -> None:
         for i, npred in enumerate(noise_preds):
             full = npred[0]  # [rows, C]
             rows = int(full.shape[0])
-            if rows == ntok + prompt_len:
-                img = full[prompt_len:]
-            elif rows == ntok:
+            if rows == ntok:
                 img = full
+            elif rows == ntok + prompt_len:
+                img = full[prompt_len:]
+            elif rows > ntok:
+                # KV-cache prefill over the expanded joint sequence (each
+                # vision slot stands for a 2x2 latent group): the pipeline
+                # consumes the trailing target-image rows
+                # (noise_pred[:, -latents.size(1):]).
+                img = full[-ntok:]
             else:
                 die(
                     f"step {i}: noise_pred has {rows} rows, expected {ntok} "
@@ -469,15 +689,17 @@ def main() -> None:
         manifest = {
             "tool": "scripts/qwen_image_21_golden.py",
             "reference": "diffusers.QwenImage21Pipeline",
-            "prompt": PROMPT,
+            "prompt": PROMPT_EFF,
             "prompt_source": {
                 "method": "pipeline.encode_prompt() with the pipeline's raw "
-                "T2I template (no chat template)",
+                + ("edit (ti2i) template (no chat template)"
+                   if edit_mode else
+                   "T2I template (no chat template)"),
                 "pipeline_arg": pipeline_arg,
                 "prompt_embeds_dtype": str(pe.dtype).replace("torch.", ""),
             },
-            "width": WIDTH,
-            "height": HEIGHT,
+            "width": eff_w,
+            "height": eff_h,
             "latent_shape": [channels, lat_h, lat_w],
             "latent_tokens": ntok,
             "latent_channels": channels,
@@ -499,6 +721,7 @@ def main() -> None:
             "use_kv_cache": True,
             "placement": args.placement,
             "device": args.device,
+            "edit": edit_meta,
             "artifact_dtype": "float32 little-endian raw",
             "sums_note": "all f64 sums are over the float32 artifacts written "
             "here (not over the model's bf16 tensors)",
