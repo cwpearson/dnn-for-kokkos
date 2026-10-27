@@ -36,6 +36,12 @@
 //                           optional bias
 //   grouped_conv1x1_forward grouped 1x1, no padding, optional bias
 //
+// Plus one strided operator for VAE encoder downsamplers:
+//
+//   conv3x3_stride2_forward dense 3x3, stride 2, ZeroPad(0,1,0,1)
+//                           (asymmetric: zero past the right/bottom edges
+//                           only; H and W must be even), optional bias
+//
 // Scalar-agnostic (float, bhalf_t); accumulation is FP32, cast back to
 // Scalar. The native kernels (im2col gather, depthwise, grouped) are
 // backend-portable parallel_for only (no backend-specific code outside
@@ -76,6 +82,18 @@
 // gemm lowering, which on HIP rides the hipBLAS ladder. All other builds
 // run the lowering (dense) / native kernels (depthwise, grouped)
 // unconditionally.
+//
+// The stride-2 operator has no TPL convolution dispatch on any build, by
+// construction rather than by omission: the legacy cudnnConvolution* and
+// miopen convolution descriptors each take a single symmetric pad per
+// spatial axis, so the asymmetric ZeroPad(0,1,0,1) (right/bottom-only)
+// padding of the downsampler is not expressible through them, and a
+// symmetric-pad dispatch would silently compute the wrong border values.
+// The stride-2 lowering below (im2col-stride2 + gemm_bias, same budget
+// blocking) still rides the cuBLAS/hipBLAS ladder for its compute, so TPL
+// silicon is used where it matters; only the gather stays native. (A
+// future cuDNN-backend-API path could express the asymmetry with pre/post
+// paddings; until then native == dispatched by construction.)
 //
 // Bias convention (matches gemm_bias / depthwise_conv3x3_forward): b is
 // [Cout] (or [C] for depthwise), or empty (extent 0, e.g. a
@@ -314,6 +332,127 @@ void conv_dense3x3_2d(
   }
 }
 
+// Gather one stride-2 im2col row-block: col[tm, i*9+kh*3+kw] =
+// x_pad(2*h2+kh, 2*w2+kw, i) with ZeroPad(0,1,0,1) semantics (zero past
+// the right/bottom edges), where (h2, w2) is the output position of row
+// r0+tm. Same flat-1D, k-innermost layout as conv3x3_im2col_block (see
+// the coalescing note there); H2/W2 are the output dims (H/2, W/2).
+template <class ExecSpace, class Scalar>
+void conv3x3_stride2_im2col_block(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace,
+                       Kokkos::MemoryUnmanaged>& col,
+    size_t r0, size_t H, size_t W, size_t H2, size_t W2,
+    const std::string& label) {
+  const size_t cur = col.extent(0), K9 = col.extent(1);
+  if (cur == 0 || K9 == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::RangePolicy<ExecSpace>(0, cur * K9),
+      KOKKOS_LAMBDA(size_t e) {
+        const size_t tm = e / K9, k = e % K9;
+        const size_t i = k / 9, rem = k % 9;
+        const size_t kh = rem / 3, kw = rem % 3;
+        const size_t t2 = r0 + tm;
+        const size_t h2 = t2 / W2, w2 = t2 % W2;
+        const size_t ih = 2 * h2 + kh, iw = 2 * w2 + kw;
+        Scalar v = static_cast<Scalar>(0);
+        if (ih < H && iw < W) v = x(ih * W + iw, i);
+        col(tm, k) = v;
+      });
+  (void)H2;
+}
+
+// Skinny-output direct stride-2 convolution: one output element per
+// thread, FP32 accumulation over the Cin*9 patch gathered on the fly with
+// the same ZeroPad(0,1,0,1) semantics. Used when Cout is small (same
+// cutoff as the stride-1 skinny team kernel), where the im2col + GEMM
+// lowering is sgemm-efficiency-bound (tiny N); the single-pass kernel
+// avoids materializing im2col entirely. Portable parallel_for only.
+template <class ExecSpace, class Scalar>
+void conv_dense3x3_stride2_skinny(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
+    const Kokkos::View<Scalar****, Kokkos::LayoutRight, ExecSpace>& w,
+    const Kokkos::View<Scalar*, ExecSpace>& b,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& y, size_t H,
+    size_t W, size_t H2, size_t W2, const std::string& label) {
+  const size_t T2 = y.extent(0), Cin = x.extent(1), Cout = w.extent(0);
+  const bool biased = (b.extent(0) != 0);
+  if (T2 == 0 || Cout == 0) return;
+  // Output-channel innermost: consecutive threads write consecutive
+  // channels of one token row (LayoutRight-contiguous).
+  Kokkos::parallel_for(
+      label, Kokkos::RangePolicy<ExecSpace>(0, T2 * Cout),
+      KOKKOS_LAMBDA(size_t e) {
+        const size_t t2 = e / Cout, o = e % Cout;
+        const size_t h2 = t2 / W2, w2 = t2 % W2;
+        float acc = biased ? static_cast<float>(b(o)) : 0.0f;
+        for (size_t i = 0; i < Cin; ++i)
+          for (size_t kh = 0; kh < 3; ++kh) {
+            const size_t ih = 2 * h2 + kh;
+            if (ih >= H) continue;
+            for (size_t kw = 0; kw < 3; ++kw) {
+              const size_t iw = 2 * w2 + kw;
+              if (iw >= W) continue;
+              acc += static_cast<float>(x(ih * W + iw, i)) *
+                     static_cast<float>(w(o, i, kh, kw));
+            }
+          }
+        y(t2, o) = static_cast<Scalar>(acc);
+      });
+  (void)H2;
+}
+
+// Dense 3x3, stride 2, ZeroPad(0,1,0,1) (asymmetric: zero past the
+// right/bottom edges only; H and W must be even). Rank-2 token path:
+// x [T,Cin] with T = H*W row-major, w [Cout,Cin,3,3], b [Cout] (or
+// empty), y [T2,Cout] with T2 = (H/2)*(W/2). Same lowering discipline as
+// conv_dense3x3_2d (skinny direct kernel, else budget-blocked im2col +
+// gemm_bias reusing ConvIm2colBudgetBytes), so the compute still rides
+// the dispatched gemm ladder on every backend.
+template <class ExecSpace, class Scalar>
+void conv_dense3x3_stride2_2d(
+    const DNNHandle<ExecSpace>& handle,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
+    const Kokkos::View<Scalar****, Kokkos::LayoutRight, ExecSpace>& w,
+    const Kokkos::View<Scalar*, ExecSpace>& b,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& y, size_t H,
+    size_t W, const std::string& label) {
+  const size_t T = x.extent(0), Cin = x.extent(1), Cout = w.extent(0);
+  if (T == 0 || Cin == 0 || Cout == 0) return;
+  const size_t H2 = H / 2, W2 = W / 2;
+  const size_t K9 = Cin * 9;
+  // Skinny-output fast path (tiny N kills sgemm efficiency).
+  if (Cout <= ConvSkinnyMaxCout && K9 <= ConvSkinnyMaxK9) {
+    conv_dense3x3_stride2_skinny<ExecSpace, Scalar>(x, w, b, y, H, W, H2, W2,
+                                                   label);
+    return;
+  }
+  // Row-block the scratch so peak im2col memory stays at the budget.
+  const size_t T2 = H2 * W2;
+  size_t Tm = T2;
+  const size_t per_row = K9 * sizeof(Scalar);
+  if (per_row != 0) {
+    size_t budget_rows = ConvIm2colBudgetBytes / per_row;
+    if (budget_rows < 1) budget_rows = 1;
+    if (Tm > budget_rows) Tm = budget_rows;
+  }
+  using Mat2u = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace,
+                             Kokkos::MemoryUnmanaged>;
+  // Zero-copy [Cout, Cin*9] flatten of the dense LayoutRight weight.
+  Mat2u w2d(w.data(), Cout, K9);
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> col(
+      "conv3x3_stride2_im2col", Tm, K9);
+  for (size_t r0 = 0; r0 < T2; r0 += Tm) {
+    const size_t cur = (r0 + Tm <= T2) ? Tm : T2 - r0;
+    Mat2u col_cur(col.data(), cur, K9);
+    Mat2u y_cur(y.data() + r0 * Cout, cur, Cout);
+    conv3x3_stride2_im2col_block<ExecSpace, Scalar>(x, col_cur, r0, H, W, H2,
+                                                   W2, label + "_im2col");
+    ::KokkosDNN::gemm_bias<ExecSpace, Scalar>(handle, col_cur, w2d, b, y_cur,
+                                              label + "_gemm");
+  }
+}
+
 // Depthwise KxK, stride 1, pad K/2 (zero padding), groups = C. Rank-2
 // token path: x/y [T,C] with T = H*W row-major, w [C,K,K], b [C] (or
 // empty). K must be odd (checked by the caller) so the padding is
@@ -431,6 +570,48 @@ void conv3x3_forward(
   }
 #endif
   Impl::conv_dense3x3_2d<ExecSpace, Scalar>(handle, x, w, b, y, H, W, label);
+}
+
+// Dense 3x3 convolution forward, stride 2, ZeroPad(0,1,0,1) (asymmetric:
+// zero past the right/bottom edges only; H and W must be even):
+//   y(t2,o) = b(o) + sum_{i,kh,kw} w(o,i,kh,kw) * x_pad(2*h2+kh, 2*w2+kw, i)
+// with t2 = h2*W2 + w2, H2 = H/2, W2 = W/2. x [T,Cin] with T = H*W,
+// w [Cout,Cin,3,3], b [Cout] or empty for no bias, y [T2,Cout] with
+// T2 = H2*W2. Scalar-agnostic; FP32 accumulation.
+//
+// NOTE: there is deliberately no TPL convolution dispatch here (see the
+// TPL-status note at the top of this file): the legacy cuDNN/MIOpen
+// descriptors only express symmetric padding, so the asymmetric
+// right/bottom-only padding is not expressible through them. The compute
+// still rides the dispatched gemm ladder via the im2col + gemm_bias
+// lowering. The handle is threaded into that lowering (cuBLAS ladder on
+// CUDA, hipBLAS on HIP, portable tiled GEMM elsewhere) and is still
+// taken on every build for API uniformity with the other operators.
+template <class ExecSpace, class Scalar>
+void conv3x3_stride2_forward(
+    const DNNHandle<ExecSpace>& handle,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
+    const Kokkos::View<Scalar****, Kokkos::LayoutRight, ExecSpace>& w,
+    const Kokkos::View<Scalar*, ExecSpace>& b,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& y, size_t H,
+    size_t W,
+    const std::string& label = "KokkosDNN::conv3x3_stride2_forward") {
+  const size_t T = x.extent(0), Cin = x.extent(1), Cout = w.extent(0);
+  const bool biased = (b.extent(0) != 0);
+  if (H == 0 || W == 0 || (H % 2) != 0 || (W % 2) != 0)
+    throw std::invalid_argument("conv3x3_stride2_forward: H and W must be "
+                                "even and nonzero");
+  const size_t H2 = H / 2, W2 = W / 2;
+  if (w.extent(1) != Cin || w.extent(2) != 3 || w.extent(3) != 3 ||
+      y.extent(0) != H2 * W2 || y.extent(1) != Cout ||
+      (biased && b.extent(0) != Cout))
+    throw std::invalid_argument("conv3x3_stride2_forward: dimension mismatch");
+  if (T != H * W)
+    throw std::invalid_argument("conv3x3_stride2_forward: H and W must be "
+                                "nonzero with H*W == input rows");
+  if (T == 0 || Cin == 0 || Cout == 0) return;
+  Impl::conv_dense3x3_stride2_2d<ExecSpace, Scalar>(handle, x, w, b, y, H, W,
+                                                   label);
 }
 
 // Depthwise convolution forward, stride 1, symmetric zero padding, one
