@@ -1,30 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 // SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
-// kokkosdnn_server: OpenAI-compatible HTTP front-end for KokkosDNN (LFM2.5).
+// kokkosdnn_server: OpenAI-compatible HTTP front-end for KokkosDNN.
+// Multi-architecture: the serving backend (chat template, stop defaults,
+// tool grammar, weight formats, session mechanics) is selected by --arch
+// through the KokkosDNN::Server::ChatBackend interface (server/Backend.hpp;
+// per-arch code in BackendLFM25.cpp / BackendGlimmer.cpp).
 //
-// Translation only: HTTP/JSON <-> LFM25 Session calls. No sampling, chat
+// Translation only: HTTP/JSON <-> ChatBackend calls. No sampling, chat
 // templating, detokenization, or model math lives here — all of that belongs
 // to models/* (Session, Tokenizer, Sampler, Detokenizer). This file owns
-// Kokkos::initialize/finalize, CLI parsing, weight/tokenizer loading, the
+// Kokkos::initialize/finalize, CLI parsing, backend loading, the
 // cpp-httplib route table, and OpenAI request/response mapping.
 //
 // Concurrency: one global mutex guards all inference (single in-flight
-// request; a second concurrent request blocks until the first finishes). A
-// fresh Session is built per request under that lock so per-request
-// sampling/stop/seed options apply without mutating shared state; weights
-// and the tokenizer are shared read-only. A streaming client that goes away
-// mid-response is detected from sink.write() and its turn stops at the next
-// token instead of burning the remaining max_new tokens under that lock.
+// request; a second concurrent request blocks until the first finishes).
+// Per-request sampling/stop/seed options apply through the backend's
+// set_turn_options under that lock; weights and the tokenizer are shared
+// read-only. A streaming client that goes away mid-response is detected
+// from sink.write() and its turn stops at the next token instead of
+// burning the remaining max_new tokens under that lock.
 
 #include <Kokkos_Core.hpp>
 
 #include <KokkosDNN.hpp>
 
+#include "Backend.hpp"
 #include "KokkosDNN_config.h"
-#include "KokkosDNN_LFM25Config.hpp"
-#include "KokkosDNN_LFM25Session.hpp"
-#include "KokkosDNN_LFM25Tokenizer.hpp"
-#include "KokkosDNN_LFM25Weights.hpp"
 
 #include <httplib.h>
 
@@ -47,23 +48,18 @@
 
 namespace {
 
-using KokkosDNN::LFM25::ChatMessage;
-using KokkosDNN::LFM25::Config;
-using KokkosDNN::LFM25::ToolCall;
-using KokkosDNN::LFM25::ToolCallStreamParser;
-using KokkosDNN::LFM25::StreamDeltas;
-using KokkosDNN::LFM25::ToolParseResult;
-using KokkosDNN::LFM25::DefaultScalar;
-using KokkosDNN::LFM25::Session;
-using KokkosDNN::LFM25::SessionOptions;
-using KokkosDNN::LFM25::StepOutcome;
-using KokkosDNN::LFM25::Tokenizer;
-using KokkosDNN::LFM25::Weights;
+using KokkosDNN::Server::BackendStepOutcome;
+using KokkosDNN::Server::CachedPrefill;
+using KokkosDNN::Server::ChatBackend;
+using KokkosDNN::Server::ParsedTail;
+using KokkosDNN::Server::ServerChatMessage;
+using KokkosDNN::Server::ServerSessionOptions;
+using KokkosDNN::Server::ServerToolCall;
+using KokkosDNN::Server::StepDeltas;
+using KokkosDNN::Server::StreamParser;
+namespace Server = KokkosDNN::Server;
 namespace Common = KokkosDNN::Common;
 using Exec = Kokkos::DefaultExecutionSpace;
-using Scalar = DefaultScalar;
-using ServerSession = Session<Exec, Scalar>;
-using ServerSessionHost = Session<Exec, Scalar, Kokkos::HostSpace>;
 using json = nlohmann::json;
 
 // Single-sourced from the top-level project(VERSION ...): the generated
@@ -219,7 +215,7 @@ struct TurnTimings {
   double lock_ms = 0.0;     // waiting for the single-flight inference mutex
   double encode_ms = 0.0;   // render + encode the full message history
   double prefill_ms = 0.0;  // suffix prefill after prefix-cache reuse
-  double decode_ms = 0.0;   // sum of Session::step() (model forward + detok)
+  double decode_ms = 0.0;   // sum of backend step() (model forward + detok)
   double sse_ms = 0.0;      // SSE framing + socket writes inside the loop
   bool aborted = false;     // peer disconnected; generation stopped early
   bool prefix_hit = false;  // a cached content prefix was reused
@@ -232,21 +228,21 @@ double now_ms() {
       .count();
 }
 
-// One line per completed turn: prompt/completion counts, the split above, and
-// decode tok/s (completion tokens over decode time — the rate a streaming
-// client observes, prefill excluded).
-void log_turn(const std::string& method, const std::string& target, int status,
-              const TurnTimings& tm, size_t prompt_tokens,
-              size_t completion_tokens) {
+// One line per completed turn: arch + prompt/completion counts, the split
+// above, and decode tok/s (completion tokens over decode time — the rate a
+// streaming client observes, prefill excluded).
+void log_turn(const std::string& arch, const std::string& method,
+              const std::string& target, int status, const TurnTimings& tm,
+              size_t prompt_tokens, size_t completion_tokens) {
   const double tok_s =
       tm.decode_ms > 0.0 ? completion_tokens * 1000.0 / tm.decode_ms : 0.0;
-  char tail[384];
+  char tail[448];
   std::snprintf(tail, sizeof(tail),
-                " prompt_tokens=%zu completion_tokens=%zu lock_ms=%.1f"
+                " arch=%s prompt_tokens=%zu completion_tokens=%zu lock_ms=%.1f"
                 " encode_ms=%.1f prefill_ms=%.1f decode_ms=%.1f sse_ms=%.1f"
                 " decode_tok_s=%.1f prefix_hit=%d prefix_reused=%zu%s",
-                prompt_tokens, completion_tokens, tm.lock_ms, tm.encode_ms,
-                tm.prefill_ms, tm.decode_ms, tm.sse_ms, tok_s,
+                arch.c_str(), prompt_tokens, completion_tokens, tm.lock_ms,
+                tm.encode_ms, tm.prefill_ms, tm.decode_ms, tm.sse_ms, tok_s,
                 tm.prefix_hit ? 1 : 0, tm.prefix_reused,
                 tm.aborted ? " aborted=client-disconnect" : "");
   std::fprintf(stderr, "%s %s -> %d%s\n", method.c_str(), target.c_str(),
@@ -260,8 +256,11 @@ void log_turn(const std::string& method, const std::string& target, int status,
 
 struct CliOptions {
   int port = kDefaultPort;
+  std::string arch;  // empty => auto-detect from --config, else default
+  bool arch_set = false;
   std::string model = kDefaultModel;
-  std::string weights;
+  bool model_set = false;
+  std::vector<std::string> weights;  // repeatable; glimmer accepts globs
   std::string tokenizer;
   std::string config_path;
   int max_seq_len = 0;  // 0 => keep the config file / preset value
@@ -273,27 +272,37 @@ struct CliOptions {
 [[maybe_unused]] int parse_cli(int argc, char* argv[], CliOptions& out) {
   auto help = [&]() {
     std::printf(
-        "Usage: %s [--port N] [--model ID] [--weights PATH] [--tokenizer "
-        "PATH]\n"
-        "             [--config PATH] [--max-seq-len N] [--help] "
-        "[--version]\n"
-        "             [--prefix-cache-host]\n"
+        "Usage: %s [--arch ARCH] [--port N] [--model ID] [--weights PATH ...]\n"
+        "             [--tokenizer PATH] [--config PATH] [--max-seq-len N]\n"
+        "             [--help] [--version] [--prefix-cache-host]\n"
         "\n"
-        "OpenAI-compatible inference server for KokkosDNN (LFM2.5).\n"
+        "OpenAI-compatible inference server for KokkosDNN (multi-architecture).\n"
         "\n"
         "Options:\n"
+        "  --arch ARCH     model architecture to serve: 'lfm2.5' or 'glimmer'\n"
+        "                    (aliases: lfm2_5/lfm25, glimmer-30b/muse-glimmer).\n"
+        "                    Default: auto-detect from --config, else lfm2.5.\n",
+        argv[0]);
+    std::printf(
         "  --port N          TCP port to listen on (default: %d)\n"
-        "  --model ID        model identifier to serve (default: %s)\n"
-        "  --weights PATH    GGUF checkpoint to load (required to serve)\n"
+        "  --model ID        model identifier to serve (default: arch default\n"
+        "                    'lfm2_5' / 'glimmer-30b')\n"
+        "  --weights PATH    checkpoint to load (repeatable; globs allowed).\n"
+        "                    lfm2.5: exactly one GGUF file. glimmer: one .gguf\n"
+        "                    file or one or more safetensors shards (globs\n"
+        "                    like 'model-*.safetensors' are expanded).\n"
         "  --tokenizer PATH  tokenizer.json path or directory (required)\n"
-        "  --config PATH     optional model config JSON overlay (base: HF\n"
-        "                    lfm2_5_24b_a2b defaults)\n"
+        "  --config PATH     optional model config JSON overlay (base: arch\n"
+        "                    preset). Also used to auto-detect --arch when it\n"
+        "                    is absent; an explicit --arch that disagrees with\n"
+        "                    a recognizable config is a startup error.\n"
         "  --max-seq-len N   context window to serve (overrides the config;\n"
         "                    the KV cache is allocated for N tokens)\n"
         "  --prefix-cache-host\n"
         "                    keep the single prefix-cache KV entry in host\n"
         "                    memory instead of device memory (saves VRAM at\n"
-        "                    the cost of host<->device copies per turn)\n"
+        "                    the cost of host<->device copies per turn;\n"
+        "                    LFM2.5 only, ignored by glimmer)\n"
         "  --help            print this message and exit\n"
         "  --version         print the server version and exit\n"
         "\n"
@@ -301,7 +310,7 @@ struct CliOptions {
         "  GET  /v1/models\n"
         "  POST /v1/chat/completions\n"
         "  POST /v1/completions\n",
-        argv[0], kDefaultPort, kDefaultModel);
+        kDefaultPort);
   };
   for (int i = 1; i < argc; ++i) {
     const char* a = argv[i];
@@ -321,7 +330,18 @@ struct CliOptions {
       std::printf("kokkosdnn_server %s\n", kVersion);
       return 2;
     }
-    if (std::strcmp(a, "--port") == 0) {
+    if (std::strcmp(a, "--arch") == 0) {
+      std::string v;
+      if (!need_value("--arch", v)) return 1;
+      const std::string canon = Server::normalize_arch_name(v);
+      if (canon.empty()) {
+        std::printf("Unknown --arch '%s' (expected 'lfm2.5' or 'glimmer')\n",
+                    v.c_str());
+        return 1;
+      }
+      out.arch = canon;
+      out.arch_set = true;
+    } else if (std::strcmp(a, "--port") == 0) {
       if (i + 1 >= argc) {
         std::printf("Missing value for --port\n");
         return 1;
@@ -329,8 +349,16 @@ struct CliOptions {
       out.port = std::atoi(argv[++i]);
     } else if (std::strcmp(a, "--model") == 0) {
       if (!need_value("--model", out.model)) return 1;
+      out.model_set = true;
     } else if (std::strcmp(a, "--weights") == 0) {
-      if (!need_value("--weights", out.weights)) return 1;
+      // Repeatable; each occurrence takes one or more values (globs for
+      // sharded checkpoints). Stops at the next flag.
+      if (i + 1 >= argc) {
+        std::printf("Missing value for --weights\n");
+        return 1;
+      }
+      while (i + 1 < argc && std::strncmp(argv[i + 1], "--", 2) != 0)
+        out.weights.emplace_back(argv[++i]);
     } else if (std::strcmp(a, "--tokenizer") == 0) {
       if (!need_value("--tokenizer", out.tokenizer)) return 1;
     } else if (std::strcmp(a, "--config") == 0) {
@@ -361,50 +389,62 @@ struct CliOptions {
 // ---------------------------------------------------------------------------
 
 struct ServerState {
-  std::string model_id;
-  Config cfg;
-  Weights<Exec, Scalar> weights;
-  Tokenizer tok;
-  std::mutex mu;  // single in-flight request; others block
+  std::unique_ptr<ChatBackend> backend;
+  std::string arch;  // backend->arch(); logged per turn
+  std::mutex mu;     // single in-flight request; others block
   std::atomic<unsigned long long> next_id{1};
-  // Long-lived decoding session reused across requests (guarded by mu).
-  // Per-request construction re-rents the full KV cache and deep-copies
-  // the tokenizer (~170ms TTFT); Session::prefill_cached() instead keeps a
-  // single-entry prefix cache of content states across turns (exact-prefix
-  // reuse for agentic loops) while still resetting all turn state, and
-  // run_session() re-applies per-request options + seed. The concrete
-  // Session instantiation (device- vs host-resident cache entry) is picked
-  // from prefix_cache_host at construction; the interface erases it.
-  bool prefix_cache_host = false;
-  std::unique_ptr<KokkosDNN::LFM25::ISession> sess;
 };
 
-// Loads Config (HF defaults + optional JSON overlay), GGUF weights, and the
-// tokenizer. Requires Kokkos to be initialized (allocates device views).
+// Resolve --arch (explicit, else sniffed from --config, else default) and the
+// served model id (explicit, else the arch default). Weight-free: safe to
+// call before Kokkos::initialize for startup logging.
+void resolve_arch_and_model(const CliOptions& o, std::string& arch,
+                            std::string& model) {
+  arch = o.arch_set ? o.arch : Server::detect_config_arch(o.config_path);
+  if (arch.empty()) arch = Server::kArchLFM25;  // back-compat default
+  model = o.model;
+  if (!o.model_set) {
+    if (auto proto = Server::create_backend(arch))
+      model = proto->default_model_id();
+  }
+}
+
+// Resolve --arch (explicit, else sniffed from --config, else default),
+// create the backend, apply the arch model-id default, and load.
+// Requires Kokkos to be initialized (backends allocate device views).
 // Returns true on success; on failure `err` describes the problem.
 [[maybe_unused]] bool load_model(const CliOptions& o, ServerState& st, std::string& err) {
-  if (o.weights.empty()) {
-    err = "missing required --weights PATH (GGUF checkpoint)";
+  std::string arch, model;
+  resolve_arch_and_model(o, arch, model);
+  auto backend = Server::create_backend(arch);
+  if (!backend) {
+    std::string names;
+    for (const auto& n : Server::available_backends()) {
+      if (!names.empty()) names += ", ";
+      names += "'" + n + "'";
+    }
+    err = "unknown arch '" + arch + "' (available: " + names + ")";
     return false;
   }
-  if (o.tokenizer.empty()) {
-    err = "missing required --tokenizer PATH (tokenizer.json)";
-    return false;
+  if (o.arch_set && !o.config_path.empty()) {
+    const std::string sniffed = Server::detect_config_arch(o.config_path);
+    if (!sniffed.empty() && sniffed != arch) {
+      err = "--arch '" + arch + "' disagrees with --config '" + o.config_path +
+            "' (looks like '" + sniffed + "')";
+      return false;
+    }
   }
-  try {
-    st.model_id = o.model;
-    st.cfg = o.config_path.empty()
-                 ? Config::lfm2_5_24b_a2b()
-                 : Config::from_json_file(o.config_path);
-    if (o.max_seq_len > 0) st.cfg.max_seq_len = o.max_seq_len;
-    st.cfg.validate();
-    st.weights.allocate(st.cfg);
-    KokkosDNN::LFM25::load_gguf(st.cfg, o.weights, st.weights);
-    st.tok = Tokenizer(o.tokenizer);
-  } catch (const std::exception& e) {
-    err = std::string("failed to load model: ") + e.what();
-    return false;
-  }
+  Server::LoadOptions lo;
+  lo.arch = arch;
+  lo.model_id = model;
+  lo.config_path = o.config_path;
+  lo.weights = o.weights;
+  lo.tokenizer = o.tokenizer;
+  lo.max_seq_len = o.max_seq_len;
+  lo.prefix_cache_host = o.prefix_cache_host;
+  if (!backend->load(lo, err)) return false;
+  st.arch = backend->arch();
+  st.backend = std::move(backend);
   return true;
 }
 
@@ -436,13 +476,14 @@ std::string new_id(const std::string& prefix, ServerState& st) {
 }
 
 // ---------------------------------------------------------------------------
-// Request parsing (pure JSON -> Session inputs; no model math)
+// Request parsing (pure JSON -> backend turn inputs; no model math)
 // ---------------------------------------------------------------------------
 
 struct ParsedRequest {
-  std::vector<ChatMessage> messages;
-  SessionOptions opts;  // sampling + stop_ids/stop_strings; max_new filled in
-                        // after the prompt is encoded (needs prompt length)
+  std::vector<ServerChatMessage> messages;
+  ServerSessionOptions opts;  // sampling + stop_ids/stop_strings; max_new
+                              // filled in after the prompt is encoded
+                              // (needs prompt length)
   int req_max_tokens = -1;  // -1 = client did not ask; default applies later
   bool has_seed = false;
   uint64_t seed = 0;
@@ -460,9 +501,10 @@ struct ParsedRequest {
 };
 
 // Shared fields: model id, unsupported-feature gates, sampling options,
-// logit_bias, logprobs, stop, seed, stream, max tokens. Returns true on
-// success; on failure `err` carries the 400 message.
-bool parse_common(const json& body, const Config& cfg,
+// logit_bias, logprobs, stop, seed, stream, max tokens. `default_stop_ids`
+// is the backend's arch default (always seeded). Returns true on success;
+// on failure `err` carries the 400 message.
+bool parse_common(const json& body, const std::vector<int>& default_stop_ids,
                   const std::string& served_model, ParsedRequest& out,
                   std::string& err) {
   if (!body.is_object()) {
@@ -727,7 +769,7 @@ bool parse_common(const json& body, const Config& cfg,
 
   // stop: string | number | array thereof. Integer-valued entries become
   // stop ids; everything else becomes a stop string.
-  out.opts.stop_ids = {cfg.eos};
+  out.opts.stop_ids = default_stop_ids;
   out.opts.stop_strings.clear();
   if (body.contains("stop") && !body["stop"].is_null()) {
     const auto& stop = body["stop"];
@@ -801,7 +843,7 @@ bool parse_common(const json& body, const Config& cfg,
   return true;
 }
 
-// messages -> vector<ChatMessage>. "developer" maps to "user";
+// messages -> vector<ServerChatMessage>. "developer" maps to "user";
 // "function" (legacy role) maps to "tool". Assistant turns may carry
 // OpenAI `tool_calls` (validated, arguments string or object) plus a
 // `thinking` / `reasoning` / `reasoning_content` trace (first non-empty
@@ -811,7 +853,7 @@ bool parse_common(const json& body, const Config& cfg,
 // other role requires string content.
 // Non-text content parts and message-level `function_call` are rejected
 // (400) rather than silently dropped.
-bool parse_messages(const json& body, std::vector<ChatMessage>& out,
+bool parse_messages(const json& body, std::vector<ServerChatMessage>& out,
                     std::string& err) {
   auto it = body.find("messages");
   if (it == body.end() || !it->is_array() || it->empty()) {
@@ -865,7 +907,7 @@ bool parse_messages(const json& body, std::vector<ChatMessage>& out,
     }
     std::string content;
     if (!text_content(m, content)) return false;
-    ChatMessage msg;
+    ServerChatMessage msg;
     msg.role = std::move(role);
     msg.content = std::move(content);
     const bool has_content =
@@ -923,7 +965,7 @@ bool parse_messages(const json& body, std::vector<ChatMessage>& out,
               return false;
             }
           }
-          ToolCall c;
+          ServerToolCall c;
           auto idit = tc.find("id");
           c.id = (idit != tc.end() && idit->is_string())
                      ? idit->get<std::string>()
@@ -968,11 +1010,12 @@ bool parse_messages(const json& body, std::vector<ChatMessage>& out,
   return true;
 }
 
-// Stop strings actually enforced for this request (mirrors Session's
-// empty-means-default resolution) for the tool stream parser.
-std::vector<std::string> resolved_stops(const ParsedRequest& pr) {
+// Stop strings actually enforced for this request (mirrors the backends'
+// empty-means-default resolution) for the stream parser.
+std::vector<std::string> resolved_stops(const ParsedRequest& pr,
+                                        const ChatBackend& backend) {
   if (!pr.opts.stop_strings.empty()) return pr.opts.stop_strings;
-  return KokkosDNN::LFM25::default_stop_strings();
+  return backend.default_stop_strings();
 }
 
 // System-prompt directives assembled from tool_choice (required/named)
@@ -1009,7 +1052,8 @@ std::string strip_json_fences(std::string s) {
 }
 
 // Build the OpenAI `tool_calls` message payload, assigning fresh ids.
-json tool_calls_json(ServerState& st, const std::vector<ToolCall>& calls) {
+json tool_calls_json(ServerState& st,
+                     const std::vector<ServerToolCall>& calls) {
   json tcs = json::array();
   for (const auto& c : calls) {
     tcs.push_back({{"id", new_id("call", st)},
@@ -1024,11 +1068,11 @@ json tool_calls_json(ServerState& st, const std::vector<ToolCall>& calls) {
 
 // Assembled non-streaming turn: OpenAI message payload + finish reason.
 // Pure JSON mapping (no inference): `text` is the parser display text in
-// every mode (never Session's raw detokenized text); `reasoning` is the parsed
+// every mode (never the backend's raw detokenized text); `reasoning` is the parsed
 // <think> trace (emitted as `reasoning_content`, the DeepSeek/OpenRouter
 // convention Zed and other OpenAI-compatible clients read); `calls` the
 // parsed native calls (post parallel_tool_calls truncation);
-// `session_finish` the Session finish string. With calls the message
+// `session_finish` the backend finish string. With calls the message
 // carries `tool_calls` (fresh ids), `content` null when no display text
 // remains, and finish "tool_calls" — even when `session_finish` was
 // "length": a recovered length-capped turn hides the cap, so callers must
@@ -1044,7 +1088,7 @@ AssembledMessage assemble_chat_message(ServerState& st,
                                        const ParsedRequest& pr,
                                        std::string text,
                                        std::string reasoning,
-                                       std::vector<ToolCall> calls,
+                                       std::vector<ServerToolCall> calls,
                                        const std::string& session_finish) {
   AssembledMessage out;
   if (pr.json_mode) text = strip_json_fences(std::move(text));
@@ -1068,7 +1112,8 @@ AssembledMessage assemble_chat_message(ServerState& st,
 
 // One SSE `tool_calls` delta payload for call `i` (OpenAI streams each
 // call as its own delta chunk carrying index/id/type/function).
-json tool_call_delta(size_t i, const std::string& id, const ToolCall& c) {
+json tool_call_delta(size_t i, const std::string& id,
+                     const ServerToolCall& c) {
   return {{"tool_calls",
            json::array(
                {{{"index", i},
@@ -1080,31 +1125,27 @@ json tool_call_delta(size_t i, const std::string& id, const ToolCall& c) {
                     c.arguments.empty() ? "{}" : c.arguments}}}}})}};
 }
 
-// Feed one sampled token through the stream parser: decode the raw piece
-// (specials visible) and return the display + reasoning newly releasable.
-// The parser holds back <think> traces and tool-call regions so neither
-// leaks into `content`. Used in every mode so the thinking trace never
-// pollutes the answer with or without tools. One parser step per token
-// keeps the per-turn cost linear. Never throws: an undecodable id
+// Feed one sampled token through the backend's stream parser: decode the
+// raw piece (specials visible) and return the display + reasoning newly
+// releasable. The parser holds back thinking traces and tool-call regions
+// so neither leaks into `content`. Used in every mode so the thinking trace
+// never pollutes the answer with or without tools. One parser step per
+// token keeps the per-turn cost linear. Never throws: an undecodable id
 // contributes nothing, and a parser failure degrades to a held delta
 // (recovered at finish) instead of killing the turn with a 500 or a
 // mid-stream SSE error.
-StreamDeltas tool_feed(ServerState& st, ToolCallStreamParser& parser,
-                       const StepOutcome& s) {
+StepDeltas tool_feed(ChatBackend& backend, StreamParser& parser,
+                     const BackendStepOutcome& s) {
   try {
-    // Persistent 1-elem staging: tools-mode decode already costs a map
-    // lookup + string build per token; no need for a vector malloc too.
-    thread_local std::vector<int> idbuf{0};
-    idbuf[0] = s.id;
-    return parser.feed(st.tok.decode(idbuf, false));
+    return parser.feed(backend.decode_piece(s.id));
   } catch (...) {
     return {};
   }
 }
 
 // ---------------------------------------------------------------------------
-// Generation driver (render/encode/prefill/step loop; no model math of its
-// own — everything runs through Session).
+// Generation driver (encode/prefill/step loop; no model math of its own —
+// everything runs through the backend).
 // ---------------------------------------------------------------------------
 
 struct GenResult {
@@ -1114,84 +1155,69 @@ struct GenResult {
   size_t completion_tokens = 0;
 };
 
-// Encodes the prompt, caps max_new against the context window, then runs
-// prefill + one-token steps to completion. Throws std::invalid_argument on
-// over-context prompts (caller maps to 400); other exceptions propagate to
-// the 500 path.
+// Caps max_new against the context window, then runs prefill + one-token
+// steps to completion. Throws std::invalid_argument on over-context prompts
+// (caller maps to 400); other exceptions propagate to the 500 path.
 //
 // full_ids is the whole prompt (history + trailing generation prompt);
 // content_ids is the cacheable history prefix (same encoding without the
-// generation prompt, expected to be an exact prefix of full_ids). The
-// single-entry prefix cache resumes from the cached content on exact
-// matches; a mismatch falls back to a full prefill internally.
+// generation prompt, expected to be an exact prefix of full_ids). Backends
+// with a prefix cache resume from the cached content on exact matches; a
+// mismatch falls back to a full prefill internally.
 //
 // on_step may return false to stop generation early (the streaming providers
 // do this when sink.write() reports the peer is gone: the single-flight
 // inference lock makes generating for a dead client steal a whole completion
 // from the next queued request).
 GenResult run_session(ServerState& st, const std::vector<int>& full_ids,
-                      const std::vector<int>& content_ids, SessionOptions opts,
-                      bool has_seed, uint64_t seed, int req_max_tokens,
-                      const std::function<bool(const StepOutcome&)>& on_step,
+                      const std::vector<int>& content_ids,
+                      ServerSessionOptions opts, bool has_seed, uint64_t seed,
+                      int req_max_tokens,
+                      const std::function<bool(const BackendStepOutcome&)>& on_step,
                       TurnTimings* tm) {
-  if (full_ids.size() >= static_cast<size_t>(st.cfg.max_seq_len))
+  ChatBackend& backend = *st.backend;
+  if (full_ids.size() >= static_cast<size_t>(backend.max_seq_len()))
     throw std::invalid_argument(
         "prompt is longer than the model's context window (" +
         std::to_string(full_ids.size()) + " tokens, max_seq_len=" +
-        std::to_string(st.cfg.max_seq_len) + ")");
+        std::to_string(backend.max_seq_len()) + ")");
   const size_t budget =
-      static_cast<size_t>(st.cfg.max_seq_len) - full_ids.size();
+      static_cast<size_t>(backend.max_seq_len()) - full_ids.size();
   int max_new = req_max_tokens < 0 ? kDefaultMaxTokens : req_max_tokens;
   if (static_cast<size_t>(max_new) > budget)
     max_new = static_cast<int>(budget);
   opts.max_new = max_new;
 
-  // Reuse one long-lived Session: avoids re-renting the KV cache and
-  // re-copying the tokenizer on every request. set_options() +
-  // prefill_cached() reset all turn state; the forced reseed reproduces
-  // fresh-session RNG behavior exactly (construction seeds from opts.seed,
-  // an explicit request seed wins, unseeded requests deterministically
-  // restart the default stream). The cache-entry placement (device vs host
-  // memory) is fixed at construction from --prefix-cache-host.
-  if (!st.sess) {
-    if (st.prefix_cache_host)
-      st.sess = std::make_unique<ServerSessionHost>(
-          st.cfg, st.weights, st.tok, opts);
-    else
-      st.sess =
-          std::make_unique<ServerSession>(st.cfg, st.weights, st.tok, opts);
-  } else {
-    st.sess->set_options(opts);
-  }
-  KokkosDNN::LFM25::ISession& sess = *st.sess;
+  // The backend owns one long-lived decoding session: set_turn_options() +
+  // prefill_cached() reset all turn state, and the forced reseed reproduces
+  // fresh-session RNG behavior exactly (an explicit request seed wins;
+  // unseeded requests deterministically restart the default stream).
+  backend.set_turn_options(opts);
   const double t_prefill = now_ms();
-  const KokkosDNN::LFM25::CachedPrefillOutcome pc =
-      sess.prefill_cached(full_ids, content_ids, has_seed ? seed : opts.seed,
-                          /*hasSeed=*/true);
+  const CachedPrefill pc = backend.prefill_cached(
+      full_ids, content_ids, has_seed ? seed : opts.seed,
+      /*hasSeed=*/true);
   if (tm) {
     tm->prefill_ms = now_ms() - t_prefill;
     tm->prefix_hit = pc.hit;
     tm->prefix_reused = pc.reused;
   }
-  std::string text;
-  while (!sess.finished()) {
+  while (true) {
     const double t_step = now_ms();
-    StepOutcome s = sess.step();
+    BackendStepOutcome s = backend.step();
     const double t_step_done = now_ms();
-    if (!s.delta.empty()) text += s.delta;
     const bool keep_going = on_step ? on_step(s) : true;
     if (tm) {
       tm->decode_ms += t_step_done - t_step;
       tm->sse_ms += now_ms() - t_step_done;
       if (!keep_going) tm->aborted = true;
     }
-    if (!keep_going) break;
+    if (!keep_going || s.finished) break;
   }
-  text += sess.flush();
-  const auto u = sess.usage();
+  const auto u = backend.usage();
   GenResult r;
-  r.text = std::move(text);
-  r.finish = Common::to_string(sess.finish());
+  r.text = backend.flush();
+  r.finish = backend.finish();
   r.prompt_tokens = u.prompt_tokens;
   r.completion_tokens = u.completion_tokens;
   return r;
@@ -1234,12 +1260,32 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
 // Route handlers
 // ---------------------------------------------------------------------------
 
+// Agentic fields need a native tool grammar. Backends without one (Glimmer)
+// reject instead of silently dropping calls/history turns.
+bool check_tools_support(const ChatBackend& backend, const ParsedRequest& pr,
+                         std::string& err) {
+  if (backend.supports_tools()) return true;
+  if (pr.tools_active) {
+    err = "'tools' is not supported for arch '" + backend.arch() +
+          "' (no native tool grammar)";
+    return false;
+  }
+  for (const auto& m : pr.messages) {
+    if (!m.tool_calls.empty() || m.role == "tool") {
+      err = "'tool_calls'/'tool' history turns are not supported for arch '" +
+            backend.arch() + "' (no native tool grammar)";
+      return false;
+    }
+  }
+  return true;
+}
+
 [[maybe_unused]] void models_handler(ServerState& st, httplib::Response& res) {
   send_json(res, 200,
             json{{"object", "list"},
                  {"data",
                   json::array(
-                      {{{"id", st.model_id},
+                      {{{"id", st.backend->model_id()},
                         {"object", "model"},
                         {"created", 0},
                         {"owned_by", "kokkosdnn"}}})}});
@@ -1256,8 +1302,13 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
   }
   ParsedRequest pr;
   std::string err;
-  if (!parse_common(body, st.cfg, st.model_id, pr, err) ||
+  if (!parse_common(body, st.backend->default_stop_ids(),
+                      st.backend->model_id(), pr, err) ||
       !parse_messages(body, pr.messages, err)) {
+    send_bad_request(res, err);
+    return;
+  }
+  if (!check_tools_support(*st.backend, pr, err)) {
     send_bad_request(res, err);
     return;
   }
@@ -1275,41 +1326,38 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
       const std::string sys_suffix = make_system_suffix(pr);
       // Full prompt plus the cacheable history prefix (same encoding
       // without the trailing generation prompt). The prefix is an exact
-      // token prefix of the full prompt, so the next turn resumes from it.
-      const std::vector<int> content_ids =
-          KokkosDNN::LFM25::encode_chatml_with_tools(
-              st.tok, pr.messages, pr.tools_json, sys_suffix,
-              /*add_generation_prompt=*/false, true);
+      // token prefix of the full prompt, so the next turn resumes from it
+      // on backends with a prefix cache.
+      const std::vector<int> content_ids = st.backend->encode(
+          pr.messages, pr.tools_json, sys_suffix,
+          /*add_generation_prompt=*/false);
       const std::vector<int> full_ids =
-          KokkosDNN::LFM25::encode_chatml_with_tools(
-              st.tok, pr.messages, pr.tools_json, sys_suffix, true, true);
+          st.backend->encode(pr.messages, pr.tools_json, sys_suffix, true);
       tm.encode_ms = now_ms() - t_encode;
       // Every turn feeds raw per-step pieces (specials visible) through
-      // the stream parser: native call blocks become `tool_calls` and the
-      // <think> trace becomes `reasoning_content` instead of leaking into
-      // `content`. The parser display replaces Session's detokenized text
-      // in every mode (equal in plain-text turns containing only handled
-      // markers; any other special token stays raw in the parser display).
-      // Without tools, parsed calls are
+      // the backend's stream parser: native call blocks become `tool_calls`
+      // and the thinking trace becomes `reasoning_content` instead of
+      // leaking into `content`. The parser display replaces the raw
+      // detokenized text in every mode. Without tools, parsed calls are
       // dropped — the client asked for text, not function calls.
-      // The prompt ends with an open <think>, so the trace opens
-      // implicitly and its bytes carry no opener.
-      ToolCallStreamParser tool_parser(resolved_stops(pr),
-                                       /*start_in_reasoning=*/true);
+      // (LFM25's prompt ends with an open <think>, so the trace opens
+      // implicitly and its bytes carry no opener.)
+      auto tool_parser = st.backend->new_stream_parser(
+          resolved_stops(pr, *st.backend), /*start_in_reasoning=*/true);
       std::string tool_text, tool_reasoning;
-      std::function<bool(const StepOutcome&)> on_step =
-          [&](const StepOutcome& s) {
-            StreamDeltas d = tool_feed(st, tool_parser, s);
+      std::function<bool(const BackendStepOutcome&)> on_step =
+          [&](const BackendStepOutcome& s) {
+            StepDeltas d = tool_feed(*st.backend, *tool_parser, s);
             tool_text += std::move(d.display);
             tool_reasoning += std::move(d.reasoning);
             return true;
           };
       GenResult r = run_session(st, full_ids, content_ids, pr.opts, pr.has_seed,
                                 pr.seed, pr.req_max_tokens, on_step, &tm);
-      ToolParseResult tp = tool_parser.finish();
+      ParsedTail tp = tool_parser->finish();
       tool_text += tp.text;
       tool_reasoning += tp.reasoning;
-      std::vector<ToolCall> calls;
+      std::vector<ServerToolCall> calls;
       if (pr.tools_active) calls = std::move(tp.calls);
       AssembledMessage turn = assemble_chat_message(
           st, pr, std::move(tool_text), std::move(tool_reasoning),
@@ -1318,7 +1366,7 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
                 json{{"id", id},
                      {"object", "chat.completion"},
                      {"created", created},
-                     {"model", st.model_id},
+                     {"model", st.backend->model_id()},
                      {"choices",
                       json::array({{{"index", 0},
                                     {"message", std::move(turn.message)},
@@ -1328,8 +1376,8 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
                        {"completion_tokens", r.completion_tokens},
                        {"total_tokens",
                         r.prompt_tokens + r.completion_tokens}}}});
-      log_turn(req.method, req.target.empty() ? req.path : req.target, 200, tm,
-               r.prompt_tokens, r.completion_tokens);
+      log_turn(st.arch, req.method, req.target.empty() ? req.path : req.target,
+               200, tm, r.prompt_tokens, r.completion_tokens);
     } catch (const std::invalid_argument& e) {
       send_bad_request(res, e.what());  // over-context prompts
     } catch (const std::exception& e) {
@@ -1357,8 +1405,15 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
           const json b = json::parse(body);  // re-parse: already validated
           ParsedRequest p;
           std::string e;
-          if (!parse_common(b, st.cfg, st.model_id, p, e) ||
+          if (!parse_common(b, st.backend->default_stop_ids(),
+                              st.backend->model_id(), p, e) ||
               !parse_messages(b, p.messages, e)) {
+            sse_send(sink, openai_error(e));
+            log_stream_error(method, target, body.size(), e);
+            sink.done();
+            return true;
+          }
+          if (!check_tools_support(*st.backend, p, e)) {
             sse_send(sink, openai_error(e));
             log_stream_error(method, target, body.size(), e);
             sink.done();
@@ -1366,13 +1421,11 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
           }
           const double t_encode = now_ms();
           const std::string sys_suffix = make_system_suffix(p);
-          const std::vector<int> content_ids =
-              KokkosDNN::LFM25::encode_chatml_with_tools(
-                  st.tok, p.messages, p.tools_json, sys_suffix,
-                  /*add_generation_prompt=*/false, true);
+          const std::vector<int> content_ids = st.backend->encode(
+              p.messages, p.tools_json, sys_suffix,
+              /*add_generation_prompt=*/false);
           const std::vector<int> full_ids =
-              KokkosDNN::LFM25::encode_chatml_with_tools(
-                  st.tok, p.messages, p.tools_json, sys_suffix, true, true);
+              st.backend->encode(p.messages, p.tools_json, sys_suffix, true);
           tm.encode_ms = now_ms() - t_encode;
           bool sse_ok = true;
           size_t steps_since_poll = 0;
@@ -1381,7 +1434,7 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
             json c{{"id", id},
                    {"object", "chat.completion.chunk"},
                    {"created", created},
-                   {"model", st.model_id},
+                   {"model", st.backend->model_id()},
                    {"choices",
                     json::array(
                         {{{"index", 0},
@@ -1395,16 +1448,16 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
           // the single-flight lock.
           if (!sse_ok || !sse_peer_alive(sink)) {
             tm.aborted = true;
-            log_turn(method, target, 200, tm, 0, 0);
+            log_turn(st.arch, method, target, 200, tm, 0, 0);
             sink.done();
             return true;
           }
-          ToolCallStreamParser tool_parser(resolved_stops(p),
-                                           /*start_in_reasoning=*/true);
+          auto tool_parser = st.backend->new_stream_parser(
+              resolved_stops(p, *st.backend), /*start_in_reasoning=*/true);
           GenResult r = run_session(
               st, full_ids, content_ids, p.opts, p.has_seed, p.seed,
               p.req_max_tokens,
-              [&](const StepOutcome& s) {
+              [&](const BackendStepOutcome& s) {
                 // Cheap periodic liveness check: picks up a client that
                 // disconnected without the socket write failing yet.
                 if (++steps_since_poll >= kLivenessPollSteps) {
@@ -1412,10 +1465,11 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
                   if (!sse_peer_alive(sink)) sse_ok = false;
                 }
                 if (!sse_ok) return false;
-                // <think> traces stream as `reasoning_content` (Zed renders
+                // Thinking traces stream as `reasoning_content` (Zed renders
                 // them in the thinking trace, not the answer); display text
-                // as `content`. Never the twain shall leak.
-                StreamDeltas d = tool_feed(st, tool_parser, s);
+                // as `content`. Never the twain shall leak. (Backends
+                // without a trace only ever emit display.)
+                StepDeltas d = tool_feed(*st.backend, *tool_parser, s);
                 if (!d.display.empty())
                   chunk({{"content", std::move(d.display)}}, nullptr);
                 if (!d.reasoning.empty())
@@ -1430,13 +1484,13 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
           if (sse_ok) {
             // (json_mode fence stripping is a non-streaming affordance;
             // streamed deltas arrive unmodified.)
-            ToolParseResult tp = tool_parser.finish();
+            ParsedTail tp = tool_parser->finish();
             if (!tp.text.empty()) chunk({{"content", tp.text}}, nullptr);
             if (!tp.reasoning.empty())
               chunk({{"reasoning_content", tp.reasoning}}, nullptr);
             // Without tools the client asked for text: parsed calls are
             // dropped (their blocks were already excised from `content`).
-            std::vector<ToolCall> calls;
+            std::vector<ServerToolCall> calls;
             if (p.tools_active) calls = std::move(tp.calls);
             if (!p.parallel_tool_calls && calls.size() > 1) calls.resize(1);
             if (!calls.empty()) {
@@ -1451,7 +1505,7 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
                 json{{"id", id},
                      {"object", "chat.completion.chunk"},
                      {"created", created},
-                     {"model", st.model_id},
+                     {"model", st.backend->model_id()},
                      {"choices",
                       json::array({{{"index", 0},
                                     {"delta", json::object()},
@@ -1464,7 +1518,7 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
             sse_send(sink, final);
             sse_done(sink);
           }
-          log_turn(method, target, 200, tm, r.prompt_tokens,
+          log_turn(st.arch, method, target, 200, tm, r.prompt_tokens,
                    r.completion_tokens);
         } catch (const std::exception& ex) {
           sse_send(sink, openai_error(ex.what(), "server_error"));
@@ -1493,7 +1547,8 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
   }
   ParsedRequest pr;
   std::string err;
-  if (!parse_common(body, st.cfg, st.model_id, pr, err)) {
+  if (!parse_common(body, st.backend->default_stop_ids(),
+                    st.backend->model_id(), pr, err)) {
     send_bad_request(res, err);
     return;
   }
@@ -1512,8 +1567,7 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
     send_bad_request(res, "'prompt' must be a string");
     return;
   }
-  pr.messages = KokkosDNN::LFM25::make_chat_messages(
-      pit->get<std::string>(), /*system=*/"", "user");
+  pr.messages = st.backend->make_single_turn(pit->get<std::string>());
 
   const std::string id = new_id("cmpl", st);
   const std::time_t created = std::time(nullptr);
@@ -1525,32 +1579,32 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
     tm.lock_ms = now_ms() - t_lock;
     try {
       const double t_encode = now_ms();
-      const std::vector<int> content_ids =
-          KokkosDNN::LFM25::encode_chatml(st.tok, pr.messages, false, true);
+      const std::vector<int> content_ids = st.backend->encode(
+          pr.messages, "", "", /*add_generation_prompt=*/false);
       const std::vector<int> full_ids =
-          KokkosDNN::LFM25::encode_chatml(st.tok, pr.messages, true, true);
+          st.backend->encode(pr.messages, "", "", true);
       tm.encode_ms = now_ms() - t_encode;
-      // Legacy envelope has no reasoning/tool channels: the <think> trace
+      // Legacy envelope has no reasoning/tool channels: thinking traces
       // and any call blocks are stripped from the text (never leaked).
       // Only the display channel is consumed (no reasoning poll).
-      // The prompt ends with an open <think>, so the trace opens
-      // implicitly and its bytes carry no opener.
-      ToolCallStreamParser tool_parser(resolved_stops(pr),
-                                       /*start_in_reasoning=*/true);
+      // (LFM25's prompt ends with an open <think>, so the trace opens
+      // implicitly and its bytes carry no opener.)
+      auto tool_parser = st.backend->new_stream_parser(
+          resolved_stops(pr, *st.backend), /*start_in_reasoning=*/true);
       std::string tool_text;
-      std::function<bool(const StepOutcome&)> on_step =
-          [&](const StepOutcome& s) {
-            tool_text += tool_feed(st, tool_parser, s).display;
+      std::function<bool(const BackendStepOutcome&)> on_step =
+          [&](const BackendStepOutcome& s) {
+            tool_text += tool_feed(*st.backend, *tool_parser, s).display;
             return true;
           };
       GenResult r = run_session(st, full_ids, content_ids, pr.opts, pr.has_seed,
                                 pr.seed, pr.req_max_tokens, on_step, &tm);
-      tool_text += tool_parser.finish().text;
+      tool_text += tool_parser->finish().text;
       send_json(res, 200,
                 json{{"id", id},
                      {"object", "text_completion"},
                      {"created", created},
-                     {"model", st.model_id},
+                     {"model", st.backend->model_id()},
                      {"choices",
                       json::array({{{"text", tool_text},
                                     {"index", 0},
@@ -1560,8 +1614,8 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
                        {"completion_tokens", r.completion_tokens},
                        {"total_tokens",
                         r.prompt_tokens + r.completion_tokens}}}});
-      log_turn(req.method, req.target.empty() ? req.path : req.target, 200, tm,
-               r.prompt_tokens, r.completion_tokens);
+      log_turn(st.arch, req.method, req.target.empty() ? req.path : req.target,
+               200, tm, r.prompt_tokens, r.completion_tokens);
     } catch (const std::invalid_argument& e) {
       send_bad_request(res, e.what());
     } catch (const std::exception& e) {
@@ -1586,7 +1640,8 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
           const json b = json::parse(body);
           ParsedRequest p;
           std::string e;
-          if (!parse_common(b, st.cfg, st.model_id, p, e)) {
+          if (!parse_common(b, st.backend->default_stop_ids(),
+                            st.backend->model_id(), p, e)) {
             sse_send(sink, openai_error(e));
             log_stream_error(method, target, body.size(), e);
             sink.done();
@@ -1600,45 +1655,44 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
             sink.done();
             return true;
           }
-          p.messages = KokkosDNN::LFM25::make_chat_messages(
-              it->get<std::string>(), "", "user");
+          p.messages = st.backend->make_single_turn(it->get<std::string>());
           // This endpoint has no opening chunk, so this is the last chance to
           // notice a peer that left before paying for the prefill.
           if (!sse_peer_alive(sink)) {
             tm.aborted = true;
-            log_turn(method, target, 200, tm, 0, 0);
+            log_turn(st.arch, method, target, 200, tm, 0, 0);
             sink.done();
             return true;
           }
           size_t steps_since_poll = 0;
           const double t_encode = now_ms();
-          const std::vector<int> content_ids =
-              KokkosDNN::LFM25::encode_chatml(st.tok, p.messages, false, true);
+          const std::vector<int> content_ids = st.backend->encode(
+              p.messages, "", "", /*add_generation_prompt=*/false);
           const std::vector<int> full_ids =
-              KokkosDNN::LFM25::encode_chatml(st.tok, p.messages, true, true);
+              st.backend->encode(p.messages, "", "", true);
           tm.encode_ms = now_ms() - t_encode;
           bool sse_ok = true;
           // Legacy envelope has no reasoning/tool channels: stream display
-          // text only (the <think> trace and call blocks never leak).
-          ToolCallStreamParser tool_parser(resolved_stops(p),
-                                           /*start_in_reasoning=*/true);
+          // text only (thinking traces and call blocks never leak).
+          auto tool_parser = st.backend->new_stream_parser(
+              resolved_stops(p, *st.backend), /*start_in_reasoning=*/true);
           GenResult r = run_session(
               st, full_ids, content_ids, p.opts, p.has_seed, p.seed,
               p.req_max_tokens,
-              [&](const StepOutcome& s) {
+              [&](const BackendStepOutcome& s) {
                 if (++steps_since_poll >= kLivenessPollSteps) {
                   steps_since_poll = 0;
                   if (!sse_peer_alive(sink)) sse_ok = false;
                 }
                 if (!sse_ok) return false;
                 const std::string d =
-                    tool_feed(st, tool_parser, s).display;
+                    tool_feed(*st.backend, *tool_parser, s).display;
                 if (d.empty()) return sse_ok;
                 sse_ok = sse_send(
                     sink, json{{"id", id},
                                {"object", "text_completion.chunk"},
                                {"created", created},
-                               {"model", st.model_id},
+                               {"model", st.backend->model_id()},
                                {"choices",
                                 json::array({{{"text", d},
                                               {"index", 0},
@@ -1647,13 +1701,13 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
               },
               &tm);
           if (sse_ok) {
-            const std::string tail = tool_parser.finish().text;
+            const std::string tail = tool_parser->finish().text;
             if (!tail.empty())
               sse_send(sink,
                        json{{"id", id},
                             {"object", "text_completion.chunk"},
                             {"created", created},
-                            {"model", st.model_id},
+                            {"model", st.backend->model_id()},
                             {"choices",
                              json::array({{{"text", tail},
                                            {"index", 0},
@@ -1664,7 +1718,7 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
                      json{{"id", id},
                           {"object", "text_completion.chunk"},
                           {"created", created},
-                          {"model", st.model_id},
+                          {"model", st.backend->model_id()},
                           {"choices",
                            json::array({{{"text", ""},
                                          {"index", 0},
@@ -1676,7 +1730,7 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
                              r.prompt_tokens + r.completion_tokens}}}});
             sse_done(sink);
           }
-          log_turn(method, target, 200, tm, r.prompt_tokens,
+          log_turn(st.arch, method, target, 200, tm, r.prompt_tokens,
                    r.completion_tokens);
         } catch (const std::exception& ex) {
           sse_send(sink, openai_error(ex.what(), "server_error"));
@@ -1709,10 +1763,23 @@ int main(int argc, char* argv[]) {
   install_stop_handlers();
   int exit_code = 0;
   {
+    std::string arch, model;
+    resolve_arch_and_model(opt, arch, model);
     startup_log(std::string("kokkosdnn_server ") + kVersion + " starting...");
-    startup_log("  model: " + opt.model);
-    startup_log("  weights: " +
-                (opt.weights.empty() ? std::string("(none)") : opt.weights));
+    startup_log("  arch: " + arch +
+                (opt.arch_set ? "" : " (auto-detected)"));
+    startup_log("  model: " + model);
+    {
+      std::string w = "(none)";
+      if (!opt.weights.empty()) {
+        w.clear();
+        for (size_t i = 0; i < opt.weights.size(); ++i) {
+          if (i) w += ", ";
+          w += opt.weights[i];
+        }
+      }
+      startup_log("  weights: " + w);
+    }
     startup_log("  tokenizer: " +
                 (opt.tokenizer.empty() ? std::string("(none)")
                                        : opt.tokenizer));
@@ -1732,7 +1799,6 @@ int main(int argc, char* argv[]) {
     }
     startup_log("loading weights...");
     ServerState st;
-    st.prefix_cache_host = opt.prefix_cache_host;
     std::string err;
     if (!load_model(opt, st, err)) {
       startup_log(std::string("kokkosdnn_server: ") + err);
@@ -1741,8 +1807,9 @@ int main(int argc, char* argv[]) {
       startup_log("kokkosdnn_server: shutdown requested during load, exiting");
       exit_code = 0;
     } else {
-      startup_log("model loaded: " + st.model_id + " (max_seq_len=" +
-                  std::to_string(st.cfg.max_seq_len) + ")");
+      startup_log("model loaded: " + st.backend->model_id() +
+                  " (arch=" + st.arch + ", max_seq_len=" +
+                  std::to_string(st.backend->max_seq_len()) + ")");
       startup_log("listening on 0.0.0.0:" + std::to_string(opt.port) +
                   " — ready to serve");
       httplib::Server svr;
