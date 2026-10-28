@@ -56,21 +56,70 @@ device, or a build with the TPL dispatch compiled out all show up there.
 
 ## Docker
 
+One image serves EITHER LFM2.5 OR Glimmer — the builder compiles both
+model components and the checkpoint is volume-mounted at run time, so the
+arch is selected per `docker run`, not per image build. (On a server build
+that predates the `--arch lfm2.5|glimmer` selector, drop the `--arch` flag;
+`--model` still selects the served id.)
+
 `server/Dockerfile` is a multi-stage CUDA build: the builder stage compiles
 Kokkos (CUDA backend, `KOKKOS_VERSION` 5.2.1, `CUDA_ARCH` AMPERE80 — both
 overridable via `--build-arg`) plus `kokkosdnn_server` with cuBLAS/cuDNN
 dispatch on top of an `nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04` image
 (same tags as the `tpl=ON` leg of `.github/workflows/cuda.yaml`); the
-runtime stage copies only the server binary onto the matching
-`cudnn-runtime` image. Build from the repo root:
+runtime stage copies only the server binary (plus a tiny argument-
+validating entrypoint) onto the matching `cudnn-runtime` image. Glimmer's
+sharded-safetensors glob is expanded inside the binary (POSIX `glob(3)`),
+so the runtime image needs no extra packages. Build from the repo root:
 
 ```sh
 docker build -f server/Dockerfile -t kokkosdnn-server:cuda .
-docker run --gpus all -p 8000:8000 \
-    -v /path/to/weights:/models:ro \
-    kokkosdnn-server:cuda \
-    --weights /models/lfm2_5.gguf --tokenizer /models/tokenizer.json
 ```
+
+LFM2.5 (GGUF checkpoint):
+
+```sh
+docker run --gpus all -p 8000:8000 \
+    -v /path/to/lfm:/models/lfm:ro \
+    kokkosdnn-server:cuda \
+    --weights /models/lfm/lfm2_5.gguf --tokenizer /models/lfm/tokenizer.json
+```
+
+Glimmer (sharded safetensors, ~60 GiB BF16 — quote the glob so the shell
+passes it through; the server expands `model-*.safetensors` itself):
+
+```sh
+docker run --gpus all -p 8000:8000 \
+    -v /path/to/glimmer:/models/glimmer:ro \
+    kokkosdnn-server:cuda \
+    --arch glimmer --model glimmer-30b \
+    --weights '/models/glimmer/model-*.safetensors' \
+    --tokenizer /models/glimmer/tokenizer.json \
+    --config /models/glimmer/config-glimmer-30b-text.json
+```
+
+Glimmer from a single llama.cpp GGUF file instead (`--weights` ending in
+`.gguf` selects the GGUF loader; F32/F16/BF16 exact, Q8_0/Q4_K/Q6_K
+dequantized on the host):
+
+```sh
+docker run --gpus all -p 8000:8000 \
+    -v /path/to/glimmer:/models/glimmer:ro \
+    kokkosdnn-server:cuda \
+    --arch glimmer --model glimmer-30b \
+    --weights /models/glimmer/model.gguf \
+    --tokenizer /models/glimmer/tokenizer.json
+```
+
+Both `-v` layouts may be mounted at once (`-v /path/to/lfm:/models/lfm:ro
+-v /path/to/glimmer:/models/glimmer:ro`); only the `--weights` /
+`--tokenizer` paths on the command line decide what is served. With no
+args the container prints `kokkosdnn_server --help`; omitting `--weights`
+or `--tokenizer` fails fast with a mount-oriented error from the
+entrypoint. Note the ~60 GiB Glimmer weights need a large-GPU host (or a
+small `--max-seq-len` to cap the KV cache); see
+[glimmer](../examples/glimmer/README.md) for checkpoint download and
+memory notes.
 
 For a non-Ampere GPU, target it natively with
 `--build-arg CUDA_ARCH=HOPPER90` (any `Kokkos_ARCH_*` suffix works). The
