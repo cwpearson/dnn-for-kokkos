@@ -129,6 +129,14 @@ if(KokkosDNN_ENABLE_CUDNN)
     GIT_TAG b8e39555bbcc64b030dc7ea8d8f01c43ff88f483
   )
   FetchContent_MakeAvailable(cudnn_frontend)
+  # Header-only: stage its headers with our install tree. The installed
+  # KokkosDNN::kokkosdnn links cudnn_frontend PUBLICly, and a FetchContent
+  # target is not part of our export set, so without this (+ the IMPORTED
+  # definition in KokkosDNNConfig.cmake.in) every consumer configure fails
+  # with "imported targets are referenced, but are missing: cudnn_frontend".
+  # Layout matches the frontend's own install (top-level include/).
+  install(DIRECTORY ${cudnn_frontend_SOURCE_DIR}/include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
   # The frontend's experimental engines need NVRTC at link time.
   find_package(CUDAToolkit REQUIRED)
 endif()
