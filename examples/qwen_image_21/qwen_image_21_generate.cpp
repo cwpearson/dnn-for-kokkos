@@ -52,7 +52,7 @@
 //                           each rounds to the nearest 16*patch multiple)
 //                          [--steps 8] [--cfg 1.0] [--shift 3.0]
 //                          [--sigmas driver|turbo]
-//                          [--seed 42] [--init-latents-in lat.f32]
+//                          [--seed S] [--init-latents-in lat.f32]
 //                          [--no-vae-decode]
 //                          [--decode-latents-in lat.f32
 //                           [--decode-latents-layout chw|token]
@@ -333,7 +333,7 @@ void usage() {
       "  --sigmas       'driver' (default): nearest-grid schedule from\n"
       "                 --steps/--shift; 'turbo': checkpoint sample_sigmas\n"
       "                 verbatim (mu-shifted already, 8 steps, shift=1.0)\n"
-      "  --seed         latent init seed (default 42; ignored when\n"
+      "  --seed         latent init seed (random if omitted; ignored when\n"
       "                 --init-latents-in is given)\n"
       "  --init-latents-in raw float32 LE initial latents [C,H,W]\n"
       "                 row-major, flattened C-major lat[(c*H+h)*W+w]\n"
@@ -839,6 +839,7 @@ int main(int argc, char** argv) {
   float guidance = 1.0f, flow_shift = 3.0f;
   std::string sigmas_mode = "driver";
   uint64_t seed = 42;
+  bool seed_given = false;
   bool tiny = false;
   bool staged = true, vae_decode = true;
   bool prompt_given = false;
@@ -904,6 +905,7 @@ int main(int argc, char** argv) {
       }
     } else if (a == "--seed" && i + 1 < argc) {
       seed = (uint64_t)std::stoull(argv[++i]);
+      seed_given = true;
     } else if (a == "--tiny") {
       tiny = true;
     } else if (a == "--no-staged" || a == "--no-stage") {
@@ -914,6 +916,11 @@ int main(int argc, char** argv) {
     } else {
       std::fprintf(stderr, "warning: ignoring unknown arg '%s'\n", a.c_str());
     }
+  }
+
+  if (!seed_given) {
+    std::random_device rd;
+    seed = (uint64_t(rd()) << 32) | uint64_t(rd());
   }
 
   Kokkos::initialize(argc, argv);
