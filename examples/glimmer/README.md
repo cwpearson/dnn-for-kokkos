@@ -2,7 +2,7 @@
 
 Muse Glimmer 30B text-path inference built on the core library: 30B text config defaults, a safetensors checkpoint loader, a BPE `tokenizer.json` loader, a hybrid sliding/full KV-cache autoregressive model, and a `glimmer_generate` driver.
 
-Scope: **text only** (`text_config`); vision tower and multimodal glue are out of scope. **Inference only** with **bfloat16 storage/compute by default** (`--fp32` opts in). There is no weight quantization; KV caches are dense FP. The driver encodes raw prompts directly.
+Scope: **text only** (`text_config`); vision tower and multimodal glue are out of scope. **Inference only** with **bfloat16 storage/compute by default** (`--fp32` opts in). Safetensors weights load at full precision; a `.gguf` checkpoint instead dequantizes on the host (F32/F16/BF16 exact, Q8_0/Q4_K/Q6_K supported). KV caches are dense FP. The driver encodes raw prompts directly.
 
 > Status: **driver implemented**. `glimmer_generate` runs tiny random models (`--tiny`), full-size shapes with random weights (`--model glimmer-30b`), and real checkpoints (`--weights`, `--tokenizer`); `KokkosDNN_Glimmer{Config,Weights,Model,Tokenizer}.hpp` are functional and covered by `test_glimmer_generate` + `test_glimmer_tokenizer`. Tensor names and the chat template carry ASSUMPTION markers (see `DESIGN.md` and the headers); confirm them against `modeling_muse_glimmer.py` and the upstream chat template when published.
 
@@ -76,7 +76,26 @@ FP32 comparison run:
   --prompt "Hello" --max-new 64 --fp32
 ```
 
-Useful flags: `--temperature 0` (greedy; the generation_config default is greedy), `--top-k/--top-p/--min-p/--repetition-penalty/--seed`, `--stop <id> ...`, `--stop-string`, `--add-bos/--no-add-bos`, `--prefill-chunk N` (`0` = single-shot), `--max-seq-len N` (validated against `[1, 131072]`), `--chat/--system/--role/--messages` (Muse-style template, assumption — see header), `--list-tensors`. `--weights` accepts glob patterns for sharded checkpoints.
+GGUF checkpoint run (llama.cpp naming, dequantized on the host):
+
+```bash
+./build/examples/glimmer/glimmer_generate \
+  --model glimmer-30b --config examples/glimmer/config-glimmer-30b-text.json \
+  --weights weights/muse-glimmer-30b-text/model.gguf \
+  --tokenizer weights/muse-glimmer-30b-text/tokenizer.json \
+  --prompt "Hello" --max-new 64
+```
+
+A single `--weights` entry ending in `.gguf` (case-insensitive) selects the GGUF path (`KokkosDNN::Glimmer::load_gguf`); F32/F16/BF16 decode exactly, Q8_0/Q4_K/Q6_K (i.e. the Q4_K_M recipe, which stores those per-tensor dtypes) dequantize on the host, anything else throws. Mixing `.gguf` with safetensors shards is an error. `--list-tensors` works on `.gguf` files too.
+
+GGUF conversion-trap handling (verified against llama.cpp `conversion/muse_glimmer.py` + `src/models/muse-glimmer.cpp`):
+
+- Norm shift: conversion adds `+1` to the four layer norms (`norm_shift`, since GGUF `rms_norm` is `x/rms*w` while the HF CenteredRMSNorm is `x/rms*(1+w)`); the final norm is untouched (shift 0). The loader subtracts the shift back so the Model's `one_plus` path sees HF-centered weights.
+- Q/K RoPE layout: conversion unpermutes q/k into ggml interleaved (NORM) layout; the loader re-permutes rows into the HF permuted (rotate_half) layout consumed by `rope_neoX_inplace` (tested: loader output equals the pre-conversion layout exactly).
+- Synthesized QK norms: GGUF `attn_q_norm` (full `qk_scale_factor` 3.87) / `attn_k_norm` (ones) absorb the q pre-scale into a *scaled* RMSNorm, while the Model runs a *scaleless* QK norm plus the separate 3.87 multiply — mathematically identical (`rms(x)*3.87`, `rms(x)*1`, same eps), so the loader ignores both tensors (files with or without them load identically).
+- Metadata: `muse-glimmer.{logit_scale, final_logit_softcapping, attention.sliding_window, attention.sliding_window_pattern}` are read and validated against `Config` (throw on missing/mismatch), never silently overriding it.
+
+Useful flags: `--temperature 0` (greedy; the generation_config default is greedy), `--top-k/--top-p/--min-p/--repetition-penalty/--seed`, `--stop <id> ...`, `--stop-string`, `--add-bos/--no-add-bos`, `--prefill-chunk N` (`0` = single-shot), `--max-seq-len N` (validated against `[1, 131072]`), `--chat/--system/--role/--messages` (Muse-style template, assumption — see header), `--list-tensors`. `--weights` accepts glob patterns for sharded checkpoints, or a single `.gguf` file for a llama.cpp GGUF checkpoint (see above).
 
 ## Notes
 
@@ -96,7 +115,7 @@ ctest --test-dir build --output-on-failure -R 'Glimmer'
 ./build/examples/glimmer/glimmer_generate --tiny --prompt "Hello" --max-new 8
 ```
 
-Unit tests: `Test_GlimmerConfig.cpp` (presets, fixture, full-config wrapper, tiny preset), `Test_GlimmerGenerate.cpp` (tiny forward/generate smoke, determinism, chunked-prefill equivalence, NoPE/RoPE branches), and `Test_GlimmerTokenizer.cpp`.
+Unit tests: `Test_GlimmerConfig.cpp` (presets, fixture, full-config wrapper, tiny preset), `Test_GlimmerGenerate.cpp` (tiny forward/generate smoke, determinism, chunked-prefill equivalence, NoPE/RoPE branches), `Test_GlimmerWeightsGGUF.cpp` (synthetic-GGUF loader roundtrip: norm shift, Q/K re-permute, synthesized-norm handling, mixed dtypes, metadata validation), and `Test_GlimmerTokenizer.cpp`.
 
 ## Performance
 

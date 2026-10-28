@@ -393,6 +393,50 @@ class GgufFile {
     return str_kv_;
   }
 
+  bool has_kv_f32(const std::string& key) const {
+    return f32_kv_.count(key) != 0;
+  }
+
+  float kv_f32(const std::string& key) const {
+    auto it = f32_kv_.find(key);
+    if (it == f32_kv_.end())
+      throw std::runtime_error("GgufFile: F32 KV not found '" + key + "'");
+    return it->second;
+  }
+
+  bool has_kv_u32(const std::string& key) const {
+    return u32_kv_.count(key) != 0;
+  }
+
+  uint32_t kv_u32(const std::string& key) const {
+    auto it = u32_kv_.find(key);
+    if (it == u32_kv_.end())
+      throw std::runtime_error("GgufFile: U32 KV not found '" + key + "'");
+    return it->second;
+  }
+
+  bool has_kv_bool_array(const std::string& key) const {
+    return bool_arr_kv_.count(key) != 0;
+  }
+
+  const std::vector<char>& kv_bool_array(const std::string& key) const {
+    auto it = bool_arr_kv_.find(key);
+    if (it == bool_arr_kv_.end())
+      throw std::runtime_error("GgufFile: bool-array KV not found '" + key +
+                               "'");
+    return it->second;
+  }
+
+  // Full typed-KV maps (for suffix-based key lookup when the arch prefix
+  // differs from the expected one).
+  const std::map<std::string, float>& kv_f32_all() const { return f32_kv_; }
+  const std::map<std::string, uint32_t>& kv_u32_all() const {
+    return u32_kv_;
+  }
+  const std::map<std::string, std::vector<char>>& kv_bool_arrays_all() const {
+    return bool_arr_kv_;
+  }
+
   // Bounds-checked pointer to a tensor's packed payload.
   const uint8_t* payload(const GgufTensorInfo& info) const {
     const size_t abs = data_start_ + (size_t)info.offset;
@@ -439,7 +483,9 @@ class GgufFile {
     }
   };
 
-  // Skip one metadata value of `type` (arrays recurse); store strings.
+  // Skip one metadata value of `type` (arrays recurse); store strings,
+  // float32/uint32 scalars, and bool arrays (the conversion-written
+  // hyperparameters loaders validate against, e.g. logit scale).
   void parse_value(Cursor& c, uint32_t type, const std::string& key,
                    bool store) {
     switch (type) {
@@ -447,9 +493,20 @@ class GgufFile {
       case 1: c.need(1, "i8"); c.p += 1; return;    // INT8
       case 2: c.need(2, "u16"); c.p += 2; return;   // UINT16
       case 3: c.need(2, "i16"); c.p += 2; return;   // INT16
-      case 4: c.need(4, "u32"); c.p += 4; return;   // UINT32
+      case 4: {                                     // UINT32
+        const uint32_t v = c.u32();
+        if (store) u32_kv_[key] = v;
+        return;
+      }
       case 5: c.need(4, "i32"); c.p += 4; return;   // INT32
-      case 6: c.need(4, "f32"); c.p += 4; return;   // FLOAT32
+      case 6: {                                     // FLOAT32
+        c.need(4, "f32");
+        float v = 0;
+        std::memcpy(&v, c.p, 4);
+        c.p += 4;
+        if (store) f32_kv_[key] = v;
+        return;
+      }
       case 7: c.need(1, "bool"); c.p += 1; return;  // BOOL
       case 8: {                                     // STRING
         std::string s = c.str();
@@ -459,6 +516,12 @@ class GgufFile {
       case 9: {  // ARRAY
         uint32_t et = c.u32();
         uint64_t n  = c.u64();
+        if (store && et == 7) {  // BOOL array (e.g. sliding-window pattern)
+          c.need((size_t)n, "bool array");
+          bool_arr_kv_[key] = std::vector<char>(c.p, c.p + (size_t)n);
+          c.p += (size_t)n;
+          return;
+        }
         for (uint64_t i = 0; i < n; ++i) parse_value(c, et, key, false);
         return;
       }
@@ -540,6 +603,9 @@ class GgufFile {
   std::vector<GgufTensorInfo> tensors_;
   std::map<std::string, size_t> index_;
   std::map<std::string, std::string> str_kv_;
+  std::map<std::string, float> f32_kv_;
+  std::map<std::string, uint32_t> u32_kv_;
+  std::map<std::string, std::vector<char>> bool_arr_kv_;
 };
 
 // Dequantize a whole tensor to FP32 (streamed block by block; peak extra RAM
@@ -1862,12 +1928,25 @@ struct SyntheticTensor {
   std::vector<uint8_t> raw;    // packed payload
 };
 
+// Typed key-value metadata for write_synthetic_gguf. Implicitly constructible
+// from a string map so existing (path, tensors, string_map) calls keep
+// working; the writer emits F32/U32/BOOL-array entries after the strings.
+struct SyntheticKV {
+  std::map<std::string, std::string> strings;
+  std::map<std::string, float> f32;
+  std::map<std::string, uint32_t> u32;
+  std::map<std::string, std::vector<char>> bool_arrays;  // 0/1 bytes
+  SyntheticKV() = default;
+  SyntheticKV(const std::map<std::string, std::string>& s) : strings(s) {}
+};
+
 inline void write_synthetic_gguf(
     const std::string& path, const std::vector<SyntheticTensor>& tensors,
-    const std::map<std::string, std::string>& string_kv = {}) {
+    const SyntheticKV& kv = {}) {
   std::ofstream f(path, std::ios::binary | std::ios::trunc);
   if (!f) throw std::runtime_error("write_synthetic_gguf: cannot open '" +
                                    path + "'");
+  const std::map<std::string, std::string>& string_kv = kv.strings;
   auto put = [&](const void* p, size_t n) {
     f.write((const char*)p, (std::streamsize)n);
   };
@@ -1882,11 +1961,31 @@ inline void write_synthetic_gguf(
   put(magic, 4);
   u32(GgufFile::kVersion);
   u64(tensors.size());
-  u64(string_kv.size());
+  const uint64_t n_kv = (uint64_t)(string_kv.size() + kv.f32.size() +
+                                   kv.u32.size() + kv.bool_arrays.size());
+  u64(n_kv);
   for (const auto& [k, v] : string_kv) {
     str(k);
     u32(8);  // GGUF_TYPE_STRING
     str(v);
+  }
+  for (const auto& [k, v] : kv.f32) {
+    str(k);
+    u32(6);  // GGUF_TYPE_FLOAT32
+    put(&v, 4);
+  }
+  for (const auto& [k, v] : kv.u32) {
+    str(k);
+    u32(4);  // GGUF_TYPE_UINT32
+    uint32_t x = v;
+    put(&x, 4);
+  }
+  for (const auto& [k, v] : kv.bool_arrays) {
+    str(k);
+    u32(9);  // GGUF_TYPE_ARRAY
+    u32(7);  // GGUF_TYPE_BOOL elements
+    u64(v.size());
+    if (!v.empty()) put(v.data(), v.size());
   }
   // Tensor infos + expected payload sizes.
   std::vector<uint64_t> nbytes;
@@ -1926,6 +2025,16 @@ inline void write_synthetic_gguf(
   size_t off_pos = 24;
   for (const auto& [k, v] : string_kv)
     off_pos += 8 + k.size() + 4 + 8 + v.size();
+  for (const auto& [k, v] : kv.f32) {
+    (void)v;
+    off_pos += 8 + k.size() + 4 + 4;
+  }
+  for (const auto& [k, v] : kv.u32) {
+    (void)v;
+    off_pos += 8 + k.size() + 4 + 4;
+  }
+  for (const auto& [k, v] : kv.bool_arrays)
+    off_pos += 8 + k.size() + 4 + 4 + 8 + v.size();
   std::vector<size_t> off_fields;
   for (const auto& t : tensors) {
     size_t p = off_pos + 8 + t.name.size() + 4 + 8 * t.dims.size() + 4;
@@ -1955,6 +2064,16 @@ inline void write_synthetic_gguf(
   f.flush();
   if (!f) throw std::runtime_error("write_synthetic_gguf: write failed '" +
                                    path + "'");
+}
+
+// Backward-compatible string-KV-only overload (no default argument, so
+// two-argument calls unambiguously select the SyntheticKV overload above).
+inline void write_synthetic_gguf(
+    const std::string& path, const std::vector<SyntheticTensor>& tensors,
+    const std::map<std::string, std::string>& string_kv) {
+  SyntheticKV kv;
+  kv.strings = string_kv;
+  write_synthetic_gguf(path, tensors, kv);
 }
 
 }  // namespace Gguf
