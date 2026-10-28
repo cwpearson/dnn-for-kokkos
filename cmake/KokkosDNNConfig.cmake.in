@@ -2,6 +2,14 @@
 # SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 @PACKAGE_INIT@
 
+# find_dependency() loads the dependency's package config into this scope.
+# With CMake <= 3.29 (Ubuntu 24.04 ships 3.28) a dependency can overwrite
+# PACKAGE_PREFIX_DIR: Kokkos' config sets it to <kokkos-prefix>/lib, so a
+# later "${PACKAGE_PREFIX_DIR}/include" resolves to <kokkos-prefix>/lib/include.
+# Keep our own copy for paths that must stay inside this package's tree, and
+# restore it afterwards (CMake >= 3.30 preserves it across find_dependency).
+set(_KokkosDNN_PACKAGE_PREFIX_DIR "${PACKAGE_PREFIX_DIR}")
+
 include(CMakeFindDependencyMacro)
 
 # Core dependency: Kokkos >= 5.2.1 (see CMakeLists.txt find_package(Kokkos)).
@@ -41,9 +49,13 @@ if(@KOKKOSDNN_ENABLE_CUDNN@ AND NOT TARGET cudnn_frontend)
   # already provides cudnn_frontend keeps its own.
   add_library(cudnn_frontend INTERFACE IMPORTED)
   set_target_properties(cudnn_frontend PROPERTIES
-    INTERFACE_INCLUDE_DIRECTORIES "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_INCLUDEDIR@"
+    INTERFACE_INCLUDE_DIRECTORIES "${_KokkosDNN_PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_INCLUDEDIR@"
     INTERFACE_COMPILE_FEATURES cxx_std_17)
 endif()
+
+# Undo any PACKAGE_PREFIX_DIR clobbering by the dependency configs above.
+set(PACKAGE_PREFIX_DIR "${_KokkosDNN_PACKAGE_PREFIX_DIR}")
+unset(_KokkosDNN_PACKAGE_PREFIX_DIR)
 
 include("${CMAKE_CURRENT_LIST_DIR}/KokkosDNNTargets.cmake")
 check_required_components(KokkosDNN)
