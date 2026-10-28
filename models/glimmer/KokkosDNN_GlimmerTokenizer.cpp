@@ -1367,8 +1367,8 @@ std::vector<ChatMessage> make_chat_messages(const std::string& prompt,
                                             const std::string& system,
                                             const std::string& role) {
   std::vector<ChatMessage> msgs;
-  if (!system.empty()) msgs.push_back({"system", system});
-  msgs.push_back({role.empty() ? "user" : role, prompt});
+  if (!system.empty()) msgs.push_back({"system", system, "", {}, ""});
+  msgs.push_back({role.empty() ? "user" : role, prompt, "", {}, ""});
   return msgs;
 }
 
@@ -1425,6 +1425,141 @@ std::string truncate_at_stop_strings(
   size_t p = find_stop_string(text, stop_strings);
   if (p == std::string::npos) return text;
   return text.substr(0, p);
+}
+
+std::string render_glimmer_chatml_with_tools(
+    const std::vector<ChatMessage>& messages, const std::string& tools_json,
+    const std::string& system_suffix, bool add_generation_prompt,
+    const std::string& default_system) {
+  // Effective system block: first system message (if any) + default +
+  // tools catalogue + caller directives. With no system content anywhere
+  // this renders byte-identical to render_chat_template().
+  std::string sys;
+  bool has_system = false;
+  for (const auto& m : messages)
+    if (m.role == "system") {
+      has_system = true;
+      if (!m.content.empty()) sys += (sys.empty() ? "" : "\n") + m.content;
+    }
+  if (!has_system && !default_system.empty()) sys = default_system;
+  if (!tools_json.empty())
+    sys += (sys.empty() ? "" : "\n") + std::string("List of tools: ") +
+           tools_json;
+  if (!system_suffix.empty())
+    sys += (sys.empty() ? "" : "\n") + system_suffix;
+
+  std::string out = "<|begin_of_text|>";
+  if (has_system || !sys.empty())
+    out += "<|start|>system<|message|>" + sys + "<|eot|>";
+  for (const auto& m : messages) {
+    if (m.role == "system") continue;  // folded into the block above
+    out += "<|start|>" + m.role + "<|message|>";
+    out += m.content;
+    out += "<|eot|>";
+  }
+  if (add_generation_prompt) out += "<|start|>assistant<|message|>";
+  return out;
+}
+
+std::vector<int> encode_chatml_with_tools(
+    const Tokenizer& tok, const std::vector<ChatMessage>& messages,
+    const std::string& tools_json, const std::string& system_suffix,
+    bool add_generation_prompt, bool add_bos) {
+  return encode_rendered_chat(
+      tok, render_glimmer_chatml_with_tools(messages, tools_json,
+                                            system_suffix,
+                                            add_generation_prompt),
+      add_bos);
+}
+
+std::vector<std::string> default_stop_strings() {
+  return {"<|eot|>", "<|eom|>"};
+}
+
+ToolParseResult parse_tool_calls(const std::string& raw,
+                                 const std::vector<std::string>& stops) {
+  // No native markers: the whole (stop-truncated) completion is display
+  // text, with no calls and no reasoning.
+  size_t p = find_stop_string(raw, stops);
+  const std::string text = (p == std::string::npos) ? raw : raw.substr(0, p);
+  return ToolParseResult{text, std::string{}, std::vector<ToolCall>{}};
+}
+
+namespace {
+// Length of a trailing incomplete UTF-8 sequence (0 when the tail ends on
+// a character boundary). Hold-back keeps multi-byte characters from
+// splitting across stream deltas.
+size_t trailing_partial_utf8(const std::string& s) {
+  size_t n = 0;
+  for (size_t i = s.size(); i > 0 && n < 4; --i, ++n) {
+    const unsigned char c = static_cast<unsigned char>(s[i - 1]);
+    if ((c & 0x80) == 0) return 0;  // ASCII boundary
+    if ((c & 0xC0) == 0xC0) {
+      // Lead byte: the sequence needs (expected - available) more bytes.
+      size_t need = 1;
+      if ((c & 0xE0) == 0xC0) need = 2;
+      else if ((c & 0xF0) == 0xE0) need = 3;
+      else if ((c & 0xF8) == 0xF0) need = 4;
+      return (n + 1 >= need) ? 0 : (n + 1);
+    }
+    // Continuation byte: keep scanning back toward the lead.
+  }
+  return s.size();  // all continuation bytes: hold everything
+}
+}  // namespace
+
+ToolCallStreamParser::ToolCallStreamParser(
+    const std::vector<std::string>& stop_strings) {
+  for (const auto& s : stop_strings) {
+    if (s.empty()) continue;
+    stops_.push_back(s);
+    if (s.size() > max_stop_len_) max_stop_len_ = s.size();
+  }
+}
+
+StreamDeltas ToolCallStreamParser::feed(const std::string& raw_piece) {
+  StreamDeltas out;
+  out.display = push(raw_piece);
+  return out;
+}
+
+std::string ToolCallStreamParser::push(const std::string& raw_piece) {
+  if (stopped_) return std::string{};
+  buf_ += raw_piece;
+  std::string hit;
+  const size_t p = find_stop_string(buf_, stops_, &hit);
+  if (p != std::string::npos) {
+    // Stop fires: emit everything before it, latch, discard the rest.
+    std::string out = buf_.substr(0, p);
+    buf_.clear();
+    stopped_ = true;
+    matched_ = std::move(hit);
+    return out;
+  }
+  // No stop yet: emit everything except a bounded tail (a stop completing
+  // on a later push must never split) plus any trailing partial UTF-8.
+  const size_t hold_stop = (max_stop_len_ > 1) ? max_stop_len_ - 1 : 0;
+  const size_t hold_utf8 = trailing_partial_utf8(buf_);
+  const size_t hold = (hold_stop > hold_utf8) ? hold_stop : hold_utf8;
+  if (buf_.size() <= hold) return std::string{};
+  std::string out = buf_.substr(0, buf_.size() - hold);
+  buf_.erase(0, buf_.size() - hold);
+  return out;
+}
+
+std::string ToolCallStreamParser::poll_reasoning() { return std::string{}; }
+
+ToolParseResult ToolCallStreamParser::finish() {
+  // Drained tail: run the same stop cut over whatever was held back so the
+  // concatenated stream (deltas + finish().text) agrees with a whole-text
+  // parse_tool_calls() on the same input.
+  if (stopped_) return ToolParseResult{std::string{}, std::string{},
+                                       std::vector<ToolCall>{}};
+  const bool cut = find_stop_string(buf_, stops_) != std::string::npos;
+  ToolParseResult out = parse_tool_calls(buf_, stops_);
+  buf_.clear();
+  if (cut) stopped_ = true;
+  return out;
 }
 
 }  // namespace Glimmer
