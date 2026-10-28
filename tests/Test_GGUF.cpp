@@ -83,6 +83,31 @@ BlockQ4K make_unit_q4k() {
   return b;
 }
 
+// Q5_K block with unit scale / zero min: dequantized value == 5-bit quant
+// (0..31). Same (1,0) scale/min packing as make_unit_q4k; qh starts cleared.
+BlockQ5K make_unit_q5k() {
+  BlockQ5K b{};
+  b.d    = 0x3C00;  // 1.0
+  b.dmin = 0x0000;  // 0.0
+  const uint8_t s[12] = {1, 1, 1, 1, 0, 0, 0, 0, 0x01, 0x01, 0x01, 0x01};
+  std::memcpy(b.scales, s, 12);
+  std::memset(b.qh, 0, 32);
+  return b;
+}
+
+// Pack 256 values (each 0..31) into a unit-scale Q5_K block.
+void pack_unit_q5k(const float* v, BlockQ5K* b) {
+  std::memset(b->qh, 0, 32);
+  for (int iter = 0; iter < 4; ++iter)
+    for (int l = 0; l < 32; ++l) {
+      const int v0 = (int)v[iter * 64 + l];
+      const int v1 = (int)v[iter * 64 + 32 + l];
+      b->qs[iter * 32 + l] = (uint8_t)((v0 & 0xF) | ((v1 & 0xF) << 4));
+      const int bits = ((v0 >> 4) << (2 * iter)) | ((v1 >> 4) << (2 * iter + 1));
+      b->qh[l]          = (uint8_t)(b->qh[l] | bits);
+    }
+}
+
 template <class ExecSpace>
 QuantWeight<ExecSpace> make_qw(GgmlType dt, size_t rows, size_t cols,
                                const std::vector<uint8_t>& bytes) {
@@ -129,6 +154,11 @@ void host_dequant(GgmlType dt, const uint8_t* raw, size_t numel,
     case GgmlType::Q6_K:
       for (size_t b = 0; b < numel / 256; ++b)
         dequant_q6k_block(reinterpret_cast<const BlockQ6K*>(raw + b * 210),
+                          out.data() + b * 256);
+      return;
+    case GgmlType::Q5_K:
+      for (size_t b = 0; b < numel / 256; ++b)
+        dequant_q5k_block(reinterpret_cast<const BlockQ5K*>(raw + b * 176),
                           out.data() + b * 256);
       return;
     default: throw std::runtime_error("host_dequant: unsupported dtype");
@@ -248,6 +278,120 @@ TEST(GgufDequant, Q6KSpot) {
   EXPECT_FLOAT_EQ(out[0], -32.0f);
   EXPECT_FLOAT_EQ(out[200], -32.0f);
   EXPECT_FLOAT_EQ(out[255], -32.0f);
+}
+
+TEST(GgufDequant, Q5KHandComputed) {
+  BlockQ5K b{};
+  b.d    = 0x3C00;  // dall = 1.0
+  b.dmin = 0x4000;  // 2.0 -> subtracted term is 2.0 * m
+  // Same scale/min layout as the Q4_K test: sub-blocks get (sc, mn) =
+  // (1,0),(2,1),(3,0),(4,2),(1,3),(2,0),(1,1),(4,2).
+  const uint8_t s[12] = {1, 2, 3, 4, 0, 1, 0, 2, 0x31, 0x02, 0x11, 0x24};
+  std::memcpy(b.scales, s, 12);
+  for (int i = 0; i < 128; ++i) b.qs[i] = (uint8_t)i;
+  // 0xE4 = 0b11100100: per-group (low-bit, high-bit) = (0,0),(1,0),(0,1),(1,1).
+  std::memset(b.qh, 0xE4, 32);
+
+  float out[256];
+  dequant_q5k_block(&b, out);
+
+  // Hand-computed spots: val = 1*sc*(nib + 16*hibit) - 2*mn. qs byte
+  // iter*32+l holds low nibble (iter*32+l)&0xF and high nibble ((iter*32+l)>>4).
+  EXPECT_FLOAT_EQ(out[0], 0.0f);     // t0 low l=0: 1*(0+0) - 0
+  EXPECT_FLOAT_EQ(out[5], 5.0f);     // t0 low l=5: 1*(5+0) - 0
+  EXPECT_FLOAT_EQ(out[32], -2.0f);   // t0 high l=0: 2*(0+0) - 2*1
+  EXPECT_FLOAT_EQ(out[70], 66.0f);   // t1 low l=6: 3*(6+16) - 0
+  EXPECT_FLOAT_EQ(out[103], 4.0f);   // t1 high l=7: 4*(2+0) - 2*2
+  EXPECT_FLOAT_EQ(out[128], -6.0f);  // t2 low l=0: 1*(0+0) - 2*3
+  EXPECT_FLOAT_EQ(out[163], 40.0f);  // t2 high l=3: 2*(4+16) - 0
+  EXPECT_FLOAT_EQ(out[200], 22.0f);  // t3 low l=8: 1*(8+16) - 2*1
+  EXPECT_FLOAT_EQ(out[235], 84.0f);  // t3 high l=11: 4*(6+16) - 2*2
+
+  // Full-block check with an independent per-lane re-derivation.
+  for (int i = 0; i < 256; ++i) {
+    const int iter = i / 64;
+    const int pos  = i % 64;
+    const bool low = pos < 32;
+    const int l    = pos % 32;
+    const uint8_t q =
+        low ? (uint8_t)(b.qs[iter * 32 + l] & 0xF)
+            : (uint8_t)(b.qs[iter * 32 + l] >> 4);
+    const uint8_t u = (uint8_t)((low ? 1u : 2u) << (2 * iter));
+    const int qv    = (int)q + ((b.qh[l] & u) ? 16 : 0);
+    const int sub   = 2 * iter + (low ? 0 : 1);
+    uint8_t sc, mn;
+    if (sub < 4) {
+      sc = s[sub] & 63;
+      mn = s[sub + 4] & 63;
+    } else {
+      sc = (s[sub + 4] & 0xF) | ((s[sub - 4] >> 6) << 4);
+      mn = (s[sub + 4] >> 4) | ((s[sub] >> 6) << 4);
+    }
+    const float want = 1.0f * (float)sc * (float)qv + (-2.0f) * (float)mn;
+    EXPECT_FLOAT_EQ(out[i], want) << "i=" << i;
+  }
+}
+
+TEST(GgufDequant, Q5KPathsAgree) {
+  // All Q5_K consumers (per-element, grouped GEMV/GEMM, decode-unit scalar
+  // and vectorized) must agree with dequant_q5k_block on one block.
+  float vals[256];
+  for (int i = 0; i < 256; ++i) vals[i] = (float)((i * 13 + 7) % 32);
+  BlockQ5K b = make_unit_q5k();
+  pack_unit_q5k(vals, &b);
+  float ref[256];
+  dequant_q5k_block(&b, ref);
+  const uint8_t* row = reinterpret_cast<const uint8_t*>(&b);
+
+  for (int k = 0; k < 256; ++k)
+    EXPECT_FLOAT_EQ(Impl::quant_elem(GgmlType::Q5_K, row, (size_t)k), ref[k])
+        << "k=" << k;
+
+  alignas(16) float x[256];
+  for (int i = 0; i < 256; ++i) x[i] = 0.125f * (float)((i % 5) - 2);
+
+  size_t gs = 0;
+  ASSERT_TRUE(Impl::quant_can_group(GgmlType::Q5_K, 256, gs));
+  EXPECT_EQ(gs, 32u);
+  EXPECT_EQ(Impl::quant_unit_count(GgmlType::Q5_K, 256), 8u);
+  for (int g = 0; g < 8; ++g) {
+    double want = 0;
+    for (int l = 0; l < 32; ++l)
+      want += (double)ref[g * 32 + l] * (double)x[g * 32 + l];
+    EXPECT_FLOAT_EQ(
+        Impl::quant_group_dot(GgmlType::Q5_K, row, x, size_t(1),
+                              (size_t)(g * 32)),
+        (float)want)
+        << "g=" << g;
+    EXPECT_FLOAT_EQ(
+        Impl::quant_unit_dot(GgmlType::Q5_K, row, x, size_t(1), (size_t)g,
+                             false),
+        (float)want)
+        << "c=" << g;
+    EXPECT_FLOAT_EQ(
+        Impl::quant_unit_dot(GgmlType::Q5_K, row, x, size_t(1), (size_t)g,
+                             true),
+        (float)want)
+        << "c=" << g;
+  }
+}
+
+TEST(GgufDequant, Q50Q51Unsupported) {
+  // Q5_0/Q5_1 are intentionally outside gguf_can_compute (see the note
+  // there): dispatchers must reject them naming the dtype, not silently.
+  EXPECT_FALSE(gguf_can_compute(GgmlType::Q5_0));
+  EXPECT_FALSE(gguf_can_compute(GgmlType::Q5_1));
+  EXPECT_TRUE(gguf_can_compute(GgmlType::Q5_K));
+  for (GgmlType t : {GgmlType::Q5_0, GgmlType::Q5_1}) {
+    try {
+      Impl::quant_check(t, 1, 32, ggml_row_bytes(t, 32), "probe");
+      FAIL() << "expected throw for " << ggml_type_name(t);
+    } catch (const std::invalid_argument& e) {
+      EXPECT_NE(std::string(e.what()).find(ggml_type_name(t)),
+                std::string::npos)
+          << e.what();
+    }
+  }
 }
 
 TEST(GgufDequant, Float16) {
@@ -410,6 +554,53 @@ TEST(GgufFile, Roundtrip) {
 }
 
 // ---------------------------------------------------------------------------
+// (c2) Synthetic GGUF roundtrip for Q5_K: 176-byte blocks, two rows.
+// ---------------------------------------------------------------------------
+TEST(GgufFile, RoundtripQ5K) {
+  std::remove(kRtPath);
+
+  std::vector<float> q5kv(2 * 256);
+  for (int r = 0; r < 2; ++r)
+    for (int i = 0; i < 256; ++i) q5kv[(size_t)r * 256 + (size_t)i] = (float)((r + i) % 32);
+
+  SyntheticTensor t;
+  t.name  = "t_q5k";
+  t.dtype = GgmlType::Q5_K;
+  t.dims  = {256, 2};
+  t.raw.resize(2 * 176);
+  for (int r = 0; r < 2; ++r) {
+    BlockQ5K b = make_unit_q5k();
+    pack_unit_q5k(q5kv.data() + r * 256, &b);
+    std::memcpy(t.raw.data() + (size_t)r * 176, &b, 176);
+  }
+  write_synthetic_gguf(kRtPath, {t});
+
+  GgufFile f(kRtPath);
+  const GgufTensorInfo& q5k = f.find("t_q5k");
+  EXPECT_EQ(q5k.dtype, GgmlType::Q5_K);
+  EXPECT_EQ(q5k.numel, 512u);
+  EXPECT_EQ(q5k.nbytes, 352u);
+  EXPECT_EQ(q5k.rows(), 2u);
+  EXPECT_EQ(q5k.cols(), 256u);
+
+  std::vector<float> out;
+  dequant_tensor_to_float(f, q5k, out);
+  ASSERT_EQ(out.size(), 512u);
+  for (int i = 0; i < 512; ++i) EXPECT_FLOAT_EQ(out[i], q5kv[i]) << "i=" << i;
+
+  // load_quant_weight path (used by the GEMV kernels below).
+  {
+    KokkosDNN::DNNHandle<Exec> h;
+    QuantWeight<Exec> w = load_quant_weight<Exec>(f, q5k);
+    EXPECT_EQ(w.rows, 2u);
+    EXPECT_EQ(w.cols, 256u);
+    EXPECT_EQ(w.data.extent(0), 352u);
+  }
+
+  std::remove(kRtPath);
+}
+
+// ---------------------------------------------------------------------------
 // (d) quant_gemv / quant_gemm vs dense reference.
 // ---------------------------------------------------------------------------
 namespace {
@@ -438,6 +629,18 @@ void build_case(GgmlType dtype, size_t N, size_t K, std::vector<float>& ref,
           b.qs[iter * 32 + l] = (uint8_t)(lo | (hi << 4));
         }
       std::memcpy(raw.data() + i * 144, &b, 144);
+    }
+    return;
+  }
+  if (dtype == GgmlType::Q5_K) {
+    for (size_t i = 0; i < N; ++i)
+      for (size_t k = 0; k < K; ++k)
+        ref[i * K + k] = (float)((i * K + k) % 32);
+    raw.resize(N * 176);
+    for (size_t i = 0; i < N; ++i) {
+      BlockQ5K b = make_unit_q5k();
+      pack_unit_q5k(ref.data() + i * K, &b);
+      std::memcpy(raw.data() + i * 176, &b, 176);
     }
     return;
   }
@@ -541,7 +744,7 @@ void check_quant_gemv(GgmlType dtype, size_t K, float tol) {
       acc0 += (double)ref[j * K + k] * (double)xf[k];
     const float loose =
         (dtype == GgmlType::F32 || dtype == GgmlType::Q4_K ||
-         dtype == GgmlType::Q6_K)
+         dtype == GgmlType::Q5_K || dtype == GgmlType::Q6_K)
             ? tol
             : 5e-2f;
     EXPECT_NEAR((float)got(j), (float)acc0, loose)
@@ -624,6 +827,7 @@ TEST(GgufQuantGemm, GemvFloat) {
   check_quant_gemv<float>(GgmlType::BF16, 64, 1e-4f);
   check_quant_gemv<float>(GgmlType::Q8_0, 64, 1e-4f);
   check_quant_gemv<float>(GgmlType::Q4_K, 256, 1e-4f);
+  check_quant_gemv<float>(GgmlType::Q5_K, 256, 1e-4f);
   check_quant_gemv<float>(GgmlType::Q6_K, 256, 1e-4f);
 }
 
@@ -641,6 +845,7 @@ TEST(GgufQuantGemm, GemmFloat) {
   check_quant_gemm<float>(GgmlType::BF16, 64, 1e-4f);
   check_quant_gemm<float>(GgmlType::Q8_0, 64, 1e-4f);
   check_quant_gemm<float>(GgmlType::Q4_K, 256, 1e-4f);
+  check_quant_gemm<float>(GgmlType::Q5_K, 256, 1e-4f);
   check_quant_gemm<float>(GgmlType::Q6_K, 256, 1e-4f);
 }
 
@@ -650,6 +855,7 @@ TEST(GgufDequantToDense, Float) {
   check_dequant_to_dense<float>(GgmlType::BF16, 64, 1e-4f);
   check_dequant_to_dense<float>(GgmlType::Q8_0, 64, 1e-4f);
   check_dequant_to_dense<float>(GgmlType::Q4_K, 256, 1e-4f);
+  check_dequant_to_dense<float>(GgmlType::Q5_K, 256, 1e-4f);
   check_dequant_to_dense<float>(GgmlType::Q6_K, 256, 1e-4f);
 }
 
