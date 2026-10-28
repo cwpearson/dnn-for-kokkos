@@ -150,7 +150,7 @@ struct VisionTensorSpec {
 inline std::vector<VisionTensorSpec> qwen21_vision_expected_tensors(
     const Config& cfg) {
   cfg.validate();
-  const int64_t H = cfg.hidden_dim, Hd = cfg.head_dim(), I = cfg.intermediate_dim,
+  const int64_t H = cfg.hidden_dim, I = cfg.intermediate_dim,
                 P = cfg.patch_size, T = cfg.temporal_patch_size,
                 C = cfg.in_channels, M = (int64_t)cfg.spatial_merge_size,
                 O = cfg.out_hidden_size;

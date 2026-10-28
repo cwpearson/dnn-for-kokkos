@@ -141,8 +141,8 @@ inline KokkosDNN::Image::HostImageF32 edit_bicubic_resize_hwc(
   const size_t ih = in.extent(0), iw = in.extent(1), ch = in.extent(2);
   if (ih == 0 || iw == 0 || ch == 0 || out_h <= 0 || out_w <= 0)
     throw std::invalid_argument("edit lanczos: bad dims");
-  constexpr double kPi = 3.14159265358979323846;
-  const auto lanczos3 = [kPi](double x) {
+  const auto lanczos3 = [](double x) {
+    constexpr double kPi = 3.14159265358979323846;
     if (x <= -3.0 || x >= 3.0) return 0.0;
     if (x == 0.0) return 1.0;
     const double px = kPi * x;
@@ -236,10 +236,10 @@ inline KokkosDNN::Image::HostImageU8 edit_pil_resize_rgba_u8(
   const size_t ih = in.extent(0), iw = in.extent(1);
   if (in.extent(2) != 4 || ih == 0 || iw == 0 || out_h <= 0 || out_w <= 0)
     throw std::invalid_argument("edit pil resize: bad dims");
-  constexpr double kPi = 3.14159265358979323846;
   constexpr int kFixBits = 22;
   constexpr int64_t kFixRound = int64_t{1} << (kFixBits - 1);
-  const auto lanczos3 = [kPi](double x) {
+  const auto lanczos3 = [](double x) {
+    constexpr double kPi = 3.14159265358979323846;
     if (x <= -3.0 || x >= 3.0) return 0.0;
     if (x == 0.0) return 1.0;
     const double px = kPi * x;

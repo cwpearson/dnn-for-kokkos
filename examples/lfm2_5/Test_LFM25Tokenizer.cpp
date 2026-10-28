@@ -618,22 +618,22 @@ TEST(LFM25Tokenizer, ToolStreamImplicitLead) {
       std::string("\n\n<think>r</think>"),
       std::string("r1</think>") + kToolCallStartToken + "[f(x=1)]" +
           kToolCallEndToken};
-  for (const std::string& raw : tricky) {
-    const ToolParseResult w = parse_tool_calls(raw, {}, true);
+  for (const std::string& case_raw : tricky) {
+    const ToolParseResult w = parse_tool_calls(case_raw, {}, true);
     for (size_t chunk = 1; chunk <= 3; ++chunk) {
       ToolCallStreamParser s({}, true);
       std::string a, r;
-      for (size_t p = 0; p < raw.size(); p += chunk) {
-        a += s.push(raw.substr(p, chunk));
+      for (size_t p = 0; p < case_raw.size(); p += chunk) {
+        a += s.push(case_raw.substr(p, chunk));
         r += s.poll_reasoning();
-        EXPECT_TRUE(w.text.find(a) == 0) << "raw=" << raw;
-        EXPECT_TRUE(w.reasoning.find(r) == 0) << "raw=" << raw;
+        EXPECT_TRUE(w.text.find(a) == 0) << "raw=" << case_raw;
+        EXPECT_TRUE(w.reasoning.find(r) == 0) << "raw=" << case_raw;
       }
       ToolParseResult t = s.finish();
       a += t.text;
       r += t.reasoning;
-      EXPECT_EQ(a, w.text) << "raw=" << raw << " chunk=" << chunk;
-      EXPECT_EQ(r, w.reasoning) << "raw=" << raw << " chunk=" << chunk;
+      EXPECT_EQ(a, w.text) << "raw=" << case_raw << " chunk=" << chunk;
+      EXPECT_EQ(r, w.reasoning) << "raw=" << case_raw << " chunk=" << chunk;
     }
   }
 }
