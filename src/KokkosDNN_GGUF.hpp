@@ -12,10 +12,11 @@
 //
 // A note on "Q4_K_M": it is a file-level quantization *recipe*, not a ggml
 // storage type. Q4_K_M checkpoints store most tensors as Q4_K blocks (a few,
-// typically attention V/projections, as Q6_K; norms stay F32). Since this
-// module dispatches per-tensor dtype, supporting Q4_K + Q6_K (+ Q8_0, F32,
-// F16, BF16) covers Q4_K_M inference. Per-tensor dtypes are read from the
-// GGUF tensor infos, so mixed files work without extra plumbing.
+// typically attention V/projections, as Q6_K; large vocab/output matrices as
+// Q5_K; norms stay F32). Since this module dispatches per-tensor dtype,
+// supporting Q4_K + Q5_K + Q6_K (+ Q8_0, F32, F16, BF16) covers Q4_K_M
+// inference. Per-tensor dtypes are read from the GGUF tensor infos, so mixed
+// files work without extra plumbing.
 //
 // GGUF layout assumed (v3, little-endian):
 //   header: magic u32 0x46554747 ("GGUF"), version u32 (3),
@@ -31,7 +32,8 @@
 // 12 F64.
 //
 // Dequantization reference: ggml/src/ggml-quants.c (get_scale_min_k4,
-// dequantize_row_q4_K, dequantize_row_q6_K, dequantize_row_q8_0).
+// dequantize_row_q4_K, dequantize_row_q5_K, dequantize_row_q6_K,
+// dequantize_row_q8_0).
 
 #include <Kokkos_Core.hpp>
 
@@ -138,9 +140,15 @@ inline constexpr bool ggml_is_k_quant(GgmlType t) {
 }
 
 // This module's quantized-kernel + host-dequant coverage.
+// Q5_0/Q5_1 (legacy non-K 5-bit, 22/24-byte blocks) are intentionally NOT
+// covered: no current recipe emits them (Q4_K_M uses Q5_K for the large
+// matrices instead), and their scale/zero-point layout shares nothing with
+// the K-quant blocks below. They keep throwing "unsupported dtype" naming
+// the dtype (see the dispatch defaults) rather than failing silently.
 inline constexpr bool gguf_can_compute(GgmlType t) {
   return t == GgmlType::F32 || t == GgmlType::F16 || t == GgmlType::BF16 ||
-         t == GgmlType::Q8_0 || t == GgmlType::Q4_K || t == GgmlType::Q6_K;
+         t == GgmlType::Q8_0 || t == GgmlType::Q4_K || t == GgmlType::Q5_K ||
+         t == GgmlType::Q6_K;
 }
 
 inline std::string ggml_type_name(GgmlType t) {
@@ -245,6 +253,15 @@ struct BlockQ6K {
 };
 static_assert(sizeof(BlockQ6K) == 210, "BlockQ6K must be 210 bytes");
 
+struct BlockQ5K {
+  uint16_t d;          // superblock scale (fp16)
+  uint16_t dmin;       // superblock min (fp16, subtracted)
+  uint8_t scales[12];  // 8x (6-bit scale, 6-bit min), same packing as Q4_K
+  uint8_t qh[32];      // high bit of each 5-bit quant (see dequant_q5k_block)
+  uint8_t qs[128];     // low 4 bits (nibble per quant, low nibble first)
+};
+static_assert(sizeof(BlockQ5K) == 176, "BlockQ5K must be 176 bytes");
+
 // Scale/min unpacking for Q4_K (and Q5_K): 8 sub-blocks of 32 elements share
 // 12 bytes. j<4: 6-bit values straight out of bytes j/j+4; j>=4: 4-bit nibble
 // of bytes j+4 plus the top 2 bits stashed in bytes j-4/j. Verbatim ggml.
@@ -314,6 +331,36 @@ KOKKOS_INLINE_FUNCTION void dequant_q6k_block(const BlockQ6K* b, float* out) {
     ql += 64;
     qh += 32;
     sc += 8;
+  }
+}
+
+// Q5_K: same 8x32-element sub-blocks and scale/min packing as Q4_K, but each
+// quant is 5 bits. The low 4 bits sit in the qs nibbles (low nibble: even
+// sub-block 2*iter, high nibble: odd sub-block 2*iter+1 of the 64-element
+// group `iter`); the top bit sits in qh. One qh byte covers all four groups
+// -- the even/odd sub-block bits of group `iter` are bits 2*iter/2*iter+1 --
+// so the select mask shifts per group. Value: d*sc*q - min*mn.
+KOKKOS_INLINE_FUNCTION void dequant_q5k_block(const BlockQ5K* b, float* out) {
+  const float d   = fp16_to_float(b->d);
+  const float min = fp16_to_float(b->dmin);
+  const uint8_t* ql = b->qs;
+  const uint8_t* qh = b->qh;
+  for (int iter = 0; iter < 4; ++iter) {
+    uint8_t sc, mn;
+    get_scale_min_k4(2 * iter, b->scales, &sc, &mn);
+    const float d1 = d * (float)sc;
+    const float m1 = min * (float)mn;
+    get_scale_min_k4(2 * iter + 1, b->scales, &sc, &mn);
+    const float d2 = d * (float)sc;
+    const float m2 = min * (float)mn;
+    const uint8_t u1 = (uint8_t)(1u << (2 * iter));
+    const uint8_t u2 = (uint8_t)(2u << (2 * iter));
+    for (int l = 0; l < 32; ++l) {
+      out[l]      = d1 * (float)((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1;
+      out[l + 32] = d2 * (float)((ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0)) - m2;
+    }
+    out += 64;
+    ql += 32;
   }
 }
 
@@ -664,6 +711,16 @@ inline void dequant_tensor_to_float(const GgufFile& file,
       }
       return;
     }
+    case GgmlType::Q5_K: {
+      float tmp[256];
+      for (uint64_t b = 0, n = info.numel / 256; b < n; ++b) {
+        BlockQ5K blk;
+        std::memcpy(&blk, src + b * sizeof(blk), sizeof(blk));
+        dequant_q5k_block(&blk, tmp);
+        std::memcpy(dst + b * 256, tmp, sizeof(tmp));
+      }
+      return;
+    }
     default:
       throw std::runtime_error("dequant_tensor_to_float: unsupported dtype " +
                                ggml_type_name(info.dtype));
@@ -741,6 +798,23 @@ KOKKOS_INLINE_FUNCTION float quant_elem(GgmlType dtype, const uint8_t* row,
       return fp16_to_float(b->d) * (float)sc * (float)nib +
              (-fp16_to_float(b->dmin)) * (float)mn;
     }
+    case GgmlType::Q5_K: {
+      const BlockQ5K* b =
+          reinterpret_cast<const BlockQ5K*>(row + (k / 256) * sizeof(BlockQ5K));
+      const size_t l    = k % 256;
+      const size_t sub  = l / 32;  // 0..7: sub-block sharing one scale/min
+      const size_t iter = sub / 2;
+      const bool low    = (sub % 2) == 0;
+      const size_t ll   = l % 32;
+      const uint8_t q   = b->qs[iter * 32 + ll];
+      const uint8_t nib = low ? (uint8_t)(q & 0xF) : (uint8_t)(q >> 4);
+      const uint8_t u   = (uint8_t)((low ? 1u : 2u) << (2 * iter));
+      const uint8_t qv  = (uint8_t)(nib + ((b->qh[ll] & u) ? 16 : 0));
+      uint8_t sc, mn;
+      get_scale_min_k4((int)sub, b->scales, &sc, &mn);
+      return fp16_to_float(b->d) * (float)sc * (float)qv -
+             fp16_to_float(b->dmin) * (float)mn;
+    }
     case GgmlType::Q6_K: {
       const BlockQ6K* b =
           reinterpret_cast<const BlockQ6K*>(row + (k / 256) * sizeof(BlockQ6K));
@@ -784,8 +858,8 @@ KOKKOS_INLINE_FUNCTION float quant_elem(GgmlType dtype, const uint8_t* row,
 // quant_elem() repeats per element (32x/16x fewer), leaving one nibble
 // extract + FMA per element. Same values up to FP32 reassociation (the
 // callers reduce over groups instead of elements). xd/xs cover strided
-// activation rows: element k reads xd[k * xs]. Q4_K/Q6_K/Q8_0 only; other
-// dtypes stay on quant_elem().
+// activation rows: element k reads xd[k * xs]. Q4_K/Q5_K/Q6_K/Q8_0 only;
+// other dtypes stay on quant_elem().
 template <class Scalar>
 KOKKOS_INLINE_FUNCTION float quant_group_dot(GgmlType dtype,
                                              const uint8_t* row,
@@ -811,6 +885,34 @@ KOKKOS_INLINE_FUNCTION float quant_group_dot(GgmlType dtype,
         for (size_t l = 0; l < 32; ++l)
           s += (dm * (float)(q[l] >> 4) + mm) *
                static_cast<float>(xd[(k0 + l) * xs]);
+      }
+      return s;
+    }
+    case GgmlType::Q5_K: {
+      const BlockQ5K* b = reinterpret_cast<const BlockQ5K*>(
+          row + (k0 / 256) * sizeof(BlockQ5K));
+      const size_t sub  = (k0 / 32) % 8;
+      const size_t iter = sub / 2;
+      const bool low    = (sub % 2) == 0;
+      uint8_t sc, mn;
+      get_scale_min_k4((int)sub, b->scales, &sc, &mn);
+      const float dm = fp16_to_float(b->d) * (float)sc;
+      const float mm = -fp16_to_float(b->dmin) * (float)mn;
+      const uint8_t* q = b->qs + iter * 32;
+      const uint8_t u  = (uint8_t)((low ? 1u : 2u) << (2 * iter));
+      float s          = 0;
+      if (low) {
+        for (size_t l = 0; l < 32; ++l) {
+          const uint8_t qv =
+              (uint8_t)((q[l] & 0xF) + ((b->qh[l] & u) ? 16 : 0));
+          s += (dm * (float)qv + mm) * static_cast<float>(xd[(k0 + l) * xs]);
+        }
+      } else {
+        for (size_t l = 0; l < 32; ++l) {
+          const uint8_t qv =
+              (uint8_t)((q[l] >> 4) + ((b->qh[l] & u) ? 16 : 0));
+          s += (dm * (float)qv + mm) * static_cast<float>(xd[(k0 + l) * xs]);
+        }
       }
       return s;
     }
@@ -869,7 +971,7 @@ KOKKOS_INLINE_FUNCTION float quant_group_dot(GgmlType dtype,
         s += d * (float)b->qs[l] * static_cast<float>(xd[(k0 + l) * xs]);
       return s;
     }
-    default: return 0.0f;  // unreachable: grouped path is Q4_K/Q6_K/Q8_0 only
+    default: return 0.0f;  // unreachable: grouped path is Q4_K/Q5_K/Q6_K/Q8_0 only
   }
 }
 
@@ -879,6 +981,7 @@ KOKKOS_INLINE_FUNCTION float quant_group_dot(GgmlType dtype,
 inline bool quant_can_group(GgmlType dtype, size_t K, size_t& gs) {
   switch (dtype) {
     case GgmlType::Q4_K: gs = 32; return K % 32 == 0;
+    case GgmlType::Q5_K: gs = 32; return K % 32 == 0;
     case GgmlType::Q6_K: gs = 16; return K % 16 == 0;
     case GgmlType::Q8_0: gs = 32; return K % 32 == 0;
     default: return false;
@@ -892,6 +995,8 @@ inline bool quant_can_group(GgmlType dtype, size_t K, size_t& gs) {
 // span that covers whole quant sub-blocks and can be fetched with wide loads:
 //   Q4_K: 16 packed bytes, one aligned 128-bit load (low-nibble sub-block 2i
 //         at +0, high-nibble sub-block 2i+1 at +32 elements)
+//   Q5_K: 32 qs + 32 qh bytes of one 32-element sub-block (four 128-bit
+//         loads; only one nibble side and one qh bit are used)
 //   Q6_K: 32 packed bytes, 16 low + 16 high bytes covering the 32-element span
 //         at +0 and +64 elements (2-byte loads; see below)
 //   Q8_0: one 34-byte block, 2-byte loads (same alignment reason)
@@ -918,6 +1023,7 @@ inline bool quant_can_group(GgmlType dtype, size_t K, size_t& gs) {
 inline size_t quant_unit_count(GgmlType dtype, size_t cols) {
   switch (dtype) {
     case GgmlType::Q4_K:
+    case GgmlType::Q5_K:
     case GgmlType::Q6_K:
     case GgmlType::Q8_0: return cols / 32;
     default: return cols;
@@ -1128,6 +1234,70 @@ KOKKOSDNN_PRAGMA_UNROLL()
   return s;
 }
 
+// One Q5_K unit: one 32-element sub-block (32 contiguous elements sharing one
+// (d*scale, -dmin*min) pair, unlike the split Q4_K/Q6_K units). Unit c of a
+// row: block c/8, sub (c%8) = 2*iter + half; the unit's first element is
+// block*256 + iter*64 + half*32. The 32 qs bytes come from qs + iter*32 (two
+// 128-bit loads) and the 32 qh bytes from qh (two more); only the nibble side
+// `half` and the one qh bit (1/2 << 2*iter) are used.
+template <class Scalar>
+KOKKOS_INLINE_FUNCTION float quant_q5k_chunk_dot(const uint8_t* row,
+                                                  const Scalar* xd, size_t xs,
+                                                  size_t c, bool xvec) {
+  const size_t blk  = c / 8;
+  const BlockQ5K* b = reinterpret_cast<const BlockQ5K*>(
+      row + blk * sizeof(BlockQ5K));
+  const size_t sub  = c % 8;
+  const size_t iter = sub / 2;
+  const bool low    = (sub % 2) == 0;
+  const size_t k0   = blk * 256 + iter * 64 + (low ? 0 : 32);
+  const QuantU8x16 ql0 =
+      *reinterpret_cast<const QuantU8x16*>(b->qs + iter * 32);
+  const QuantU8x16 ql1 =
+      *reinterpret_cast<const QuantU8x16*>(b->qs + iter * 32 + 16);
+  const QuantU8x16 qh0 = *reinterpret_cast<const QuantU8x16*>(b->qh);
+  const QuantU8x16 qh1 = *reinterpret_cast<const QuantU8x16*>(b->qh + 16);
+  uint8_t sc, mn;
+  get_scale_min_k4(static_cast<int>(sub), b->scales, &sc, &mn);
+  const float dm = fp16_to_float(b->d) * (float)sc;
+  const float mm = -fp16_to_float(b->dmin) * (float)mn;
+  const uint8_t u = (uint8_t)((low ? 1u : 2u) << (2 * iter));
+  float s         = 0;
+  if (xvec) {
+    const QuantX8<Scalar>* xa =
+        reinterpret_cast<const QuantX8<Scalar>*>(xd + k0);
+    const QuantX8<Scalar> a0 = xa[0], a1 = xa[1], a2 = xa[2], a3 = xa[3];
+    float xf[32];
+KOKKOSDNN_PRAGMA_UNROLL()
+    for (int i = 0; i < 8; ++i) {
+      xf[i]      = static_cast<float>(a0.v[i]);
+      xf[i + 8]  = static_cast<float>(a1.v[i]);
+      xf[i + 16] = static_cast<float>(a2.v[i]);
+      xf[i + 24] = static_cast<float>(a3.v[i]);
+    }
+    for (int i = 0; i < 32; ++i) {
+      const uint8_t qb = i < 16 ? (low ? (uint8_t)(ql0.b[i] & 0xF)
+                                       : (uint8_t)(ql0.b[i] >> 4))
+                                : (low ? (uint8_t)(ql1.b[i - 16] & 0xF)
+                                       : (uint8_t)(ql1.b[i - 16] >> 4));
+      const uint8_t hb = i < 16 ? qh0.b[i] : qh1.b[i - 16];
+      const float qf   = (float)qb + (float)((hb & u) ? 16 : 0);
+      s = fmaf(dm * qf + mm, xf[i], s);
+    }
+  } else {
+    for (int i = 0; i < 32; ++i) {
+      const uint8_t qb = i < 16 ? (low ? (uint8_t)(ql0.b[i] & 0xF)
+                                       : (uint8_t)(ql0.b[i] >> 4))
+                                : (low ? (uint8_t)(ql1.b[i - 16] & 0xF)
+                                       : (uint8_t)(ql1.b[i - 16] >> 4));
+      const uint8_t hb = i < 16 ? qh0.b[i] : qh1.b[i - 16];
+      const float qf   = (float)qb + (float)((hb & u) ? 16 : 0);
+      s = fmaf(dm * qf + mm, static_cast<float>(xd[(k0 + (size_t)i) * xs]), s);
+    }
+  }
+  return s;
+}
+
 // One decode unit of a packed row (see quant_unit_count above).
 template <class Scalar>
 KOKKOS_INLINE_FUNCTION float quant_unit_dot(GgmlType dtype,
@@ -1136,6 +1306,7 @@ KOKKOS_INLINE_FUNCTION float quant_unit_dot(GgmlType dtype,
                                             size_t c, bool xvec) {
   switch (dtype) {
     case GgmlType::Q4_K: return quant_q4k_chunk_dot(row, xd, xs, c, xvec);
+    case GgmlType::Q5_K: return quant_q5k_chunk_dot(row, xd, xs, c, xvec);
     case GgmlType::Q6_K: return quant_q6k_chunk_dot(row, xd, xs, c, xvec);
     case GgmlType::Q8_0: return quant_q80_chunk_dot(row, xd, xs, c, xvec);
     default:
@@ -1276,7 +1447,7 @@ inline void quant_check(GgmlType dtype, size_t rows, size_t cols,
   if (!gguf_can_compute(dtype))
     throw std::invalid_argument(
         std::string(what) + ": unsupported dtype " + ggml_type_name(dtype) +
-        " (supported: F32/F16/BF16/Q8_0/Q4_K/Q6_K)");
+        " (supported: F32/F16/BF16/Q8_0/Q4_K/Q5_K/Q6_K)");
   const size_t want = rows * ggml_row_bytes(dtype, cols);  // validates cols
   if (have_bytes != want)
     throw std::invalid_argument(std::string(what) + ": payload size " +
@@ -1650,6 +1821,7 @@ void quant_moe_decode(
   auto block_aligned = [](GgmlType dt, size_t n) {
     switch (dt) {
       case GgmlType::Q4_K:
+      case GgmlType::Q5_K:
       case GgmlType::Q6_K:
       case GgmlType::Q8_0: return n % 256 == 0;
       default: return true;
@@ -1752,7 +1924,7 @@ void quant_gemm(
 
 
 // Dequantize a packed weight to a dense row-major matrix: Y[r,c] = w[r,c].
-// Covers the gguf_can_compute() dtype set (Q4_K/Q6_K/Q8_0 per-element
+// Covers the gguf_can_compute() dtype set (Q4_K/Q5_K/Q6_K/Q8_0 per-element
 // dequantization, F32/F16/BF16 via cast-copy). Portable elementwise kernels
 // (one thread per output, MDRange over rows x cols), no backend ifdefs.
 // Throws on dimension mismatch, unsupported dtype, or a column count that
@@ -1814,6 +1986,34 @@ void dequant_to_dense(
             const uint8_t qv = b->qs[iter * 32 + (c & 31)];
             const float qf =
                 (float)(((sub & 1) == 0) ? (qv & 0xF) : (qv >> 4));
+            dst(r, c) = static_cast<Scalar>(dm * qf + mm);
+          });
+      return;
+    }
+    case GgmlType::Q5_K: {
+      if (C % 256 != 0)
+        throw std::invalid_argument(
+            "dequant_to_dense: Q5_K cols must be a multiple of 256");
+      Kokkos::parallel_for(
+          label, Kokkos::RangePolicy<ExecSpace>(0, R * C),
+          KOKKOS_LAMBDA(size_t k) {
+            const size_t r = k / C;
+            const size_t c = k - r * C;
+            const BlockQ5K* b = reinterpret_cast<const BlockQ5K*>(
+                wdata + r * rb + (c >> 8) * sizeof(BlockQ5K));
+            const size_t sub  = (c >> 5) & 7;
+            const size_t iter = sub >> 1;
+            const bool low    = (sub & 1) == 0;
+            const size_t ll   = c & 31;
+            uint8_t sc, mn;
+            get_scale_min_k4((int)sub, b->scales, &sc, &mn);
+            const float dm = fp16_to_float(b->d) * (float)sc;
+            const float mm = -fp16_to_float(b->dmin) * (float)mn;
+            const uint8_t qv = b->qs[iter * 32 + ll];
+            const uint8_t u  = (uint8_t)((low ? 1u : 2u) << (2 * iter));
+            const float qf =
+                (float)(low ? (qv & 0xF) : (qv >> 4)) +
+                (float)(((b->qh[ll] & u) != 0) ? 16 : 0);
             dst(r, c) = static_cast<Scalar>(dm * qf + mm);
           });
       return;

@@ -717,7 +717,7 @@ void gguf_permute_qk_for_rope(std::vector<float>& m, size_t n_heads,
 }
 
 // Dequantize one GGUF tensor to host FP32 with an informative error when
-// the dtype is outside the compute set (F32/F16/BF16/Q8_0/Q4_K/Q6_K).
+// the dtype is outside the compute set (F32/F16/BF16/Q8_0/Q4_K/Q5_K/Q6_K).
 std::vector<float> gguf_dequant_rows(const Gguf::GgufFile& file,
                                      const Gguf::GgufTensorInfo& info) {
   std::vector<float> tmp;
