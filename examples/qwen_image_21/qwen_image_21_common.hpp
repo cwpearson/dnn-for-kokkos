@@ -826,7 +826,7 @@ bool file_exists(const std::string& path) {
 }
 
 // Weights source: a single .safetensors file or a directory of shards
-// (sorted). Shared by --text-encoder, --weights, and --vae-weights. Only
+// (sorted). Shared by the --ckpt transformer/text_encoder/vae subdirs. Only
 // needed when a true-pipeline header is present; guarded so header-less
 // builds see no unused-function warning.
 #if defined(QWEN21_DRIVER_HAVE_DIT) || defined(QWEN21_DRIVER_HAVE_ENCODER) || \
@@ -852,6 +852,33 @@ inline std::vector<std::string> resolve_shard_list(const std::string& path,
   return shards;
 }
 #endif
+
+// ---- Canonical checkpoint dir (--ckpt) ------------------------------------
+// The drivers aim at one canonical Qwen-Image-2.1-Turbo checkpoint root
+// (e.g. `hf download Qwen/Qwen-Image-2.1-Turbo --local-dir <ckpt>`) instead
+// of one flag per component:
+//
+//   <ckpt>/transformer/  DiT shards
+//   <ckpt>/text_encoder/ Qwen text encoder, single-shard model.safetensors
+//   <ckpt>/processor/    dir holding tokenizer.json (+ configs)
+//   <ckpt>/vae/          VAE shards + config.json
+//
+// Unguarded so both the encode and decode paths share it (and so the
+// header-less placeholder build still reports the same layout).
+inline std::string ckpt_sub(const std::string& ckpt, const char* sub) {
+  std::string r = ckpt;
+  while (r.size() > 1 && r.back() == '/') r.pop_back();
+  return r + "/" + sub;
+}
+
+inline void require_ckpt_dir(const std::string& ckpt) {
+  std::error_code ec;
+  if (ckpt.empty() || !std::filesystem::is_directory(ckpt, ec))
+    throw std::runtime_error(
+        "--ckpt '" + ckpt +
+        "' is not a directory (need the canonical Qwen-Image-2.1 "
+        "checkpoint dir)");
+}
 
 #if defined(QWEN21_DRIVER_HAVE_ENCODER) && \
     defined(QWEN21_DRIVER_HAVE_TOKENIZER)
@@ -1162,10 +1189,10 @@ inline std::vector<int> encode_qwen_raw(const RawQwenTables& t,
 // produces and hands to the DiT sample phase (cond + null uncond).
 //
 // Conditioning precedence (first hit wins):
-//   1. In-process Qwen forward: --tokenizer (dir with tokenizer.json) +
-//      --text-encoder (weights file or shard dir), not --tiny. Tokenizes
-//      the prompt and runs the encoder forward on-device. Weights are
-//      released before the DiT load.
+//   1. In-process Qwen forward: --ckpt (canonical checkpoint dir), not
+//      --tiny. Tokenizes the prompt (processor/tokenizer.json) and runs
+//      the text_encoder forward on-device. Weights are released before
+//      the DiT load.
 //   2. Raw float32 LE file (--text-weights / --prompt-embeds-in): cond from
 //      file, uncond zeros.
 //   3. Null (zeros) for both, prompt logged only.
@@ -1231,14 +1258,16 @@ struct EncoderStage {
   template <class CfgT>
   static void run_qwen(EncoderStage& st, const CfgT& cfg,
                        const std::string& prompt,
-                       const std::string& tokenizer_dir,
-                       const std::string& encoder_path) {
+                       const std::string& ckpt_dir) {
     namespace QE = KokkosDNN::QwenImage21Encoder;
-    const std::string tok_json = tokenizer_dir + "/tokenizer.json";
+    require_ckpt_dir(ckpt_dir);
+    const std::string tok_json =
+        ckpt_sub(ckpt_dir, "processor") + "/tokenizer.json";
+    const std::string encoder_path = ckpt_sub(ckpt_dir, "text_encoder");
     if (!file_exists(tok_json))
-      throw std::runtime_error("--tokenizer '" + tokenizer_dir +
-                               "' has no tokenizer.json (need the "
-                               "Qwen-Image-2.1 processor/ dir)");
+      throw std::runtime_error("--ckpt '" + ckpt_dir +
+                               "' has no processor/tokenizer.json (need the "
+                               "canonical Qwen-Image-2.1 checkpoint dir)");
     const RawQwenTables tabs = load_raw_qwen_tables(tok_json);
     const size_t max_len = be_max_seq(cfg);
     // Pipeline drop_idx = system block only (see above): qwen21_t2i_head()
@@ -1279,10 +1308,10 @@ struct EncoderStage {
           ") != caption dim (" + std::to_string(st.Cc) + ")");
     QE::QwenImage21EncoderModel<Exec, Kokkos::Experimental::bhalf_t> enc(ecfg);
     const std::vector<std::string> shards =
-        resolve_shard_list(encoder_path, "--text-encoder");
+        resolve_shard_list(encoder_path, "--ckpt");
     if (shards.size() != 1)
       throw std::runtime_error(
-          "--text-encoder must be the single-shard text_encoder/ "
+          "--ckpt text_encoder must be the single-shard text_encoder/ "
           "model.safetensors (got " +
           std::to_string(shards.size()) + " shards)");
     std::printf("[loading %s]\n", encoder_path.c_str());
@@ -1337,9 +1366,11 @@ struct EncoderStage {
                              const std::vector<int>& vis_rows,
                              const std::vector<int>& pos3,
                              const std::vector<float>& pixels, int Hp, int Wp,
-                             size_t drop, const std::string& encoder_path) {
+                             size_t drop, const std::string& ckpt_dir) {
     namespace QE = KokkosDNN::QwenImage21Encoder;
     namespace QV = KokkosDNN::QwenImage21Vision;
+    require_ckpt_dir(ckpt_dir);
+    const std::string encoder_path = ckpt_sub(ckpt_dir, "text_encoder");
     const size_t S = ids.size(), Nv = vis_rows.size();
     if (S == 0 || Nv == 0)
       throw std::runtime_error(
@@ -1370,10 +1401,10 @@ struct EncoderStage {
     QV::QwenImage21VisionModel<Exec, Kokkos::Experimental::bhalf_t> vis(vcfg);
     {
       const std::vector<std::string> shards =
-          resolve_shard_list(encoder_path, "--text-encoder");
+          resolve_shard_list(encoder_path, "--ckpt");
       if (shards.size() != 1)
         throw std::runtime_error(
-            "--text-encoder must be the single-shard text_encoder/ "
+            "--ckpt text_encoder must be the single-shard text_encoder/ "
             "model.safetensors (got " +
             std::to_string(shards.size()) + " shards)");
       std::printf("[loading %s]\n", encoder_path.c_str());
@@ -1412,7 +1443,7 @@ struct EncoderStage {
     QE::QwenImage21EncoderModel<Exec, Kokkos::Experimental::bhalf_t> enc(ecfg);
     {
       const std::vector<std::string> shards =
-          resolve_shard_list(encoder_path, "--text-encoder");
+          resolve_shard_list(encoder_path, "--ckpt");
       enc.weights().load_safetensors(shards[0]);
       std::printf("[encode] Qwen weights resident: %.1f GB\n",
                   (double)enc.weights().resident_bytes() / 1e9);
@@ -1498,25 +1529,20 @@ struct EncoderStage {
   template <class CfgT>
   static EncoderStage run(const CfgT& cfg, const std::string& prompt,
                           const std::string& caption_path,
-                          const std::string& tokenizer_dir,
-                          const std::string& encoder_path, bool tiny,
+                          const std::string& ckpt_dir, bool tiny,
                           size_t max_seq_override = 0) {
     EncoderStage st;
     st.L = be_max_seq(cfg);
     st.Cc = be_caption_dim(cfg);
 #if defined(QWEN21_DRIVER_HAVE_ENCODER) && \
     defined(QWEN21_DRIVER_HAVE_TOKENIZER)
-    // In-process Qwen forward when --tokenizer + --text-encoder are given
-    // (and not --tiny: the smoke model uses random weights at test geometry,
-    // which real token ids cannot address). A throw inside the attempt
-    // falls back to file/null with a logged reason instead of failing.
-    if (!tiny && (!tokenizer_dir.empty() || !encoder_path.empty())) {
-      if (tokenizer_dir.empty() || encoder_path.empty())
-        throw std::runtime_error(
-            "--tokenizer and --text-encoder must be given together for the "
-            "in-process Qwen forward");
+    // In-process Qwen forward when --ckpt is given (and not --tiny: the
+    // smoke model uses random weights at test geometry, which real token
+    // ids cannot address). A throw inside the attempt falls back to
+    // file/null with a logged reason instead of failing.
+    if (!tiny && !ckpt_dir.empty()) {
       try {
-        run_qwen(st, cfg, prompt, tokenizer_dir, encoder_path);
+        run_qwen(st, cfg, prompt, ckpt_dir);
         return st;
       } catch (const std::exception& e) {
         std::fprintf(stderr,
@@ -1529,25 +1555,25 @@ struct EncoderStage {
         st.Cc = be_caption_dim(cfg);
       }
     }
-    if (tiny && (!tokenizer_dir.empty() || !encoder_path.empty()))
+    if (tiny && !ckpt_dir.empty())
       std::printf("[encode] --tiny skips the Qwen forward (random-weights "
                   "smoke model); falling back to %s\n",
                   caption_path.empty() ? "null" : "file");
 #elif defined(QWEN21_DRIVER_HAVE_ENCODER)
     // The encoder header is present but the BPE tables header is not, so
     // the in-process forward cannot tokenize: fall through to file/null.
-    if (!tiny && (!tokenizer_dir.empty() || !encoder_path.empty()))
-      std::printf("[encode] --tokenizer/--text-encoder need "
+    if (!tiny && !ckpt_dir.empty())
+      std::printf("[encode] --ckpt needs "
                   "KokkosDNN_QwenTokenizer.hpp, not present in this "
                   "build; falling back to %s\n",
                   caption_path.empty() ? "null" : "file");
-    if (tiny && (!tokenizer_dir.empty() || !encoder_path.empty()))
+    if (tiny && !ckpt_dir.empty())
       std::printf("[encode] --tiny skips the Qwen forward (random-weights "
                   "smoke model); falling back to %s\n",
                   caption_path.empty() ? "null" : "file");
 #else
-    if (!tokenizer_dir.empty() || !encoder_path.empty())
-      std::printf("[encode] --tokenizer/--text-encoder need "
+    if (!ckpt_dir.empty())
+      std::printf("[encode] --ckpt needs "
                   "KokkosDNN_QwenImage21Encoder.hpp, not present in this "
                   "build; falling back to %s\n",
                   caption_path.empty() ? "null" : "file");
@@ -2003,25 +2029,23 @@ struct DitForward {
 // Real VAE encode: pipeline-preprocessed RGBA image (host CHW in [-1,1],
 // same pixels the reference preprocess() feeds vae_images) -> normalized
 // ref latents (host chw [C,Hc,Wc], the (mode-mean)/std tensor the edit
-// pipeline carries). Returns the latents (C = z_dim, Hc = H/16); throws
-// with a reason so the caller can fall back to file/null.
+// pipeline carries). `ckpt_dir` is the canonical checkpoint root (the VAE
+// lives in <ckpt>/vae/). Returns the latents (C = z_dim, Hc = H/16);
+// throws with a reason so the caller can fall back to file/null.
 inline std::vector<float> try_vae_encode_image(
     const std::vector<float>& rgba_chw, size_t H, size_t W,
-    const std::string& vae_weights) {
+    const std::string& ckpt_dir) {
   namespace QV = KokkosDNN::QwenImage21Vae;
+  require_ckpt_dir(ckpt_dir);
+  const std::string vae_dir = ckpt_sub(ckpt_dir, "vae");
   QV::Config vcfg;
   {
     std::error_code ec;
-    std::string cfg_path;
-    if (std::filesystem::is_directory(vae_weights, ec)) {
-      cfg_path = vae_weights + "/config.json";
-    } else {
-      const std::filesystem::path p(vae_weights);
-      cfg_path = p.has_parent_path()
-                     ? (p.parent_path() / "config.json").string()
-                     : "config.json";
-    }
-    QV::qwen21_load_vae_config_json(cfg_path, vcfg);
+    if (!std::filesystem::is_directory(vae_dir, ec))
+      throw std::runtime_error("--ckpt '" + ckpt_dir +
+                               "' has no vae/ subdir (need the canonical "
+                               "Qwen-Image-2.1 checkpoint dir)");
+    QV::qwen21_load_vae_config_json(vae_dir + "/config.json", vcfg);
   }
   vcfg.validate();
   if (rgba_chw.size() != (size_t)vcfg.in_channels * H * W)
@@ -2031,12 +2055,9 @@ inline std::vector<float> try_vae_encode_image(
         std::to_string(H) + "x" + std::to_string(W));
   QV::QwenImage21VaeModel<Exec, DScalar> enc(vcfg);
   {
-    std::error_code ec;
-    std::vector<std::string> shards =
-        std::filesystem::is_directory(vae_weights, ec)
-            ? resolve_shard_list(vae_weights, "--vae-weights")
-            : std::vector<std::string>{vae_weights};
-    std::printf("[loading %s]%s\n", vae_weights.c_str(),
+    const std::vector<std::string> shards =
+        resolve_shard_list(vae_dir, "--ckpt");
+    std::printf("[loading %s]%s\n", vae_dir.c_str(),
                 shards.size() > 1 ? " (shards)" : "");
     enc.weights().load_safetensors(shards);
     std::printf("[vae-encode] weights resident: %.3f GB\n",
@@ -2071,30 +2092,28 @@ inline std::vector<float> try_vae_encode_image(
 
 // Real VAE decode: raw DiT latents [C,H,W] host float -> device [1,C,H,W]
 // -> pipeline denormalize (x*std+mean per channel, runtime affine from
-// vae/config.json) -> QwenImage21VaeModel::decode -> RGBA [oH,oW,4] u8
-// (x*0.5+0.5 by the pipeline, PNG alpha = ch 3). Returns true on success
-// (pix/oH/oW/oCh set, decoded); throws with a reason otherwise so the
-// caller can fall back to the grayscale preview.
+// <ckpt>/vae/config.json) -> QwenImage21VaeModel::decode -> RGBA [oH,oW,4]
+// u8 (x*0.5+0.5 by the pipeline, PNG alpha = ch 3). `ckpt_dir` is the
+// canonical checkpoint root. Returns true on success (pix/oH/oW/oCh set,
+// decoded); throws with a reason otherwise so the caller can fall back to
+// the grayscale preview.
 inline bool try_vae_decode_rgba(const std::vector<float>& lat, size_t C,
                                 size_t H, size_t W,
-                                const std::string& vae_weights,
+                                const std::string& ckpt_dir,
                                 std::vector<unsigned char>& pix, size_t& oH,
                                 size_t& oW, int& oCh,
                                 std::vector<float>* rgba_f32 = nullptr) {
   namespace QV = KokkosDNN::QwenImage21Vae;
+  require_ckpt_dir(ckpt_dir);
+  const std::string vae_dir = ckpt_sub(ckpt_dir, "vae");
   QV::Config vcfg;
   {
     std::error_code ec;
-    std::string cfg_path;
-    if (std::filesystem::is_directory(vae_weights, ec)) {
-      cfg_path = vae_weights + "/config.json";
-    } else {
-      const std::filesystem::path p(vae_weights);
-      cfg_path = p.has_parent_path()
-                     ? (p.parent_path() / "config.json").string()
-                     : "config.json";
-    }
-    QV::qwen21_load_vae_config_json(cfg_path, vcfg);
+    if (!std::filesystem::is_directory(vae_dir, ec))
+      throw std::runtime_error("--ckpt '" + ckpt_dir +
+                               "' has no vae/ subdir (need the canonical "
+                               "Qwen-Image-2.1 checkpoint dir)");
+    QV::qwen21_load_vae_config_json(vae_dir + "/config.json", vcfg);
   }
   vcfg.validate();
   std::printf("[vae affine %zuch] mean[0]=%.4g std[0]=%.4g (runtime "
@@ -2103,12 +2122,9 @@ inline bool try_vae_decode_rgba(const std::vector<float>& lat, size_t C,
               (double)vcfg.latents_std[0]);
   QV::QwenImage21VaeModel<Exec, DScalar> dec(vcfg);
   {
-    std::error_code ec;
-    std::vector<std::string> shards =
-        std::filesystem::is_directory(vae_weights, ec)
-            ? resolve_shard_list(vae_weights, "--vae-weights")
-            : std::vector<std::string>{vae_weights};
-    std::printf("[loading %s]%s\n", vae_weights.c_str(),
+    const std::vector<std::string> shards =
+        resolve_shard_list(vae_dir, "--ckpt");
+    std::printf("[loading %s]%s\n", vae_dir.c_str(),
                 shards.size() > 1 ? " (shards)" : "");
     dec.weights().load_safetensors(shards);
     std::printf("[vae] weights resident: %.3f GB\n",
@@ -2201,10 +2217,11 @@ inline void write_output_image(const std::string& out,
 
 // VAE-only parity path (--decode-latents-in): golden latents -> runtime
 // affine -> QwenImage21VaeModel::decode -> image. No encoder, no DiT, no
-// sampler, so a VAE change can be checked in seconds.
+// sampler, so a VAE change can be checked in seconds. `ckpt_dir` is the
+// canonical checkpoint root (the VAE lives in <ckpt>/vae/).
 inline void run_vae_only(const std::string& lat_path, bool token_major,
                          size_t C, size_t H, size_t W,
-                         const std::string& vae_weights, const std::string& out,
+                         const std::string& ckpt_dir, const std::string& out,
                          const std::string& f32_out) {
 #ifdef QWEN21_DRIVER_HAVE_VAE
   std::vector<float> lat = load_decode_latents(lat_path, C, H, W, token_major);
@@ -2214,7 +2231,7 @@ inline void run_vae_only(const std::string& lat_path, bool token_major,
   size_t oH = 0, oW = 0;
   int oCh = 1;
   std::vector<unsigned char> pix;
-  const bool ok = try_vae_decode_rgba(lat, C, H, W, vae_weights, pix, oH, oW,
+  const bool ok = try_vae_decode_rgba(lat, C, H, W, ckpt_dir, pix, oH, oW,
                                       oCh,
                                       f32_out.empty() ? nullptr : &rgba_f32);
   if (!ok) throw std::runtime_error("VAE-only decode failed");
@@ -2230,7 +2247,7 @@ inline void run_vae_only(const std::string& lat_path, bool token_major,
   (void)C;
   (void)H;
   (void)W;
-  (void)vae_weights;
+  (void)ckpt_dir;
   (void)out;
   (void)f32_out;
   throw std::runtime_error(
