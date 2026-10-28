@@ -249,6 +249,7 @@ int main(int argc, char** argv) {
     // size derives from the LAST image's aspect, matching the reference.
     std::vector<int> cond_ws, cond_hs;  // resized condition pixels per image
     std::vector<int> in_lat_hs, in_lat_ws;
+    std::vector<size_t> orig_iws, orig_ihs;  // input HxW per image (resize-back targets)
     std::vector<std::vector<float>> vis_pixels_list;  // packed vision rows [-1,1]
     std::vector<std::vector<float>> vae_chw_list;     // resized RGBA [-1,1] CHW
     {
@@ -264,6 +265,8 @@ int main(int argc, char** argv) {
       cond_hs.reserve(n_load);
       in_lat_hs.reserve(n_load);
       in_lat_ws.reserve(n_load);
+      orig_iws.reserve(n_load);
+      orig_ihs.reserve(n_load);
       vis_pixels_list.reserve(n_load);
       vae_chw_list.reserve(n_load);
       for (size_t ii = 0; ii < n_load; ++ii) {
@@ -288,6 +291,8 @@ int main(int argc, char** argv) {
         const size_t iw = img.extent(1), ih = img.extent(0);
         std::printf("[image %zu/%zu %s] %zux%zu RGBA\n", ii + 1, n_load,
                     synthetic ? "(synthetic)" : image_paths[ii].c_str(), iw, ih);
+        orig_iws.push_back(iw);
+        orig_ihs.push_back(ih);
         int cond_w = 0, cond_h = 0;
         if (tiny) {
           cond_w = cond_h = 4 * kPixelScale;
@@ -350,6 +355,8 @@ int main(int argc, char** argv) {
       (void)cond_hs;
       (void)in_lat_hs;
       (void)in_lat_ws;
+      (void)orig_iws;
+      (void)orig_ihs;
       (void)vis_pixels_list;
       (void)vae_chw_list;
       throw std::runtime_error(
@@ -1072,6 +1079,59 @@ int main(int argc, char** argv) {
     if (!decoded) {
       pix = render_preview(lat, C, (size_t)H, (size_t)W, oH, oW);
       QW::print_phase_memory("decode-preview", 0, 0);
+    }
+    // Output resize-back: diffusion ran at the /32-fitted condition size;
+    // without explicit --height/--width the decoded pixels are resized back
+    // to the last input's HxW so the edit is a drop-in replacement. The
+    // reference pipeline keeps the fitted size, so this is a deliberate UX
+    // deviation (logged). Explicit sizes skip it.
+    const size_t orig_iw = orig_iws.empty() ? 0 : orig_iws.back();
+    const size_t orig_ih = orig_ihs.empty() ? 0 : orig_ihs.back();
+    if (!tiny && !image_paths.empty() && height <= 0 && width <= 0 &&
+        orig_iw > 0 && orig_ih > 0 && (oW != orig_iw || oH != orig_ih)) {
+#ifdef KOKKOSDNN_ENABLE_IMAGE
+      namespace KI = KokkosDNN::Image;
+      const int back_h = (int)orig_ih, back_w = (int)orig_iw;
+      if (decoded && oCh == 4) {
+        KI::HostImageU8 src("qwen21edit_out_src", oH, oW, 4);
+        for (size_t y = 0; y < oH; ++y)
+          for (size_t x = 0; x < oW; ++x)
+            for (size_t c = 0; c < 4; ++c)
+              src(y, x, c) = pix[(y * oW + x) * 4 + c];
+        KI::HostImageU8 dst = edit_pil_resize_rgba_u8(src, back_h, back_w);
+        pix.resize(orig_ih * orig_iw * 4);
+        for (size_t y = 0; y < orig_ih; ++y)
+          for (size_t x = 0; x < orig_iw; ++x)
+            for (size_t c = 0; c < 4; ++c)
+              pix[(y * orig_iw + x) * 4 + c] = dst(y, x, c);
+      } else {
+        KI::HostImageF32 src("qwen21edit_out_src_f32", oH, oW, (size_t)oCh);
+        for (size_t y = 0; y < oH; ++y)
+          for (size_t x = 0; x < oW; ++x)
+            for (int c = 0; c < oCh; ++c)
+              src(y, x, (size_t)c) =
+                  (float)pix[(y * oW + x) * (size_t)oCh + (size_t)c] / 255.0f;
+        KI::HostImageF32 dst = edit_bicubic_resize_hwc(src, back_h, back_w);
+        pix.resize(orig_ih * orig_iw * (size_t)oCh);
+        for (size_t y = 0; y < orig_ih; ++y)
+          for (size_t x = 0; x < orig_iw; ++x)
+            for (int c = 0; c < oCh; ++c) {
+              const float v = dst(y, x, (size_t)c) * 255.0f;
+              const long r = std::lround(v);
+              pix[(y * orig_iw + x) * (size_t)oCh + (size_t)c] =
+                  (unsigned char)(r < 0 ? 0 : (r > 255 ? 255 : r));
+            }
+      }
+      std::printf("[output] resized %zux%zu -> %zux%zu (back to the last input "
+                  "HxW; explicit --height/--width skips this)\n",
+                  oW, oH, orig_iw, orig_ih);
+      oW = orig_iw;
+      oH = orig_ih;
+#else
+      std::printf("[output] keeping %zux%zu (input %zux%zu; no image-component "
+                  "resize)\n",
+                  oW, oH, orig_iw, orig_ih);
+#endif
     }
     write_output_image(out, pix, oH, oW, oCh, decoded);
   } catch (const std::exception& e) {
