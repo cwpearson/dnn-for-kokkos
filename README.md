@@ -49,7 +49,8 @@ Options:
 | `KokkosDNN_ENABLE_MIOPEN` | OFF | convolutions via MIOpen on HIP spaces (attention path falls back to native; no fused SDPA in MIOpen) |
 | `KokkosDNN_ENABLE_ACCELERATE` | OFF | GEMM/GEMV via Apple Accelerate `cblas_sgemm` on host spaces (float only; native fallback otherwise) |
 | `KokkosDNN_ENABLE_TEST_DISCOVERY` | ON | register gtest tests via `gtest_discover_tests` (set OFF for GPU-less build-only CI, where test binaries cannot run at build time) |
-| `KokkosDNN_ENABLE_IMAGE` | OFF | optional image component (`KokkosDNN::image`, stb-backed I/O + preprocessing) |
+| `KokkosDNN_ENABLE_IMAGE` | OFF | optional image component (`KokkosDNN::image`, stb-backed I/O + preprocessing, WebP via libwebp) |
+| `KokkosDNN_ENABLE_IMAGE_WEBP` | ON | WebP decode/encode in the image component (libwebp: system package, else fetched) |
 | `KokkosDNN_ENABLE_MODEL_LFM25` | ON | build LFM2.5 model component (`KokkosDNN::lfm25`) |
 | `KokkosDNN_ENABLE_MODEL_GLIMMER` | ON | build Muse Glimmer 30B text model component (`KokkosDNN::glimmer`) |
 | `KokkosDNN_ENABLE_MODEL_MOSS` | ON | build MOSS-Image model component (`KokkosDNN::moss`) |

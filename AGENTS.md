@@ -9,7 +9,7 @@ Example for Muse Spark 1.3:
 ```text
 src/             core library (native Kokkos ops; no model-specific code)
 src/tpl/         optional CUDA TPL dispatch (cublas, cudnn)
-src/images/      optional image component (stb-backed I/O + preprocessing)
+src/images/      optional image component (stb-backed I/O + preprocessing, WebP via libwebp)
 models/          installable per-model components (KokkosDNN::lfm25, KokkosDNN::moss)
 models/common/   shared model-support scaffold (JSON/BPE/chat/sampling/detok; header-only)
 models/lfm2_5/   LFM2.5 model library (weights/tokenizer/config)
