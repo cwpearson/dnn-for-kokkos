@@ -1,8 +1,13 @@
 # server/
 
-OpenAI-compatible HTTP front-end for KokkosDNN (LFM2.5).
+OpenAI-compatible HTTP front-end for KokkosDNN (multi-architecture:
+LFM2.5 and Glimmer).
 Enabled with `-DKokkosDNN_ENABLE_SERVER=ON` (default `OFF`, so the default
-build is unaffected). Requires `KokkosDNN_ENABLE_MODEL_LFM25=ON` (default).
+build is unaffected). Requires at least one model component
+(`KokkosDNN_ENABLE_MODEL_LFM25=ON` (default) and/or
+`KokkosDNN_ENABLE_MODEL_GLIMMER=ON` once the `models/glimmer` promotion
+lands — until then the Glimmer backend builds as a stub whose `load()`
+reports the missing target).
 
 Fetching `cpp-httplib` + `nlohmann/json` via FetchContent touches the
 network at configure time. For offline builds, pre-seed the sources and
@@ -14,20 +19,34 @@ pass `-DFETCHCONTENT_SOURCE_DIR_CPP_HTTPLIB=<path>` /
 ```sh
 cmake -B build -DKokkosDNN_ENABLE_SERVER=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target kokkosdnn_server
-./build/server/kokkosdnn_server --weights lfm2_5.gguf \
+./build/server/kokkosdnn_server --arch lfm2.5 --weights lfm2_5.gguf \
     --tokenizer /path/to/tokenizer.json [--config overlay.json] \
     [--max-seq-len 16384] [--model lfm2_5] [--port 8000] \
     [--prefix-cache-host]
+# Glimmer (once KokkosDNN::glimmer exists):
+./build/server/kokkosdnn_server --arch glimmer \
+    --weights '/path/to/model-*.safetensors' \
+    --tokenizer /path/to/tokenizer.json [--model glimmer-30b]
 ```
 
-`--help` / `--version` work without Kokkos weights. `--weights` and
-`--tokenizer` are required to serve; `--config` is an optional model-config
-JSON overlay on top of the baked-in `lfm2_5_24b_a2b` defaults.
-`--max-seq-len N` overrides the context window (the default is 8192, and the
-KV cache is allocated for N tokens), so prompts longer than 8k tokens need
-either this flag or a config overlay.
+`--help` / `--version` work without Kokkos weights. `--arch` selects the
+model architecture (`lfm2.5` (aliases `lfm2_5`, `lfm25`) or `glimmer`
+(aliases `glimmer-30b`, `muse-glimmer[-30b]`, optional `darkc0de-` prefix),
+case-insensitive). When `--arch` is absent the server sniffs `--config`
+(LFM2.5 markers: `lfm2_moe` / `num_experts` / `hidden_act`; Glimmer markers:
+`text_config` / `layer_rope_theta` / `qk_scale_factor`); an explicit
+`--arch` that disagrees with a recognizable config is a startup error,
+otherwise the default is `lfm2.5`. `--model` defaults to the arch default
+(`lfm2_5` / `glimmer-30b`) when absent.
+`--weights` is repeatable and accepts globs: LFM2.5 needs exactly one GGUF
+file; Glimmer takes one `.gguf` file or one or more safetensors shards
+(`model-*.safetensors` is expanded). `--tokenizer` is required to serve;
+`--config` is an optional model-config JSON overlay on top of the arch
+preset. `--max-seq-len N` overrides the context window (LFM2.5 default
+8192; Glimmer default 8192, arch max 131072), so prompts longer than the
+default need either this flag or a config overlay.
 `--prefix-cache-host` keeps the prefix-cache entry in host memory instead
-of device memory (saves VRAM at the cost of host<->device copies per turn).
+of device memory (LFM25 only; Glimmer has no prefix cache and ignores it).
 
 Startup logs the execution space, the device actually in use (name, compute
 capability, SM count, memory, clocks) and the dispatch table (`cuBLAS
@@ -72,6 +91,34 @@ image on an H100.
   `user` message; same sampling/stop/seed/max-tokens handling, legacy
   `text_completion` envelope
 
+## Architectures
+
+Route handlers are arch-agnostic: they parse OpenAI JSON once and drive the
+`KokkosDNN::Server::ChatBackend` selected by `--arch`. Per-arch differences:
+
+| Concern | `lfm2.5` (`BackendLFM25.cpp`) | `glimmer` (`BackendGlimmer.cpp`) |
+|---|---|---|
+| Chat template | LFM2.5-Instruct ChatML + `<think>` generation prompt, `List of tools:` system block, tool history turns | Muse-style `<\|begin_of_text\|>` + `<\|start\|>{role}<\|message\|>{content}<\|eot\|>` blocks + open assistant header (upstream ships no chat template; ASSUMPTION, see `examples/glimmer`) |
+| Default stops | ids `{cfg.eos}`, strings `["<\|im_end\|>"]` | ids `{eos, eot}`, strings `[eot literal]` (decoded from the tokenizer file when present) |
+| Tools | native `<\|tool_call_start\|>` grammar, full `tools`/`tool_choice` support | none: `tools`/`tool_choice`/`tool_calls` history are rejected with 400 |
+| Weights | exactly one `--weights` GGUF | one `--weights` `.gguf` or sharded safetensors (globs expanded) |
+| Reasoning channel | `<think>` trace → `reasoning_content` | none (no thinking trace; assistant `thinking` replay is dropped) |
+| Prefix cache | single-entry content-state cache (exact-prefix reuse) | none: every turn re-prefills (`prefix_hit=0`) |
+| Response format | JSON-mode system directive + fence stripping | JSON-mode directive prepended to the system message (no fence stripping on streams, same as LFM25); no grammar enforcement |
+
+### Adding a third architecture (3-step recipe)
+
+1. New `server/BackendX.cpp` implementing `KokkosDNN::Server::ChatBackend`
+   (load/render+encode/prefill_cached/step/flush/usage/stops/decode/stream
+   parser) plus a file-static `register_backend("<name>", ...)` registrar —
+   no handler or CLI edits needed. Non-public helpers go in `Impl`.
+2. `server/CMakeLists.txt`: `KOKKOSDNN_SERVER_HAVE_X` compile definition +
+   conditional `KokkosDNN::x` link (mirror the LFM25 block; stub the backend
+   when the target is absent so `--arch` still resolves).
+3. `server/test_server_parsing.cpp`: registry/defaults assertions plus a
+   weight-free render test with a tiny config; `server/README.md`: a row in
+   the table above.
+
 ## Supported request params
 
 | Param | Mapping |
@@ -92,7 +139,7 @@ image on an H100.
 | `model` | must match `--model` or be absent, else 400 |
 | unknown fields | ignored |
 
-Agentic loop: with `tools` set, a turn that emits native
+Agentic loop (LFM2.5): with `tools` set, a turn that emits native
 `<|tool_call_start|>[name(args)]<|tool_call_end|>` blocks returns
 `finish_reason:"tool_calls"` with an OpenAI `tool_calls` payload (fresh
 `call-kdnn-N` ids, `content` is the surrounding text or `null`) instead of
@@ -112,7 +159,7 @@ with a custom `stop` list, and a length-capped turn ending mid-marker has
 only its longest trailing partial marker head stripped (an earlier `<`
 followed by `<` is content).
 
-Thinking: LFM2.5-Instruct always reasons inside `<think>...</think>` first.
+Thinking (LFM2.5-Instruct): LFM2.5-Instruct always reasons inside `<think>...</think>` first.
 The generation prompt ends with an open `<think>` (matching the upstream
 chat template), so raw completions normally open implicitly: the leading
 segment up to the first `</think>` / tool-call start / `<|im_end|>` is
@@ -169,8 +216,11 @@ Limits to know:
 
 - **No sampling/chat/detokenizer logic in `server/`** — that belongs to
   `models/` (shared primitives in `models/common/`). The server only
-  translates HTTP <-> model-component calls (all generation runs through
-  `LFM25::Session`).
+  translates HTTP <-> backend calls (all generation runs through the
+  arch backend). Exception: `BackendGlimmer.cpp` carries a minimal
+  `Impl::GlimmerSession` until the `models/glimmer` promotion lands with a
+  `Session` of its own (see `server/GlimmerShim.hpp`); it is model logic
+  parked in `server/` temporarily, not a pattern to copy.
 - The server owns `Kokkos::initialize/finalize` for the serving process.
 - Single-user, blocking: one global mutex guards all inference. A second
   concurrent request blocks until the in-flight request finishes (no 409;
@@ -189,6 +239,8 @@ Limits to know:
   lives in device memory by default; `--prefix-cache-host` keeps it in
   host memory instead (H2D/D2H copies per turn, ~20 KB per token for
   LFM2.5-24B at 128k context ≈ 2.5 GiB per full-window entry).
+  The prefix cache is currently an LFM2.5-only optimization: the Glimmer
+  backend re-prefills every turn and always logs `prefix_hit=0`.
 - A streaming client that disconnects stops the turn at the next token
   (detected from `sink.write()`); the abandoned turn is logged with
   `aborted=client-disconnect` instead of holding the inference lock for the
@@ -199,7 +251,7 @@ Limits to know:
 Every completed turn logs one line to stderr:
 
 ```
-POST /v1/chat/completions -> 200 prompt_tokens=17 completion_tokens=64
+POST /v1/chat/completions -> 200 arch=lfm2.5 prompt_tokens=17 completion_tokens=64
   lock_ms=0.0 encode_ms=0.2 prefill_ms=261.4 decode_ms=1576.9 sse_ms=1.9
   decode_tok_s=40.6 prefix_hit=1 prefix_reused=12
 ```
