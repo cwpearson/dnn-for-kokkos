@@ -380,7 +380,7 @@ inline std::vector<float> edit_pack_patches_blockmajor(
 // (joint path only): compiled out with the template builders above.
 #if defined(QWEN21_DRIVER_HAVE_ENCODER) && \
     defined(QWEN21_DRIVER_HAVE_TOKENIZER) && defined(KOKKOSDNN_ENABLE_IMAGE)
-inline std::vector<int> edit_rope_positions(size_t head_len, int llm_h,
+[[maybe_unused]] inline std::vector<int> edit_rope_positions(size_t head_len, int llm_h,
                                             int llm_w, size_t tail_len) {
   if (llm_h <= 0 || llm_w <= 0)
     throw std::invalid_argument("edit rope: bad vision grid");
