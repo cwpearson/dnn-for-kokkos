@@ -169,3 +169,26 @@ jobs:
       # so execution would fail; this workflow is compile coverage only.
       - name: Build everything
         run: cmake --build build --parallel "$(nproc)"
+
+      # Install + consume: verifies the installed package config, export
+      # names, and headers via the standalone consumer in tests/consume.
+      # The tpl=ON leg is the only CI coverage for the HIP branches of
+      # KokkosDNNConfig.cmake (hipblas/miopen finds): without it a missing
+      # or mis-pathed TPL import target configures/generates silently past
+      # CI. Build-only like the rest of this workflow: no GPU on the
+      # runner, so the consumer is configured and built but not executed.
+      # The consumer links a HIP Kokkos, so it needs hipcc (same compiler
+      # as the main build) and /opt/rocm on the prefix path for the
+      # downstream TPL finds.
+      - name: Install KokkosDNN
+        run: cmake --install build --prefix "${{ github.workspace }}/kdnn-install"
+
+      - name: Build install consumer
+        run: |
+          cmake --version
+          cmake -S tests/consume -B /tmp/kdnn-consume-build \
+            -DCMAKE_CXX_COMPILER="${ROCM_PATH}/bin/hipcc" \
+            -DCMAKE_PREFIX_PATH="${ROCM_PATH}" \
+            -DKokkos_ROOT="${KOKKOS_INSTALL}" \
+            -DKokkosDNN_ROOT="${{ github.workspace }}/kdnn-install"
+          cmake --build /tmp/kdnn-consume-build --parallel "$(nproc)"

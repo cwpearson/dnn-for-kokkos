@@ -100,42 +100,18 @@ jobs:
           ./build/examples/xor/xor_train
 
       # Install + consume: verifies the installed package config, export
-      # names, and headers (core, lfm25, image). This is the only CI
-      # coverage for `cmake --install` + `find_package(KokkosDNN)`.
+      # names, and headers by configuring, building, and running the
+      # standalone consumer in tests/consume against the install tree
+      # (core, common, lfm25, moss, qwen_image_21, image). TPL branches of
+      # the package config (CUDNN/CUBLAS, hipBLAS/MIOpen) are not enabled
+      # in this workflow; those are covered by the CUDA/ROCm install
+      # consumers.
       - name: Install KokkosDNN
         run: cmake --install build --prefix "${{ github.workspace }}/kdnn-install"
 
-      - name: Build and run install consumer (core + lfm25 + image)
+      - name: Build and run install consumer (all components)
         run: |
-          mkdir -p /tmp/kdnn-consume
-          cat > /tmp/kdnn-consume/CMakeLists.txt <<'EOF'
-          cmake_minimum_required(VERSION 3.22)
-          project(KdnnConsume CXX)
-          find_package(Kokkos REQUIRED)
-          find_package(KokkosDNN REQUIRED)
-          add_executable(consumer consumer.cpp)
-          target_link_libraries(consumer PRIVATE KokkosDNN::kokkosdnn KokkosDNN::lfm25 KokkosDNN::image)
-          set_target_properties(consumer PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
-          EOF
-          cat > /tmp/kdnn-consume/consumer.cpp <<'EOF'
-          #include <Kokkos_Core.hpp>
-          #include <KokkosDNN.hpp>
-          #include <KokkosDNN_LFM25Config.hpp>
-          #include <images/KokkosDNN_Image.hpp>
-          #include <iostream>
-          int main(int argc, char** argv) {
-            Kokkos::initialize(argc, argv);
-            {
-              KokkosDNN::print_configuration(std::cout);
-              KokkosDNN::Image::ImageInfo info{2, 2, 3};
-              std::cout << "image " << info.width << "x" << info.height << "x" << info.channels << "\n";
-              std::cout << "lfm25 max seq " << KokkosDNN::LFM25::kMaxSupportedSeqLen << "\n";
-            }
-            Kokkos::finalize();
-            return 0;
-          }
-          EOF
-          cmake -S /tmp/kdnn-consume -B /tmp/kdnn-consume-build \
+          cmake -S tests/consume -B /tmp/kdnn-consume-build \
             -DKokkos_ROOT="${KOKKOS_INSTALL}" \
             -DKokkosDNN_ROOT="${{ github.workspace }}/kdnn-install"
           cmake --build /tmp/kdnn-consume-build --parallel "$(nproc)"
