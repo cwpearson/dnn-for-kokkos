@@ -52,7 +52,9 @@ jobs:
           sudo apt-get update
           # libstb-dev provides the system stb headers (/usr/include/stb/)
           # preferred by the optional image component (find-or-fetch).
-          sudo apt-get install -y cmake g++ git curl gpg libstb-dev
+          # libwebp-dev exercises its system-libwebp path (without it the
+          # component falls back to fetching libwebp).
+          sudo apt-get install -y cmake g++ git curl gpg libstb-dev libwebp-dev
 
       # Install the ROCm HIP SDK (hipcc, headers, CMake config, LLVM, device
       # libs) from AMD's apt repositories. rocm-hip-sdk is the documented

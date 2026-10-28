@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -27,6 +28,19 @@ using KokkosDNN::Image::HostImageU8;
 
 std::string tmp_png(const std::string& name) {
   return (std::filesystem::temp_directory_path() / ("kokkosdnn_" + name)).string();
+}
+
+std::vector<unsigned char> read_bytes(const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return {};
+  in.seekg(0, std::ios::end);
+  const std::streampos end = in.tellg();
+  if (end <= 0) return {};
+  in.seekg(0, std::ios::beg);
+  std::vector<unsigned char> bytes(static_cast<size_t>(end));
+  in.read(reinterpret_cast<char*>(bytes.data()),
+          static_cast<std::streamsize>(bytes.size()));
+  return bytes;
 }
 
 HostImageU8 make_pattern_u8(size_t h, size_t w, size_t c) {
@@ -256,4 +270,142 @@ TEST(ImagePreprocess, Dinov3SingleShape) {
   for (size_t c = 0; c < 3; ++c)
     for (size_t s = 0; s < 224; s += 37)
       EXPECT_TRUE(std::isfinite(host(c, s, s))) << "non-finite at (" << c << "," << s << ")";
+}
+
+TEST(ImageWebP, LosslessRoundTripRGB) {
+  namespace Img = KokkosDNN::Image;
+  if (!Img::Impl::webp_supported()) {
+    GTEST_SKIP() << "libwebp support not built in";
+  }
+  const std::string path = tmp_png("roundtrip_rgb.webp");
+  HostImageU8 src = make_pattern_u8(8, 6, 3);
+  ASSERT_NO_THROW(Img::save_image_webp(path, src, 90, true));
+
+  Img::ImageInfo info = Img::load_image_info(path);
+  EXPECT_EQ(info.width, 6);
+  EXPECT_EQ(info.height, 8);
+  EXPECT_EQ(info.channels, 3);
+
+  HostImageU8 got = Img::load_image_u8(path, 3);
+  EXPECT_EQ(got.extent(0), 8u);
+  EXPECT_EQ(got.extent(1), 6u);
+  EXPECT_EQ(got.extent(2), 3u);
+  for (size_t y = 0; y < 8; ++y)
+    for (size_t x = 0; x < 6; ++x)
+      for (size_t c = 0; c < 3; ++c) EXPECT_EQ(got(y, x, c), src(y, x, c));
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST(ImageWebP, LosslessRoundTripRGBAAndNative) {
+  namespace Img = KokkosDNN::Image;
+  if (!Img::Impl::webp_supported()) {
+    GTEST_SKIP() << "libwebp support not built in";
+  }
+  const std::string path = tmp_png("roundtrip_rgba.webp");
+  HostImageU8 src = make_pattern_u8(5, 7, 4);
+  ASSERT_NO_THROW(Img::save_image_webp(path, src, 90, true));
+
+  Img::ImageInfo info = Img::load_image_info(path);
+  EXPECT_EQ(info.width, 7);
+  EXPECT_EQ(info.height, 5);
+  EXPECT_EQ(info.channels, 4);
+
+  // Native channels keep the alpha plane.
+  HostImageU8 got = Img::load_image_u8(path, 0);
+  ASSERT_EQ(got.extent(2), 4u);
+  for (size_t y = 0; y < 5; ++y)
+    for (size_t x = 0; x < 7; ++x)
+      for (size_t c = 0; c < 4; ++c) EXPECT_EQ(got(y, x, c), src(y, x, c));
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST(ImageWebP, LosslessRoundTripGray) {
+  namespace Img = KokkosDNN::Image;
+  if (!Img::Impl::webp_supported()) {
+    GTEST_SKIP() << "libwebp support not built in";
+  }
+  const std::string path = tmp_png("roundtrip_gray.webp");
+  HostImageU8 src = make_pattern_u8(4, 9, 1);
+  ASSERT_NO_THROW(Img::save_image_webp(path, src, 90, true));
+
+  HostImageU8 got = Img::load_image_u8(path, 1);
+  EXPECT_EQ(got.extent(0), 4u);
+  EXPECT_EQ(got.extent(1), 9u);
+  EXPECT_EQ(got.extent(2), 1u);
+  for (size_t y = 0; y < 4; ++y)
+    for (size_t x = 0; x < 9; ++x) EXPECT_EQ(got(y, x, 0), src(y, x, 0));
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST(ImageWebP, LossyRoundTripDims) {
+  namespace Img = KokkosDNN::Image;
+  if (!Img::Impl::webp_supported()) {
+    GTEST_SKIP() << "libwebp support not built in";
+  }
+  const std::string path = tmp_png("roundtrip_lossy.webp");
+  HostImageU8 src("webp_src", 16, 16, 3);
+  for (size_t y = 0; y < 16; ++y)
+    for (size_t x = 0; x < 16; ++x)
+      for (size_t c = 0; c < 3; ++c) src(y, x, c) = 128;
+  ASSERT_NO_THROW(Img::save_image_webp(path, src));
+
+  Img::ImageInfo info = Img::load_image_info(path);
+  EXPECT_EQ(info.width, 16);
+  EXPECT_EQ(info.height, 16);
+
+  HostImageU8 got = Img::load_image_u8(path, 3);
+  int max_abs_err = 0;
+  for (size_t y = 0; y < 16; ++y)
+    for (size_t x = 0; x < 16; ++x)
+      for (size_t c = 0; c < 3; ++c)
+        max_abs_err = std::max(max_abs_err, std::abs(static_cast<int>(got(y, x, c)) -
+                                                     static_cast<int>(src(y, x, c))));
+  EXPECT_LE(max_abs_err, 8);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST(ImageWebP, MemoryDecode) {
+  namespace Img = KokkosDNN::Image;
+  if (!Img::Impl::webp_supported()) {
+    GTEST_SKIP() << "libwebp support not built in";
+  }
+  const std::string path = tmp_png("memory.webp");
+  HostImageU8 src = make_pattern_u8(6, 6, 3);
+  ASSERT_NO_THROW(Img::save_image_webp(path, src, 90, true));
+
+  const std::vector<unsigned char> bytes = read_bytes(path);
+  ASSERT_FALSE(bytes.empty());
+  HostImageU8 got = Img::decode_image_u8(bytes.data(), bytes.size(), 3);
+  EXPECT_EQ(got.extent(0), 6u);
+  EXPECT_EQ(got.extent(1), 6u);
+  for (size_t y = 0; y < 6; ++y)
+    for (size_t x = 0; x < 6; ++x)
+      for (size_t c = 0; c < 3; ++c) EXPECT_EQ(got(y, x, c), src(y, x, c));
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
+
+TEST(ImageWebP, Validation) {
+  namespace Img = KokkosDNN::Image;
+  if (!Img::Impl::webp_supported()) {
+    GTEST_SKIP() << "libwebp support not built in";
+  }
+  const std::string path = tmp_png("invalid.webp");
+  HostImageU8 src = make_pattern_u8(4, 4, 3);
+  EXPECT_THROW(Img::save_image_webp(path, src, -1), std::invalid_argument);
+  EXPECT_THROW(Img::save_image_webp(path, src, 101), std::invalid_argument);
+  HostImageU8 empty("webp_empty", 0, 0, 0);
+  EXPECT_THROW(Img::save_image_webp(path, empty), std::invalid_argument);
+  // libwebp has no gray+alpha encoding.
+  HostImageU8 two("webp_two", 4, 4, 2);
+  EXPECT_THROW(Img::save_image_webp(path, two), std::invalid_argument);
 }

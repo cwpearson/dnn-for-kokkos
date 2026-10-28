@@ -41,6 +41,20 @@ endif()
 # NOTE: KokkosDNN_ENABLE_ACCELERATE needs no find: Accelerate is an Apple
 # system framework linked by absolute path baked into the targets file.
 
+if(@KOKKOSDNN_IMAGE_HAVE_WEBP@ AND NOT @KokkosDNN_IMAGE_USES_SYSTEM_WEBP@)
+  # Fetched libwebp: its webp/sharpyuv targets are installed into our own
+  # export set, but the build-tree link can still reference
+  # Threads::Threads, which the consumer must re-find.
+  # (Manually-located libwebp bakes absolute paths into the targets file
+  # and needs no find; the Threads find is harmless there.)
+  find_dependency(Threads)
+endif()
+
+if(@KokkosDNN_IMAGE_USES_SYSTEM_WEBP@)
+  # Build linked WebP::webp from a WebP package config; re-find it here.
+  find_dependency(WebP)
+endif()
+
 if(@KOKKOSDNN_ENABLE_CUDNN@ AND NOT TARGET cudnn_frontend)
   # Header-only cuDNN graph API: FetchContent at build time, deliberately
   # not in our export set. Define the link name the exported

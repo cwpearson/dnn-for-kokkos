@@ -4,10 +4,13 @@
 #define KOKKOSDNN_IMAGE_IO_HPP
 
 // stb-based image I/O to Kokkos host views (JPEG/PNG/BMP/GIF/etc. for
-// decode; PNG/JPEG for encode). All returned views are owning, deep copies in
+// decode; PNG/JPEG for encode) plus WebP decode/encode via libwebp.
+// All returned views are owning, deep copies in
 // host space with HWC layout [H,W,C]. Decoding itself is third-party only
-// (stb); no hand-rolled decoders here. The stb implementation lives in the
-// single translation unit KokkosDNN_Image.cpp.
+// (stb, libwebp); no hand-rolled decoders here. The stb implementation lives
+// in the single translation unit KokkosDNN_Image.cpp, as do the WebP
+// helpers (declared below, defined there) so no libwebp headers leak into
+// this header or its consumers.
 
 #include "KokkosDNN_ImageTypes.hpp"
 
@@ -40,49 +43,94 @@ inline void validate_desired_channels(int desired_channels) {
   }
 }
 
+// WebP helpers, defined (non-inline) in KokkosDNN_Image.cpp so libwebp
+// stays out of this header. When the build lacks libwebp,
+// webp_supported() returns false and the rest throw std::runtime_error.
+// Native WebP channels are 3 (no alpha) or 4 (alpha), matching the file.
+bool webp_supported();
+// Case-insensitive ".webp" extension check (routing hint only; the memory
+// probe below is authoritative for buffers).
+bool has_webp_extension(const std::string& path);
+// Cheap non-throwing probe: true iff data holds a WebP bitstream.
+bool is_webp_memory(const unsigned char* data, size_t len);
+ImageInfo webp_info_from_file(const std::string& path);
+HostImageU8 webp_decode_file(const std::string& path, int desired_channels);
+HostImageU8 webp_decode_memory(const unsigned char* data, size_t len,
+                               int desired_channels);
+
 }  // namespace Impl
 
 // Probe dimensions without decoding pixels. Throws std::runtime_error if the
-// file is missing or not a recognized image.
+// file is missing or not a recognized image (WebP included when built with
+// libwebp support; see Impl::webp_supported()).
 inline ImageInfo load_image_info(const std::string& path) {
   int w = 0, h = 0, comp = 0;
-  if (stbi_info(path.c_str(), &w, &h, &comp) == 0) {
-    std::string why = stbi_failure_reason() ? stbi_failure_reason() : "unknown error";
-    throw std::runtime_error("KokkosDNN::Image::load_image_info: cannot read '" + path +
-                             "': " + why);
+  if (stbi_info(path.c_str(), &w, &h, &comp) != 0) {
+    ImageInfo info;
+    info.width = w;
+    info.height = h;
+    info.channels = comp;
+    return info;
   }
-  ImageInfo info;
-  info.width = w;
-  info.height = h;
-  info.channels = comp;
-  return info;
+  std::string stb_why = stbi_failure_reason() ? stbi_failure_reason() : "unknown error";
+  if (Impl::webp_supported()) {
+    try {
+      return Impl::webp_info_from_file(path);
+    } catch (const std::exception& e) {
+      throw std::runtime_error("KokkosDNN::Image::load_image_info: cannot read '" + path +
+                               "': stb says '" + stb_why + "'; webp says '" + e.what() +
+                               "'");
+    }
+  }
+  throw std::runtime_error("KokkosDNN::Image::load_image_info: cannot read '" + path +
+                           "': " + stb_why +
+                           " (WebP support not built in; configure with "
+                           "-DKokkosDNN_ENABLE_IMAGE_WEBP=ON)");
 }
 
 // Decode an image file to an owning host HWC uint8 view. If desired_channels
 // != 0 the output is forced to that many channels, else native is kept.
+// WebP files route to the libwebp decoder when built with WebP support
+// (by extension, with a content fallback for misnamed files).
 // Throws std::runtime_error on missing file / decode failure.
 inline HostImageU8 load_image_u8(const std::string& path, int desired_channels = 3) {
   Impl::validate_desired_channels(desired_channels);
+  if (Impl::webp_supported() && Impl::has_webp_extension(path)) {
+    return Impl::webp_decode_file(path, desired_channels);
+  }
   int w = 0, h = 0, native = 0;
   unsigned char* pix = stbi_load(path.c_str(), &w, &h, &native, desired_channels);
-  if (pix == nullptr) {
-    std::string why = stbi_failure_reason() ? stbi_failure_reason() : "unknown error";
-    throw std::runtime_error("KokkosDNN::Image::load_image_u8: cannot load '" + path +
-                             "': " + why);
+  if (pix != nullptr) {
+    const int c = (desired_channels != 0) ? desired_channels : native;
+    HostImageU8 img("KokkosDNN::Image::load_u8", static_cast<size_t>(h),
+                    static_cast<size_t>(w), static_cast<size_t>(c));
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x)
+        for (int cc = 0; cc < c; ++cc)
+          img(static_cast<size_t>(y), static_cast<size_t>(x), static_cast<size_t>(cc)) =
+              pix[(static_cast<size_t>(y) * static_cast<size_t>(w) +
+                   static_cast<size_t>(x)) *
+                      static_cast<size_t>(c) +
+                  static_cast<size_t>(cc)];
+    stbi_image_free(pix);
+    return img;
   }
-  const int c = (desired_channels != 0) ? desired_channels : native;
-  HostImageU8 img("KokkosDNN::Image::load_u8", static_cast<size_t>(h),
-                  static_cast<size_t>(w), static_cast<size_t>(c));
-  for (int y = 0; y < h; ++y)
-    for (int x = 0; x < w; ++x)
-      for (int cc = 0; cc < c; ++cc)
-        img(static_cast<size_t>(y), static_cast<size_t>(x), static_cast<size_t>(cc)) =
-            pix[(static_cast<size_t>(y) * static_cast<size_t>(w) +
-                 static_cast<size_t>(x)) *
-                    static_cast<size_t>(c) +
-                static_cast<size_t>(cc)];
-  stbi_image_free(pix);
-  return img;
+  std::string stb_why = stbi_failure_reason() ? stbi_failure_reason() : "unknown error";
+  if (Impl::webp_supported()) {
+    try {
+      return Impl::webp_decode_file(path, desired_channels);
+    } catch (const std::exception& e) {
+      throw std::runtime_error("KokkosDNN::Image::load_image_u8: cannot load '" + path +
+                               "': stb says '" + stb_why + "'; webp says '" + e.what() +
+                               "'");
+    }
+  }
+  throw std::runtime_error("KokkosDNN::Image::load_image_u8: cannot load '" + path +
+                           "': " + stb_why +
+                           (Impl::has_webp_extension(path)
+                                ? " (looks like WebP but WebP support is not built in; "
+                                  "configure with -DKokkosDNN_ENABLE_IMAGE_WEBP=ON)"
+                                : ""));
 }
 
 // Decode to float HWC in 0..1 (u8 / 255.0f). Same channel rules as load_image_u8.
@@ -98,6 +146,7 @@ inline HostImageF32 load_image_f32(const std::string& path, int desired_channels
 }
 
 // In-memory decode (e.g. for tests without files). Same channel rules;
+// WebP buffers route to the libwebp decoder when built with WebP support.
 // throws std::invalid_argument on empty input, std::runtime_error on failure.
 inline HostImageU8 decode_image_u8(const unsigned char* data, size_t len,
                                    int desired_channels = 3) {
@@ -107,6 +156,9 @@ inline HostImageU8 decode_image_u8(const unsigned char* data, size_t len,
   }
   if (len > static_cast<size_t>((std::numeric_limits<int>::max)())) {
     throw std::invalid_argument("KokkosDNN::Image::decode_image_u8: input too large");
+  }
+  if (Impl::webp_supported() && Impl::is_webp_memory(data, len)) {
+    return Impl::webp_decode_memory(data, len, desired_channels);
   }
   int w = 0, h = 0, native = 0;
   unsigned char* pix =
@@ -191,6 +243,20 @@ inline void save_image_jpg(const std::string& path, const HostImageU8& img,
                              "'");
   }
 }
+
+// Encode a host HWC uint8 view as WebP (libwebp). Channels must be 1
+// (gray, expanded to RGB), 3 (RGB), or 4 (RGBA); 2-channel views are
+// rejected. The view may be strided; pixels are packed to a contiguous
+// row-major buffer first. Quality is the lossy quality 0..100 (default 90,
+// matching save_image_jpg); lossless=true selects lossless encoding and the
+// quality value is ignored. WebP is lossy by default: a decode of the
+// written file may differ slightly from the input (use lossless=true for an
+// exact roundtrip). Throws std::invalid_argument on bad extents, channel
+// count, or out-of-range quality, and std::runtime_error on encode/write
+// failure — including when the build lacks libwebp support (see
+// Impl::webp_supported()).
+void save_image_webp(const std::string& path, const HostImageU8& img, int quality = 90,
+                     bool lossless = false);
 
 }  // namespace KokkosDNN::Image
 

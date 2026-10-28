@@ -51,8 +51,11 @@ jobs:
           # cmake via Homebrew only if missing. No sudo on macOS runners.
           # There is no Homebrew `stb` formula (other formulae vendor stb
           # headers as a resource; MacPorts/vcpkg do ship stb), so the
-          # optional image component just uses its FetchContent fallback on
-          # this runner — no extra install step needed.
+          # optional image component just uses its stb FetchContent fallback
+          # on this runner — no extra install step needed. (The same
+          # FetchContent fallback covers libwebp here, so this runner also
+          # exercises the bundled-libwebp path while the apt runners above
+          # exercise the system-libwebp path.)
           brew list cmake >/dev/null 2>&1 || brew install cmake
           cmake --version
           c++ --version
