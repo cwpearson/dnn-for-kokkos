@@ -74,9 +74,12 @@ See each directory's README for flags, run commands, and design notes.
 ## Server
 
 `server/kokkosdnn_server` (opt-in via `-DKokkosDNN_ENABLE_SERVER=ON`) is an
-OpenAI-compatible HTTP front-end for LFM2.5 (`GET /v1/models`,
-`POST /v1/chat/completions` with SSE streaming, `POST /v1/completions` alias).
-See [server](server/README.md) for flags, routes, and request params.
+OpenAI-compatible HTTP front-end for LFM2.5 and Glimmer
+(`GET /v1/models`, `POST /v1/chat/completions` with SSE streaming,
+`POST /v1/completions` alias; `--arch` selects the model family).
+See [server](server/README.md) for flags, routes, and request params. The
+`server/Dockerfile` CUDA image serves either arch with weights
+volume-mounted at run time.
 
 ## Benchmarks
 
