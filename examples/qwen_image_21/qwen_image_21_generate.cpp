@@ -25,11 +25,10 @@
 // the shim below). Status: Config geometry + the DiT are usable when
 // present (the driver samples with the real DiT, including --tiny on
 // random weights); encode runs the in-process raw-text BPE +
-// EncoderModel forward when --tokenizer + --text-encoder are given (else
-// --prompt-embeds-in file or null), and decode runs the real VAE decode
-// to RGBA by default when --vae-weights are given (else a grayscale
-// preview; pass --no-vae-decode for the preview), each fallback with a
-// logged reason.
+// EncoderModel forward when --ckpt is given (else --prompt-embeds-in
+// file or null), and decode runs the real VAE decode to RGBA by default
+// from <ckpt>/vae (else a grayscale preview; pass --no-vae-decode for
+// the preview), each fallback with a logged reason.
 //
 // Interactive loop (default): without --prompt on a TTY (and without the
 // file/parity handoff flags) the driver asks for a prompt, asks for a
@@ -45,9 +44,8 @@
 // and exits. The per-iteration seed is --seed + iteration; an empty
 // filename auto-numbers qwen_image_21_out_<n>.png.
 //
-//   qwen_image_21_generate [--tiny] [--weights transformer_dir]
+//   qwen_image_21_generate [--tiny] [--ckpt ckpt_dir]
 //                          [--prompt "text"]   (one-off; omit to loop)
-//                          [--tokenizer tok_dir] [--text-encoder enc_dir]
 //                          [--text-weights feats.f32]
 //                          [--prompt-embeds-in feats.f32]
 //                          [--height H] [--width W]   (output pixels;
@@ -55,21 +53,21 @@
 //                          [--steps 8] [--cfg 1.0] [--shift 3.0]
 //                          [--sigmas driver|turbo]
 //                          [--seed 42] [--init-latents-in lat.f32]
-//                          [--vae-weights vae.safetensors [--no-vae-decode]]
+//                          [--no-vae-decode]
 //                          [--decode-latents-in lat.f32
 //                           [--decode-latents-layout chw|token]
 //                           [--decode-out-f32 file]]
 //                          [--out img.png]
 //                          [--no-staged] [--dump-steps DIR]
-//// Text conditioning precedence: in-process Qwen forward (--tokenizer dir
-// with tokenizer.json + --text-encoder weights, raw T2I template, no chat
-// template) -> --prompt-embeds-in file (alias
-// --text-weights) -> null (zeros) with the prompt logged. --tokenizer /
-// --text-encoder must be given together. --tiny skips the Qwen forward.
-// --vae-weights is validated whenever given; VAE decode runs by default
-// (latents denormalized by the runtime vae/config.json affine, then
-// QwenImage21VaeModel::decode to RGBA; pass --no-vae-decode for the
-// channel-mean grayscale preview).
+//   <ckpt> is the canonical Qwen-Image-2.1-Turbo checkpoint root holding
+//   transformer/, text_encoder/, processor/tokenizer.json, and vae/.
+// Text conditioning precedence: in-process Qwen forward (--ckpt, raw T2I
+// template, no chat template) -> --prompt-embeds-in file (alias
+// --text-weights) -> null (zeros) with the prompt logged. --tiny skips
+// the Qwen forward.
+// VAE decode runs by default from <ckpt>/vae (latents denormalized by the
+// runtime vae/config.json affine, then QwenImage21VaeModel::decode to RGBA;
+// pass --no-vae-decode for the channel-mean grayscale preview).
 //
 // Staged execution (24GB fit, default): encode -> releases the encoder
 // weights (the MiB-scale embeds stay resident on the device) ->
@@ -261,15 +259,13 @@ void copy_enc_weights(
 // Fixed generation options shared by every loop iteration (prompt, output
 // path, and per-iteration seed vary).
 struct LoopFixedOpts {
-  std::string weights = "transformer";
-  std::string tokenizer_dir;
-  std::string text_encoder;
+  std::string ckpt;  // canonical checkpoint root (transformer/,
+                     // text_encoder/, processor/, vae/)
   int H = 1024, W = 1024;  // requested output pixels (rounded at generation)
   int steps_eff = 8;
   float guidance = 1.0f, flow_shift = 3.0f;
   std::string sigmas_mode = "driver";
   uint64_t seed = 42;
-  std::string vae_weights;
   bool vae_decode = true;
   std::string out_default = "qwen_image_21_out.png";
   bool staged = true;
@@ -278,16 +274,15 @@ struct LoopFixedOpts {
 
 void usage() {
   std::printf(
-      "usage: qwen_image_21_generate [--tiny] [--weights transformer_dir]\n"
+      "usage: qwen_image_21_generate [--tiny] [--ckpt ckpt_dir]\n"
       "                    [--prompt \"text\"]\n"
-      "                    [--tokenizer tok_dir] [--text-encoder enc_dir]\n"
       "                    [--text-weights feats.f32]\n"
       "                    [--prompt-embeds-in feats.f32]\n"
       "                    [--height H] [--width W]\n"
       "                    [--steps N] [--cfg G] [--shift S]\n"
       "                    [--sigmas driver|turbo]\n"
       "                    [--seed N] [--init-latents-in lat.f32]\n"
-      "                    [--vae-weights vae.safetensors [--no-vae-decode]]\n"
+      "                    [--no-vae-decode]\n"
       "                    [--decode-latents-in lat.f32\n"
       "                     [--decode-latents-layout chw|token]\n"
       "                     [--decode-out-f32 file]]\n"
@@ -296,12 +291,14 @@ void usage() {
       "\n"
       "  --tiny         random-weights smoke model, 4x4 latents, 2 steps\n"
       "                 (no files)\n"
-      "  --weights      DiT transformer checkpoint: transformer/ shard dir\n"
-      "                 or single .safetensors (default: transformer)\n"
+      "  --ckpt         canonical Qwen-Image-2.1-Turbo checkpoint root\n"
+      "                 holding transformer/, text_encoder/,\n"
+      "                 processor/tokenizer.json, and vae/ (required\n"
+      "                 unless --tiny)\n"
       "  --prompt       caption text (Qwen-encoded in-process with\n"
-      "                 --tokenizer + --text-encoder, else needs\n"
-      "                 --text-weights, else null). Giving --prompt runs ONE\n"
-      "                 generation and exits; without it (TTY stdin, no\n"
+      "                 --ckpt, else needs --text-weights, else null).\n"
+      "                 Giving --prompt runs ONE generation and exits;\n"
+      "                 without it (TTY stdin, no\n"
       "                 --prompt-embeds-in/--text-weights/--init-latents-in/\n"
       "                 --dump-steps/--decode-latents-in) the driver loops:\n"
       "                 it asks for a prompt, asks for a filename, generates,\n"
@@ -314,13 +311,8 @@ void usage() {
       "                 through the in-memory prompt history). ESC at output>\n"
       "                 goes back to prompt> (previous prompt pre-filled);\n"
       "                 ESC at prompt> re-asks.\n"
-      "  --tokenizer    dir holding tokenizer.json;\n"
-      "                 with --text-encoder runs the in-process Qwen forward\n"
-      "                 (raw T2I template, no chat template)\n"
       "  --text-weights raw float32 LE caption features [L,Cc]\n"
       "                 (L <= maxlen, Cc == caption dim)\n"
-      "  --text-encoder Qwen text-encoder weights: text_encoder/ shard dir\n"
-      "                 or single .safetensors\n"
       "  --prompt-embeds-in alias of --text-weights (wins if both differ)\n"
       "  --staged       (default ON) encode -> release encoder weights (MiB\n"
       "                 embeds stay resident on device) -> fence -> load DiT\n"
@@ -346,13 +338,13 @@ void usage() {
       "                 row-major, flattened C-major lat[(c*H+h)*W+w]\n"
       "                 (C*H*W floats, PRE-denormalization latent noise:\n"
       "                 no mean/std applied); replaces the mt19937 sample\n"
-      "  --vae-weights  VAE checkpoint (validated whenever given)\n"
       "  --vae-decode   (default ON) run the real VAE decode (denormalize by\n"
-      "                 the runtime vae/config.json affine, decode to RGBA)\n"
-      "                 when the VAE header + weights are present, else\n"
-      "                 grayscale preview. Pass --no-vae-decode for the preview\n"
+      "                 the runtime <ckpt>/vae/config.json affine, decode to\n"
+      "                 RGBA) when the VAE header + checkpoint are present,\n"
+      "                 else grayscale preview. Pass --no-vae-decode for the\n"
+      "                 preview\n"
       "  --decode-latents-in raw fp32 LE latents to decode directly (skips\n"
-      "                 encode, DiT load and sampling; needs --vae-weights;\n"
+      "                 encode, DiT load and sampling; needs --ckpt;\n"
       "                 --height/--width are the output pixels)\n"
       "  --decode-latents-layout 'chw' (default: lat[(c*H+h)*W+w]) or\n"
       "                 'token' (torch packed [H*W,C], golden final latents)\n"
@@ -398,26 +390,34 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
               be_label(cfg));
 
   // VAE checkpoint validated once (decoded per iteration from disk; 0.7GB).
-  // VAE decode is ON by default whenever --vae-weights are given.
+  // VAE decode is ON by default from <ckpt>/vae.
   bool vae_decode = o.vae_decode;
-  if (!o.vae_weights.empty()) {
+  if (!o.tiny) {
+    require_ckpt_dir(o.ckpt);
+  }
+  if (!o.tiny && vae_decode) {
+    const std::string vae_dir = ckpt_sub(o.ckpt, "vae");
     std::error_code ec0;
-    const bool vae_is_dir = std::filesystem::is_directory(o.vae_weights, ec0);
-    if (!vae_is_dir && !file_exists(o.vae_weights))
-      throw std::runtime_error("vae weights file '" + o.vae_weights +
-                               "' not found");
+    if (!std::filesystem::is_directory(vae_dir, ec0))
+      throw std::runtime_error("--ckpt '" + o.ckpt +
+                               "' has no vae/ subdir (need the canonical "
+                               "Qwen-Image-2.1 checkpoint dir)");
 #ifdef QWEN21_DRIVER_HAVE_VAE
-    std::printf("[vae %s] validated%s\n", o.vae_weights.c_str(),
-                vae_decode ? "; decode enabled (default)"
-                           : "; preview (pass --vae-decode to decode)");
+    std::printf("[vae %s] validated%s\n", vae_dir.c_str(),
+                "; decode enabled (default)");
 #else
     std::printf("[vae %s] validated, but KokkosDNN_QwenImage21Vae.hpp is "
                 "not in this build; writing a grayscale preview instead\n",
-                o.vae_weights.c_str());
+                vae_dir.c_str());
 #endif
   } else if (vae_decode) {
-    std::printf("[vae] VAE decode needs --vae-weights (else grayscale "
-                "preview); disabling decode for this run\n");
+    if (!o.ckpt.empty()) {
+      std::printf("[vae] --tiny skips the VAE decode (random-weights smoke "
+                  "model); writing a grayscale preview instead\n");
+    } else {
+      std::printf("[vae] VAE decode needs --ckpt (else grayscale "
+                  "preview); disabling decode for this run\n");
+    }
     vae_decode = false;
   }
 
@@ -428,13 +428,14 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
       dit_host;
   bool have_dit_host = false;
   if (!o.tiny) {
+    const std::string dit_dir = ckpt_sub(o.ckpt, "transformer");
     const std::vector<std::string> shards =
-        resolve_shard_list(o.weights, "--weights");
+        resolve_shard_list(dit_dir, "--ckpt");
     KokkosDNN::QwenImage21Dit::QwenImage21DitModel<Exec, DScalar> tmp(cfg);
     if (shards.size() > 1)
       std::printf("[loading %zu shards]\n", shards.size());
     else
-      std::printf("[loading %s]\n", o.weights.c_str());
+      std::printf("[loading %s]\n", dit_dir.c_str());
     try {
       tmp.weights().load_safetensors(shards);
     } catch (const std::exception& e) {
@@ -464,17 +465,15 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
       Kokkos::HostSpace, Kokkos::Experimental::bhalf_t>
       enc_host;
   bool have_enc_host = false;
-  if (!o.tiny && (!o.tokenizer_dir.empty() || !o.text_encoder.empty())) {
-    if (o.tokenizer_dir.empty() || o.text_encoder.empty())
-      throw std::runtime_error(
-          "--tokenizer and --text-encoder must be given together for the "
-          "in-process Qwen forward");
+  if (!o.tiny && !o.ckpt.empty()) {
     namespace QELoop = KokkosDNN::QwenImage21Encoder;
-    const std::string tok_json = o.tokenizer_dir + "/tokenizer.json";
+    require_ckpt_dir(o.ckpt);
+    const std::string tok_json =
+        ckpt_sub(o.ckpt, "processor") + "/tokenizer.json";
     if (!file_exists(tok_json))
-      throw std::runtime_error("--tokenizer '" + o.tokenizer_dir +
-                               "' has no tokenizer.json (need the "
-                               "Qwen-Image-2.1 processor/ dir)");
+      throw std::runtime_error("--ckpt '" + o.ckpt +
+                               "' has no processor/tokenizer.json (need the "
+                               "canonical Qwen-Image-2.1 checkpoint dir)");
     loop_tabs = load_raw_qwen_tables(tok_json);
     const size_t max_len = be_max_seq(cfg);
     const std::string kUserPrefix = "<|im_start|>user\n";
@@ -508,13 +507,13 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
         Exec, Kokkos::Experimental::bhalf_t>
         enc_tmp(loop_ecfg);
     const std::vector<std::string> eshards =
-        resolve_shard_list(o.text_encoder, "--text-encoder");
+        resolve_shard_list(ckpt_sub(o.ckpt, "text_encoder"), "--ckpt");
     if (eshards.size() != 1)
       throw std::runtime_error(
-          "--text-encoder must be the single-shard text_encoder/ "
+          "--ckpt text_encoder must be the single-shard text_encoder/ "
           "model.safetensors (got " +
           std::to_string(eshards.size()) + " shards)");
-    std::printf("[loading %s]\n", o.text_encoder.c_str());
+    std::printf("[loading %s]\n", ckpt_sub(o.ckpt, "text_encoder").c_str());
     enc_tmp.weights().load_safetensors(eshards[0]);
     enc_host.allocate(loop_ecfg);
     copy_enc_weights(enc_host, enc_tmp.weights());
@@ -523,12 +522,12 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
                 "GB (copied host->device each iteration)\n",
                 (double)enc_tmp.weights().resident_bytes() / 1e9);
   }
-  if (o.tiny && (!o.tokenizer_dir.empty() || !o.text_encoder.empty()))
+  if (o.tiny && !o.ckpt.empty())
     std::printf("[encode] --tiny skips the Qwen forward (random-weights "
                 "smoke model); using null embeddings\n");
 #else
-  if (!o.tiny && (!o.tokenizer_dir.empty() || !o.text_encoder.empty()))
-    std::printf("[encode] --tokenizer/--text-encoder need "
+  if (!o.tiny && !o.ckpt.empty())
+    std::printf("[encode] --ckpt needs "
                 "KokkosDNN_QwenImage21Encoder.hpp + "
                 "KokkosDNN_QwenTokenizer.hpp, not present in this build; "
                 "using null embeddings\n");
@@ -725,7 +724,7 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
                   cfg.hidden_size, cfg.depth, H, W);
     } else {
       throw std::runtime_error(
-          "weights file '" + o.weights +
+          "checkpoint '" + ckpt_sub(o.ckpt, "transformer") +
           "' needs the true Qwen-Image-2.1 DiT "
           "(KokkosDNN_QwenImage21Dit.hpp is not in this build); pass --tiny "
           "for the random-weights smoke run. See README for the expected "
@@ -796,8 +795,8 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
     if (vae_decode) {
 #ifdef QWEN21_DRIVER_HAVE_VAE
       try {
-        decoded = try_vae_decode_rgba(lat, C, (size_t)H, (size_t)W,
-                                      o.vae_weights, pix, oH, oW, oCh);
+        decoded = try_vae_decode_rgba(lat, C, (size_t)H, (size_t)W, o.ckpt,
+                                      pix, oH, oW, oCh);
         std::printf("[decode] VAE RGBA %zux%zux%d ready for output\n", oH, oW,
                     oCh);
       } catch (const std::exception& e) {
@@ -810,7 +809,7 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
       std::printf("[vae] VAE decode requested (default) but "
                   "KokkosDNN_QwenImage21Vae.hpp is not in this build; writing "
                   "a grayscale preview instead (need the VAE worktree "
-                  "header + --vae-weights)\n");
+                  "header + --ckpt)\n");
 #endif
     }
     if (!decoded) {
@@ -826,11 +825,10 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
 }
 
 int main(int argc, char** argv) {
-  std::string weights = "transformer";
+  std::string ckpt;
   std::string prompt = "a red panda reading a newspaper";
   std::string text_weights, prompt_embeds_in, init_latents_in, dump_dir;
-  std::string tokenizer_dir, text_encoder;
-  std::string vae_weights, out = "qwen_image_21_out.png";
+  std::string out = "qwen_image_21_out.png";
   std::string decode_latents_in, decode_latents_layout = "chw",
               decode_out_f32;
   int height = 1024, width = 1024;
@@ -853,16 +851,11 @@ int main(int argc, char** argv) {
       dst = argv[++i];
       return true;
     };
-    if (a == "--weights") {
-      if (!need(weights)) return 1;
-      tiny = false;
+    if (a == "--ckpt") {
+      if (!need(ckpt)) return 1;
     } else if (a == "--prompt" && i + 1 < argc) {
       prompt = argv[++i];
       prompt_given = true;
-    } else if (a == "--tokenizer" && i + 1 < argc) {
-      tokenizer_dir = argv[++i];
-    } else if (a == "--text-encoder" && i + 1 < argc) {
-      text_encoder = argv[++i];
     } else if (a == "--text-weights" && i + 1 < argc) {
       text_weights = argv[++i];
     } else if (a == "--prompt-embeds-in" && i + 1 < argc) {
@@ -871,8 +864,6 @@ int main(int argc, char** argv) {
       init_latents_in = argv[++i];
     } else if (a == "--dump-steps" && i + 1 < argc) {
       dump_dir = argv[++i];
-    } else if (a == "--vae-weights" && i + 1 < argc) {
-      vae_weights = argv[++i];
     } else if (a == "--vae-decode") {
       vae_decode = true;
     } else if (a == "--no-vae-decode" || a == "--no-vae_decode") {
@@ -985,18 +976,18 @@ int main(int argc, char** argv) {
     std::printf("[model %s: %s]\n", tiny ? "tiny_test" : "qwen-image-2.1",
                 be_label(cfg));
 
+    // Full runs need the canonical checkpoint; --tiny skips it.
+    if (!tiny) require_ckpt_dir(ckpt);
+
     // ---- VAE-only parity path (--decode-latents-in) ----
     // Bypasses encode + DiT load + sampler: golden latents go straight
     // through the runtime affine + VAE decode. Needs the real VAE.
     if (!decode_latents_in.empty()) {
-      if (vae_weights.empty())
-        throw std::runtime_error(
-            "--decode-latents-in needs --vae-weights (implies decode)");
       if (tiny)
         throw std::runtime_error(
             "--decode-latents-in needs the real VAE; drop --tiny");
       run_vae_only(decode_latents_in, decode_latents_layout == "token", C,
-                   (size_t)H, (size_t)W, vae_weights, out, decode_out_f32);
+                   (size_t)H, (size_t)W, ckpt, out, decode_out_f32);
       Kokkos::finalize();
       return 0;
     }
@@ -1022,9 +1013,7 @@ int main(int argc, char** argv) {
         dump_dir.empty() && stdin_is_tty();
     if (loop_mode) {
       LoopFixedOpts lo;
-      lo.weights = weights;
-      lo.tokenizer_dir = tokenizer_dir;
-      lo.text_encoder = text_encoder;
+      lo.ckpt = ckpt;
       lo.H = height;
       lo.W = width;
       lo.steps_eff = steps_eff;
@@ -1032,7 +1021,6 @@ int main(int argc, char** argv) {
       lo.flow_shift = flow_shift;
       lo.sigmas_mode = sigmas_mode;
       lo.seed = seed;
-      lo.vae_weights = vae_weights;
       lo.vae_decode = vae_decode;
       lo.out_default = out;
       lo.staged = staged;
@@ -1043,8 +1031,8 @@ int main(int argc, char** argv) {
     }
 
     // ---- Phase 1: encode (no DiT weights are loaded yet) ----
-    EncoderStage enc = EncoderStage::run(cfg, prompt, caption_src,
-                                         tokenizer_dir, text_encoder, tiny);
+    EncoderStage enc =
+        EncoderStage::run(cfg, prompt, caption_src, ckpt, tiny);
     log_encode_memory(enc);
 
     // In-memory handoff: the embeds (~L*Cc floats per branch, MiB-scale) are
@@ -1078,10 +1066,11 @@ int main(int argc, char** argv) {
         std::printf("[tiny random weights] layers=%d hidden=%d latent=%dx%d\n",
                     cfg.num_layers, cfg.hidden_dim, H, W);
       } else {
-        std::printf("[loading %s]\n", weights.c_str());
+        const std::string dit_dir = ckpt_sub(ckpt, "transformer");
+        std::printf("[loading %s]\n", dit_dir.c_str());
         try {
           const std::vector<std::string> shards =
-              resolve_shard_list(weights, "--weights");
+              resolve_shard_list(dit_dir, "--ckpt");
           if (shards.size() > 1)
             std::printf("[loading %zu shards]\n", shards.size());
           w.load_safetensors(shards);
@@ -1105,7 +1094,7 @@ int main(int argc, char** argv) {
                   cfg.hidden_size, cfg.depth, H, W);
     } else {
       throw std::runtime_error(
-          "weights file '" + weights +
+          "checkpoint '" + ckpt_sub(ckpt, "transformer") +
           "' needs the true Qwen-Image-2.1 DiT "
           "(KokkosDNN_QwenImage21Dit.hpp is not in this build); pass --tiny "
           "for the random-weights smoke run. See README for the expected "
@@ -1117,24 +1106,29 @@ int main(int argc, char** argv) {
                 "GB + activations vs 24GB (see README fit table)\n",
                 QW::kDitBudgetBytes / 1e9, QW::kVaeBudgetBytes / 1e9);
 
-    if (!vae_weights.empty()) {
+    if (!tiny) {
+      const std::string vae_dir = ckpt_sub(ckpt, "vae");
       std::error_code ec0;
-      const bool vae_is_dir = std::filesystem::is_directory(vae_weights, ec0);
-      if (!vae_is_dir && !file_exists(vae_weights))
-        throw std::runtime_error("vae weights file '" + vae_weights +
-                                 "' not found");
+      if (!std::filesystem::is_directory(vae_dir, ec0))
+        throw std::runtime_error("--ckpt '" + ckpt +
+                                 "' has no vae/ subdir (need the canonical "
+                                 "Qwen-Image-2.1 checkpoint dir)");
 #ifdef QWEN21_DRIVER_HAVE_VAE
-      std::printf("[vae %s] validated%s\n", vae_weights.c_str(),
+      std::printf("[vae %s] validated%s\n", vae_dir.c_str(),
                   vae_decode ? "; decode enabled (default)"
                              : "; preview (pass --vae-decode to decode)");
 #else
       std::printf("[vae %s] validated, but KokkosDNN_QwenImage21Vae.hpp is "
                   "not in this build; writing a grayscale preview instead\n",
-                  vae_weights.c_str());
+                  vae_dir.c_str());
 #endif
     } else if (vae_decode) {
-      std::printf("[vae] VAE decode needs --vae-weights (else grayscale "
-                  "preview); disabling decode for this run\n");
+      if (!ckpt.empty())
+        std::printf("[vae] --tiny skips the VAE decode (random-weights smoke "
+                    "model); writing a grayscale preview instead\n");
+      else
+        std::printf("[vae] VAE decode needs --ckpt (else grayscale "
+                    "preview); disabling decode for this run\n");
       vae_decode = false;
     }
 
@@ -1308,8 +1302,8 @@ int main(int argc, char** argv) {
     if (vae_decode) {
 #ifdef QWEN21_DRIVER_HAVE_VAE
       try {
-        decoded = try_vae_decode_rgba(lat, C, (size_t)H, (size_t)W,
-                                      vae_weights, pix, oH, oW, oCh);
+        decoded = try_vae_decode_rgba(lat, C, (size_t)H, (size_t)W, ckpt, pix,
+                                      oH, oW, oCh);
         std::printf("[decode] VAE RGBA %zux%zux%d ready for output\n", oH, oW,
                     oCh);
       } catch (const std::exception& e) {
@@ -1322,7 +1316,7 @@ int main(int argc, char** argv) {
       std::printf("[vae] VAE decode requested (default) but "
                   "KokkosDNN_QwenImage21Vae.hpp is not in this build; writing "
                   "a grayscale preview instead (need the VAE worktree "
-                  "header + --vae-weights)\n");
+                  "header + --ckpt)\n");
 #endif
     }
     if (!decoded) {
