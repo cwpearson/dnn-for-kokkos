@@ -1510,6 +1510,209 @@ struct EncoderStage {
                 "vision slot, drop_idx=%zu)\n",
                 st.L, st.Cc, drop);
   }
+
+  // Multi-image joint encode: one vision-tower forward per condition image
+  // (the reference packs one image per call), concatenating the LLM vision
+  // tokens and DeepStack taps in --image order, then a single text-tower
+  // forward_joint over the multi-slot edit sequence. Hps/Wps/pixels_list
+  // are parallel vectors (pixels_list[i] holds Np_i*patch_dim floats for
+  // the Hps[i] x Wps[i] patch grid). Drops the first `drop` rows.
+  template <class CfgT>
+  static void run_qwen_joint_multi(
+      EncoderStage& st, const CfgT& cfg, const std::vector<int>& ids,
+      const std::vector<int>& vis_rows, const std::vector<int>& pos3,
+      const std::vector<std::vector<float>>& pixels_list,
+      const std::vector<int>& Hps, const std::vector<int>& Wps, size_t drop,
+      const std::string& ckpt_dir) {
+    namespace QE = KokkosDNN::QwenImage21Encoder;
+    namespace QV = KokkosDNN::QwenImage21Vision;
+    require_ckpt_dir(ckpt_dir);
+    const std::string encoder_path = ckpt_sub(ckpt_dir, "text_encoder");
+    const size_t S = ids.size(), Nv = vis_rows.size();
+    const size_t n_imgs = pixels_list.size();
+    if (S == 0 || Nv == 0 || n_imgs == 0)
+      throw std::runtime_error(
+          "in-process joint encode: empty token/pixel sequence");
+    if (Hps.size() != n_imgs || Wps.size() != n_imgs)
+      throw std::runtime_error(
+          "in-process joint encode: grid count != image count");
+    if (pos3.size() != 3 * S)
+      throw std::runtime_error(
+          "in-process joint encode: pos3 must hold 3*S ints");
+    if (drop > S)
+      throw std::runtime_error("in-process joint encode: drop out of range");
+    const size_t Cc = be_caption_dim(cfg);
+    QV::Config vcfg;
+    vcfg.validate();
+    if ((size_t)vcfg.out_hidden_size != Cc)
+      throw std::runtime_error(
+          "in-process joint encode: vision out dim != caption dim");
+    size_t Nv_expect = 0;
+    for (size_t i = 0; i < n_imgs; ++i) {
+      const int Hp = Hps[i], Wp = Wps[i];
+      if (Hp <= 0 || Wp <= 0 || Hp % 2 != 0 || Wp % 2 != 0)
+        throw std::runtime_error(
+            "in-process joint encode: patch grid must tile the 2x2 merge");
+      const size_t Np = (size_t)Hp * (size_t)Wp;
+      Nv_expect += Np / 4;
+      if (pixels_list[i].size() != Np * (size_t)vcfg.patch_dim())
+        throw std::runtime_error(
+            "in-process joint encode: pixel rows != Np*patch_dim");
+    }
+    if (Nv != Nv_expect)
+      throw std::runtime_error(
+          "in-process joint encode: vision slots != sum(patches/4)");
+    QV::QwenImage21VisionModel<Exec, Kokkos::Experimental::bhalf_t> vis(vcfg);
+    {
+      const std::vector<std::string> shards =
+          resolve_shard_list(encoder_path, "--ckpt");
+      if (shards.size() != 1)
+        throw std::runtime_error(
+            "--ckpt text_encoder must be the single-shard text_encoder/ "
+            "model.safetensors (got " +
+            std::to_string(shards.size()) + " shards)");
+      std::printf("[loading %s]\n", encoder_path.c_str());
+      vis.weights().load_safetensors(shards[0]);
+      std::printf("[encode] vision weights resident: %.3f GB\n",
+                  (double)vis.weights().resident_bytes() / 1e9);
+    }
+    using DScalar2 = Kokkos::Experimental::bhalf_t;
+    std::vector<float> host_vis;
+    std::vector<float> host_deep[3];
+    host_vis.reserve(Nv * Cc);
+    for (int k = 0; k < 3; ++k) host_deep[k].reserve(Nv * Cc);
+    KokkosDNN::DNNHandle<Exec> vhandle;
+    for (size_t i = 0; i < n_imgs; ++i) {
+      const int Hp = Hps[i], Wp = Wps[i];
+      const size_t Np = (size_t)Hp * (size_t)Wp;
+      const size_t Nv_i = Np / 4;
+      Kokkos::View<DScalar2**, Kokkos::LayoutRight, Exec> d_pix(
+          "qwen21edit_pix", Np, (size_t)vcfg.patch_dim());
+      {
+        auto h = Kokkos::create_mirror_view(d_pix);
+        size_t kk = 0;
+        const std::vector<float>& px = pixels_list[i];
+        for (size_t p = 0; p < Np; ++p)
+          for (int d = 0; d < vcfg.patch_dim(); ++d)
+            h(p, (size_t)d) = (DScalar2)px[kk++];
+        Kokkos::deep_copy(d_pix, h);
+      }
+      Kokkos::View<DScalar2**, Kokkos::LayoutRight, Exec> d_vis(
+          "qwen21edit_vis", Nv_i, Cc);
+      std::vector<Kokkos::View<DScalar2**, Kokkos::LayoutRight, Exec>> d_deep;
+      for (int k = 0; k < 3; ++k)
+        d_deep.emplace_back("qwen21edit_deep", Nv_i, Cc);
+      vis.forward(vhandle, d_pix, Hp, Wp, d_vis, d_deep);
+      Kokkos::fence();
+      auto h_vis =
+          Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), d_vis);
+      for (size_t r = 0; r < Nv_i; ++r)
+        for (size_t c = 0; c < Cc; ++c)
+          host_vis.push_back((float)h_vis(r, c));
+      for (int k = 0; k < 3; ++k) {
+        auto h_deep = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(),
+                                                           d_deep[(size_t)k]);
+        for (size_t r = 0; r < Nv_i; ++r)
+          for (size_t c = 0; c < Cc; ++c)
+            host_deep[k].push_back((float)h_deep(r, c));
+      }
+      std::printf("[encode] vision image %zu/%zu tokens %zu (grid %dx%d -> "
+                  "%zu patches)\n",
+                  i + 1, n_imgs, Nv_i, Hp, Wp, Np);
+    }
+    Kokkos::View<DScalar2**, Kokkos::LayoutRight, Exec> d_vis_all(
+        "qwen21edit_vis_all", Nv, Cc);
+    std::vector<Kokkos::View<DScalar2**, Kokkos::LayoutRight, Exec>> d_deep_all;
+    for (int k = 0; k < 3; ++k)
+      d_deep_all.emplace_back("qwen21edit_deep_all", Nv, Cc);
+    {
+      auto h = Kokkos::create_mirror_view(d_vis_all);
+      size_t kk = 0;
+      for (size_t r = 0; r < Nv; ++r)
+        for (size_t c = 0; c < Cc; ++c) h(r, c) = (DScalar2)host_vis[kk++];
+      Kokkos::deep_copy(d_vis_all, h);
+      for (int k = 0; k < 3; ++k) {
+        auto hd = Kokkos::create_mirror_view(d_deep_all[(size_t)k]);
+        size_t kk2 = 0;
+        for (size_t r = 0; r < Nv; ++r)
+          for (size_t c = 0; c < Cc; ++c)
+            hd(r, c) = (DScalar2)host_deep[k][kk2++];
+        Kokkos::deep_copy(d_deep_all[(size_t)k], hd);
+      }
+    }
+    QE::Config ecfg;
+    ecfg.validate();
+    if ((size_t)ecfg.hidden_dim != Cc)
+      throw std::runtime_error(
+          "Qwen encoder hidden (" + std::to_string(ecfg.hidden_dim) +
+          ") != caption dim (" + std::to_string(Cc) + ")");
+    QE::QwenImage21EncoderModel<Exec, Kokkos::Experimental::bhalf_t> enc(ecfg);
+    {
+      const std::vector<std::string> shards =
+          resolve_shard_list(encoder_path, "--ckpt");
+      enc.weights().load_safetensors(shards[0]);
+      std::printf("[encode] Qwen weights resident: %.1f GB\n",
+                  (double)enc.weights().resident_bytes() / 1e9);
+    }
+    Kokkos::View<int**, Kokkos::LayoutRight, Exec> toks("qwen21encj_toks", 1,
+                                                         S);
+    Kokkos::View<int*, Exec> d_rows("qwen21encj_visrows", Nv);
+    Kokkos::View<int*, Exec> d_pos3("qwen21encj_pos3", 3 * S);
+    {
+      auto ht = Kokkos::create_mirror_view(toks);
+      for (size_t s = 0; s < S; ++s) ht(0, s) = ids[s];
+      Kokkos::deep_copy(toks, ht);
+      auto hr = Kokkos::create_mirror_view(d_rows);
+      for (size_t k = 0; k < Nv; ++k) hr(k) = vis_rows[k];
+      Kokkos::deep_copy(d_rows, hr);
+      auto hp = Kokkos::create_mirror_view(d_pos3);
+      for (size_t i = 0; i < 3 * S; ++i) hp(i) = pos3[i];
+      Kokkos::deep_copy(d_pos3, hp);
+    }
+    Kokkos::View<Kokkos::Experimental::bhalf_t***, Kokkos::LayoutRight, Exec>
+        hid("qwen21encj_hid", 1, S, (size_t)ecfg.hidden_dim);
+    KokkosDNN::DNNHandle<Exec> handle;
+    using JV3 = typename QE::QwenImage21EncoderModel<
+        Exec, Kokkos::Experimental::bhalf_t>::V3;
+    JV3 vis3("qwen21encj_vis3", 1, Nv, Cc);
+    Kokkos::deep_copy(
+        Kokkos::subview(vis3, 0, Kokkos::ALL, Kokkos::ALL), d_vis_all);
+    JV3 deep3[3] = {JV3("qwen21encj_deep0", 1, Nv, Cc),
+                    JV3("qwen21encj_deep1", 1, Nv, Cc),
+                    JV3("qwen21encj_deep2", 1, Nv, Cc)};
+    for (int k = 0; k < 3; ++k)
+      Kokkos::deep_copy(
+          Kokkos::subview(deep3[k], 0, Kokkos::ALL, Kokkos::ALL),
+          d_deep_all[(size_t)k]);
+    enc.forward_joint(handle, toks, d_rows, vis3, deep3, d_pos3, hid,
+                      (int)drop);
+    Kokkos::fence();
+    {
+      auto hhid = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), hid);
+      const size_t L = S - drop;
+      st.L = L;
+      st.Cc = Cc;
+      st.embeds.assign(L * Cc, 0.0f);
+      st.neg_embeds.assign(L * Cc, 0.0f);
+      st.source = "qwen-joint";
+      for (size_t t = 0; t < L; ++t)
+        for (size_t h = 0; h < Cc; ++h)
+          st.embeds[t * Cc + h] = (float)hhid(0, drop + t, h);
+    }
+    const size_t wbytes =
+        enc.weights().resident_bytes() + vis.weights().resident_bytes();
+    enc.weights().release();
+    vis.weights().release();
+    Kokkos::fence();
+    std::printf("[encode] released %.1f GB joint Qwen+vision weights; %.1f "
+                "MiB embeds survive for the sample phase\n",
+                (double)wbytes / 1e9,
+                (double)(2 * st.L * st.Cc * sizeof(float)) / (1024.0 * 1024.0));
+    st.stage_device();
+    std::printf("[caption qwen-joint] %zux%zu features (edit template + %zu "
+                "vision slots across %zu images, drop_idx=%zu)\n",
+                st.L, st.Cc, Nv, n_imgs, drop);
+  }
 #else
   // Joint encode needs the encoder + tokenizer + vision headers; the edit
   // driver falls back to file/null with a logged reason when absent.
@@ -1518,6 +1721,16 @@ struct EncoderStage {
                              const std::vector<int>&, const std::vector<int>&,
                              const std::vector<int>&, const std::vector<float>&,
                              int, int, size_t, const std::string&) {
+    throw std::runtime_error(
+        "in-process joint encode needs KokkosDNN_QwenImage21Encoder.hpp + "
+        "KokkosDNN_QwenImage21Vision.hpp in this build");
+  }
+  template <class CfgT>
+  static void run_qwen_joint_multi(
+      EncoderStage&, const CfgT&, const std::vector<int>&,
+      const std::vector<int>&, const std::vector<int>&,
+      const std::vector<std::vector<float>>&, const std::vector<int>&,
+      const std::vector<int>&, size_t, const std::string&) {
     throw std::runtime_error(
         "in-process joint encode needs KokkosDNN_QwenImage21Encoder.hpp + "
         "KokkosDNN_QwenImage21Vision.hpp in this build");
