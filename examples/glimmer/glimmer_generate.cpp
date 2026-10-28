@@ -46,11 +46,22 @@ std::vector<std::string> expand_weight_patterns(
   out.erase(std::unique(out.begin(), out.end()), out.end());
   return out;
 }
+
+// A single .gguf file (case-insensitive suffix) selects the GGUF loading
+// path (llama.cpp tensor naming + dequantization); anything else is a
+// safetensors shard (possibly a glob pattern, expanded above).
+bool is_gguf_path(const std::string& p) {
+  if (p.size() < 5) return false;
+  std::string ext = p.substr(p.size() - 5);
+  for (auto& ch : ext) ch = (char)std::tolower((unsigned char)ch);
+  return ext == ".gguf";
+}
 }  // namespace
 
 // PoC driver: tiny random model by default; real weights via flags.
 //   glimmer_generate [--tiny] [--model glimmer-30b]
-//                    [--weights model.safetensors (globs accepted)]
+//                    [--weights model.safetensors (globs accepted) |
+//                               model.gguf (single file, llama.cpp naming)]
 //                    [--tokenizer tokenizer.json] [--prompt "text"]
 //                    [--max-new N] [--stop <id> ...] [--fp32]
 //                    [--prefill-chunk N] [--config config.json]
@@ -82,7 +93,13 @@ std::vector<std::string> expand_weight_patterns(
 // (present keys win, missing keys keep hardcoded defaults); --max-seq-len
 // caps the KV-cache context (validated against [1, 131072], the arch max).
 // --list-tensors prints the tensor names stored in --weights files
-// (useful to inspect partial/sharded downloads) and exits.
+// (useful to inspect partial/sharded downloads) and exits. A single
+// --weights entry ending in .gguf (case-insensitive) instead loads a
+// llama.cpp GGUF checkpoint (dequantized on the host; F32/F16/BF16 exact,
+// Q8_0/Q4_K/Q6_K supported, anything else throws); mixing .gguf with
+// safetensors shards is an error. See README.md for the GGUF
+// conversion-trap handling (norm shift, Q/K re-permute, synthesized QK
+// norms, metadata validation).
 //
 // BOS: --add-bos (default) ensures exactly one leading BOS id
 // (<|begin_of_text|>/200000); --no-add-bos strips it.
@@ -116,7 +133,17 @@ int run_model(KokkosDNN::Glimmer::Config cfg,
     KokkosDNN::Glimmer::random_init(cfg, w);
     std::printf("[%srandom weights] dim=%d layers=%d\n", tiny ? "tiny " : "",
                 cfg.dim, cfg.n_layers);
+  } else if (wfiles.size() == 1 && is_gguf_path(wfiles[0])) {
+    KokkosDNN::Glimmer::load_gguf(cfg, wfiles[0], w);
+    std::printf("[loaded %s]\n", wfiles[0].c_str());
   } else {
+    for (auto& fp : wfiles)
+      if (is_gguf_path(fp))
+        throw std::runtime_error(
+            "GGUF loading takes a single .gguf file: got '" + fp +
+            "' among " + std::to_string(wfiles.size()) +
+            " --weights entries (mixing .gguf with safetensors shards is "
+            "unsupported)");
     KokkosDNN::Glimmer::load_safetensors(cfg, wfiles, w);
     std::printf("[loaded %zu shard(s)]\n", wfiles.size());
   }
@@ -373,7 +400,11 @@ int main(int argc, char** argv) {
         return 1;
       }
       try {
-        auto names = KokkosDNN::Glimmer::list_checkpoint_tensors(wfiles);
+        std::vector<std::string> names;
+        if (wfiles.size() == 1 && is_gguf_path(wfiles[0]))
+          names = KokkosDNN::Glimmer::list_gguf_tensors(wfiles[0]);
+        else
+          names = KokkosDNN::Glimmer::list_checkpoint_tensors(wfiles);
         std::printf("%zu tensor(s):\n", names.size());
         for (auto& n : names) std::printf("  %s\n", n.c_str());
       } catch (const std::exception& e) {

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -646,6 +647,286 @@ void load_safetensors(const Config& cfg,
   }
 }
 
+// ---- GGUF loading (llama.cpp `tn()` tensor naming) ----
+
+namespace {
+
+// GGUF leaf names follow llama.cpp's `tn()` convention: per-layer tensors
+// live under "blk.{l}." with a ".weight" suffix.
+std::string gguf_blk(int l, const std::string& leaf) {
+  return "blk." + std::to_string(l) + "." + leaf;
+}
+
+std::string gguf_shape_str(const Gguf::GgufTensorInfo& info) {
+  std::string o = "[";
+  if (info.n_dims == 1) {
+    o += std::to_string((size_t)info.numel);
+  } else if (info.n_dims == 2) {
+    o += std::to_string(info.rows()) + "," + std::to_string(info.cols());
+  } else {
+    for (uint32_t d = 0; d < info.n_dims; ++d) {
+      if (d != 0) o += ",";
+      o += std::to_string(info.dims[d]);
+    }
+  }
+  return o + "]:" + Gguf::ggml_type_name(info.dtype);
+}
+
+// Resolve stem+".weight", falling back to the bare stem. Returns nullptr
+// when neither is present (caller reports the missing tensor).
+const Gguf::GgufTensorInfo* gguf_resolve(const Gguf::GgufFile& file,
+                                         const std::string& stem) {
+  if (file.contains(stem + ".weight")) return &file.find(stem + ".weight");
+  if (file.contains(stem)) return &file.find(stem);
+  return nullptr;
+}
+
+const Gguf::GgufTensorInfo& gguf_require(const Gguf::GgufFile& file,
+                                         const std::string& stem) {
+  if (const auto* info = gguf_resolve(file, stem)) return *info;
+  throw std::runtime_error("tensor not found in checkpoint: '" + stem +
+                           ".weight' (also tried '" + stem + "')");
+}
+
+// Invert the llama.cpp conversion _unpermute_for_rope
+// (conversion/muse_glimmer.py): GGUF q/k rows are stored in ggml
+// interleaved (NORM) layout while the model consumes the HF permuted
+// (rotate_half) layout matched by rope_neoX_inplace. This is transformers'
+// _permute_for_rope:
+//   out[h*hd + i*(hd/2)+j, :] = in[h*hd + j*2+i, :], i in {0,1}.
+// m is row-major [n_heads*head_dim, cols]; rewritten via a scratch buffer
+// (no in-place cycle chasing). head_dim must be even (Config enforces it).
+void gguf_permute_qk_for_rope(std::vector<float>& m, size_t n_heads,
+                              size_t head_dim, size_t cols) {
+  const size_t rows = n_heads * head_dim;
+  if (rows == 0 || cols == 0 || head_dim % 2 != 0 ||
+      m.size() != rows * cols)
+    throw std::runtime_error("permute_qk_for_rope: bad dims");
+  const size_t half = head_dim / 2;
+  std::vector<float> out(m.size());
+  for (size_t h = 0; h < n_heads; ++h) {
+    for (size_t i = 0; i < 2; ++i) {
+      for (size_t j = 0; j < half; ++j) {
+        const size_t dst = (h * head_dim + i * half + j) * cols;
+        const size_t src = (h * head_dim + j * 2 + i) * cols;
+        for (size_t k = 0; k < cols; ++k) out[dst + k] = m[src + k];
+      }
+    }
+  }
+  m.swap(out);
+}
+
+// Dequantize one GGUF tensor to host FP32 with an informative error when
+// the dtype is outside the compute set (F32/F16/BF16/Q8_0/Q4_K/Q6_K).
+std::vector<float> gguf_dequant_rows(const Gguf::GgufFile& file,
+                                     const Gguf::GgufTensorInfo& info) {
+  std::vector<float> tmp;
+  try {
+    Gguf::dequant_tensor_to_float(file, info, tmp);
+  } catch (const std::exception& e) {
+    throw std::runtime_error("cannot decode '" + info.name + "': " + e.what());
+  }
+  return tmp;
+}
+
+template <class ExecSpace, class Scalar>
+void gguf_load_mat(const Gguf::GgufFile& file, const std::string& stem,
+                   size_t rows, size_t cols,
+                   const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>&
+                       dst,
+                   bool permute_rope = false, size_t rope_heads = 0,
+                   size_t rope_head_dim = 0) {
+  const auto& info = gguf_require(file, stem);
+  if (info.n_dims != 2 || info.rows() != rows || info.cols() != cols)
+    throw std::runtime_error("shape mismatch for '" + info.name +
+                             "': checkpoint has " + gguf_shape_str(info) +
+                             ", expected [" + std::to_string(rows) + "," +
+                             std::to_string(cols) + "]");
+  std::vector<float> tmp = gguf_dequant_rows(file, info);
+  if (permute_rope)
+    gguf_permute_qk_for_rope(tmp, rope_heads, rope_head_dim, cols);
+  copy_host_to_device<ExecSpace, Scalar>(tmp, rows, cols, dst);
+}
+
+// Load one 1-D norm tensor, subtracting the conversion-time norm shift.
+// Conversion adds +shift to HF-centered weights (GGUF rms_norm is x/rms*w
+// while HF CenteredRMSNorm is x/rms*(1+w)); shift is 1 for the four layer
+// norms and 0 for the final norm (norm_shift in conversion/muse_glimmer.py).
+template <class ExecSpace, class Scalar>
+void gguf_load_norm(const Gguf::GgufFile& file, const std::string& stem,
+                    const Kokkos::View<Scalar*, ExecSpace>& dst, float shift) {
+  const auto& info = gguf_require(file, stem);
+  if (info.numel != dst.extent(0))
+    throw std::runtime_error("shape mismatch for '" + info.name +
+                             "': checkpoint has " + gguf_shape_str(info) +
+                             ", expected [" + std::to_string(dst.extent(0)) +
+                             "]");
+  std::vector<float> tmp = gguf_dequant_rows(file, info);
+  if (shift != 0.0f)
+    for (auto& v : tmp) v -= shift;
+  auto h = Kokkos::create_mirror_view(dst);
+  for (size_t i = 0; i < tmp.size(); ++i)
+    h(i) = static_cast<Scalar>(tmp[i]);
+  Kokkos::deep_copy(dst, h);
+}
+
+// Find a typed KV by exact key, else by unique suffix match (tolerates a
+// renamed arch prefix). Throws when missing or ambiguous.
+template <class Map>
+typename Map::mapped_type gguf_find_kv(const Map& all,
+                                       const std::string& exact,
+                                       const std::string& suffix,
+                                       const std::string& what) {
+  auto it = all.find(exact);
+  if (it != all.end()) return it->second;
+  const typename Map::mapped_type* hit = nullptr;
+  std::string hit_key;
+  for (const auto& [k, v] : all) {
+    if (k.size() >= suffix.size() &&
+        k.compare(k.size() - suffix.size(), suffix.size(), suffix) == 0) {
+      if (hit != nullptr)
+        throw std::runtime_error("GGUF metadata: ambiguous " + what +
+                                 " keys '" + hit_key + "' and '" + k + "'");
+      hit     = &v;
+      hit_key = k;
+    }
+  }
+  if (hit == nullptr)
+    throw std::runtime_error("GGUF metadata missing: '" + exact +
+                             "' (no key ending in '" + suffix + "')");
+  return *hit;
+}
+
+// Validate conversion-written hyperparameters against cfg. The GGUF file is
+// authoritative about its own bytes, but the Model runs off cfg: any
+// disagreement is a hard error, never a silent override.
+void gguf_validate_metadata(const Gguf::GgufFile& file, const Config& cfg) {
+  constexpr const char* arch = "muse-glimmer";
+  constexpr double rel_tol   = 1e-6;
+  auto close = [&](const std::string& what, double have, double want) {
+    const double tol = rel_tol * std::max(1.0, std::fabs(want));
+    if (std::fabs(have - want) > tol)
+      throw std::runtime_error("GGUF metadata mismatch: '" + what + "' is " +
+                               std::to_string(have) + " but Config expects " +
+                               std::to_string(want));
+  };
+  const std::string prefix(arch);
+  const float logit_scale =
+      gguf_find_kv(file.kv_f32_all(), prefix + ".logit_scale", ".logit_scale",
+                   "logit scale");
+  close("logit_scale", (double)logit_scale, cfg.output_multiplier);
+  const float softcap = gguf_find_kv(file.kv_f32_all(),
+                                     prefix + ".final_logit_softcapping",
+                                     ".final_logit_softcapping", "softcap");
+  close("final_logit_softcapping", (double)softcap,
+        (double)cfg.final_logit_softcap);
+  const uint32_t swin = gguf_find_kv(file.kv_u32_all(),
+                                     prefix + ".attention.sliding_window",
+                                     ".attention.sliding_window",
+                                     "sliding window");
+  if (swin != (uint32_t)cfg.sliding_window)
+    throw std::runtime_error(
+        "GGUF metadata mismatch: 'attention.sliding_window' is " +
+        std::to_string(swin) + " but Config expects " +
+        std::to_string(cfg.sliding_window));
+  const std::vector<char> pat =
+      gguf_find_kv(file.kv_bool_arrays_all(),
+                   prefix + ".attention.sliding_window_pattern",
+                   ".attention.sliding_window_pattern", "s_w pattern");
+  if (pat.size() != (size_t)cfg.n_layers)
+    throw std::runtime_error(
+        "GGUF metadata mismatch: 'attention.sliding_window_pattern' has " +
+        std::to_string(pat.size()) + " entries but Config has " +
+        std::to_string(cfg.n_layers) + " layers");
+  for (int l = 0; l < cfg.n_layers; ++l) {
+    const char b = pat[(size_t)l];
+    if (b != 0 && b != 1)
+      throw std::runtime_error(
+          "GGUF metadata mismatch: 'attention.sliding_window_pattern'[" +
+          std::to_string(l) + "] is " + std::to_string((int)b) +
+          " (expected 0/1)");
+    const bool expect_sliding = !cfg.is_full(l);
+    if ((b != 0) != expect_sliding)
+      throw std::runtime_error(
+          "GGUF metadata mismatch: 'attention.sliding_window_pattern'[" +
+          std::to_string(l) + "] marks a " +
+          std::string(b != 0 ? "sliding" : "full") +
+          " layer but Config marks it " +
+          std::string(expect_sliding ? "sliding" : "full"));
+  }
+}
+
+}  // namespace
+
+template <class ExecSpace, class Scalar>
+void load_gguf(const Config& cfg, const std::string& path,
+               Weights<ExecSpace, Scalar>& w) {
+  w.allocate(cfg);
+  Gguf::GgufFile file(path);  // throws on missing/corrupt file
+  gguf_validate_metadata(file, cfg);
+  const size_t D = (size_t)cfg.dim, V = (size_t)cfg.vocab_size;
+  gguf_load_mat<ExecSpace, Scalar>(file, "token_embd", V, D, w.embed);
+  // Final norm: the conversion shift is 0 (only *layernorm names shift).
+  gguf_load_norm<ExecSpace, Scalar>(file, "output_norm", w.final_norm, 0.0f);
+  // Untied head (tie_word_embeddings=false): the checkpoint carries a
+  // separate output tensor; a missing tensor is an error (never aliased).
+  // A tied config still falls back to aliasing the embedding table.
+  if (gguf_resolve(file, "output") != nullptr) {
+    gguf_load_mat<ExecSpace, Scalar>(file, "output", V, D, w.lm_head);
+  } else if (cfg.tie_word_embeddings) {
+    w.lm_head = w.embed;  // tied: alias the embedding table
+  } else {
+    gguf_require(file, "output");  // rethrow the missing-tensor error
+  }
+  const size_t hq  = (size_t)cfg.n_heads * (size_t)cfg.head_dim;
+  const size_t hkv = (size_t)cfg.n_kv_heads * (size_t)cfg.head_dim;
+  const size_t HD  = (size_t)cfg.head_dim;
+  for (int l = 0; l < cfg.n_layers; ++l) {
+    auto& b = w.blocks[(size_t)l];
+    gguf_load_norm<ExecSpace, Scalar>(file, gguf_blk(l, "attn_norm"),
+                                      b.input_norm, 1.0f);
+    gguf_load_mat<ExecSpace, Scalar>(file, gguf_blk(l, "attn_q"), hq, D, b.wq,
+                                     true, (size_t)cfg.n_heads, HD);
+    gguf_load_mat<ExecSpace, Scalar>(file, gguf_blk(l, "attn_k"), hkv, D,
+                                     b.wk, true, (size_t)cfg.n_kv_heads, HD);
+    gguf_load_mat<ExecSpace, Scalar>(file, gguf_blk(l, "attn_v"), hkv, D,
+                                     b.wv);
+    gguf_load_mat<ExecSpace, Scalar>(file, gguf_blk(l, "attn_output"), D, hq,
+                                     b.wo);
+    // Attention output gate: sigmoid(gate) * attn_out before o_proj.
+    gguf_load_mat<ExecSpace, Scalar>(file, gguf_blk(l, "attn_gate"), hq, D,
+                                     b.wgate_attn);
+    gguf_load_norm<ExecSpace, Scalar>(file, gguf_blk(l, "post_attention_norm"),
+                                      b.post_attn_norm, 1.0f);
+    gguf_load_norm<ExecSpace, Scalar>(file, gguf_blk(l, "ffn_norm"),
+                                      b.pre_ffn_norm, 1.0f);
+    gguf_load_mat<ExecSpace, Scalar>(file, gguf_blk(l, "ffn_gate"),
+                                     (size_t)cfg.ffn_dim, D, b.wgate);
+    gguf_load_mat<ExecSpace, Scalar>(file, gguf_blk(l, "ffn_down"), D,
+                                     (size_t)cfg.ffn_dim, b.wdown);
+    gguf_load_mat<ExecSpace, Scalar>(file, gguf_blk(l, "ffn_up"),
+                                     (size_t)cfg.ffn_dim, D, b.wup);
+    gguf_load_norm<ExecSpace, Scalar>(file, gguf_blk(l, "post_ffw_norm"),
+                                      b.post_ffn_norm, 1.0f);
+    // NOTE: blk.{l}.attn_q_norm / attn_k_norm are intentionally never
+    // looked up. Conversion synthesizes them (full qk_scale_factor / ones)
+    // to absorb the q pre-scale into a *scaled* RMSNorm, while the Model
+    // runs a *scaleless* QK norm (ones stand-in) plus the separate 3.87
+    // multiply: qk_rmsnorm(q2, ones, eps)*3.87 == rms(q2, eps)*3.87 and
+    // qk_rmsnorm(k2, ones, eps) == rms(k2, eps) with the same eps, so
+    // loading the synthesized tensors would be exactly equivalent. Files
+    // with or without them load identically.
+  }
+}
+
+std::vector<std::string> list_gguf_tensors(const std::string& path) {
+  Gguf::GgufFile file(path);
+  std::vector<std::string> out;
+  for (const auto& t : file.tensors()) out.push_back(t.name);
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
 // Explicit instantiations for the default execution space (defined here so
 // the .cpp compiles them). All callers use DefaultExecutionSpace, so no
 // backend needs enumerating here: whichever space Kokkos was configured with
@@ -658,11 +939,13 @@ void load_safetensors(const Config& cfg,
 // avoid duplicate explicit instantiations.
 template void random_init<Kokkos::DefaultExecutionSpace, float>(const Config&, Weights<Kokkos::DefaultExecutionSpace, float>&, uint64_t);
 template void load_safetensors<Kokkos::DefaultExecutionSpace, float>(const Config&, const std::vector<std::string>&, Weights<Kokkos::DefaultExecutionSpace, float>&);
+template void load_gguf<Kokkos::DefaultExecutionSpace, float>(const Config&, const std::string&, Weights<Kokkos::DefaultExecutionSpace, float>&);
 template void copy_host_to_device<Kokkos::DefaultExecutionSpace, float>(const std::vector<float>&, size_t, size_t,
     const Kokkos::View<float**, Kokkos::LayoutRight, Kokkos::DefaultExecutionSpace>&);
 #if !KOKKOS_BHALF_T_IS_FLOAT
 template void random_init<Kokkos::DefaultExecutionSpace, Kokkos::Experimental::bhalf_t>(const Config&, Weights<Kokkos::DefaultExecutionSpace, Kokkos::Experimental::bhalf_t>&, uint64_t);
 template void load_safetensors<Kokkos::DefaultExecutionSpace, Kokkos::Experimental::bhalf_t>(const Config&, const std::vector<std::string>&, Weights<Kokkos::DefaultExecutionSpace, Kokkos::Experimental::bhalf_t>&);
+template void load_gguf<Kokkos::DefaultExecutionSpace, Kokkos::Experimental::bhalf_t>(const Config&, const std::string&, Weights<Kokkos::DefaultExecutionSpace, Kokkos::Experimental::bhalf_t>&);
 template void copy_host_to_device<Kokkos::DefaultExecutionSpace, Kokkos::Experimental::bhalf_t>(const std::vector<float>&, size_t, size_t,
     const Kokkos::View<Kokkos::Experimental::bhalf_t**, Kokkos::LayoutRight, Kokkos::DefaultExecutionSpace>&);
 #endif

@@ -9,6 +9,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "KokkosDNN_GGUF.hpp"
 #include "KokkosDNN_GlimmerConfig.hpp"
 
 namespace KokkosDNN {
@@ -126,6 +127,46 @@ void load_safetensors(const Config& cfg, const std::vector<std::string>& files,
 // tensor data is read). Useful to inspect partial/sharded downloads.
 std::vector<std::string> list_checkpoint_tensors(
     const std::vector<std::string>& files);
+
+// Load a llama.cpp Muse-Glimmer GGUF checkpoint (single .gguf file) into
+// device views. Dense views hold dequantized values in Scalar (F32/F16/BF16
+// dequantize exactly; Q8_0/Q4_K/Q6_K dequantize on the host like
+// LFM25::load_gguf; anything else throws). Throws on missing tensors,
+// shape mismatch, or GGUF metadata (logit scale, softcap, sliding window
+// + pattern) that disagrees with cfg.
+//
+// Expected GGUF names (llama.cpp `tn()` convention with the ".weight"
+// suffix; bare stems are also accepted):
+//   token_embd.weight, output_norm.weight, output.weight,
+//   per layer blk.%d.{attn_norm, post_attention_norm, attn_q, attn_k,
+//   attn_v, attn_output, attn_q_norm, attn_k_norm, attn_gate, ffn_norm,
+//   post_ffw_norm, ffn_gate, ffn_down, ffn_up}.weight
+//
+// Conversion-trap handling (see conversion/muse_glimmer.py +
+// src/models/muse-glimmer.cpp in llama.cpp):
+//   * Norm shift: conversion adds +1 to the four layer norms (GGUF rms_norm
+//     is x/rms*w while HF CenteredRMSNorm is x/rms*(1+w)); the final norm
+//     is untouched (shift 0). The loader subtracts 1 back from the four
+//     layer norms so the Model's one_plus path sees HF-centered weights.
+//   * Q/K RoPE layout: conversion unpermutes q/k into ggml interleaved
+//     (NORM) layout; the loader re-permutes rows back into the HF
+//     rotate_half layout consumed by rope_neoX_inplace.
+//   * Synthesized QK norms: GGUF attn_q_norm (full qk_scale_factor) /
+//     attn_k_norm (ones) absorb the q pre-scale into a *scaled* RMSNorm,
+//     while the Model runs a *scaleless* QK norm plus the separate 3.87
+//     multiply -- mathematically identical (rms(x)*3.87, rms(x)*1), same
+//     eps), so the loader IGNORES both tensors (never looked up).
+//   * Metadata: muse-glimmer.{logit_scale, final_logit_softcapping,
+//     attention.sliding_window, attention.sliding_window_pattern} are read
+//     and VALIDATED against cfg (throw on missing/mismatch), never
+//     silently overriding it.
+template <class ExecSpace, class Scalar = DefaultScalar>
+void load_gguf(const Config& cfg, const std::string& path,
+               Weights<ExecSpace, Scalar>& w);
+
+// List all tensor names stored in a GGUF file (header only, no tensor data
+// is read). GGUF counterpart of list_checkpoint_tensors().
+std::vector<std::string> list_gguf_tensors(const std::string& path);
 
 // Raw FP32 host buffer (row-major) converted into a device matrix view.
 template <class ExecSpace, class Scalar>
