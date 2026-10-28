@@ -4,7 +4,7 @@ Muse Glimmer 30B text-path inference built on the core library: 30B text config 
 
 Scope: **text only** (`text_config`); vision tower and multimodal glue are out of scope. **Inference only** with **bfloat16 storage/compute by default** (`--fp32` opts in). Safetensors weights load at full precision; a `.gguf` checkpoint instead dequantizes on the host (F32/F16/BF16 exact, Q8_0/Q4_K/Q6_K supported). KV caches are dense FP. The driver encodes raw prompts directly.
 
-> Status: **driver implemented**. `glimmer_generate` runs tiny random models (`--tiny`), full-size shapes with random weights (`--model glimmer-30b`), and real checkpoints (`--weights`, `--tokenizer`); `KokkosDNN_Glimmer{Config,Weights,Model,Tokenizer}.hpp` are functional and covered by `test_glimmer_generate` + `test_glimmer_tokenizer`. Tensor names and the chat template carry ASSUMPTION markers (see `DESIGN.md` and the headers); confirm them against `modeling_muse_glimmer.py` and the upstream chat template when published.
+> Status: **driver implemented**. `glimmer_generate` runs tiny random models (`--tiny`), full-size shapes with random weights (`--model glimmer-30b`), and real checkpoints (`--weights`, `--tokenizer`); the model library (`KokkosDNN_Glimmer{Config,Weights,Model,Tokenizer,Session,PrefixCache}.hpp`, `KokkosDNN::glimmer` in `models/glimmer/`) is functional and covered by `test_glimmer_generate` + `test_glimmer_session` + `test_glimmer_tokenizer`. Tensor names and the chat template carry ASSUMPTION markers (see `DESIGN.md` and the headers); confirm them against `modeling_muse_glimmer.py` and the upstream chat template when published.
 
 ## Quickstart (0 to working)
 
@@ -37,7 +37,7 @@ hf download darkc0de/Muse-Glimmer-30B-heretic model.safetensors* tokenizer.json 
 
 # Real checkpoint run (~60 GiB weights).
 ./build/examples/glimmer/glimmer_generate \
-  --model glimmer-30b --config examples/glimmer/config-glimmer-30b-text.json \
+  --model glimmer-30b --config models/glimmer/config-glimmer-30b-text.json \
   --weights weights/muse-glimmer-30b-text/model.safetensors \
   --tokenizer weights/muse-glimmer-30b-text/tokenizer.json \
   --prompt "Hello" --max-new 64
@@ -70,7 +70,7 @@ FP32 comparison run:
 
 ```bash
 ./build/examples/glimmer/glimmer_generate \
-  --model glimmer-30b --config examples/glimmer/config-glimmer-30b-text.json \
+  --model glimmer-30b --config models/glimmer/config-glimmer-30b-text.json \
   --weights weights/muse-glimmer-30b-text/model.safetensors \
   --tokenizer weights/muse-glimmer-30b-text/tokenizer.json \
   --prompt "Hello" --max-new 64 --fp32
@@ -80,7 +80,7 @@ GGUF checkpoint run (llama.cpp naming, dequantized on the host):
 
 ```bash
 ./build/examples/glimmer/glimmer_generate \
-  --model glimmer-30b --config examples/glimmer/config-glimmer-30b-text.json \
+  --model glimmer-30b --config models/glimmer/config-glimmer-30b-text.json \
   --weights weights/muse-glimmer-30b-text/model.gguf \
   --tokenizer weights/muse-glimmer-30b-text/tokenizer.json \
   --prompt "Hello" --max-new 64
@@ -99,7 +99,7 @@ Useful flags: `--temperature 0` (greedy; the generation_config default is greedy
 
 ## Notes
 
-- Separate family from [llama](../llama/), [smollm2](../smollm2/), and [gemma4](../gemma4/): config, weights, model, and tokenizer will be split-form duplicates in namespace `KokkosDNN::Glimmer` (only the core `src/` ops are reused).
+- Separate family from [llama](../llama/), [smollm2](../smollm2/), and [gemma4](../gemma4/): the model library (config, weights, model, tokenizer, session) lives in `models/glimmer/` as `KokkosDNN::glimmer` in namespace `KokkosDNN::Glimmer` (only the core `src/` ops are shared).
 - Weights: single `model.safetensors`-style layout (sharded at 30B scale, ~60 GiB BF16); only the `model.language_model.*` tensors are loaded. With `tie_word_embeddings=false` the loader requires a separate `lm_head` tensor and must NOT alias the embedding table. See `DESIGN.md` for the authoritative math.
 - Dtype: native bfloat16 (`Kokkos::Experimental::bhalf_t`, the checkpoint dtype) for weights/activations/KV; reductions, scales, and `inv_freq` stay FP32 — same convention as the Llama/SmolLM2/Gemma4 examples.
 - Attention: QK RMSNorms plus the `qk_scale_factor` (3.87) score multiplier (NOT `1/sqrt(d)`); sliding layers use the sliding GQA kernel (window 2048, RoPE theta 500000); full layers use full GQA with NoPE (no rotary — `layer_rope_theta` 0).
@@ -115,7 +115,7 @@ ctest --test-dir build --output-on-failure -R 'Glimmer'
 ./build/examples/glimmer/glimmer_generate --tiny --prompt "Hello" --max-new 8
 ```
 
-Unit tests: `Test_GlimmerConfig.cpp` (presets, fixture, full-config wrapper, tiny preset), `Test_GlimmerGenerate.cpp` (tiny forward/generate smoke, determinism, chunked-prefill equivalence, NoPE/RoPE branches), `Test_GlimmerWeightsGGUF.cpp` (synthetic-GGUF loader roundtrip: norm shift, Q/K re-permute, synthesized-norm handling, mixed dtypes, metadata validation), and `Test_GlimmerTokenizer.cpp`.
+Unit tests: `Test_GlimmerConfig.cpp` (presets, fixture, full-config wrapper, tiny preset), `Test_GlimmerGenerate.cpp` (tiny forward/generate smoke, determinism, chunked-prefill equivalence, NoPE/RoPE branches), `Test_GlimmerSession.cpp` (prefill/step termination, stop-id policy, reseed determinism, prefix-cache equivalence, `ISession` front-end), `Test_GlimmerWeightsGGUF.cpp` (synthetic-GGUF loader roundtrip: norm shift, Q/K re-permute, synthesized-norm handling, mixed dtypes, metadata validation), and `Test_GlimmerTokenizer.cpp` (fixture BPE/pre-tokenizer, chat template + tool-aware render parity, plain-text tool shim).
 
 ## Performance
 
