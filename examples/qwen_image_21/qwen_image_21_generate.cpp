@@ -33,7 +33,7 @@
 // Interactive loop (default): without --prompt on a TTY (and without the
 // file/parity handoff flags) the driver asks for a prompt, asks for a
 // filename, generates, and repeats until EOF or quit/exit. Each iteration
-// prints the current pixel HxW (and latent HxW) on the line before the
+// prints the current pixel WxH (and latent WxH) on the line before the
 // prompt, offers the previous prompt for editing (UP/DN move through the
 // in-memory prompt history), accepts /w N and /h N to set the pixel
 // width/height going forward (rounded to the nearest patch-stride multiple,
@@ -147,7 +147,7 @@ inline bool try_size_command(std::string_view line, int& Hpx, int& Wpx,
     return false;
   const std::string_view rest = trim_ws(t.substr(2));
   if (rest.empty()) {
-    std::printf("[size] %dx%d px\n", Hpx, Wpx);
+    std::printf("[size] %dx%d px\n", Wpx, Hpx);
     std::fflush(stdout);
     return true;
   }
@@ -181,7 +181,7 @@ inline bool try_size_command(std::string_view line, int& Hpx, int& Wpx,
   }
   std::printf("[size] now %dx%d px (rounded to the patch stride when "
               "generating)\n",
-              Hpx, Wpx);
+              Wpx, Hpx);
   std::fflush(stdout);
   return true;
 }
@@ -385,8 +385,8 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
   if (!o.tiny && (cur_geo.px_h != cur_Hpx || cur_geo.px_w != cur_Wpx))
     std::printf("[size] rounded %dx%d px -> %dx%d px (latent %dx%d, stride "
                 "%dpx)\n",
-                cur_Hpx, cur_Wpx, cur_geo.px_h, cur_geo.px_w, cur_geo.lat_h,
-                cur_geo.lat_w, kPixelScale * patch);
+                cur_Wpx, cur_Hpx, cur_geo.px_w, cur_geo.px_h, cur_geo.lat_w,
+                cur_geo.lat_h, kPixelScale * patch);
   const size_t C = be_latent_channels(cfg);
   std::printf("[model %s: %s]\n", o.tiny ? "tiny_test" : "qwen-image-2.1",
               be_label(cfg));
@@ -574,8 +574,8 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
     if (!o.tiny) {
       // Current geometry on its own line, ahead of the prompt line.
       cur_geo = resolve_hw(cur_Hpx, cur_Wpx);
-      std::printf("[size] %dx%d px (latent %dx%d)\n", cur_geo.px_h,
-                  cur_geo.px_w, cur_geo.lat_h, cur_geo.lat_w);
+      std::printf("[size] %dx%d px (latent %dx%d)\n", cur_geo.px_w,
+                  cur_geo.px_h, cur_geo.lat_w, cur_geo.lat_h);
       std::fflush(stdout);
     }
     std::string cur_prompt;
@@ -611,7 +611,7 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
     const int pxH = cur_geo.px_h, pxW = cur_geo.px_w;
     if (!o.tiny && (cur_geo.px_h != cur_Hpx || cur_geo.px_w != cur_Wpx))
       std::printf("[size] rounded %dx%d px -> %dx%d px (latent %dx%d)\n",
-                  cur_Hpx, cur_Wpx, pxH, pxW, H, W);
+                  cur_Wpx, cur_Hpx, pxW, pxH, W, H);
     const uint64_t cur_seed = o.seed + iter;
     std::printf("[iter %zu] seed=%llu out=%s\n", iter,
                 (unsigned long long)cur_seed, cur_out.c_str());
@@ -709,7 +709,7 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
       } else if (o.tiny) {
         w.random_init(o.seed);
         std::printf("[tiny random weights] layers=%d hidden=%d latent=%dx%d\n",
-                    cfg.num_layers, cfg.hidden_dim, H, W);
+                    cfg.num_layers, cfg.hidden_dim, W, H);
       } else {
         throw std::runtime_error(
             "need Qwen-Image-2.1 weights or --tiny (unreachable: host load "
@@ -723,7 +723,7 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
     if (o.tiny) {
       QW::random_init(cfg, w, o.seed);
       std::printf("[tiny random weights] hidden=%d depth=%d latent=%dx%d\n",
-                  cfg.hidden_size, cfg.depth, H, W);
+                  cfg.hidden_size, cfg.depth, W, H);
     } else {
       throw std::runtime_error(
           "checkpoint '" + ckpt_sub(o.ckpt, "transformer") +
@@ -742,7 +742,7 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
         QW::sample_gaussian(C * (size_t)H * (size_t)W, cur_seed);
     std::printf("[sample] %dx%d px (latent %dx%d) steps=%d cfg=%.3g shift=%.3g "
                 "seed=%llu\n",
-                pxH, pxW, H, W, steps_run, (double)o.guidance, (double)o.flow_shift,
+                pxW, pxH, W, H, steps_run, (double)o.guidance, (double)o.flow_shift,
                 (unsigned long long)cur_seed);
 #ifdef QWEN21_DRIVER_HAVE_DIT
     KokkosDNN::DNNHandle<Exec> dit_handle;
