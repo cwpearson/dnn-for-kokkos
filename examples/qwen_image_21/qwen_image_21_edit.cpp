@@ -6,13 +6,16 @@
 // diffusers QwenImage21Pipeline reference (text-to-image + image-conditioned
 // __call__ with use_kv_cache=True):
 //
-//   load RGBA condition image -> derive geometry from its aspect (reference
-//   calculate_dimensions at --output-resolution, /32 rounding) -> resized
-//   vision copy (float Lanczos) + bit-exact VAE copy (PIL-fixed-point
-//   Lanczos replica of preprocess()) -> joint text+vision
+//   load RGBA condition images (repeatable --image, up to 10, shared by the
+//   reference QwenImage21Pipeline image=[...] list) -> derive geometry per
+//   image (reference calculate_dimensions at --output-resolution, /32
+//   rounding; the target size derives from the LAST image's aspect) ->
+//   resized vision copies (float Lanczos) + bit-exact VAE copies
+//   (PIL-fixed-point Lanczos replica of preprocess()) -> joint text+vision
 //   encode (edit template below) -> the VAE-encoded condition latents
-//   (--ref-latents-in override, else in-process VAE encode of the shared
-//   resized condition image, else zeros) are staged as packed cond tokens
+//   (--ref-latents-in per image in --image order, else in-process VAE encode
+//   of each shared resized condition image, else zeros) are staged as packed
+//   cond tokens
 //   alongside the target noise -> FlowEuler sample with the DiT
 //   image-condition path ([cond|target] + img_shapes/img_mask) -> VAE decode.
 //
@@ -38,12 +41,12 @@
 // decode, image writer, parity dumps) comes from
 // qwen_image_21_common.hpp, so the two binaries cannot drift apart.
 //
-//   qwen_image_21_edit --image in.png --prompt "make it photorealistic"
+//   qwen_image_21_edit [--image in1.png --image in2.png ...] --prompt "..."
 //                       [--ckpt ckpt_dir]
 //                       [--output-resolution 1024]
 //                       [--height H --width W]  (override output; /32 snap)
 //                       [--prompt-embeds-in pe.f32]
-//                       [--ref-latents-in ref.f32
+//                       [--ref-latents-in ref1.f32 [--ref-latents-in ref2.f32 ...]
 //                        [--ref-latents-layout chw|token]]
 //                       [--init-latents-in n.f32]
 //                       [--steps 8] [--cfg 1.0] [--shift 3.0]
@@ -448,6 +451,72 @@ inline std::vector<int> edit_rope_positions(size_t head_len, int llm_h,
   }
   return pos;
 }
+
+// Multi-image M-RoPE: same get_rope_index walk over the fully expanded
+// joint sequence (length S), where vis_rows holds the Nv_total vision rows
+// in ascending order and grids/Nvs describe each image's llm block in
+// --image order. Text runs advance cur per token; each vision block holds
+// T at its block start with H/W grids, then cur advances by
+// max(llm_h, llm_w). Inter-slot text (e.g. the space between slots) is
+// handled naturally by the scan. Returns 3*S ints row-major.
+inline std::vector<int> edit_rope_positions_multi(
+    size_t S, const std::vector<int>& vis_rows,
+    const std::vector<std::pair<int, int>>& grids,
+    const std::vector<size_t>& Nvs) {
+  if (grids.size() != Nvs.size())
+    throw std::invalid_argument("edit rope: grid/count mismatch");
+  size_t Nv_total = 0;
+  for (size_t n : Nvs) Nv_total += n;
+  if (vis_rows.size() != Nv_total)
+    throw std::invalid_argument("edit rope: rows != total vision slots");
+  for (size_t i = 0; i < grids.size(); ++i) {
+    if (grids[i].first <= 0 || grids[i].second <= 0)
+      throw std::invalid_argument("edit rope: bad vision grid");
+    if (Nvs[i] != (size_t)grids[i].first * (size_t)grids[i].second)
+      throw std::invalid_argument("edit rope: slots != llm_h*llm_w");
+  }
+  for (size_t k = 1; k < vis_rows.size(); ++k)
+    if (vis_rows[k] <= vis_rows[k - 1])
+      throw std::invalid_argument("edit rope: vision rows must ascend");
+  for (int r : vis_rows)
+    if (r < 0 || (size_t)r >= S)
+      throw std::invalid_argument("edit rope: vision row out of range");
+  std::vector<int> pos(3 * S, 0);
+  size_t pi = 0;     // index into vis_rows
+  size_t img = 0;    // current image block
+  size_t k_in = 0;   // index within the current image block
+  int cur = 0;
+  int block_start = 0;
+  for (size_t s = 0; s < S; ++s) {
+    const bool is_vis = (pi < vis_rows.size() && vis_rows[pi] == (int)s);
+    if (is_vis) {
+      if (img >= grids.size())
+        throw std::runtime_error("edit rope: vision row beyond images");
+      if (k_in == 0) block_start = cur;
+      const int llm_w = grids[img].second;
+      const int hr = (int)(k_in / (size_t)llm_w);
+      const int wc = (int)(k_in % (size_t)llm_w);
+      pos[s] = block_start;
+      pos[S + s] = block_start + hr;
+      pos[2 * S + s] = block_start + wc;
+      ++pi;
+      ++k_in;
+      if (k_in == Nvs[img]) {
+        cur = block_start + std::max(grids[img].first, grids[img].second);
+        ++img;
+        k_in = 0;
+      }
+    } else {
+      pos[s] = cur;
+      pos[S + s] = cur;
+      pos[2 * S + s] = cur;
+      ++cur;
+    }
+  }
+  if (pi != vis_rows.size() || img != grids.size())
+    throw std::runtime_error("edit rope: vision rows do not match images");
+  return pos;
+}
 #endif  // HAVE_ENCODER && HAVE_TOKENIZER && IMAGE (joint path)
 #endif  // KOKKOSDNN_ENABLE_IMAGE
 
@@ -481,18 +550,17 @@ void edit_usage() {
       "with image=..., use_kv_cache=True). One edit per invocation; no "
       "REPL.\n"
       "\n"
-      "  --image PATH            condition image (required; exactly one in "
-      "v1;\n"
-      "                          RGBA via the image component, needs "
-      "KOKKOSDNN_ENABLE_IMAGE)\n"
+      "  --image PATH            condition image (repeatable, up to 10, in\n"
+      "                          --image order like the reference image=[...]\n"
+      "                          list; required unless --tiny; RGBA via the\n"
+      "                          image component, needs KOKKOSDNN_ENABLE_IMAGE)\n"
       "  --prompt TEXT           edit instruction\n"
-      "  --output-resolution N   reference area side (default 1024): input "
-      "HxW\n"
-      "                          derives from the condition aspect (both snap "
+      "  --output-resolution N   reference area side (default 1024): each input\n"
+      "                          HxW derives from its own aspect (both snap "
       "to\n"
-      "                          /32); explicit --height/--width override only "
-      "the\n"
-      "                          output size\n"
+      "                          /32); the output size derives from the LAST\n"
+      "                          image's aspect; explicit --height/--width\n"
+      "                          override only the output size\n"
       "  --height/--width N      output pixels (override the derived size)\n"
       "  --ckpt DIR              canonical Qwen-Image-2.1-Turbo checkpoint\n"
       "                          root holding transformer/, text_encoder/,\n"
@@ -507,6 +575,8 @@ void edit_usage() {
       "chw,\n"
       "                          or torch [Hc*Wc,C] with --ref-latents-layout "
       "token);\n"
+      "                          repeatable: one per --image in the same "
+      "order;\n"
       "                          override; default is in-process VAE encode "
       "(from\n"
       "                          <ckpt>/vae), else zeros\n"
@@ -539,9 +609,11 @@ void edit_usage() {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string image_path, prompt = "turn the sketch into a photorealistic photo";
+  std::vector<std::string> image_paths;
+  std::string prompt = "turn the sketch into a photorealistic photo";
   std::string text_weights, prompt_embeds_in;
-  std::string ref_latents_in, ref_latents_layout = "chw";
+  std::vector<std::string> ref_latents_ins;
+  std::string ref_latents_layout = "chw";
   std::string vis_rows_in;
   std::string init_latents_in, dump_dir;
   std::string ckpt;  // canonical checkpoint root (transformer/,
@@ -558,7 +630,21 @@ int main(int argc, char** argv) {
   uint64_t seed = 42;
   bool tiny = false;
   bool staged = true, vae_decode = true;
-  int n_image_flags = 0;
+
+  // Like the reference image=[...] list: repeatable, order-significant.
+  constexpr size_t kMaxImages = 10;
+
+  // Shared helper for flags that append to a list (repeatable --image and
+  // --ref-latents-in, both in --image order).
+  const auto need_list = [&](std::vector<std::string>& dst, const std::string& a,
+                             int& i) {
+    if (i + 1 >= argc) {
+      std::fprintf(stderr, "error: %s needs a value\n", a.c_str());
+      return false;
+    }
+    dst.push_back(argv[++i]);
+    return true;
+  };
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -571,8 +657,7 @@ int main(int argc, char** argv) {
       return true;
     };
     if (a == "--image") {
-      if (!need(image_path)) return 1;
-      ++n_image_flags;
+      if (!need_list(image_paths, a, i)) return 1;
     } else if (a == "--prompt" && i + 1 < argc) {
       prompt = argv[++i];
 #ifdef KOKKOSDNN_ENABLE_IMAGE
@@ -584,7 +669,7 @@ int main(int argc, char** argv) {
     } else if (a == "--prompt-embeds-in" && i + 1 < argc) {
       prompt_embeds_in = argv[++i];
     } else if (a == "--ref-latents-in" && i + 1 < argc) {
-      ref_latents_in = argv[++i];
+      if (!need_list(ref_latents_ins, a, i)) return 1;
     } else if (a == "--ref-latents-layout" && i + 1 < argc) {
       ref_latents_layout = argv[++i];
       if (ref_latents_layout != "chw" && ref_latents_layout != "token") {
@@ -643,15 +728,26 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (n_image_flags == 0 && !tiny) {
+  if (image_paths.empty() && !tiny) {
     std::fprintf(stderr, "error: --image PATH is required (omit only with --tiny,"
                          " which uses a synthesized test card)\n");
     return 1;
   }
-  if (n_image_flags > 1) {
+  if (image_paths.size() > kMaxImages) {
     std::fprintf(stderr,
-                 "error: v1 supports exactly one --image (the reference "
-                 "accepts up to 10; multi-image edit is a follow-up)\n");
+                 "error: got %zu --image flags (the reference accepts up to "
+                 "%zu; pass one set of condition images per edit)\n",
+                 image_paths.size(), kMaxImages);
+    return 1;
+  }
+  if (!ref_latents_ins.empty() && !image_paths.empty() &&
+      ref_latents_ins.size() != image_paths.size()) {
+    // Single-image runs keep the old single-file form; multi-image runs
+    // take one file per --image in the same order (or none for VAE encode).
+    std::fprintf(stderr,
+                 "error: got %zu --ref-latents-in files for %zu --image "
+                 "flags (pass 0 or exactly %zu, one per --image in order)\n",
+                 ref_latents_ins.size(), image_paths.size(), image_paths.size());
     return 1;
   }
 
@@ -690,113 +786,140 @@ int main(int argc, char** argv) {
     // Full runs need the canonical checkpoint; --tiny skips it.
     if (!tiny) require_ckpt_dir(ckpt);
 
-    // ---- Condition image: load + reference geometry ----
-    // One resize feeds both the vision copy and the VAE copy (reference:
-    // input_images for the text encoder, vae_images for the VAE). The
-    // pipeline reads RGBA (non-RGBA inputs are converted up); the vision
-    // copy is flattened over white for the encoder while the VAE keeps all
-    // four channels. Input size comes from the reference
-    // calculate_dimensions (output_resolution^2 area at the condition
+    // ---- Condition images: load + reference geometry ----
+    // One resize per image feeds both the vision copy and the VAE copy
+    // (reference: input_images for the text encoder, vae_images for the
+    // VAE). The pipeline reads RGBA (non-RGBA inputs are converted up);
+    // the vision copy is flattened over white for the encoder while the
+    // VAE keeps all four channels. Each input size comes from the reference
+    // calculate_dimensions (output_resolution^2 area at that image's own
     // aspect, /32 rounding); explicit --height/--width override only the
-    // OUTPUT size (floored to /32 like the reference).
-    int cond_w = 0, cond_h = 0;  // resized condition pixels
-    int in_lat_h = 0, in_lat_w = 0;
-    std::vector<float> vis_pixels;  // packed vision rows, [-1,1]
-    std::vector<float> vae_chw;     // resized RGBA [-1,1] CHW for VAE encode
+    // OUTPUT size (floored to /32 like the reference). The default output
+    // size derives from the LAST image's aspect, matching the reference.
+    std::vector<int> cond_ws, cond_hs;  // resized condition pixels per image
+    std::vector<int> in_lat_hs, in_lat_ws;
+    std::vector<std::vector<float>> vis_pixels_list;  // packed vision rows [-1,1]
+    std::vector<std::vector<float>> vae_chw_list;     // resized RGBA [-1,1] CHW
     {
 #ifdef KOKKOSDNN_ENABLE_IMAGE
       namespace KI = KokkosDNN::Image;
-      KI::HostImageF32 img("qwen21edit_testcard", 0, 0, 0);
-      KI::HostImageU8 img_u8("qwen21edit_rgba_u8", 0, 0, 0);
-      if (image_path.empty()) {
-        // Weight-free smoke card (tiny only): 64x64 RGBA gradient.
-        img = KI::HostImageF32("qwen21edit_testcard", 64, 64, 4);
-        for (size_t y = 0; y < 64; ++y)
-          for (size_t x = 0; x < 64; ++x) {
-            img(y, x, 0) = (float)x / 63.0f;
-            img(y, x, 1) = (float)y / 63.0f;
-            img(y, x, 2) = 0.5f;
-            img(y, x, 3) = 1.0f;
-          }
-        std::printf("[image synthesized test card] 64x64 RGBA (--tiny, no "
-                    "--image)\n");
-      } else {
-        img = KI::load_image_f32(image_path, /*desired_channels=*/4);
-        img_u8 = KI::load_image_u8(image_path, /*desired_channels=*/4);
+      // --tiny with no --image exercises the smoke path with one
+      // synthesized card; the cond DiT path stays off under --tiny.
+      const bool synthetic = image_paths.empty();
+      const size_t n_load = synthetic ? 1 : image_paths.size();
+      if (!synthetic && output_resolution <= 0 && !tiny)
+        throw std::runtime_error("--output-resolution must be > 0");
+      cond_ws.reserve(n_load);
+      cond_hs.reserve(n_load);
+      in_lat_hs.reserve(n_load);
+      in_lat_ws.reserve(n_load);
+      vis_pixels_list.reserve(n_load);
+      vae_chw_list.reserve(n_load);
+      for (size_t ii = 0; ii < n_load; ++ii) {
+        KI::HostImageF32 img("qwen21edit_img", 0, 0, 0);
+        KI::HostImageU8 img_u8("qwen21edit_rgba_u8", 0, 0, 0);
+        if (synthetic) {
+          // Weight-free smoke card (tiny only): 64x64 RGBA gradient.
+          img = KI::HostImageF32("qwen21edit_testcard", 64, 64, 4);
+          for (size_t y = 0; y < 64; ++y)
+            for (size_t x = 0; x < 64; ++x) {
+              img(y, x, 0) = (float)x / 63.0f;
+              img(y, x, 1) = (float)y / 63.0f;
+              img(y, x, 2) = 0.5f;
+              img(y, x, 3) = 1.0f;
+            }
+          std::printf("[image synthesized test card] 64x64 RGBA (--tiny, no "
+                      "--image)\n");
+        } else {
+          img = KI::load_image_f32(image_paths[ii], /*desired_channels=*/4);
+          img_u8 = KI::load_image_u8(image_paths[ii], /*desired_channels=*/4);
+        }
+        const size_t iw = img.extent(1), ih = img.extent(0);
+        std::printf("[image %zu/%zu %s] %zux%zu RGBA\n", ii + 1, n_load,
+                    synthetic ? "(synthetic)" : image_paths[ii].c_str(), iw, ih);
+        int cond_w = 0, cond_h = 0;
+        if (tiny) {
+          cond_w = cond_h = 4 * kPixelScale;
+        } else {
+          edit_calculate_dimensions(output_resolution * output_resolution,
+                                    (double)iw / (double)ih, cond_w, cond_h);
+          if (cond_w < 32 || cond_h < 32)
+            throw std::runtime_error(
+                "edit geometry: derived condition size too small");
+        }
+        KI::HostImageF32 rgb = edit_flatten_white_rgb(img);
+        if ((size_t)cond_w != iw || (size_t)cond_h != ih) {
+          rgb = edit_bicubic_resize_hwc(rgb, cond_h, cond_w);
+          std::printf("[image %zu] resized %zux%zu -> %dx%d (float lanczos "
+                      "vision copy; PIL-exact uint8 VAE copy)\n",
+                      ii + 1, iw, ih, cond_w, cond_h);
+        }
+        // VAE copy: bit-exact replica of the reference preprocess() resize
+        // (PIL LANCZOS on the uint8 RGBA image, no white flatten, no RGB
+        // drop) then u8/255 normalized to [-1,1] like pil_to_numpy +
+        // normalize. A float-domain resize here leaves ~2 LSB of mismatch
+        // that the VAE encoder amplifies past the gate, so the uint8-exact
+        // path above is required.
+        std::vector<float> vae_chw;
+        if (!tiny) {
+          KI::HostImageU8 vrgba = img_u8;
+          if ((size_t)cond_w != iw || (size_t)cond_h != ih)
+            vrgba = edit_pil_resize_rgba_u8(img_u8, cond_h, cond_w);
+          vae_chw.resize(4 * (size_t)cond_h * (size_t)cond_w);
+          size_t vk = 0;
+          for (size_t c = 0; c < 4; ++c)
+            for (int y = 0; y < cond_h; ++y)
+              for (int x = 0; x < cond_w; ++x)
+                vae_chw[vk++] = static_cast<float>(vrgba((size_t)y, (size_t)x,
+                                                          c)) /
+                                255.0f * 2.0f - 1.0f;
+        }
+        // Processor normalize: (x - 0.5) / 0.5 over RGB.
+        for (size_t y = 0; y < rgb.extent(0); ++y)
+          for (size_t x = 0; x < rgb.extent(1); ++x)
+            for (size_t c = 0; c < 3; ++c)
+              rgb(y, x, c) = rgb(y, x, c) * 2.0f - 1.0f;
+        std::vector<float> vis_pixels = edit_pack_patches_blockmajor(rgb, 16, 2);
+        std::printf("[vision %zu] %dx%d px -> %zu patches (16px, block-major, "
+                    "temporal x2)\n",
+                    ii + 1, cond_w, cond_h, vis_pixels.size() / 1536);
+        const int in_lat_h = cond_h / kPixelScale;
+        const int in_lat_w = cond_w / kPixelScale;
+        std::printf("[condition %zu] %dx%d px -> VAE grid %dx%d (x%d)\n",
+                    ii + 1, cond_w, cond_h, in_lat_h, in_lat_w, kPixelScale);
+        cond_ws.push_back(cond_w);
+        cond_hs.push_back(cond_h);
+        in_lat_hs.push_back(in_lat_h);
+        in_lat_ws.push_back(in_lat_w);
+        vis_pixels_list.push_back(std::move(vis_pixels));
+        vae_chw_list.push_back(std::move(vae_chw));
       }
-      const size_t iw = img.extent(1), ih = img.extent(0);
-      std::printf("[image %s] %zux%zu RGBA\n", image_path.c_str(), iw, ih);
-      if (tiny) {
-        cond_w = cond_h = 4 * kPixelScale;
-      } else {
-        if (output_resolution <= 0)
-          throw std::runtime_error("--output-resolution must be > 0");
-        edit_calculate_dimensions(output_resolution * output_resolution,
-                                  (double)iw / (double)ih, cond_w, cond_h);
-        if (cond_w < 32 || cond_h < 32)
-          throw std::runtime_error(
-              "edit geometry: derived condition size too small");
-      }
-      KI::HostImageF32 rgb = edit_flatten_white_rgb(img);
-      if ((size_t)cond_w != iw || (size_t)cond_h != ih) {
-        rgb = edit_bicubic_resize_hwc(rgb, cond_h, cond_w);
-        std::printf("[image] resized %zux%zu -> %dx%d (float lanczos vision "
-                    "copy; PIL-exact uint8 VAE copy)\n",
-                    iw, ih, cond_w, cond_h);
-      }
-      // VAE copy: bit-exact replica of the reference preprocess() resize
-      // (PIL LANCZOS on the uint8 RGBA image, no white flatten, no RGB
-      // drop) then u8/255 normalized to [-1,1] like pil_to_numpy +
-      // normalize. A float-domain resize here leaves ~2 LSB of mismatch
-      // that the VAE encoder amplifies past the gate, so the uint8-exact
-      // path above is required.
-      if (!tiny) {
-        KI::HostImageU8 vrgba = img_u8;
-        if ((size_t)cond_w != iw || (size_t)cond_h != ih)
-          vrgba = edit_pil_resize_rgba_u8(img_u8, cond_h, cond_w);
-        vae_chw.resize(4 * (size_t)cond_h * (size_t)cond_w);
-        size_t vk = 0;
-        for (size_t c = 0; c < 4; ++c)
-          for (int y = 0; y < cond_h; ++y)
-            for (int x = 0; x < cond_w; ++x)
-              vae_chw[vk++] = static_cast<float>(vrgba((size_t)y, (size_t)x,
-                                                        c)) /
-                              255.0f * 2.0f - 1.0f;
-      }
-      // Processor normalize: (x - 0.5) / 0.5 over RGB.
-      for (size_t y = 0; y < rgb.extent(0); ++y)
-        for (size_t x = 0; x < rgb.extent(1); ++x)
-          for (size_t c = 0; c < 3; ++c)
-            rgb(y, x, c) = rgb(y, x, c) * 2.0f - 1.0f;
-      vis_pixels = edit_pack_patches_blockmajor(rgb, 16, 2);
-      std::printf("[vision] %dx%d px -> %zu patches (16px, block-major, "
-                  "temporal x2)\n",
-                  cond_w, cond_h, vis_pixels.size() / 1536);
-      in_lat_h = cond_h / kPixelScale;
-      in_lat_w = cond_w / kPixelScale;
-      std::printf("[condition] %dx%d px -> VAE grid %dx%d (x%d)\n", cond_w,
-                  cond_h, in_lat_h, in_lat_w, kPixelScale);
 #else
-      (void)cond_w;
-      (void)cond_h;
-      (void)in_lat_h;
-      (void)in_lat_w;
-      (void)vis_pixels;
+      (void)cond_ws;
+      (void)cond_hs;
+      (void)in_lat_hs;
+      (void)in_lat_ws;
+      (void)vis_pixels_list;
+      (void)vae_chw_list;
       throw std::runtime_error(
           "--image needs the image component "
           "(configure with -DKokkosDNN_ENABLE_IMAGE=ON)");
 #endif
     }
+    const size_t n_imgs = cond_ws.size();
+    if (n_imgs == 0)
+      throw std::runtime_error("edit: no condition images loaded");
 
-    // Target geometry: explicit H/W override the derived condition size;
-    // --tiny pins 64px. Driver stride snap is a no-op on /32 sizes.
+    // Target geometry: explicit H/W override the derived condition size
+    // (from the LAST image, matching the reference); --tiny pins 64px.
+    // Driver stride snap is a no-op on /32 sizes.
     PixelGeometry geo;
     if (tiny) {
       geo.px_h = geo.px_w = 4 * kPixelScale;
       geo.lat_h = geo.lat_w = 4;
     } else {
-      const int req_h = (height > 0) ? height : cond_h;
-      const int req_w = (width > 0) ? width : cond_w;
+      const int req_h = (height > 0) ? height : cond_hs.back();
+      const int req_w = (width > 0) ? width : cond_ws.back();
       geo = resolve_pixel_geometry(req_h, req_w, be_patch(cfg));
       if (geo.px_h != req_h || geo.px_w != req_w)
         std::printf("[size] rounded %dx%d px -> %dx%d px (latent %dx%d, "
@@ -821,17 +944,18 @@ int main(int argc, char** argv) {
     }
 
     // Joint processor inputs for the in-process edit encode (token ids with
-    // the image_pad expansion, vision rows, M-RoPE positions, pixel rows).
-    // Built here (host-side, needs the BPE tables); consumed by
-    // EncoderStage::run_qwen_joint below. Empty unless the build succeeds.
+    // the image_pad expansions, vision rows, M-RoPE positions, pixel rows
+    // per image). Built here (host-side, needs the BPE tables); consumed
+    // by EncoderStage::run_qwen_joint_multi below. Empty unless the build
+    // succeeds.
     std::vector<int> joint_ids, joint_rows, joint_pos3;
-    std::vector<float> joint_pixels;
-    int joint_Hp = 0, joint_Wp = 0;
+    std::vector<std::vector<float>> joint_pixels_list;
+    std::vector<int> joint_Hps, joint_Wps;
     size_t joint_drop = 0;
     bool have_joint_inputs = false;
 #if defined(QWEN21_DRIVER_HAVE_ENCODER) && \
     defined(QWEN21_DRIVER_HAVE_TOKENIZER) && defined(KOKKOSDNN_ENABLE_IMAGE)
-    if (!tiny && !ckpt.empty() && !image_path.empty()) {
+    if (!tiny && !ckpt.empty() && !image_paths.empty()) {
       try {
         namespace QE = KokkosDNN::QwenImage21Encoder;
         require_ckpt_dir(ckpt);
@@ -859,8 +983,8 @@ int main(int argc, char** argv) {
               "joint encode: T2I head lost its user-role prefix");
         const std::string sys_block =
             full_head.substr(0, full_head.size() - kUserPrefix.size());
-        const std::string head_text = qwen21_edit_head(1);
-        // Tail follows the slot's own <|vision_end|>: the reference
+        const std::string head_text = qwen21_edit_head((int)n_imgs);
+        // Tail follows the last slot's own <|vision_end|>: the reference
         // prompt_template_ti2i closes each vision slot exactly once, so no
         // second close is prepended here.
         const std::string tail_text = prompt + qwen21_edit_tail();
@@ -887,66 +1011,74 @@ int main(int argc, char** argv) {
         if (pad_id < 0)
           throw std::runtime_error(
               "joint encode: tokenizer.json lacks <|image_pad|>");
-        joint_Hp = cond_h / 16;
-        joint_Wp = cond_w / 16;
-        if (joint_Hp <= 0 || joint_Wp <= 0 || joint_Hp % 2 != 0 ||
-            joint_Wp % 2 != 0)
-          throw std::runtime_error(
-              "joint encode: patch grid must tile the 2x2 merge");
-        const size_t Nv =
-            (size_t)(joint_Hp / 2) * (size_t)(joint_Wp / 2);
-        const size_t Np = (size_t)joint_Hp * (size_t)joint_Wp;
-        if (vis_pixels.size() != Np * 1536)
-          throw std::runtime_error(
-              "joint encode: pixel rows != patches*1536");
-        // Expand the slot's single <|image_pad|> placeholder in place to Nv
+        // One patch grid per image (patch 16px); each slot's single
+        // <|image_pad|> placeholder expands in place to that image's Nv
         // vision ids, mirroring the processor convention (one pad token in
-        // the raw text expands to Nv image tokens). Total pads == Nv and
-        // vis_rows covers all of them.
-        size_t pad_pos = head_ids.size();
+        // the raw text expands to Nv image tokens, slots in --image order).
+        joint_Hps.assign(n_imgs, 0);
+        joint_Wps.assign(n_imgs, 0);
+        std::vector<size_t> joint_Nvs(n_imgs, 0), joint_Nps(n_imgs, 0);
+        for (size_t ii = 0; ii < n_imgs; ++ii) {
+          joint_Hps[ii] = cond_hs[ii] / 16;
+          joint_Wps[ii] = cond_ws[ii] / 16;
+          if (joint_Hps[ii] <= 0 || joint_Wps[ii] <= 0 ||
+              joint_Hps[ii] % 2 != 0 || joint_Wps[ii] % 2 != 0)
+            throw std::runtime_error(
+                "joint encode: patch grid must tile the 2x2 merge");
+          joint_Nvs[ii] =
+              (size_t)(joint_Hps[ii] / 2) * (size_t)(joint_Wps[ii] / 2);
+          joint_Nps[ii] = (size_t)joint_Hps[ii] * (size_t)joint_Wps[ii];
+          if (vis_pixels_list[ii].size() != joint_Nps[ii] * 1536)
+            throw std::runtime_error(
+                "joint encode: pixel rows != patches*1536");
+        }
         size_t pad_count = 0;
-        for (size_t k = 0; k < head_ids.size(); ++k)
-          if (head_ids[k] == pad_id) {
-            if (pad_count == 0) pad_pos = k;
-            ++pad_count;
-          }
-        if (pad_count != 1)
+        for (int id : head_ids)
+          if (id == pad_id) ++pad_count;
+        if (pad_count != n_imgs)
           throw std::runtime_error(
-              "joint encode: head must hold exactly one <|image_pad|> "
-              "placeholder");
-        joint_ids.assign(head_ids.begin(),
-                         head_ids.begin() + (long)pad_pos);
-        joint_ids.insert(joint_ids.end(), Nv, pad_id);
-        joint_ids.insert(joint_ids.end(),
-                         head_ids.begin() + (long)pad_pos + 1, head_ids.end());
+              "joint encode: head must hold one <|image_pad|> placeholder "
+              "per --image (got " +
+              std::to_string(pad_count) + " pads for " +
+              std::to_string(n_imgs) + " images)");
+        joint_ids.reserve(head_ids.size() + tail_ids.size());
+        size_t img_slot = 0;
+        for (size_t k = 0; k < head_ids.size(); ++k) {
+          if (head_ids[k] == pad_id) {
+            for (size_t t = 0; t < joint_Nvs[img_slot]; ++t) {
+              joint_rows.push_back((int)joint_ids.size());
+              joint_ids.push_back(pad_id);
+            }
+            ++img_slot;
+          } else {
+            joint_ids.push_back(head_ids[k]);
+          }
+        }
         joint_ids.insert(joint_ids.end(), tail_ids.begin(), tail_ids.end());
         // No 512-row T2I cap here: real edits carry thousands of vision
-        // tokens (2048px -> 4096). Bound only against absurd sequences.
+        // tokens (2048px -> 4096 per image). Bound only against absurd
+        // sequences.
         if (joint_ids.size() > 32768)
           throw std::runtime_error(
               "joint encode: sequence exceeds 32768 tokens");
-        for (size_t k = 0; k < Nv; ++k)
-          joint_rows.push_back((int)(pad_pos + k));
-        // edit_rope_positions lays out [head text][Nv vision][tail text]
-        // with S = head_len + Nv + tail_len, so head_len must be the
-        // PRE-vision text only: tokens before the image_pad placeholder.
-        // The head remainder after the placeholder (e.g. <|vision_end|>)
-        // joins the tail side, placing the vision block at pad_pos per
-        // get_rope_index. Passing head_ids.size()-1+Nv here double-counted
-        // Nv (pos3 held 3*(S+Nv) ints, tripping the 3*S check in
-        // EncoderStage::run_qwen_joint).
-        const size_t joint_head_len = pad_pos;
-        const size_t joint_tail_len =
-            (head_ids.size() - pad_pos - 1) + tail_ids.size();
-        joint_pos3 = edit_rope_positions(joint_head_len, joint_Hp / 2,
-                                         joint_Wp / 2, joint_tail_len);
-        joint_pixels = vis_pixels;
+        // M-RoPE over the fully expanded sequence: text runs advance, each
+        // image's vision block holds T with H/W grids (inter-slot text such
+        // as the space between slots advances normally).
+        std::vector<std::pair<int, int>> joint_grids;
+        joint_grids.reserve(n_imgs);
+        for (size_t ii = 0; ii < n_imgs; ++ii)
+          joint_grids.emplace_back(joint_Hps[ii] / 2, joint_Wps[ii] / 2);
+        joint_pos3 = edit_rope_positions_multi(joint_ids.size(), joint_rows,
+                                               joint_grids, joint_Nvs);
+        joint_pixels_list = vis_pixels_list;
         joint_drop = sys_ids.size();
         have_joint_inputs = true;
-        std::printf("[edit template] %zu ids (%zu head + %zu vision + %zu "
-                    "tail), drop_idx=%zu, tok_vocab=%zu\n",
-                    joint_ids.size(), joint_head_len, Nv, joint_tail_len,
-                    joint_drop, tabs.vocab_size);
+        size_t joint_Nv_total = 0;
+        for (size_t n : joint_Nvs) joint_Nv_total += n;
+        std::printf("[edit template] %zu ids (%zu vision across %zu images), "
+                    "drop_idx=%zu, tok_vocab=%zu\n",
+                    joint_ids.size(), joint_Nv_total, n_imgs, joint_drop,
+                    tabs.vocab_size);
       } catch (const std::exception& e) {
         std::fprintf(stderr,
                      "warning: joint processor build failed (%s); falling "
@@ -956,58 +1088,95 @@ int main(int argc, char** argv) {
     }
 #endif  // HAVE_ENCODER && HAVE_TOKENIZER && IMAGE (joint path)
 
-    // ---- Reference latents (VAE-encoded condition image) ----
-    // Precedence: --ref-latents-in (torch/golden (latents-mean)/std,
-    // driver chw or torch token layout) -> in-process VAE encode of the
-    // shared resized condition image (needs <ckpt>/vae + the VAE
-    // header) -> zeros with a logged reason. Either way they are CARRIED
-    // (validated, dumped, reported), then staged below as packed cond
-    // tokens for the DiT image-condition path ([cond|target] +
-    // img_shapes/img_mask); without vision-slot rows the run falls back
-    // to target-only sampling (still dumped + reported).
-    std::vector<float> ref_lat;
-    if (!ref_latents_in.empty()) {
+    // ---- Reference latents (VAE-encoded condition images) ----
+    // Precedence, per image: --ref-latents-in (torch/golden
+    // (latents-mean)/std, driver chw or torch token layout, one file per
+    // --image in the same order) -> in-process VAE encode of that image's
+    // shared resized copy (needs <ckpt>/vae + the VAE header) -> zeros with
+    // a logged reason. Either way they are CARRIED (validated, dumped,
+    // reported), then staged below as packed cond tokens for the DiT
+    // image-condition path ([cond|target] + img_shapes/img_mask); without
+    // vision-slot rows the run falls back to target-only sampling (still
+    // dumped + reported).
+    std::vector<std::vector<float>> ref_lats(n_imgs);
+    if (!ref_latents_ins.empty()) {
       if (tiny)
         throw std::runtime_error(
             "--ref-latents-in needs real geometry; drop --tiny");
-      ref_lat = load_decode_latents(ref_latents_in, C, (size_t)in_lat_h,
-                                    (size_t)in_lat_w,
-                                    ref_latents_layout == "token");
-      std::printf("[ref-latents file %s] %zux%dx%d floats (%s layout)\n",
-                  ref_latents_in.c_str(), C, in_lat_h, in_lat_w,
-                  ref_latents_layout.c_str());
-    } else if (!tiny && !vae_chw.empty() && !ckpt.empty()) {
-#ifdef QWEN21_DRIVER_HAVE_VAE
-      try {
-        ref_lat = try_vae_encode_image(vae_chw, (size_t)cond_h, (size_t)cond_w,
-                                       ckpt);
-        std::printf("[ref-latents vae-encode] %zux%dx%d floats (in-process "
-                    "RGBA [-1,1] -> (mode-mean)/std)\n",
-                    C, in_lat_h, in_lat_w);
-      } catch (const std::exception& e) {
-        std::fprintf(stderr,
-                     "warning: in-process VAE encode failed (%s); using "
-                     "zeros\n",
-                     e.what());
-        ref_lat.assign(C * (size_t)in_lat_h * (size_t)in_lat_w, 0.0f);
-        std::printf("[ref-latents null] VAE encode failed: zeros %zux%dx%d\n",
-                    C, in_lat_h, in_lat_w);
+      if (ref_latents_ins.size() != n_imgs)
+        throw std::runtime_error(
+            "--ref-latents-in needs one file per --image (in --image order)");
+      for (size_t ii = 0; ii < n_imgs; ++ii) {
+        const std::string& f = ref_latents_ins[ii];
+        ref_lats[ii] = load_decode_latents(f, C, (size_t)in_lat_hs[ii],
+                                           (size_t)in_lat_ws[ii],
+                                           ref_latents_layout == "token");
+        std::printf("[ref-latents file %zu %s] %zux%dx%d floats (%s layout)\n",
+                    ii + 1, f.c_str(), C, in_lat_hs[ii], in_lat_ws[ii],
+                    ref_latents_layout.c_str());
       }
+    } else if (!tiny && !ckpt.empty()) {
+      bool any_pixels = false;
+      for (const auto& v : vae_chw_list) any_pixels = any_pixels || !v.empty();
+      if (any_pixels) {
+#ifdef QWEN21_DRIVER_HAVE_VAE
+        for (size_t ii = 0; ii < n_imgs; ++ii) {
+          if (vae_chw_list[ii].empty()) {
+            ref_lats[ii].assign(
+                C * (size_t)in_lat_hs[ii] * (size_t)in_lat_ws[ii], 0.0f);
+            std::printf("[ref-latents null %zu] no pixels: zeros %zux%dx%d\n",
+                        ii + 1, C, in_lat_hs[ii], in_lat_ws[ii]);
+            continue;
+          }
+          try {
+            ref_lats[ii] = try_vae_encode_image(
+                vae_chw_list[ii], (size_t)cond_hs[ii], (size_t)cond_ws[ii],
+                ckpt);
+            std::printf(
+                "[ref-latents vae-encode %zu] %zux%dx%d floats (in-process "
+                "RGBA [-1,1] -> (mode-mean)/std)\n",
+                ii + 1, C, in_lat_hs[ii], in_lat_ws[ii]);
+          } catch (const std::exception& e) {
+            std::fprintf(stderr,
+                         "warning: in-process VAE encode failed for image %zu "
+                         "(%s); using zeros\n",
+                         ii + 1, e.what());
+            ref_lats[ii].assign(
+                C * (size_t)in_lat_hs[ii] * (size_t)in_lat_ws[ii], 0.0f);
+            std::printf(
+                "[ref-latents null %zu] VAE encode failed: zeros %zux%dx%d\n",
+                ii + 1, C, in_lat_hs[ii], in_lat_ws[ii]);
+          }
+        }
 #else
-      ref_lat.assign(C * (size_t)in_lat_h * (size_t)in_lat_w, 0.0f);
-      std::printf("[ref-latents null] VAE encode needs "
-                  "KokkosDNN_QwenImage21Vae.hpp in this build: zeros "
-                  "%zux%dx%d\n",
-                  C, in_lat_h, in_lat_w);
+        for (size_t ii = 0; ii < n_imgs; ++ii) {
+          ref_lats[ii].assign(
+              C * (size_t)in_lat_hs[ii] * (size_t)in_lat_ws[ii], 0.0f);
+          std::printf("[ref-latents null %zu] VAE encode needs "
+                      "KokkosDNN_QwenImage21Vae.hpp in this build: zeros "
+                      "%zux%dx%d\n",
+                      ii + 1, C, in_lat_hs[ii], in_lat_ws[ii]);
+        }
 #endif
+      } else {
+        for (size_t ii = 0; ii < n_imgs; ++ii) {
+          ref_lats[ii].assign(
+              C * (size_t)in_lat_hs[ii] * (size_t)in_lat_ws[ii], 0.0f);
+          const char* why = tiny ? "--tiny skips VAE encode (smoke model)"
+                                 : "need --ckpt for VAE encode";
+          std::printf("[ref-latents null %zu] %s: zeros %zux%dx%d\n", ii + 1,
+                      why, C, in_lat_hs[ii], in_lat_ws[ii]);
+        }
+      }
     } else {
-      ref_lat.assign(C * (size_t)in_lat_h * (size_t)in_lat_w, 0.0f);
-      const char* why = tiny ? "--tiny skips VAE encode (smoke model)"
-                             : vae_chw.empty()
-                                   ? "no --image pixels to encode"
-                                   : "need --ckpt for VAE encode";
-      std::printf("[ref-latents null] %s: zeros %zux%dx%d\n", why, C, in_lat_h,
-                  in_lat_w);
+      for (size_t ii = 0; ii < n_imgs; ++ii) {
+        ref_lats[ii].assign(
+            C * (size_t)in_lat_hs[ii] * (size_t)in_lat_ws[ii], 0.0f);
+        const char* why = tiny ? "--tiny skips VAE encode (smoke model)"
+                               : "need --ckpt for VAE encode";
+        std::printf("[ref-latents null %zu] %s: zeros %zux%dx%d\n", ii + 1,
+                    why, C, in_lat_hs[ii], in_lat_ws[ii]);
+      }
     }
 
     // Caption source (resolved above): --prompt-embeds-in wins over
@@ -1025,9 +1194,10 @@ int main(int argc, char** argv) {
     bool joint_ok = false;  // true only when the joint embeds below are live
     if (have_joint_inputs) {
       try {
-        EncoderStage::run_qwen_joint(enc, cfg, joint_ids, joint_rows,
-                                     joint_pos3, joint_pixels, joint_Hp,
-                                     joint_Wp, joint_drop, ckpt);
+        EncoderStage::run_qwen_joint_multi(enc, cfg, joint_ids, joint_rows,
+                                            joint_pos3, joint_pixels_list,
+                                            joint_Hps, joint_Wps, joint_drop,
+                                            ckpt);
         joint_ok = true;
       } catch (const std::exception& e) {
         std::fprintf(stderr,
@@ -1038,7 +1208,7 @@ int main(int argc, char** argv) {
                                      /*max_seq_override=*/32768);
       }
     } else {
-      if (!tiny && !ckpt.empty() && !image_path.empty())
+      if (!tiny && !ckpt.empty() && !image_paths.empty())
         std::printf("[encode] joint Qwen forward needs the encoder + BPE "
                     "tables headers in this build; falling back to %s\n",
                     caption_src.empty() ? "null" : "file");
@@ -1172,19 +1342,24 @@ int main(int argc, char** argv) {
       std::printf("[schedule turbo] ignoring --steps %d (checkpoint schedule "
                   "has %d steps)\n",
                   steps, steps_run);
-    std::printf("[sample] edit %dx%d px (target latent %dx%d, condition grid "
-                "%dx%d) steps=%d cfg=%.3g shift=%.3g seed=%llu\n",
-                pxH, pxW, H, W, in_lat_h, in_lat_w, steps_run,
+    std::printf("[sample] edit %dx%d px (target latent %dx%d, %zu condition "
+                "image%s) steps=%d cfg=%.3g shift=%.3g seed=%llu\n",
+                pxH, pxW, H, W, n_imgs, n_imgs == 1 ? "" : "s", steps_run,
                 (double)guidance, (double)flow_shift,
                 (unsigned long long)seed);
+    for (size_t ii = 0; ii < n_imgs; ++ii)
+      std::printf("[sample] condition %zu/%zu: %dx%d px -> VAE grid %dx%d\n",
+                  ii + 1, n_imgs, cond_ws[ii], cond_hs[ii], in_lat_hs[ii],
+                  in_lat_ws[ii]);
     // ---- Edit image-condition state ([cond|target] DiT path) ----
     // Vision-slot rows in embed (post-drop) coordinates: the joint build
     // emits full-sequence positions, so subtract joint_drop; --vis-rows-in
     // is already in embed coordinates (range-checked at load). Staged cond
-    // tokens pack ref_lat host chw -> token rows (row t = h*in_lat_w + w,
-    // the same order DitForward packs the target grid); img_shapes is
-    // [[(1,in_lat_h,in_lat_w),(1,H,W)]] (cond then target) and img_mask is
-    // vision-slots True + text False, then N/4 target True.
+    // tokens pack each image's ref_lat host chw -> token rows (row t =
+    // h*in_lat_w + w, the same order DitForward packs the target grid),
+    // concatenated in --image order; img_shapes is
+    // [[(1,hc0,wc0),(1,hc1,wc1),...,(1,H,W)]] (conds then target) and
+    // img_mask is vision-slots True + text False, then N/4 target True.
     Kokkos::View<DScalar***, Kokkos::LayoutRight, Exec> cond_tok;
     std::vector<std::array<int, 3>> img_blocks;
     std::vector<char> img_mask;
@@ -1199,22 +1374,33 @@ int main(int argc, char** argv) {
             load_vis_rows_raw(vis_rows_in, (size_t)enc.device.extent(0));
       }
       const size_t Senc = (size_t)enc.device.extent(0);
-      const size_t Nc = (size_t)in_lat_h * (size_t)in_lat_w;
+      std::vector<size_t> cond_Ncs(n_imgs, 0);
+      size_t Nc_total = 0;
+      for (size_t ii = 0; ii < n_imgs; ++ii) {
+        cond_Ncs[ii] = (size_t)in_lat_hs[ii] * (size_t)in_lat_ws[ii];
+        Nc_total += cond_Ncs[ii];
+      }
       const size_t Nt = (size_t)H * (size_t)W;
       if (!tiny && !slot_rows.empty()) {
-        if (in_lat_h <= 0 || in_lat_w <= 0)
-          throw std::runtime_error("edit cond: condition grid not derived");
-        // Each VLM slot stands for a 2x2 latent group: both cond latent
-        // dims must tile the merge, and the target grid must hold N/4
+        for (size_t ii = 0; ii < n_imgs; ++ii) {
+          if (in_lat_hs[ii] <= 0 || in_lat_ws[ii] <= 0)
+            throw std::runtime_error("edit cond: condition grid not derived");
+        }
+        // Each VLM slot stands for a 2x2 latent group: every cond latent
+        // grid must tile the merge, and the target grid must hold N/4
         // slots (in_lat dims are /32-rounded, so even in practice).
-        if (in_lat_h % 2 != 0 || in_lat_w % 2 != 0 || Nt % 4 != 0)
-          throw std::runtime_error(
-              "edit cond: latent grids must tile the 2x2 slots "
-              "(in_lat_h/w even, N % 4 == 0)");
-        if (slot_rows.size() * 4 != Nc)
+        // The slot total covers all conditions (sum Nc_i/4): the joint
+        // build emits Nv_i rows per image in --image order.
+        for (size_t ii = 0; ii < n_imgs; ++ii) {
+          if (in_lat_hs[ii] % 2 != 0 || in_lat_ws[ii] % 2 != 0 || Nt % 4 != 0)
+            throw std::runtime_error(
+                "edit cond: latent grids must tile the 2x2 slots "
+                "(each in_lat_h/w even, N % 4 == 0)");
+        }
+        if (slot_rows.size() * 4 != Nc_total)
           throw std::runtime_error(
               "edit cond: " + std::to_string(slot_rows.size()) +
-              " vision slots != Nc/4 = " + std::to_string(Nc / 4));
+              " vision slots != sum(Nc_i)/4 = " + std::to_string(Nc_total / 4));
         for (size_t k = 1; k < slot_rows.size(); ++k)
           if (slot_rows[k] <= slot_rows[k - 1])
             throw std::runtime_error(
@@ -1223,34 +1409,51 @@ int main(int argc, char** argv) {
           throw std::runtime_error(
               "edit cond: vision-slot row outside the staged S");
         cond_tok = Kokkos::View<DScalar***, Kokkos::LayoutRight, Exec>(
-            "qwen21edit_cond", 1, Nc, C);
+            "qwen21edit_cond", 1, Nc_total, C);
         {
           auto hc = Kokkos::create_mirror_view(cond_tok);
-          for (int hh = 0; hh < in_lat_h; ++hh)
-            for (int ww = 0; ww < in_lat_w; ++ww)
-              for (size_t c = 0; c < C; ++c)
-                hc(0, (size_t)(hh * in_lat_w + ww), c) =
-                    static_cast<DScalar>(ref_lat[(c * (size_t)in_lat_h +
-                                                  (size_t)hh) *
-                                                     (size_t)in_lat_w +
-                                                 (size_t)ww]);
+          size_t t = 0;
+          for (size_t ii = 0; ii < n_imgs; ++ii) {
+            const int lhh = in_lat_hs[ii], lww = in_lat_ws[ii];
+            const std::vector<float>& rl = ref_lats[ii];
+            if (rl.size() != C * cond_Ncs[ii])
+              throw std::runtime_error(
+                  "edit cond: ref latents size != C*Hc*Wc");
+            for (int hh = 0; hh < lhh; ++hh)
+              for (int ww = 0; ww < lww; ++ww)
+                for (size_t c = 0; c < C; ++c)
+                  hc(0, t + (size_t)(hh * lww + ww), c) =
+                      static_cast<DScalar>(rl[(c * (size_t)lhh +
+                                              (size_t)hh) *
+                                                 (size_t)lww +
+                                             (size_t)ww]);
+            t += cond_Ncs[ii];
+          }
           Kokkos::deep_copy(cond_tok, hc);
         }
         Kokkos::fence();
-        img_blocks = {{1, in_lat_h, in_lat_w}, {1, H, W}};
+        img_blocks.reserve(n_imgs + 1);
+        for (size_t ii = 0; ii < n_imgs; ++ii)
+          img_blocks.push_back({1, in_lat_hs[ii], in_lat_ws[ii]});
+        img_blocks.push_back({1, H, W});
         img_mask.assign(Senc + Nt / 4, 0);
         for (int r : slot_rows) img_mask[(size_t)r] = 1;
         for (size_t v = Senc; v < img_mask.size(); ++v) img_mask[v] = 1;
         for (char c : img_mask) img_mask_true += c ? (size_t)1 : (size_t)0;
         std::ostringstream oss;
-        oss << "[[(1," << in_lat_h << "," << in_lat_w << "),(1," << H << ","
-            << W << ")]]";
+        oss << "[[";
+        for (size_t ii = 0; ii < n_imgs; ++ii)
+          oss << "(1," << in_lat_hs[ii] << "," << in_lat_ws[ii] << "),";
+        oss << "(1," << H << "," << W << ")]]";
         img_shapes_str = oss.str();
-        std::printf("[dit] cond path: Nc=%zu (in-lat %dx%d) N=%zu S=%zu "
-                    "T=%zu slots=%zu mask true=%zu/%zu img_shapes %s\n",
-                    Nc, in_lat_h, in_lat_w, Nt, Senc,
-                    Senc - slot_rows.size() + Nc + Nt, slot_rows.size(),
-                    img_mask_true, img_mask.size(), img_shapes_str.c_str());
+        std::printf("[dit] cond path: %zu images Nc=%zu (", n_imgs, Nc_total);
+        for (size_t ii = 0; ii < n_imgs; ++ii)
+          std::printf("%s%dx%d", ii ? "+" : "", in_lat_hs[ii], in_lat_ws[ii]);
+        std::printf(") N=%zu S=%zu T=%zu slots=%zu mask true=%zu/%zu "
+                    "img_shapes %s\n",
+                    Nt, Senc, Senc - slot_rows.size() + Nc_total + Nt,
+                    slot_rows.size(), img_mask_true, img_mask.size(),
+                    img_shapes_str.c_str());
       } else {
         std::printf("[dit] target-only sampling (no vision-slot rows%s)\n",
                     tiny ? " under --tiny"
@@ -1268,9 +1471,19 @@ int main(int argc, char** argv) {
                         ? turbo_sigmas
                         : build_sigmas_nearest_grid(steps_eff, flow_shift);
       dump.write("initial_latents", x_init);
-      // Reference latents exactly as staged (zeros when --ref-latents-in
-      // was absent): the packed tensor the cond DiT path consumes.
-      dump.write("ref_latents", ref_lat);
+      // Reference latents exactly as staged (zeros when neither
+      // --ref-latents-in nor VAE encode supplied them): the packed tensors
+      // the cond DiT path consumes. Single-image keeps the historical
+      // "ref_latents" name; multi-image dumps one file per condition.
+      if (n_imgs == 1) {
+        dump.write("ref_latents", ref_lats[0]);
+      } else {
+        for (size_t ii = 0; ii < n_imgs; ++ii) {
+          char name[64];
+          std::snprintf(name, sizeof(name), "ref_latents_%zu", ii);
+          dump.write(name, ref_lats[ii]);
+        }
+      }
       if (!img_mask.empty()) {
         std::vector<float> mf(img_mask.size());
         for (size_t i = 0; i < img_mask.size(); ++i)

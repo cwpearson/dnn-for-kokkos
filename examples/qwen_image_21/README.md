@@ -18,11 +18,12 @@ Both binaries take one checkpoint flag, `--ckpt <ckpt>`: the canonical
 `processor/tokenizer.json`, and `vae/` (see Checkpoint layout below).
 
 `qwen_image_21_edit` is the one-shot reference-image editing companion
-(Turbo `image=...` pipeline, no REPL): it loads one RGBA condition image,
-derives geometry from its aspect (reference `calculate_dimensions` at
-`--output-resolution`, `/32` rounding), resizes once for the shared
+(Turbo `image=...` pipeline, no REPL): it loads one RGBA condition image
+per `--image` flag (repeatable, up to 10),
+derives geometry per image from its aspect (reference `calculate_dimensions` at
+`--output-resolution`, `/32` rounding), resizes once per image for the shared
 vision + VAE copies, carries VAE-encoded reference latents
-(`--ref-latents-in`) and joint text+vision embeddings
+(`--ref-latents-in`, one file per image) and joint text+vision embeddings
 (`--prompt-embeds-in`) through the same staged
 encode -> sample -> decode flow, and samples the target with the real DiT.
 Both binaries share `qwen_image_21_common.hpp`, so sampler, dumps, and
@@ -34,15 +35,16 @@ has no image-conditioning flag.
 
 ## Image editing (`qwen_image_21_edit`, one-shot)
 
-Mirrors the `QwenImage21Pipeline(image=...)` Turbo edit call:
+Mirrors the `QwenImage21Pipeline(image=...)` Turbo edit call (`image` is one
+set of condition images shared by the prompt, up to 10):
 
 ```
-load RGBA -> aspect geometry (calculate_dimensions @ --output-resolution)
--> one bicubic resize feeds vision + VAE copies
--> joint text+vision encode (edit template with one <image1> vision slot)
--> VAE-encoded reference latents staged as packed cond tokens -> sample
-   with the DiT image-condition path ([cond|target] + img_shapes/img_mask)
--> VAE decode
+load RGBAs -> per-image aspect geometry (calculate_dimensions
+@ --output-resolution) -> one bicubic resize per image feeds vision + VAE
+copies -> joint text+vision encode (edit template with one <imageN>
+vision slot per --image) -> VAE-encoded reference latents staged as
+packed cond tokens -> sample with the DiT image-condition path
+([cond|target] + img_shapes/img_mask) -> VAE decode
 ```
 
 v1 status (each remaining gap is logged per run with the owning model
@@ -51,31 +53,40 @@ header):
 - Joint encode is wired in-process: `--ckpt` (canonical root:
   `<ckpt>/processor/tokenizer.json` + single-shard
   `<ckpt>/text_encoder/model.safetensors`) + `--image` runs the raw-text
-  BPE of the edit template (expanded
-  `<|image_pad|>` slots), the native Qwen3-VL vision tower
+  BPE of the edit template (one `<imageN><|vision_start|><|image_pad|><|vision_end|>`
+  slot per `--image`, slots joined by single spaces, each slot's pad
+  expanded in place to that image's Nv vision ids, processor convention),
+  the native Qwen3-VL vision tower once per image
   (`KokkosDNN_QwenImage21Vision.hpp`: patch projection, learned-grid
-  resample, axial RoPE, 27 MHA blocks, merger + 3 DeepStack taps), and the
-  text tower `forward_joint` (slot replacement, true M-RoPE, DeepStack adds
-  at layers 0-2), dropping the system block. No separate embedding step:
-  prompt + image go in together. `--prompt-embeds-in` (joint torch dump)
+  resample, axial RoPE, 27 MHA blocks, merger + 3 DeepStack taps,
+  concatenated in `--image` order), and the
+  text tower `forward_joint` (slot replacement, true multi-image M-RoPE,
+  DeepStack adds at layers 0-2), dropping the system block. No separate
+  embedding step: prompt + images go in together.
+  `--prompt-embeds-in` (joint torch dump)
   and null zeros remain as fallbacks with logged reasons. Uncond stays
   zeros under CFG.
 - VAE encode runs in-process (`QwenImage21VaeModel::encode`: conv_in,
   5 ResidualDownBlocks with stride-2 downsamplers + AvgDown3D shortcut
   adds, mid ResNet + single-head SDPA attention + ResNet, posterior-mode
   head, `(mode-mean)/std` with the runtime `vae/config.json` affine) over
-  the shared resized condition image (RGBA `[-1,1]`, no white flatten).
-  `--ref-latents-in` overrides it with torch/golden `(latents-mean)/std`
+  each shared resized condition image (RGBA `[-1,1]`, no white flatten).
+  `--ref-latents-in` (repeatable, one file per `--image` in order)
+  overrides it with torch/golden `(latents-mean)/std`
   (`chw`, or torch `[H*W,C]` with `--ref-latents-layout token`),
-  validated against the condition grid; else zeros. Either way the latents
-  are staged as packed cond tokens (`[cond|target]` order) and dumped as
-  `ref_latents.f32` under `--dump-steps`.
+  validated against each image's condition grid; else zeros. Either way
+  the latents are staged as packed cond tokens (`[cond|target]` order,
+  conditions concatenated in `--image` order) and dumped as
+  `ref_latents.f32` (single image) or `ref_latents_<i>.f32` (multi-image)
+  under `--dump-steps`.
 - The DiT image-condition path is wired (`Dit::forward_cond` with
   per-block RoPE, segment attention, and modulation; staged as
   `[cond|target]` + `img_shapes`/`img_mask` via `DitForward::cond_tok`).
-  Vision-slot rows come from the joint build (minus `drop_idx`) or
-  `--vis-rows-in` (raw int32 LE, embed-space); without either, the run
-  falls back to target-only sampling with a logged reason.
+  `img_shapes` holds one block per condition plus the target
+  (`[[(1,Hc0,Wc0),(1,Hc1,Wc1),...,(1,H,W)]]`); vision-slot-row counts must
+  match `sum(Nc_i)/4`. Vision-slot rows come from the joint build (minus
+  `drop_idx`) or `--vis-rows-in` (raw int32 LE, embed-space); without
+  either, the run falls back to target-only sampling with a logged reason.
 
 ```sh
 # Smoke (no weights, no input file: synthesized 64x64 test card):
@@ -86,16 +97,28 @@ qwen_image_21_edit --staged --ckpt <ckpt> \
   --image sketch.png --prompt "make it photorealistic" \
   --steps 8 --cfg 1.0 \
   --out edit.png
+
+# Multi-image edit (conditions compose in --image order; each image is
+# resized from its own aspect, the output size derives from the LAST
+# image unless --height/--width override it):
+qwen_image_21_edit --staged --ckpt <ckpt> \
+  --image subject.png --image scene.png \
+  --prompt "place the subject into the scene" \
+  --steps 8 --cfg 1.0 \
+  --out edit.png
 ```
 
-`--height/--width` override only the output size (the derived condition
-size snaps to `/32` via reference `calculate_dimensions`; the override then
+`--height/--width` override only the output size (each derived condition
+size snaps to `/32` via reference `calculate_dimensions`, and the default
+output size derives from the LAST image's aspect; the override then
 goes through the driver stride snap, a no-op on `/32` sizes); `--init-latents-in`, `--steps/--cfg/--shift`,
 `--sigmas driver|turbo`, `--seed`, `--staged`, and `--dump-steps` behave
 exactly as in `generate` (manifest `prompt_source` is `edit:<source>` and
-the dump adds `ref_latents.f32` plus `img_mask.f32` on the cond path).
-Exactly one `--image` in v1 (the
-reference accepts up to 10; multi-image is a follow-up). The strict edit
+the dump adds `ref_latents.f32` (single image) or `ref_latents_<i>.f32`
+(multi-image) plus `img_mask.f32` on the cond path).
+`--image` is repeatable (up to 10, like the reference `image=[...]`
+list); `--ref-latents-in` takes 0 files (VAE encode) or one file per
+`--image` in the same order. The strict edit
 gate feeds the golden joint embeds + initial latents + golden reference
 latents (`--ref-latents-in`) with vision-slot rows converted from the
 golden `image_pad_rows.npy` (`--vis-rows-in`), so `ref_latents` is gated
@@ -264,9 +287,9 @@ grayscale preview with a logged reason instead of failing.
 | `--out` | `qwen_image_21_out.png` | PNG with `KokkosDNN_ENABLE_IMAGE=ON`, else PPM |
 | `--staged` | on (`--no-staged` for single-phase) | fenced staged release between phases (see below) |
 | `--dump-steps` | — | `DIR`: write golden-parity tensors (raw float32 LE) + `manifest.json`, then exit normally |
-| `--image` | — (edit only) | condition image path (required; exactly one in v1; synthesized test card under `--tiny`) |
-| `--output-resolution` | 1024 (edit only) | reference area side: condition-derived HxW snaps to `/32`; `--height`/`--width` override only the output size |
-| `--ref-latents-in` | — (edit only) | VAE-encoded condition latents (`chw`, or torch `[H*W,C]` with `--ref-latents-layout token`); overrides the default in-process VAE encode (from `<ckpt>/vae`), else zeros |
+| `--image` | — (edit only, repeatable ≤10) | condition image path(s) in `--image` order, like the reference `image=[...]` list (required unless `--tiny`; synthesized test card under `--tiny`) |
+| `--output-resolution` | 1024 (edit only) | reference area side: each image's HxW derives from its own aspect and snaps to `/32`; the default output size derives from the LAST image's aspect; `--height`/`--width` override only the output size |
+| `--ref-latents-in` | — (edit only, repeatable) | VAE-encoded condition latents (`chw`, or torch `[H*W,C]` with `--ref-latents-layout token`); one file per `--image` in order (or none); overrides the default in-process VAE encode (from `<ckpt>/vae`), else zeros |
 | `--ref-latents-layout` | `chw` (edit only) | `chw` = driver layout `lat[(c*H+h)*W+w]`; `token` = torch packed `[H*W,C]` |
 | `--vis-rows-in` | — (edit only) | vision-slot rows (raw int32 LE, embed-space, e.g. golden `image_pad_rows.npy` converted with `numpy.load(f).astype('<i4').tofile(...)`); joint build provides them, else this file enables the `[cond\|target]` DiT path |
 
