@@ -57,7 +57,7 @@
 //                          [--decode-latents-in lat.f32
 //                           [--decode-latents-layout chw|token]
 //                           [--decode-out-f32 file]]
-//                          [--out img.png]
+//                          [--out img.png|img.jpg]
 //                          [--no-staged] [--dump-steps DIR]
 //   <ckpt> is the canonical Qwen-Image-2.1-Turbo checkpoint root holding
 //   transformer/, text_encoder/, processor/tokenizer.json, and vae/.
@@ -286,7 +286,7 @@ void usage() {
       "                    [--decode-latents-in lat.f32\n"
       "                     [--decode-latents-layout chw|token]\n"
       "                     [--decode-out-f32 file]]\n"
-      "                    [--out img.png]\n"
+      "                    [--out img.png|img.jpg]\n"
       "                    [--no-staged] [--dump-steps DIR]\n"
       "\n"
       "  --tiny         random-weights smoke model, 4x4 latents, 2 steps\n"
@@ -314,12 +314,13 @@ void usage() {
       "  --text-weights raw float32 LE caption features [L,Cc]\n"
       "                 (L <= maxlen, Cc == caption dim)\n"
       "  --prompt-embeds-in alias of --text-weights (wins if both differ)\n"
-      "  --staged       (default ON) encode -> release encoder weights (MiB\n"
-      "                 embeds stay resident on device) -> fence -> load DiT\n"
-      "                 -> sample from device embeds -> release DiT -> fence\n"
-      "                 -> decode (one component resident at a time, no disk\n"
-      "                 round-trip). Pass --no-staged for the legacy\n"
-      "                 single-phase run\n"
+      "  --no-staged    (staged is the default) run encode -> sample -> decode\n"
+      "                 in a single phase without the fenced encoder release\n"
+      "                 (encode -> release encoder weights (MiB embeds stay\n"
+      "                 resident on device) -> fence -> load DiT -> sample\n"
+      "                 from device embeds -> release DiT -> fence -> decode\n"
+      "                 is the default: one component resident at a time,\n"
+      "                 no disk round-trip)\n"
       "  --height/--width output pixels H/W (default 1024; each rounds to\n"
       "                 the nearest 16*patch px multiple, so the latent grid\n"
       "                 pixels/16 tiles the DiT patch; true path stride 16px,\n"
@@ -338,18 +339,19 @@ void usage() {
       "                 row-major, flattened C-major lat[(c*H+h)*W+w]\n"
       "                 (C*H*W floats, PRE-denormalization latent noise:\n"
       "                 no mean/std applied); replaces the mt19937 sample\n"
-      "  --vae-decode   (default ON) run the real VAE decode (denormalize by\n"
-      "                 the runtime <ckpt>/vae/config.json affine, decode to\n"
-      "                 RGBA) when the VAE header + checkpoint are present,\n"
-      "                 else grayscale preview. Pass --no-vae-decode for the\n"
-      "                 preview\n"
+      "  --no-vae-decode  do not run the real VAE decode; write the\n"
+      "                 channel-mean grayscale preview instead (VAE decode\n"
+      "                 from <ckpt>/vae/config.json affine + decode to RGBA\n"
+      "                 is the default when the VAE header + checkpoint are\n"
+      "                 present, else preview with a logged reason)\n"
       "  --decode-latents-in raw fp32 LE latents to decode directly (skips\n"
       "                 encode, DiT load and sampling; needs --ckpt;\n"
       "                 --height/--width are the output pixels)\n"
       "  --decode-latents-layout 'chw' (default: lat[(c*H+h)*W+w]) or\n"
       "                 'token' (torch packed [H*W,C], golden final latents)\n"
       "  --decode-out-f32 also write the post-clamp RGBA decode as raw f32\n"
-      "  --out          PNG with KokkosDNN_ENABLE_IMAGE=ON, else PPM\n"
+      "  --out          PNG (.jpg/.jpeg writes JPEG) with "
+      "KokkosDNN_ENABLE_IMAGE=ON, else PPM\n"
       "  --dump-steps   write golden-parity tensors (raw float32 LE + f64\n"
       "                 sums + manifest.json) into DIR: initial_latents, then\n"
       "                 stepNN_noise_pred / stepNN_latents per Euler step;\n"
@@ -864,8 +866,6 @@ int main(int argc, char** argv) {
       init_latents_in = argv[++i];
     } else if (a == "--dump-steps" && i + 1 < argc) {
       dump_dir = argv[++i];
-    } else if (a == "--vae-decode") {
-      vae_decode = true;
     } else if (a == "--no-vae-decode" || a == "--no-vae_decode") {
       vae_decode = false;
     } else if (a == "--decode-latents-in" && i + 1 < argc) {
@@ -906,8 +906,6 @@ int main(int argc, char** argv) {
       seed = (uint64_t)std::stoull(argv[++i]);
     } else if (a == "--tiny") {
       tiny = true;
-    } else if (a == "--staged") {
-      staged = true;
     } else if (a == "--no-staged" || a == "--no-stage") {
       staged = false;
     } else if (a == "--help" || a == "-h") {
@@ -1116,7 +1114,7 @@ int main(int argc, char** argv) {
 #ifdef QWEN21_DRIVER_HAVE_VAE
       std::printf("[vae %s] validated%s\n", vae_dir.c_str(),
                   vae_decode ? "; decode enabled (default)"
-                             : "; preview (pass --vae-decode to decode)");
+                             : "; preview (--no-vae-decode)");
 #else
       std::printf("[vae %s] validated, but KokkosDNN_QwenImage21Vae.hpp is "
                   "not in this build; writing a grayscale preview instead\n",
@@ -1294,7 +1292,7 @@ int main(int argc, char** argv) {
     Kokkos::fence();
     QW::print_phase_memory("dit-released", 0, 0);
     size_t oH = 0, oW = 0;
-    // Only consumed by the PNG path (KOKKOSDNN_ENABLE_IMAGE); the PPM
+    // Only consumed by the image path (KOKKOSDNN_ENABLE_IMAGE); the PPM
     // fallback below ignores it.
     [[maybe_unused]] int oCh = 1;
     std::vector<unsigned char> pix;
