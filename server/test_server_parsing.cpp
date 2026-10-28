@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 // SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // Parsing unit tests for kokkosdnn_server: exercise the pure OpenAI/JSON
-// translation helpers (parse_common, parse_messages, openai_error) by
-// including server_main.cpp with KOKKOSDNN_SERVER_NO_MAIN. No weights, no
-// tokenizer file, no network, no Kokkos runtime init needed (helpers only
-// touch Config/SessionOptions JSON mapping; Config::tiny_test() is
-// header-only defaults).
+// translation helpers (parse_common, parse_messages, openai_error) plus the
+// arch registry and per-backend render paths by including server_main.cpp
+// with KOKKOSDNN_SERVER_NO_MAIN. No weights, no tokenizer file, no network,
+// no Kokkos runtime init needed (helpers only touch JSON mapping plus tiny
+// in-memory configs; the LFM25 render tests use header-only defaults).
 //
 // Assert-based (no gtest): any failure aborts nonzero. Wired in
 // server/CMakeLists.txt behind KokkosDNN_ENABLE_TESTS.
@@ -16,11 +16,18 @@
 #include <cassert>
 #include <iostream>
 
-namespace {
+#ifdef KOKKOSDNN_SERVER_HAVE_LFM25
+#include <KokkosDNN_LFM25Config.hpp>
+#include <KokkosDNN_LFM25Tokenizer.hpp>
+#endif
+#ifdef KOKKOSDNN_SERVER_HAVE_GLIMMER
+#include "GlimmerShim.hpp"
+#endif
 
-using KokkosDNN::LFM25::Config;
-using KokkosDNN::LFM25::ToolCall;
-using KokkosDNN::LFM25::ToolParseResult;
+namespace {
+using KokkosDNN::Server::ChatBackend;
+using KokkosDNN::Server::ServerChatMessage;
+using KokkosDNN::Server::ServerToolCall;
 using json = nlohmann::json;
 
 int g_checks = 0;
@@ -33,13 +40,16 @@ int g_checks = 0;
     }                                                            \
   } while (0)
 
-bool parse_ok(const json& body, const Config& cfg, ParsedRequest& pr,
-              std::string& err, const std::string& model = "lfm2_5") {
-  return parse_common(body, cfg, model, pr, err);
+// Arch-agnostic default stop seeding (stand-in eos id; the real value comes
+// from backend->default_stop_ids()).
+bool parse_ok(const json& body, ParsedRequest& pr, std::string& err,
+              const std::vector<int>& stops = {124900},
+              const std::string& model = "lfm2_5") {
+  return parse_common(body, stops, model, pr, err);
 }
 
 int test_messages() {
-  std::vector<ChatMessage> out;
+  std::vector<ServerChatMessage> out;
   std::string err;
   // Happy path + developer alias.
   CHECK(parse_messages(json::parse(R"({"messages":[
@@ -143,30 +153,29 @@ int test_messages() {
 }
 
 int test_common() {
-  const Config cfg = Config::tiny_test();
   ParsedRequest pr;
   std::string err;
   // Minimal body passes with defaults.
-  CHECK(parse_ok(json::parse(R"({})"), cfg, pr, err));
+  CHECK(parse_ok(json::parse(R"({})"), pr, err));
   CHECK(pr.req_max_tokens == -1 && !pr.has_seed && !pr.stream);
-  CHECK(pr.opts.stop_ids == std::vector<int>{cfg.eos});
+  CHECK(pr.opts.stop_ids == std::vector<int>{124900});
   // Unknown model id rejected; absent ok.
-  CHECK(!parse_ok(json::parse(R"({"model":"other"})"), cfg, pr, err));
-  CHECK(parse_ok(json::parse(R"({"model":"lfm2_5"})"), cfg, pr, err));
+  CHECK(!parse_ok(json::parse(R"({"model":"other"})"), pr, err));
+  CHECK(parse_ok(json::parse(R"({"model":"lfm2_5"})"), pr, err));
   // Unsupported features rejected (legacy function calling retired).
   for (const char* f :
        {R"({"n":2})", R"({"functions":[]})",
         R"({"function_call":"auto"})"}) {
-    CHECK(!parse_ok(json::parse(f), cfg, pr, err));
+    CHECK(!parse_ok(json::parse(f), pr, err));
   }
   // tools accepted + validated; empty array = no-op.
-  CHECK(parse_ok(json::parse(R"({"tools":[]})"), cfg, pr, err));
+  CHECK(parse_ok(json::parse(R"({"tools":[]})"), pr, err));
   CHECK(!pr.tools_active && pr.tools_json.empty());
   CHECK(parse_ok(
       json::parse(R"({"tools":[{"type":"function",
         "function":{"name":"get_weather","description":"d",
           "parameters":{"type":"object"},"strict":false}}]})"),
-      cfg, pr, err));
+      pr, err));
   CHECK(pr.tools_active);
   CHECK(pr.tools_json.find("get_weather") != std::string::npos);
   for (const char* f :
@@ -177,26 +186,26 @@ int test_common() {
         R"({"tools":[{"function":{"name":""}}]})",
         R"({"tools":[{"function":{"name":"f","parameters":[]}}]})",
         R"({"tools":[{"function":{"name":"f","strict":"yes"}}]})"}) {
-    CHECK(!parse_ok(json::parse(f), cfg, pr, err));
+    CHECK(!parse_ok(json::parse(f), pr, err));
   }
   // tool_choice: none/auto/required/named + validation.
   pr = ParsedRequest{};
-  CHECK(parse_ok(json::parse(R"({"tool_choice":"auto"})"), cfg, pr, err));
+  CHECK(parse_ok(json::parse(R"({"tool_choice":"auto"})"), pr, err));
   CHECK(!pr.tools_active && pr.tool_directive.empty());
   CHECK(parse_ok(
       json::parse(R"({"tools":[{"function":{"name":"f"}}],
         "tool_choice":"none"})"),
-      cfg, pr, err));
+      pr, err));
   CHECK(!pr.tools_active);
   CHECK(parse_ok(
       json::parse(R"({"tools":[{"function":{"name":"f"}}],
         "tool_choice":"required"})"),
-      cfg, pr, err));
+      pr, err));
   CHECK(pr.tools_active && !pr.tool_directive.empty());
   CHECK(parse_ok(
       json::parse(R"({"tools":[{"function":{"name":"f"}}],
         "tool_choice":{"type":"function","function":{"name":"f"}}})"),
-      cfg, pr, err));
+      pr, err));
   CHECK(pr.tool_directive.find("f") != std::string::npos);
   pr = ParsedRequest{};
   for (const char* f :
@@ -206,35 +215,35 @@ int test_common() {
         R"({"tool_choice":{"function":{"name":""}}})",
         R"({"tool_choice":{"function":{"name":"f"}}})",
         R"({"tool_choice":"required"})"}) {
-    CHECK(!parse_ok(json::parse(f), cfg, pr, err));
+    CHECK(!parse_ok(json::parse(f), pr, err));
   }
   // parallel_tool_calls must be boolean.
-  CHECK(parse_ok(json::parse(R"({"parallel_tool_calls":false})"), cfg, pr,
+  CHECK(parse_ok(json::parse(R"({"parallel_tool_calls":false})"), pr,
                  err));
   CHECK(!pr.parallel_tool_calls);
-  CHECK(!parse_ok(json::parse(R"({"parallel_tool_calls":"yes"})"), cfg, pr,
+  CHECK(!parse_ok(json::parse(R"({"parallel_tool_calls":"yes"})"), pr,
                   err));
   // response_format: text/json_object/json_schema accepted + validated.
-  CHECK(parse_ok(json::parse(R"({"response_format":{"type":"text"}})"), cfg,
-                 pr, err));
+  CHECK(parse_ok(json::parse(R"({"response_format":{"type":"text"}})"), pr,
+                 err));
   CHECK(!pr.json_mode);
   CHECK(parse_ok(json::parse(R"({"response_format":{"type":"json_object"}})"),
-                 cfg, pr, err));
+                 pr, err));
   CHECK(pr.json_mode && !pr.json_directive.empty());
   CHECK(parse_ok(
       json::parse(R"({"response_format":{"type":"json_schema",
         "json_schema":{"type":"object"}}})"),
-      cfg, pr, err));
+      pr, err));
   CHECK(pr.json_mode);
   for (const char* f :
        {R"({"response_format":{"type":"json_schema"}})",
         R"({"response_format":{"type":"yaml"}})",
         R"({"response_format":{}})",
         R"({"response_format":"json"})"}) {
-    CHECK(!parse_ok(json::parse(f), cfg, pr, err));
+    CHECK(!parse_ok(json::parse(f), pr, err));
   }
   CHECK(!pr.tools_active);
-  CHECK(parse_ok(json::parse(R"({"n":1})"), cfg, pr, err));  // n=1 ok
+  CHECK(parse_ok(json::parse(R"({"n":1})"), pr, err));  // n=1 ok
   // Sampling mapping.
   CHECK(parse_ok(
       json::parse(R"({"temperature":0.7,"top_p":0.9,"top_k":40,"min_p":0.05,
@@ -242,7 +251,7 @@ int test_common() {
         "logit_bias":{"100":2.0,"200":-1.0},
         "logprobs":true,"top_logprobs":3,"seed":123,"stream":true,
         "max_tokens":64})"),
-      cfg, pr, err));
+      pr, err));
   CHECK(pr.opts.sampling.temperature == 0.7f);
   CHECK(pr.opts.sampling.top_p == 0.9f);
   CHECK(pr.opts.sampling.top_k == 40);
@@ -256,43 +265,48 @@ int test_common() {
   CHECK(pr.stream);
   CHECK(pr.req_max_tokens == 64);
   // logprobs:true without count defaults to 5; integer form passes through.
-  CHECK(parse_ok(json::parse(R"({"logprobs":true})"), cfg, pr, err));
+  CHECK(parse_ok(json::parse(R"({"logprobs":true})"), pr, err));
   CHECK(pr.opts.sampling.logprobs == 5);
-  CHECK(parse_ok(json::parse(R"({"logprobs":2})"), cfg, pr, err));
+  CHECK(parse_ok(json::parse(R"({"logprobs":2})"), pr, err));
   CHECK(pr.opts.sampling.logprobs == 2);
   // stop mapping: numeric strings -> ids, rest -> strings.
-  CHECK(parse_ok(json::parse(R"({"stop":["<|im_end|>","42"]})"), cfg, pr,
+  CHECK(parse_ok(json::parse(R"({"stop":["<|im_end|>","42"]})"), pr,
                  err));
   CHECK(pr.opts.stop_strings.size() == 1);
   CHECK(pr.opts.stop_strings[0] == "<|im_end|>");
   CHECK(pr.opts.stop_ids.size() == 2);
-  CHECK(pr.opts.stop_ids[0] == cfg.eos && pr.opts.stop_ids[1] == 42);
-  CHECK(parse_ok(json::parse(R"({"stop":"halt"})"), cfg, pr, err));
+  CHECK(pr.opts.stop_ids[0] == 124900 && pr.opts.stop_ids[1] == 42);
+  CHECK(parse_ok(json::parse(R"({"stop":"halt"})"), pr, err));
   CHECK(pr.opts.stop_strings == std::vector<std::string>{"halt"});
   // Bad types rejected.
-  CHECK(!parse_ok(json::parse(R"({"temperature":"hot"})"), cfg, pr, err));
-  CHECK(!parse_ok(json::parse(R"({"seed":1.5})"), cfg, pr, err));
-  CHECK(!parse_ok(json::parse(R"({"max_tokens":0})"), cfg, pr, err));
-  CHECK(!parse_ok(json::parse(R"({"stop":[42.5]})"), cfg, pr, err));
-  CHECK(!parse_ok(json::parse(R"({"logit_bias":{"x":1.0}})"), cfg, pr, err));
+  CHECK(!parse_ok(json::parse(R"({"temperature":"hot"})"), pr, err));
+  CHECK(!parse_ok(json::parse(R"({"seed":1.5})"), pr, err));
+  CHECK(!parse_ok(json::parse(R"({"max_tokens":0})"), pr, err));
+  CHECK(!parse_ok(json::parse(R"({"stop":[42.5]})"), pr, err));
+  CHECK(!parse_ok(json::parse(R"({"logit_bias":{"x":1.0}})"), pr, err));
   // max_completion_tokens wins over max_tokens.
   CHECK(parse_ok(
-      json::parse(R"({"max_tokens":10,"max_completion_tokens":20})"), cfg, pr,
+      json::parse(R"({"max_tokens":10,"max_completion_tokens":20})"), pr,
       err));
   CHECK(pr.req_max_tokens == 20);
   // Unknown fields ignored.
-  CHECK(parse_ok(json::parse(R"({"bogus_field":[1,2,3]})"), cfg, pr, err));
+  CHECK(parse_ok(json::parse(R"({"bogus_field":[1,2,3]})"), pr, err));
   return 0;
 }
 
-int test_tool_wire() {
+#ifdef KOKKOSDNN_SERVER_HAVE_LFM25
+int test_lfm25_tool_wire() {
   using KokkosDNN::LFM25::args_json_to_pythonic;
   using KokkosDNN::LFM25::args_pythonic_to_json;
+  using KokkosDNN::LFM25::ChatMessage;
   using KokkosDNN::LFM25::encode_chatml_with_tools;
   using KokkosDNN::LFM25::parse_tool_call_block;
   using KokkosDNN::LFM25::parse_tool_calls;
+  using KokkosDNN::LFM25::render_lfm25_chatml;
   using KokkosDNN::LFM25::render_lfm25_chatml_with_tools;
+  using KokkosDNN::LFM25::ToolCall;
   using KokkosDNN::LFM25::ToolCallStreamParser;
+  using KokkosDNN::LFM25::ToolParseResult;
   // Argument conversion round-trips.
   CHECK(args_pythonic_to_json("") == "{}");
   CHECK(args_pythonic_to_json(
@@ -506,7 +520,7 @@ int test_tool_wire() {
     CHECK(r.reasoning.empty());
     CHECK(r.text == raw);
   }
-  // System suffix lands in the system block; directives combine.
+  // System suffix lands in the LFM25 system block; directives combine.
   {
     ParsedRequest pr;
     pr.tools_json = "[t]";
@@ -520,12 +534,128 @@ int test_tool_wire() {
     CHECK(r.find("List of tools: [t]\nMUST-A.\nJSON-B.") !=
           std::string::npos);
   }
+  return 0;
+}
+#endif  // KOKKOSDNN_SERVER_HAVE_LFM25
+
+#ifdef KOKKOSDNN_SERVER_HAVE_LFM25
+// Tiny-config LFM25 render check (pure string mapping, no weights): the
+// tools render path matches the plain renderer byte-for-byte without tools.
+int test_lfm25_render_tiny() {
+  const std::vector<KokkosDNN::LFM25::ChatMessage> msgs = {
+      {{"system", "be bold", "", {}, ""}, {"user", "hi there", "", {}, ""}}};
+  CHECK(KokkosDNN::LFM25::render_lfm25_chatml_with_tools(msgs, "", "", true,
+                                                         true) ==
+        KokkosDNN::LFM25::render_lfm25_chatml(msgs, true, true));
+  return 0;
+}
+#endif  // KOKKOSDNN_SERVER_HAVE_LFM25
+
+#ifdef KOKKOSDNN_SERVER_HAVE_GLIMMER
+// Glimmer render check (pure string mapping, no weights): one user turn
+// renders the Muse-style framing with an open assistant header.
+int test_glimmer_render_tiny() {
+  const std::vector<KokkosDNN::Glimmer::ChatMessage> msgs =
+      KokkosDNN::Glimmer::make_chat_messages("hi", "", "user");
+  const std::string r =
+      KokkosDNN::Glimmer::render_chat_template(msgs, true);
+  CHECK(r.find("<|begin_of_text|>") == 0);
+  CHECK(r.find("<|start|>user<|message|>hi<|eot|>") != std::string::npos);
+  CHECK(r.rfind("<|start|>assistant<|message|>") ==
+        r.size() - std::string("<|start|>assistant<|message|>").size());
+  return 0;
+}
+#endif  // KOKKOSDNN_SERVER_HAVE_GLIMMER
+
+int test_backends() {
+  using KokkosDNN::Server::available_backends;
+  using KokkosDNN::Server::create_backend;
+  using KokkosDNN::Server::normalize_arch_name;
+  // Registry: both arch names resolve (real or stub backend), unknown does
+  // not. No weights/Kokkos needed: construction allocates nothing.
+  {
+    const std::vector<std::string> names = available_backends();
+    bool lfm = false, gli = false;
+    for (const auto& n : names) {
+      lfm = lfm || n == "lfm2.5";
+      gli = gli || n == "glimmer";
+    }
+    CHECK(lfm && gli);
+  }
+  {
+    std::unique_ptr<ChatBackend> lfm = create_backend("lfm2.5");
+    std::unique_ptr<ChatBackend> gli = create_backend("glimmer");
+    CHECK(lfm && gli);
+    CHECK(!create_backend("llama"));
+    CHECK(lfm->arch() == "lfm2.5");
+    CHECK(gli->arch() == "glimmer");
+    CHECK(lfm->default_model_id() == "lfm2_5");
+    CHECK(gli->default_model_id() == "glimmer-30b");
+    CHECK(lfm->supports_tools());
+    CHECK(!gli->supports_tools());
+    // Load-free defaults (no weights/tokenizer): parse_common seeds from
+    // these, so they must be sane before load().
+    CHECK(!lfm->default_stop_ids().empty());
+    CHECK(!lfm->default_stop_strings().empty());
+    CHECK(!gli->default_stop_ids().empty());
+    CHECK(!gli->default_stop_strings().empty());
+  }
+  // CLI arch aliases (case-insensitive, driver-style).
+  CHECK(normalize_arch_name("lfm2.5") == "lfm2.5");
+  CHECK(normalize_arch_name("LFM2_5") == "lfm2.5");
+  CHECK(normalize_arch_name("lfm25") == "lfm2.5");
+  CHECK(normalize_arch_name("glimmer") == "glimmer");
+  CHECK(normalize_arch_name("Glimmer-30B") == "glimmer");
+  CHECK(normalize_arch_name("muse-glimmer") == "glimmer");
+  CHECK(normalize_arch_name("muse-glimmer-30b") == "glimmer");
+  CHECK(normalize_arch_name("darkc0de-muse-glimmer-30b") == "glimmer");
+  CHECK(normalize_arch_name("llama") == "");
+  CHECK(normalize_arch_name("") == "");
+  // Tools gate: LFM25 accepts, Glimmer rejects (no native tool grammar).
+  {
+    std::unique_ptr<ChatBackend> lfm = create_backend("lfm2.5");
+    std::unique_ptr<ChatBackend> gli = create_backend("glimmer");
+    ParsedRequest pr;
+    pr.tools_active = true;
+    pr.tools_json = "[{}]";
+    std::string err;
+    CHECK(check_tools_support(*lfm, pr, err));
+    CHECK(!check_tools_support(*gli, pr, err));
+    CHECK(!err.empty());
+    pr.tools_active = false;
+    pr.tools_json.clear();
+    ServerToolCall c;
+    c.name = "f";
+    ServerChatMessage m;
+    m.role = "assistant";
+    m.content = "x";
+    m.tool_calls.push_back(c);
+    pr.messages.push_back(m);
+    CHECK(check_tools_support(*lfm, pr, err));
+    CHECK(!check_tools_support(*gli, pr, err));
+    pr.messages.clear();
+    CHECK(check_tools_support(*gli, pr, err));
+  }
+  return 0;
+}
+
+int test_tool_helpers() {
+  // System suffix assembly (arch-agnostic) + tool_calls_json shape +
+  // fence stripping. No model code involved.
+  {
+    ParsedRequest pr;
+    pr.tools_json = "[t]";
+    pr.tool_directive = "MUST-A.";
+    pr.json_mode = true;
+    pr.json_directive = "JSON-B.";
+    CHECK(make_system_suffix(pr) == "MUST-A.\nJSON-B.");
+  }
   // tool_calls_json shape: fresh ids, function envelope, {} default.
   // (Default-constructed ServerState performs no Kokkos allocation, so
   // no runtime init is needed; only the id counter is touched.)
   {
     ServerState st;
-    ToolCall c;
+    ServerToolCall c;
     c.name = "f";
     c.arguments = "";
     const json tcs = tool_calls_json(st, {c});
@@ -575,7 +705,7 @@ int test_assemble() {
   }
   // Tools with calls: tool_calls payload, finish tool_calls.
   {
-    ToolCall c;
+    ServerToolCall c;
     c.name = "get_weather";
     c.arguments = "{\"location\":\"SF\"}";
     AssembledMessage m =
@@ -592,7 +722,7 @@ int test_assemble() {
   }
   // Empty display text with calls -> content null.
   {
-    ToolCall c;
+    ServerToolCall c;
     c.name = "f";
     c.arguments = "";
     AssembledMessage m = assemble_chat_message(st, pr, "", "", {c}, "stop");
@@ -603,7 +733,7 @@ int test_assemble() {
   // parallel_tool_calls=false keeps the first call only.
   pr.parallel_tool_calls = false;
   {
-    ToolCall a, b;
+    ServerToolCall a, b;
     a.name = "a";
     a.arguments = "{}";
     b.name = "b";
@@ -626,7 +756,7 @@ int test_assemble() {
   pr.tools_active = false;
   // Streaming delta shape: index/id/type/function per call.
   {
-    ToolCall c;
+    ServerToolCall c;
     c.name = "f";
     c.arguments = "{\"x\":2}";
     const json d = tool_call_delta(0, "call-9", c);
@@ -648,6 +778,7 @@ int test_error_shape() {
 // Streaming robustness: partial stops/markers must be held, never emitted
 // and retracted (a shrink below the emitted count used to throw
 // std::out_of_range out of push()/poll_reasoning(), killing the turn).
+#ifdef KOKKOSDNN_SERVER_HAVE_LFM25
 int test_stream_robustness() {
   using KokkosDNN::LFM25::ToolCallStreamParser;
   using KokkosDNN::LFM25::ToolParseResult;
@@ -908,11 +1039,13 @@ int test_stream_robustness() {
   }
   return 0;
 }
+#endif  // KOKKOSDNN_SERVER_HAVE_LFM25
 
 // Single-call streaming step: one feed() per token returns both channels
 // and must agree with push()/poll_reasoning() and the whole-text parse —
 // including over a long thinking trace fed in token-sized chunks, where
 // per-step full re-scans would be quadratic.
+#ifdef KOKKOSDNN_SERVER_HAVE_LFM25
 int test_stream_feed() {
   using KokkosDNN::LFM25::StreamDeltas;
   using KokkosDNN::LFM25::ToolCallStreamParser;
@@ -1000,16 +1133,25 @@ int test_stream_feed() {
   }
   return 0;
 }
+#endif  // KOKKOSDNN_SERVER_HAVE_LFM25
 
 }  // namespace
 
 int main() {
   if (test_messages()) return 1;
   if (test_common()) return 1;
-  if (test_tool_wire()) return 1;
+  if (test_tool_helpers()) return 1;
+  if (test_backends()) return 1;
   if (test_assemble()) return 1;
+#ifdef KOKKOSDNN_SERVER_HAVE_LFM25
+  if (test_lfm25_tool_wire()) return 1;
+  if (test_lfm25_render_tiny()) return 1;
   if (test_stream_robustness()) return 1;
   if (test_stream_feed()) return 1;
+#endif
+#ifdef KOKKOSDNN_SERVER_HAVE_GLIMMER
+  if (test_glimmer_render_tiny()) return 1;
+#endif
   if (test_error_shape()) return 1;
   std::cout << "server parsing tests passed (" << g_checks << " checks)\n";
   return 0;
