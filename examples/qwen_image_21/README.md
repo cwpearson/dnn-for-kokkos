@@ -92,8 +92,9 @@ header):
 # Smoke (no weights, no input file: synthesized 64x64 test card):
 qwen_image_21_edit --tiny --prompt "smoke edit"
 
-# Staged full edit (joint in-process encode, no embedding files):
-qwen_image_21_edit --staged --ckpt <ckpt> \
+# Staged full edit (joint in-process encode, no embedding files;
+# staged is the default, pass --no-staged for single-phase):
+qwen_image_21_edit --ckpt <ckpt> \
   --image sketch.png --prompt "make it photorealistic" \
   --steps 8 --cfg 1.0 \
   --out edit.png
@@ -112,7 +113,7 @@ qwen_image_21_edit --staged --ckpt <ckpt> \
 size snaps to `/32` via reference `calculate_dimensions`, and the default
 output size derives from the LAST image's aspect; the override then
 goes through the driver stride snap, a no-op on `/32` sizes); `--init-latents-in`, `--steps/--cfg/--shift`,
-`--sigmas driver|turbo`, `--seed`, `--staged`, and `--dump-steps` behave
+`--sigmas driver|turbo`, `--seed`, `--no-staged`, and `--dump-steps` behave
 exactly as in `generate` (manifest `prompt_source` is `edit:<source>` and
 the dump adds `ref_latents.f32` (single image) or `ref_latents_<i>.f32`
 (multi-image) plus `img_mask.f32` on the cond path).
@@ -143,7 +144,7 @@ An empty prompt re-asks; an empty filename auto-numbers
 so repeats of the same prompt still vary.
 
 ```sh
-qwen_image_21_generate --staged --ckpt <ckpt>
+qwen_image_21_generate --ckpt <ckpt>
 # [size] 1024x1024 px (latent 64x64)
 # prompt> a red panda reading a newspaper
 # output> red_panda.png
@@ -152,7 +153,7 @@ qwen_image_21_generate --staged --ckpt <ckpt>
 
 The encoder and transformer weights are loaded ONCE into host memory before
 the first prompt; every iteration copies the needed component host->device,
-runs the phase, and releases the device copy, so `--staged` keeps the same
+runs the phase, and releases the device copy, so staging keeps the same
 one-component-resident property per iteration without re-reading the
 ~32 GB checkpoint from disk.
 
@@ -193,7 +194,7 @@ pip install -U "huggingface_hub[cli]"
 hf download Qwen/Qwen-Image-2.1-Turbo --local-dir <ckpt>
 
 # Smoke paths, no downloads needed:
-./build/examples/qwen_image_21/qwen_image_21_generate --tiny --steps 2 --staged --prompt "smoke test"
+./build/examples/qwen_image_21/qwen_image_21_generate --tiny --steps 2 --prompt "smoke test"
 ./build/examples/qwen_image_21/qwen_image_21_edit --tiny --prompt "smoke edit"
 ```
 
@@ -280,12 +281,12 @@ grayscale preview with a logged reason instead of failing.
 | `--sigmas` | `driver` | `driver`: nearest-grid schedule from `--steps`/`--shift` (default, unchanged); `turbo`: checkpoint `sample_sigmas` verbatim (mu-shifted already, 8 steps, shift=1.0/no-shift) |
 | `--seed` | 42 | latent init seed (ignored when `--init-latents-in` is given) |
 | `--init-latents-in` | — | raw float32 LE initial latents `[C,H,W]` row-major, C-major `lat[(c*H+h)*W+w]` (PRE-denormalization noise, no mean/std); replaces the mt19937 sample |
-| `--vae-decode` | on (`--no-vae-decode` for preview) | real VAE decode from `<ckpt>/vae` when the VAE header + checkpoint are present, else grayscale preview |
+| `--no-vae-decode` | off | write the grayscale preview instead of the real VAE decode from `<ckpt>/vae` (decode is the default when the VAE header + checkpoint are present, else preview) |
 | `--decode-latents-in` | — | raw fp32 LE latents to decode directly (skips encode/DiT/sampling; needs `--ckpt`); H/W are the output pixels |
 | `--decode-latents-layout` | `chw` | `chw` = driver layout `lat[(c*H+h)*W+w]`; `token` = torch packed `[H*W,C]` (golden final latents) |
 | `--decode-out-f32` | — | also write the post-clamp RGBA decode as raw f32 `[H,W,4]` (VAE-only parity) |
-| `--out` | `qwen_image_21_out.png` | PNG with `KokkosDNN_ENABLE_IMAGE=ON`, else PPM |
-| `--staged` | on (`--no-staged` for single-phase) | fenced staged release between phases (see below) |
+| `--out` | `qwen_image_21_out.png` | PNG (`.jpg`/`.jpeg` writes JPEG) with `KokkosDNN_ENABLE_IMAGE=ON`, else PPM |
+| `--no-staged` | off | single-phase run (staged is the default: fenced staged release between phases, see below) |
 | `--dump-steps` | — | `DIR`: write golden-parity tensors (raw float32 LE) + `manifest.json`, then exit normally |
 | `--image` | — (edit only, repeatable ≤10) | condition image path(s) in `--image` order, like the reference `image=[...]` list (required unless `--tiny`; synthesized test card under `--tiny`) |
 | `--output-resolution` | 1024 (edit only) | reference area side: each image's HxW derives from its own aspect and snaps to `/32`; the default output size derives from the LAST image's aspect; `--height`/`--width` override only the output size |
@@ -352,19 +353,19 @@ latents.
 
 ```sh
 # Smoke test (no weights, CPU or GPU; --prompt keeps it one-off):
-qwen_image_21_generate --tiny --steps 2 --staged --prompt "smoke test"
+qwen_image_21_generate --tiny --steps 2 --prompt "smoke test"
 
 # Edit smoke (one-shot; synthesized test card, no --image needed):
 qwen_image_21_edit --tiny --prompt "smoke edit"
 
-# Staged full run (once the models/qwen_image_21 headers land):
-qwen_image_21_generate --staged --ckpt <ckpt> \
+# Staged full run (staged is the default; once the models/qwen_image_21 headers land):
+qwen_image_21_generate --ckpt <ckpt> \
   --prompt "a red panda reading a newspaper" \
   --height 1024 --width 1024 --steps 8 --cfg 1.0 \
   --out qwen_out.png
 ```
 
-`--staged` fences after encode, logs `encode-released`, keeps the
+Staged execution (the default) fences after encode, logs `encode-released`, keeps the
 `~14 MiB` of embeds resident on-device across the DiT load
 (`[staged] keeping X MiB ... no disk round-trip`), samples straight from
 them (device-to-device, never through host or disk), then releases the

@@ -104,7 +104,7 @@ rm -rf "$work"
 mkdir -p "$work/driver"
 
 echo "==> strict identical-inputs run: torch embeds + torch latents"
-"$binary" --staged \
+"$binary" \
   --ckpt "$weights" \
   --prompt "$prompt" \
   --prompt-embeds-in "$golden/prompt_embeds.f32" \
@@ -153,7 +153,7 @@ fi
 if [[ "$in_process" == 1 ]]; then
   echo "==> informational full in-process run (GPU encoder, driver RNG)"
   mkdir -p "$work/inproc"
-  "$binary" --staged \
+  "$binary" \
     --ckpt "$weights" \
     --prompt "$prompt" \
     --height 1024 --width 1024 --steps 8 --sigmas turbo --cfg 1.0 --seed 42 \
@@ -203,7 +203,7 @@ if [[ "$edit" == 1 ]]; then
   # raw int32 LE in embed coordinates (range-checked at load).
   python3 -c "import numpy; numpy.load('$edit_golden/image_pad_rows.npy').astype('<i4').tofile('$work/edit/vis_rows.i32')"
   echo "==> strict identical-inputs edit run: torch joint embeds + torch latents + golden refs"
-  "$edit_binary" --staged \
+  "$edit_binary" \
     --ckpt "$weights" \
     --image "$edit_image" --prompt "$edit_prompt" \
     --prompt-embeds-in "$edit_golden/prompt_embeds.f32" \
@@ -233,7 +233,7 @@ if [[ "$edit" == 1 ]]; then
 
   echo "==> edit VAE-encode gate: default in-process path (no --ref-latents-in)"
   mkdir -p "$work/edit-vae-encode"
-  "$edit_binary" --staged \
+  "$edit_binary" \
     --ckpt "$weights" \
     --image "$edit_image" --prompt "$edit_prompt" \
     --prompt-embeds-in "$edit_golden/prompt_embeds.f32" \

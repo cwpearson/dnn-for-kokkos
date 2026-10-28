@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -1198,7 +1199,7 @@ inline std::vector<int> encode_qwen_raw(const RawQwenTables& t,
 //   3. Null (zeros) for both, prompt logged only.
 // All three paths device-stage both branches into EncoderStage::device /
 // device_neg; the sample phase reads straight from those device views, so
-// the --staged handoff never touches disk (see main).
+// the staged handoff never touches disk (see main).
 //
 struct EncoderStage {
   std::vector<float> embeds;      // host [L*Cc] row-major cond features
@@ -2385,9 +2386,24 @@ inline bool try_vae_decode_rgba(const std::vector<float>& lat, size_t C,
 }
 #endif  // QWEN21_DRIVER_HAVE_VAE
 
-// Shared image writer: PNG when the image component is built in, otherwise
-// the PPM fallback (which drops alpha). Used by the normal pipeline tail and
-// by the VAE-only parity path.
+// Shared image writer: PNG/JPEG when the image component is built in
+// (format follows the --out extension: ".jpg"/".jpeg" selects lossy JPEG,
+// anything else selects lossless PNG), otherwise the PPM fallback (which
+// drops alpha). Used by the normal pipeline tail and by the VAE-only parity
+// path.
+#ifdef KOKKOSDNN_ENABLE_IMAGE
+// Output format follows the --out extension: ".jpg"/".jpeg" (case
+// insensitive) selects lossy JPEG, anything else selects lossless PNG.
+inline bool out_is_jpeg(const std::string& path) {
+  const size_t dot = path.find_last_of('.');
+  const size_t sep = path.find_last_of("/\\");
+  if (dot == std::string::npos || (sep != std::string::npos && dot < sep))
+    return false;
+  std::string ext = path.substr(dot);
+  for (char& ch : ext) ch = (char)std::tolower((unsigned char)ch);
+  return ext == ".jpg" || ext == ".jpeg";
+}
+#endif
 inline void write_output_image(const std::string& out,
                                 const std::vector<unsigned char>& pix,
                                 size_t oH, size_t oW, int oCh, bool decoded) {
@@ -2398,9 +2414,15 @@ inline void write_output_image(const std::string& out,
     for (size_t ww = 0; ww < oW; ++ww)
       for (int c = 0; c < oCh; ++c)
         img(h, ww, (size_t)c) = pix[(h * oW + ww) * (size_t)oCh + (size_t)c];
-  KokkosDNN::Image::save_image_png(out, img);
-  std::printf("[wrote %s] %zux%zu %s (PNG)\n", out.c_str(), oH, oW,
-              decoded ? "VAE RGB" : "grayscale preview");
+  if (out_is_jpeg(out)) {
+    KokkosDNN::Image::save_image_jpg(out, img);
+    std::printf("[wrote %s] %zux%zu %s (JPEG)\n", out.c_str(), oH, oW,
+                decoded ? "VAE RGB" : "grayscale preview");
+  } else {
+    KokkosDNN::Image::save_image_png(out, img);
+    std::printf("[wrote %s] %zux%zu %s (PNG)\n", out.c_str(), oH, oW,
+                decoded ? "VAE RGB" : "grayscale preview");
+  }
 #else
   const std::string ppm = with_extension(out, ".ppm");
   if (ppm != out)

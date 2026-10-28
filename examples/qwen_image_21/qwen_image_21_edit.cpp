@@ -52,7 +52,8 @@
 //                       [--steps 8] [--cfg 1.0] [--shift 3.0]
 //                       [--sigmas driver|turbo] [--seed 42]
 //                       [--no-vae-decode]
-//                       [--out edit.png] [--staged] [--dump-steps DIR]
+//                       [--out edit.png|edit.jpg] [--no-staged]
+//                       [--dump-steps DIR]
 //                       [--tiny]
 #include "qwen_image_21_edit_helpers.hpp"
 int main(int argc, char** argv) {
@@ -134,8 +135,6 @@ int main(int argc, char** argv) {
       dump_dir = argv[++i];
     } else if (a == "--ckpt") {
       if (!need(ckpt)) return 1;
-    } else if (a == "--vae-decode") {
-      vae_decode = true;
     } else if (a == "--no-vae-decode" || a == "--no-vae_decode") {
       vae_decode = false;
     } else if (a == "--height" && i + 1 < argc) {
@@ -163,8 +162,6 @@ int main(int argc, char** argv) {
       seed = (uint64_t)std::stoull(argv[++i]);
     } else if (a == "--tiny") {
       tiny = true;
-    } else if (a == "--staged") {
-      staged = true;
     } else if (a == "--no-staged" || a == "--no-stage") {
       staged = false;
     } else if (a == "--help" || a == "-h") {
@@ -745,7 +742,7 @@ int main(int argc, char** argv) {
 #ifdef QWEN21_DRIVER_HAVE_VAE
       std::printf("[vae %s] validated%s\n", vae_dir.c_str(),
                   vae_decode ? "; decode enabled (default)"
-                             : "; preview (pass --vae-decode to decode)");
+                             : "; preview (--no-vae-decode)");
 #else
       std::printf("[vae %s] validated, but KokkosDNN_QwenImage21Vae.hpp is "
                   "not in this build; writing a grayscale preview instead\n",
