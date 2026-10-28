@@ -410,8 +410,12 @@ class GlimmerBackend final : public ChatBackend {
           break;
         }
       }
-      if (!found)
-        native.insert(native.begin(), {"system", system_suffix});
+      if (!found) {
+        Glimmer::ChatMessage sys;
+        sys.role = "system";
+        sys.content = system_suffix;
+        native.insert(native.begin(), std::move(sys));
+      }
     }
     return Glimmer::encode_chat(tok_, native, add_generation_prompt, true);
   }
