@@ -13,20 +13,11 @@
 # rule, which will place these under ${CMAKE_INSTALL_INCLUDEDIR}/images.
 
 # ---------------------------------------------------------------------------
-# Dependency policy: prefer local compatible dependencies, fall back to
-# FetchContent on a miss. Probe common system image libraries (QUIET, never
-# fatal); the canonical image-I/O path is stb (header-only, JPEG/PNG/BMP).
-# No fallback image-decoder implementations in our own code — third-party
-# only for decoding.
+# Dependency policy: the canonical image-I/O path is stb (header-only,
+# JPEG/PNG/BMP). Prefer a local stb_image.h, fall back to FetchContent on a
+# miss. No fallback image-decoder implementations in our own code —
+# third-party only for decoding.
 # ---------------------------------------------------------------------------
-find_package(JPEG QUIET)
-find_package(PNG QUIET)
-find_package(OpenCV QUIET)
-if(JPEG_FOUND OR PNG_FOUND OR OpenCV_FOUND)
-  message(STATUS "KokkosDNN image: system libs found:"
-    " JPEG=${JPEG_FOUND} PNG=${PNG_FOUND} OpenCV=${OpenCV_FOUND}"
-    " (informational only; canonical I/O path is stb)")
-endif()
 
 # Canonical path: stb (header-only). Look for a local stb_image.h first,
 # including the default Homebrew (/opt/homebrew) and MacPorts (/opt/local)
