@@ -266,10 +266,8 @@ Limits to know:
 - **No sampling/chat/detokenizer logic in `server/`** — that belongs to
   `models/` (shared primitives in `models/common/`). The server only
   translates HTTP <-> backend calls (all generation runs through the
-  arch backend). Exception: `BackendGlimmer.cpp` carries a minimal
-  `Impl::GlimmerSession` until the `models/glimmer` promotion lands with a
-  `Session` of its own (see `server/GlimmerShim.hpp`); it is model logic
-  parked in `server/` temporarily, not a pattern to copy.
+  arch backend: `Glimmer::Session` for Glimmer, `LFM25::Session` for
+  LFM2.5).
 - The server owns `Kokkos::initialize/finalize` for the serving process.
 - Single-user, blocking: one global mutex guards all inference. A second
   concurrent request blocks until the in-flight request finishes (no 409;
@@ -288,8 +286,6 @@ Limits to know:
   lives in device memory by default; `--prefix-cache-host` keeps it in
   host memory instead (H2D/D2H copies per turn, ~20 KB per token for
   LFM2.5-24B at 128k context ≈ 2.5 GiB per full-window entry).
-  The prefix cache is currently an LFM2.5-only optimization: the Glimmer
-  backend re-prefills every turn and always logs `prefix_hit=0`.
 - A streaming client that disconnects stops the turn at the next token
   (detected from `sink.write()`); the abandoned turn is logged with
   `aborted=client-disconnect` instead of holding the inference lock for the
