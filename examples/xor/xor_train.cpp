@@ -7,6 +7,7 @@
 #include <Kokkos_Core.hpp>
 #include <cstdio>
 #include <cstring>
+#include <random>
 #include <string>
 
 #include "KokkosDNN_XorMLP.hpp"
@@ -17,6 +18,7 @@ struct Args {
   long epochs = 5000;
   float lr = 0.05f;
   uint64_t seed = 0;
+  bool seed_given = false;
   long print_every = 500;
 };
 
@@ -42,6 +44,7 @@ bool parse_args(int argc, char** argv, Args& a) {
       long v = 0;
       if (!need(v) || v < 0) return false;
       a.seed = static_cast<uint64_t>(v);
+      a.seed_given = true;
     } else if (s == "--print-every") {
       if (!need(a.print_every) || a.print_every < 0) return false;
     } else if (s == "--help" || s == "-h") {
@@ -66,6 +69,11 @@ int main(int argc, char** argv) {
   Kokkos::ScopeGuard guard(argc, argv);
   using Exec = Kokkos::DefaultExecutionSpace;
   using Scalar = float;
+
+  if (!args.seed_given) {
+    std::random_device rd;
+    args.seed = (uint64_t(rd()) << 32) | uint64_t(rd());
+  }
 
   auto data = KokkosDNN::Xor::make_dataset<Exec, Scalar>();
   auto mlp = KokkosDNN::Xor::create_mlp<Exec, Scalar>(args.hidden, args.seed);

@@ -8,7 +8,7 @@
 //                 [--text-weights gemma-2-2b-it/model.safetensors]
 //                 [--tokenizer tokenizer.json] [--text-config config.json]
 //                 [--steps 18] [--guidance 5.0] [--flow-shift 4.0]
-//                 [--seed 42] [--out sana_out.png | sana_out.jpg] [--fp32]
+//                 [--seed S] [--out sana_out.png | sana_out.jpg] [--fp32]
 //
 // Text encoding: --prompt is encoded with the native Gemma-2-2B-IT text
 // encoder (KokkosDNN_SanaTextEncoder.{hpp,cpp}) when --text-weights points
@@ -41,6 +41,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -211,6 +212,7 @@ int main(int argc, char** argv) {
   int steps = 18;
   float guidance = 5.0f, flow_shift = 4.0f;
   uint64_t seed = 42;
+  bool seed_given = false;
   bool tiny = false;
   bool vae_decode = true;
   // --fp32 is accepted for forward compatibility; float is the only (and
@@ -254,6 +256,7 @@ int main(int argc, char** argv) {
       flow_shift = std::stof(argv[++i]);
     } else if (a == "--seed" && i + 1 < argc) {
       seed = (uint64_t)std::stoull(argv[++i]);
+      seed_given = true;
     } else if (a == "--vae-safetensors" && i + 1 < argc) {
       vae_path = argv[++i];
     } else if (a == "--vae-decode") {
@@ -270,6 +273,11 @@ int main(int argc, char** argv) {
     } else {
       std::fprintf(stderr, "warning: ignoring unknown arg '%s'\n", a.c_str());
     }
+  }
+
+  if (!seed_given) {
+    std::random_device rd;
+    seed = (uint64_t(rd()) << 32) | uint64_t(rd());
   }
 
   Kokkos::initialize(argc, argv);

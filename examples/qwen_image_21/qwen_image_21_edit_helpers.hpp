@@ -552,7 +552,7 @@ inline std::vector<int> load_vis_rows_raw(const std::string& path, size_t S) {
       "(default 3.0)\n"
       "  --sigmas M              driver (default) | turbo (checkpoint "
       "sample_sigmas)\n"
-      "  --seed N                default 42\n"
+      "  --seed N                random if omitted\n"
       "  --no-vae-decode         write the grayscale preview instead of the\n"
       "                          real decode (VAE decode from <ckpt>/vae is\n"
       "                          the default when the VAE header + checkpoint\n"

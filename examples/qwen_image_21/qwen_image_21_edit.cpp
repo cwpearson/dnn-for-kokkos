@@ -50,7 +50,7 @@
 //                        [--ref-latents-layout chw|token]]
 //                       [--init-latents-in n.f32]
 //                       [--steps 8] [--cfg 1.0] [--shift 3.0]
-//                       [--sigmas driver|turbo] [--seed 42]
+//                       [--sigmas driver|turbo] [--seed S]
 //                       [--no-vae-decode]
 //                       [--out edit.png|edit.jpg] [--no-staged]
 //                       [--dump-steps DIR]
@@ -76,6 +76,7 @@ int main(int argc, char** argv) {
   float guidance = 1.0f, flow_shift = 3.0f;
   std::string sigmas_mode = "driver";
   uint64_t seed = 42;
+  bool seed_given = false;
   bool tiny = false;
   bool staged = true, vae_decode = true;
 
@@ -160,6 +161,7 @@ int main(int argc, char** argv) {
       }
     } else if (a == "--seed" && i + 1 < argc) {
       seed = (uint64_t)std::stoull(argv[++i]);
+      seed_given = true;
     } else if (a == "--tiny") {
       tiny = true;
     } else if (a == "--no-staged" || a == "--no-stage") {
@@ -170,6 +172,11 @@ int main(int argc, char** argv) {
     } else {
       std::fprintf(stderr, "warning: ignoring unknown arg '%s'\n", a.c_str());
     }
+  }
+
+  if (!seed_given) {
+    std::random_device rd;
+    seed = (uint64_t(rd()) << 32) | uint64_t(rd());
   }
 
   if (image_paths.empty() && !tiny) {

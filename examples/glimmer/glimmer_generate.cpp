@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstdio>
 #include <iostream>
+#include <random>
 #include <string>
 #include <vector>
 #include "KokkosDNN.hpp"
@@ -81,7 +82,7 @@ bool is_gguf_path(const std::string& p) {
 //
 // Sampling defaults to greedy (the upstream generation_config.json sets
 // do_sample=false, no temperature/top_k/top_p); any sampling flag opts into
-// that sampler. Seed defaults to 0 so runs repeat unless --seed is given.
+// that sampler. Seed is random unless --seed is given.
 //
 // Default compute/storage is bfloat16 (heretic checkpoint dtype);
 // --fp32 opts into FP32 for comparison. BF16 30B needs ~60 GiB, so the
@@ -303,6 +304,7 @@ int main(int argc, char** argv) {
     // Upstream generation_config.json: do_sample=false (greedy), no
     // temperature/top_k/top_p. Sampling flags below opt into samplers.
     KokkosDNN::SampleOptions samp_opt;
+    bool seed_given = false;
 
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
@@ -387,7 +389,13 @@ int main(int argc, char** argv) {
         samp_opt.repetition_penalty = std::stof(argv[++i]);
       } else if (a == "--seed" && i + 1 < argc) {
         samp_opt.seed = (uint64_t)std::stoull(argv[++i]);
+        seed_given = true;
       }
+    }
+
+    if (!seed_given) {
+      std::random_device rd;
+      samp_opt.seed = (uint64_t(rd()) << 32) | uint64_t(rd());
     }
 
     KokkosDNN::print_configuration(std::cout);

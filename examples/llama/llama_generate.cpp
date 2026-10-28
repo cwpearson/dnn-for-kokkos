@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstdio>
 #include <iostream>
+#include <random>
 #include <string>
 #include <vector>
 #include "KokkosDNN.hpp"
@@ -36,7 +37,7 @@
 // the 3.2-1B base keeps the same preset (Meta recommends the same
 // temp/top-p for the 3.2 instruct models), so the sampler is unchanged.
 // --temperature 0 restores greedy decode. Every sampling flag overrides
-// the preset; seed defaults to 0 so runs repeat unless --seed is given.
+// the preset; seed is random unless --seed is given.
 //
 // Default compute/storage is bfloat16 (Llama 3.1 8B-Instruct checkpoint dtype);
 // --fp32 opts in. --prefill-chunk N caps prefill activations to
@@ -250,6 +251,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> stop_strings;
     KokkosDNN::SampleOptions samp_opt =
         KokkosDNN::SampleOptions::llama_3_1_8b_instruct();
+    bool seed_given = false;
 
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
@@ -333,7 +335,13 @@ int main(int argc, char** argv) {
         samp_opt.repetition_penalty = std::stof(argv[++i]);
       } else if (a == "--seed" && i + 1 < argc) {
         samp_opt.seed = (uint64_t)std::stoull(argv[++i]);
+        seed_given = true;
       }
+    }
+
+    if (!seed_given) {
+      std::random_device rd;
+      samp_opt.seed = (uint64_t(rd()) << 32) | uint64_t(rd());
     }
 
     KokkosDNN::print_configuration(std::cout);

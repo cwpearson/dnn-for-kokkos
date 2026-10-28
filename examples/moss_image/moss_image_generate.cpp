@@ -25,7 +25,7 @@
 //                       [--skip-layers 22]
 //                       [--slg-layers 24 --slg-scale 3.0
 //                        --slg-start 0.0 --slg-stop 1.0]
-//                       [--seed 42]
+//                       [--seed S (random if omitted)]
 //                       [--vae-weights vae.safetensors [--no-vae-decode]]
 //                       [--out img.png | img.jpg]
 //                       [--no-staged]
@@ -68,6 +68,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -1019,7 +1020,7 @@ void usage() {
       "  --slg-scale    SLG correction scale (default 0 = off)\n"
       "  --slg-start/--slg-stop SLG+uncond-skip window as a fraction of\n"
       "                 steps in denoising order (default 0..1)\n"
-      "  --seed         latent init seed (default 42)\n"
+      "  --seed         latent init seed (random if omitted)\n"
       "  --vae-weights  VAE checkpoint (validated whenever given)\n"
       "  --vae-decode   (default ON) run the real VAE decode when the VAE\n"
       "                 header + weights are present (else grayscale preview).\n"
@@ -1044,6 +1045,7 @@ int main(int argc, char** argv) {
   std::string slg_layers_str;
   float slg_scale = 0.0f, slg_start = 0.0f, slg_stop = 1.0f;
   uint64_t seed = 42;
+  bool seed_given = false;
   bool tiny = false;
   bool staged = true, vae_decode = true;
 
@@ -1102,6 +1104,7 @@ int main(int argc, char** argv) {
       slg_stop = std::stof(argv[++i]);
     } else if (a == "--seed" && i + 1 < argc) {
       seed = (uint64_t)std::stoull(argv[++i]);
+      seed_given = true;
     } else if (a == "--tiny") {
       tiny = true;
     } else if (a == "--staged") {
@@ -1114,6 +1117,11 @@ int main(int argc, char** argv) {
     } else {
       std::fprintf(stderr, "warning: ignoring unknown arg '%s'\n", a.c_str());
     }
+  }
+
+  if (!seed_given) {
+    std::random_device rd;
+    seed = (uint64_t(rd()) << 32) | uint64_t(rd());
   }
 
   Kokkos::initialize(argc, argv);

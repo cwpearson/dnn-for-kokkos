@@ -4,7 +4,7 @@
 //
 //   kokoro_tts [--weights kokoro-v1_0.pth] [--voice af_heart.pt]
 //              [--phonemes "hɛloʊ wɜːld"] [--text "hello"] [--speed 1]
-//              [--seed 42] [--out kokoro_out.wav] [--tiny]
+//              [--seed S] [--out kokoro_out.wav] [--tiny]
 //
 // KModel is language-blind: it consumes phoneme symbols, not graphemes.
 // --phonemes is the primary input (raw IPA string, e.g. produced by the
@@ -140,7 +140,7 @@ void usage() {
   std::printf(
       "usage: kokoro_tts [--weights kokoro-v1_0.pth] [--voice af_heart.pt]\n"
       "                   [--phonemes \"hɛloʊ wɜːld\"] [--text \"hello\"]\n"
-      "                   [--speed 1.0] [--seed 42] [--out kokoro_out.wav]\n"
+      "                   [--speed 1.0] [--seed S] [--out kokoro_out.wav]\n"
       "                   [--tiny]\n"
       "\n"
       "  --weights  torch.save Kokoro-82M checkpoint (default kokoro-v1_0.pth;\n"
@@ -150,8 +150,8 @@ void usage() {
       "  --phonemes raw IPA string (primary input; KModel is language-blind)\n"
       "  --text     naive fallback: vocab chars mapped directly, no G2P\n"
       "  --speed    duration divisor (default 1.0)\n"
-      "  --seed     SineGen RNG seed (default 42; audio differs from torch\n"
-      "             by RNG stream, deterministic given seed)\n"
+      "  --seed     SineGen RNG seed (random if omitted; audio differs\n"
+      "             from torch by RNG stream, deterministic given seed)\n"
       "  --out      WAV path (PCM16 peak-normalized)\n"
       "  --tiny     random-weights smoke model (no files)\n");
 }
@@ -163,6 +163,7 @@ int main(int argc, char** argv) {
   std::string phonemes = "hɛloʊ wɜːld", text, out = "kokoro_out.wav";
   float speed = 1.0f;
   uint64_t seed = 42;
+  bool seed_given = false;
   bool tiny = false, have_phonemes = false;
 
   for (int i = 1; i < argc; ++i) {
@@ -190,6 +191,7 @@ int main(int argc, char** argv) {
       speed = std::stof(argv[++i]);
     } else if (a == "--seed" && i + 1 < argc) {
       seed = (uint64_t)std::stoull(argv[++i]);
+      seed_given = true;
     } else if (a == "--tiny") {
       tiny = true;
     } else if (a == "--help" || a == "-h") {
@@ -198,6 +200,11 @@ int main(int argc, char** argv) {
     } else {
       std::fprintf(stderr, "warning: ignoring unknown arg '%s'\n", a.c_str());
     }
+  }
+
+  if (!seed_given) {
+    std::random_device rd;
+    seed = (uint64_t(rd()) << 32) | uint64_t(rd());
   }
 
   Kokkos::initialize(argc, argv);
