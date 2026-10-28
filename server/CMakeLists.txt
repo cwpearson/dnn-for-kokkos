@@ -7,9 +7,9 @@
 # cpp-httplib. All inference, sampling, and chat logic belongs in
 # models/* — the server only translates HTTP <-> backend calls.
 # Requires at least one model component. The Glimmer backend additionally
-# needs the models/glimmer promotion (KokkosDNN::glimmer target); without it
+# needs the models/glimmer component (KokkosDNN::glimmer target); without it
 # BackendGlimmer.cpp compiles to a stub whose load() reports the missing
-# target (see server/GlimmerShim.hpp).
+# component.
 
 if(NOT KokkosDNN_ENABLE_MODEL_LFM25 AND NOT KokkosDNN_ENABLE_MODEL_GLIMMER)
   message(FATAL_ERROR
@@ -19,8 +19,8 @@ endif()
 if(KokkosDNN_ENABLE_MODEL_GLIMMER AND NOT TARGET KokkosDNN::glimmer)
   message(FATAL_ERROR
     "KokkosDNN_ENABLE_MODEL_GLIMMER=ON but the KokkosDNN::glimmer target is "
-    "missing (the models/glimmer promotion has not landed; unset the option "
-    "to build the server with the Glimmer backend stubbed out).")
+    "missing (unset the option to build the server with the Glimmer backend "
+    "stubbed out).")
 endif()
 
 # HTTP + JSON front-end deps. Pins: cpp-httplib v0.63.0, nlohmann/json
