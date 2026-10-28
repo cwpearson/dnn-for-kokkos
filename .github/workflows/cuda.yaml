@@ -132,3 +132,30 @@ jobs:
       # so execution would fail; this workflow is compile coverage only.
       - name: Build everything
         run: cmake --build build --parallel "$(nproc)"
+
+      # Install + consume: verifies the installed package config, export
+      # names, and headers via the standalone consumer in tests/consume.
+      # The tpl=ON leg is the only CI coverage for the CUDA branches of
+      # KokkosDNNConfig.cmake: without it the missing-cudnn_frontend and
+      # PACKAGE_PREFIX_DIR-clobbering regressions configure/generate
+      # silently past CI. This container's apt CMake is 3.28 (Ubuntu
+      # 24.04), so the tpl=ON leg also exercises the <= 3.29
+      # find_dependency path (cmake --version is logged for evidence).
+      # Build-only like the rest of this workflow: no GPU on the runner,
+      # so the consumer is configured and built but not executed. The
+      # consumer links a CUDA Kokkos, so it needs the same nvcc_wrapper
+      # compiler as the main build. $GITHUB_WORKSPACE (container-side
+      # path), not ${{ github.workspace }} (host path), per the note above.
+      - name: Install KokkosDNN
+        run: |
+          cmake --install build --prefix "$GITHUB_WORKSPACE/kdnn-install"
+
+      - name: Build install consumer
+        run: |
+          cmake --version
+          NVCC_WRAPPER="$GITHUB_WORKSPACE/kokkos-src/bin/nvcc_wrapper"
+          cmake -S tests/consume -B /tmp/kdnn-consume-build \
+            -DCMAKE_CXX_COMPILER="${NVCC_WRAPPER}" \
+            -DKokkos_ROOT="$GITHUB_WORKSPACE/kokkos-install" \
+            -DKokkosDNN_ROOT="$GITHUB_WORKSPACE/kdnn-install"
+          cmake --build /tmp/kdnn-consume-build --parallel "$(nproc)"
