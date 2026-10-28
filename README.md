@@ -41,7 +41,7 @@ Options:
 | Option | Default | Effect |
 | --- | --- | --- |
 | `KokkosDNN_ENABLE_TESTS` | ON | build `tests/` |
-| `KokkosDNN_ENABLE_EXAMPLES` | ON | build `examples/` (`llama_generate`, `smollm2_generate`, `gemma4_generate`, `lfm2_5_generate`, `xor_train`, `dinov3_encode`, `sana_generate`, `moss_image_generate`, `kokoro_tts`, + example tests) |
+| `KokkosDNN_ENABLE_EXAMPLES` | ON | build `examples/` (`llama_generate`, `smollm2_generate`, `gemma4_generate`, `glimmer_generate`, `lfm2_5_generate`, `xor_train`, `dinov3_encode`, `sana_generate`, `moss_image_generate`, `kokoro_tts`, + example tests) |
 | `KokkosDNN_ENABLE_BENCHMARKS` | OFF | build `benchmarks/kokkosdnn_bench` (Google Benchmark, fetched if needed) |
 | `KokkosDNN_ENABLE_CUBLAS` | OFF | GEMM via cuBLAS on CUDA spaces (incl. fused GEMM+bias via cublasLt) |
 | `KokkosDNN_ENABLE_CUDNN` | OFF | attention + convolutions via cuDNN (with automatic native fallback; needs `<cudnn.h>` + `cudnn-frontend`, fetched automatically) |
@@ -51,6 +51,7 @@ Options:
 | `KokkosDNN_ENABLE_TEST_DISCOVERY` | ON | register gtest tests via `gtest_discover_tests` (set OFF for GPU-less build-only CI, where test binaries cannot run at build time) |
 | `KokkosDNN_ENABLE_IMAGE` | OFF | optional image component (`KokkosDNN::image`, stb-backed I/O + preprocessing) |
 | `KokkosDNN_ENABLE_MODEL_LFM25` | ON | build LFM2.5 model component (`KokkosDNN::lfm25`) |
+| `KokkosDNN_ENABLE_MODEL_GLIMMER` | ON | build Muse Glimmer 30B text model component (`KokkosDNN::glimmer`) |
 | `KokkosDNN_ENABLE_MODEL_MOSS` | ON | build MOSS-Image model component (`KokkosDNN::moss`) |
 | `KokkosDNN_ENABLE_SERVER` | OFF | build OpenAI-compatible HTTP server (`kokkosdnn_server`; requires `KokkosDNN_ENABLE_MODEL_LFM25=ON`) |
 | `KokkosDNN_ENABLE_COMPILER_WARNINGS` | OFF | enable compiler warnings as errors (mirroring `Kokkos_ENABLE_COMPILER_WARNINGS`) |

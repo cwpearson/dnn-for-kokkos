@@ -108,9 +108,28 @@ class Tokenizer {
 // keeps the minimal uniform framing and documents the gap. Revisit against
 // the upstream chat template when one is published.
 // ---------------------------------------------------------------------------
+// A single tool invocation. `arguments` is a JSON object string (OpenAI
+// `function.arguments` wire form). Glimmer has no native call markers, so
+// parsed completions never produce these; the type exists so generic
+// server code compiles against Glimmer unchanged.
+struct ToolCall {
+  std::string id;         // OpenAI tool_call id ("" when unknown/unparsed)
+  std::string name;       // function name
+  std::string arguments;  // JSON object string ("" or "{}" when none)
+};
+
 struct ChatMessage {
   std::string role;     // "system" | "user" | "assistant"
   std::string content;
+  // Agentic-history interchange (kept for API parity with the LFM2.5 chat
+  // helpers so server code can stay generic; Glimmer publishes no native
+  // tool-call markers, so the _with_tools renderer ignores per-message
+  // tool_calls and the tool parser below always returns none).
+  // Defaulted so the existing {"role", "content"} aggregate init keeps
+  // working.
+  std::string thinking;  // unused by the renderer (kept for parity)
+  std::vector<ToolCall> tool_calls;
+  std::string tool_call_id;
 };
 
 std::string render_chat_template(const std::vector<ChatMessage>& messages,
@@ -144,6 +163,37 @@ std::vector<int> encode_chat(const Tokenizer& tok,
                              bool add_bos = true);
 
 // ---------------------------------------------------------------------------
+// Tool-aware entry points (API parity with LFM25's
+// render_lfm25_chatml_with_tools / encode_chatml_with_tools).
+//
+// Glimmer publishes no native tool-call markers (no <|tool_call_start|>
+// equivalent) and no tool catalogue convention, so:
+//   - tools_json (compact-serialized OpenAI `tools` array, "" = none) is
+//     appended to the system block as "\nList of tools: <json>" (a system
+//     block is injected when no system message exists), exactly like the
+//     LFM25 renderer;
+//   - system_suffix ("" = none): extra instruction sentence(s) appended to
+//     the system block (tool_choice required/named directives, JSON-mode
+//     bias);
+//   - per-message tool_calls / tool_call_id / thinking render as nothing
+//     (only `content` is emitted); a "tool"-role message renders under that
+//     role verbatim.
+// Tool results therefore only round-trip as plain text; structured
+// tool_calls never parse back out (see parse_tool_calls below).
+// ---------------------------------------------------------------------------
+std::string render_glimmer_chatml_with_tools(
+    const std::vector<ChatMessage>& messages, const std::string& tools_json,
+    const std::string& system_suffix = "", bool add_generation_prompt = true,
+    const std::string& default_system = "");
+
+// Render + encode with tool support (same BOS semantics as
+// encode_rendered_chat).
+std::vector<int> encode_chatml_with_tools(
+    const Tokenizer& tok, const std::vector<ChatMessage>& messages,
+    const std::string& tools_json, const std::string& system_suffix = "",
+    bool add_generation_prompt = true, bool add_bos = true);
+
+// ---------------------------------------------------------------------------
 // Stop-strings (checked on decoded text): truncate the generated text
 // before the earliest occurrence of any non-empty stop string.
 // ---------------------------------------------------------------------------
@@ -152,6 +202,59 @@ size_t find_stop_string(const std::string& text,
                         std::string* matched = nullptr);
 std::string truncate_at_stop_strings(
     const std::string& text, const std::vector<std::string>& stop_strings);
+
+// Default stop strings: the chat turn terminator <|eot|> plus the
+// end-of-message marker <|eom|> (the generation-config eos id 200001 stays
+// covered by the stop-id side of the Session policy).
+std::vector<std::string> default_stop_strings();
+
+// ---------------------------------------------------------------------------
+// Plain-text tool shim (API parity with LFM25's parse_tool_calls /
+// ToolCallStreamParser so generic server code compiles unchanged).
+//
+// Glimmer defines no native tool-call markers, so there is nothing to
+// extract: parse_tool_calls() truncates the raw completion at the first
+// stop string and returns the remainder as display text with no calls and
+// no reasoning. The streaming parser below is the incremental form of the
+// same policy: it holds back only a bounded stop-prefix tail (plus partial
+// UTF-8, mirroring IncrementalDetokenizer safety) and emits everything
+// else as display deltas. Never throws.
+// ---------------------------------------------------------------------------
+struct ToolParseResult {
+  std::string text;
+  std::string reasoning;  // always "" (Glimmer has no thinking trace)
+  std::vector<ToolCall> calls;  // always empty (no native markers)
+};
+
+ToolParseResult parse_tool_calls(
+    const std::string& raw, const std::vector<std::string>& stops = {});
+
+struct StreamDeltas {
+  std::string display;
+  std::string reasoning;  // always "" (no thinking trace)
+};
+
+class ToolCallStreamParser {
+ public:
+  explicit ToolCallStreamParser(
+      const std::vector<std::string>& stop_strings = {});
+  // One parser step for one raw piece: returns display text newly safe to
+  // stream (may be empty = "hold"). Prefer this over push() on hot paths.
+  StreamDeltas feed(const std::string& raw_piece);
+  // Returns display text newly safe to stream (may be empty = "hold").
+  std::string push(const std::string& raw_piece);
+  // Glimmer has no reasoning channel: always returns "".
+  std::string poll_reasoning();
+  // Tail text (not yet emitted); calls is always empty.
+  ToolParseResult finish();
+
+ private:
+  std::string buf_;  // undecided tail (bounded by the longest stop string)
+  std::string matched_;  // stop string that fired ("" until it does)
+  bool stopped_ = false;
+  std::vector<std::string> stops_;  // configured stop strings (no empties)
+  size_t max_stop_len_ = 1;
+};
 
 }  // namespace Glimmer
 }  // namespace KokkosDNN

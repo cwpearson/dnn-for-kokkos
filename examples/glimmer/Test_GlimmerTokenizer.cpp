@@ -148,6 +148,85 @@ TEST(GlimmerTokenizer, FixtureChat) {
   EXPECT_EQ(ensure_bos({200000, 0}, 200000, false), (std::vector<int>{0}));
 }
 
+TEST(GlimmerTokenizer, ChatWithToolsParity) {
+  using namespace KokkosDNN::Glimmer;
+  // No tools/system extras: byte-identical to the plain template.
+  auto msgs = make_chat_messages("abc", "sys", "user");
+  EXPECT_EQ(render_glimmer_chatml_with_tools(msgs, ""),
+            render_chat_template(msgs, true));
+  EXPECT_EQ(render_glimmer_chatml_with_tools({msgs[1]}, "", "", false),
+            render_chat_template({msgs[1]}, false));
+  // Tools catalogue + suffix fold into the system block.
+  std::string rendered = render_glimmer_chatml_with_tools(
+      msgs, R"([{"type":"function"}])", "Always answer.", true);
+  EXPECT_EQ(rendered,
+            "<|begin_of_text|>"
+            "<|start|>system<|message|>sys\n"
+            "List of tools: [{\"type\":\"function\"}]\n"
+            "Always answer.<|eot|>"
+            "<|start|>user<|message|>abc<|eot|>"
+            "<|start|>assistant<|message|>");
+  // System injected when no system message exists.
+  std::string injected = render_glimmer_chatml_with_tools(
+      {msgs[1]}, R"([{"type":"function"}])", "", true, "be nice");
+  EXPECT_EQ(injected,
+            "<|begin_of_text|>"
+            "<|start|>system<|message|>be nice\n"
+            "List of tools: [{\"type\":\"function\"}]<|eot|>"
+            "<|start|>user<|message|>abc<|eot|>"
+            "<|start|>assistant<|message|>");
+  // Encode path matches the render path: the framing literals must split
+  // as specials, so the check runs on a fixture extended with them (the
+  // base fixture only carries begin/end_of_text) and fixture-safe content.
+  // The role words also need their missing letters as base singletons.
+  std::string chat_fixture = fixture_json();
+  const std::string vocab_anchor = "\"e\": 16, \":\": 17,";
+  ASSERT_NE(chat_fixture.find(vocab_anchor), std::string::npos);
+  chat_fixture.replace(chat_fixture.find(vocab_anchor), vocab_anchor.size(),
+                       "\"e\": 16, \":\": 17, \"y\": 100, \"u\": 101, "
+                       "\"r\": 102, \"i\": 103, \"n\": 104, \"m\": 105,");
+  const std::string anchor =
+      "{\"id\": 200001, \"content\": \"<|end_of_text|>\", \"special\": true}";
+  ASSERT_NE(chat_fixture.find(anchor), std::string::npos);
+  chat_fixture.replace(
+      chat_fixture.find(anchor), anchor.size(),
+      anchor +
+          ",\n    {\"id\": 200007, \"content\": \"<|eom|>\", "
+          "\"special\": true},\n"
+          "    {\"id\": 200008, \"content\": \"<|eot|>\", \"special\": true},\n"
+          "    {\"id\": 200010, \"content\": \"<|start|>\", "
+          "\"special\": true},\n"
+          "    {\"id\": 200011, \"content\": \"<|message|>\", "
+          "\"special\": true}");
+  Tokenizer tok(write_tmp(chat_fixture));
+  auto enc_msgs = make_chat_messages("abc", "cab", "user");
+  EXPECT_EQ(encode_chatml_with_tools(tok, enc_msgs, "", "", true, true),
+            encode_chat(tok, enc_msgs, true, true));
+}
+
+TEST(GlimmerTokenizer, DefaultStopsAndPlainTextTools) {
+  using namespace KokkosDNN::Glimmer;
+  EXPECT_EQ(default_stop_strings(),
+            (std::vector<std::string>{"<|eot|>", "<|eom|>"}));
+  // No native markers: everything before the stop cut is display text,
+  // calls and reasoning stay empty.
+  ToolParseResult r = parse_tool_calls("hello <|eot|> tail",
+                                       default_stop_strings());
+  EXPECT_EQ(r.text, "hello ");
+  EXPECT_TRUE(r.reasoning.empty());
+  EXPECT_TRUE(r.calls.empty());
+
+  // Streaming shim agrees with the whole-text parse.
+  ToolCallStreamParser p(default_stop_strings());
+  std::string streamed;
+  for (const char* piece : {"hel", "lo ", "<|e", "ot|> tail"})
+    streamed += p.feed(piece).display;
+  ToolParseResult tail = p.finish();
+  EXPECT_EQ(streamed + tail.text, "hello ");
+  EXPECT_TRUE(tail.calls.empty());
+  EXPECT_EQ(p.poll_reasoning(), "");
+}
+
 TEST(GlimmerTokenizer, MissingFileThrows) {
   EXPECT_THROW(KokkosDNN::Glimmer::Tokenizer("/nonexistent/tok.json"),
                std::runtime_error);

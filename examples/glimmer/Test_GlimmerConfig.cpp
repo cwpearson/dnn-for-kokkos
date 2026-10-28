@@ -14,9 +14,13 @@
 namespace {
 
 std::string glimmer_source_dir() {
+#ifdef GLIMMER_MODEL_DIR
+  return GLIMMER_MODEL_DIR;
+#else
   std::string f = __FILE__;
   size_t slash  = f.find_last_of('/');
   return (slash == std::string::npos) ? "." : f.substr(0, slash);
+#endif
 }
 
 std::string read_file(const std::string& path) {
