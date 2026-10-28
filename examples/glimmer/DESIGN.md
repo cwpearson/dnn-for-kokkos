@@ -27,7 +27,7 @@ Upstream references:
 | `num_key_value_heads` | 2 (all layers) |
 | `head_dim` | **128, explicit** (6656 / 32 = 208 — NOT derived) |
 | `layer_types` | 3× sliding + 1× full repeating → full layers at idx 3,7,...,51 (13 full, 39 sliding) |
-| `layer_rope_theta` | 500000.0 on sliding layers, **0 on full layers** (= use global theta) |
+| `layer_rope_theta` | 500000.0 on sliding layers, **0 on full layers** (= NoPE: no rotary on full layers) |
 | `sliding_window` | 2048 (sliding layers only) |
 | `rope_parameters` | `{rope_type: default, rope_theta: 500000}` |
 | `hidden_activation` | `silu` (SwiGLU) |
@@ -56,12 +56,14 @@ Upstream references:
    2048 window (vs 512) and no KV sharing, no per-type head dims, no
    partial-RoPE: both layer kinds rotate the full head dim with the same
    theta (see 3).
-3. **Per-layer RoPE theta.** `layer_rope_theta` is 500000 on all sliding
-   layers and 0 on all full layers. ASSUMPTION (matches the HF convention
-   and the fact that the global `rope_parameters.rope_theta` is also
-   500000): 0 means "use the global theta", so every layer rotates with
-   theta 500000 and only the attention window differs. Encoded as
-   `Config::rope_theta_for_layer()`; the fixture test pins the 0-marking.
+3. **Per-layer RoPE theta (NoPE on full layers).** `layer_rope_theta` is
+   500000 on all sliding layers and 0 on all full layers. Confirmed
+   against `modeling_muse_glimmer.py`: 0 means NoPE — the HF model passes
+   `position_embeddings=None` on those layers, so they rotate nothing and
+   only the attention window differs. The Model keys off the raw
+   `layer_rope_theta` entry (`Config::rope_theta_for_layer()` still falls
+   back to the global theta for callers that need a numeric theta); the
+   fixture test pins the 0-marking.
 4. **QK scale factor (3.87).** After QK RMSNorm, attention scores are
    multiplied by `qk_scale_factor = 3.87` — NOT by `1/sqrt(128) ≈ 0.0884`.
    (Gemma4 instead uses scale 1.0 with QK norms; Llama uses `1/sqrt(d)` with
@@ -101,7 +103,8 @@ Llama/SmolLM2/Gemma4 examples.
    require `lm_head`, never alias the embedding table; single head dim 128
    for all layers.
 2. **Model:** Llama-model skeleton (chunked prefill, dense KV per layer);
-   per-layer RoPE table from `rope_theta_for_layer()`; sliding-window mask
+   per-layer RoPE table from the raw `layer_rope_theta` entries (empty
+   table = NoPE on 0-marked full layers); sliding-window mask
    2048 on sliding layers; QK RMSNorm + 3.87 score scale; post-norms with
    `post_norm_eps`; `output_multiplier` before the head; tied-... (untied)
    `lm_head` gemv + softcap-20 head.

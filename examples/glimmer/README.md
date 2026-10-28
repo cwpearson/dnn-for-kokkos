@@ -83,7 +83,7 @@ Useful flags: `--temperature 0` (greedy; the generation_config default is greedy
 - Separate family from [llama](../llama/), [smollm2](../smollm2/), and [gemma4](../gemma4/): config, weights, model, and tokenizer will be split-form duplicates in namespace `KokkosDNN::Glimmer` (only the core `src/` ops are reused).
 - Weights: single `model.safetensors`-style layout (sharded at 30B scale, ~60 GiB BF16); only the `model.language_model.*` tensors are loaded. With `tie_word_embeddings=false` the loader requires a separate `lm_head` tensor and must NOT alias the embedding table. See `DESIGN.md` for the authoritative math.
 - Dtype: native bfloat16 (`Kokkos::Experimental::bhalf_t`, the checkpoint dtype) for weights/activations/KV; reductions, scales, and `inv_freq` stay FP32 — same convention as the Llama/SmolLM2/Gemma4 examples.
-- Attention: QK RMSNorms plus the `qk_scale_factor` (3.87) score multiplier (NOT `1/sqrt(d)`); sliding layers use the sliding GQA kernel (window 2048, RoPE theta 500000); full layers use full GQA with the global theta 500000.
+- Attention: QK RMSNorms plus the `qk_scale_factor` (3.87) score multiplier (NOT `1/sqrt(d)`); sliding layers use the sliding GQA kernel (window 2048, RoPE theta 500000); full layers use full GQA with NoPE (no rotary — `layer_rope_theta` 0).
 - Head: `output_multiplier`-scaled hidden states, final RMSNorm, separate `lm_head` (`gemv` over it), `20·tanh(logits/20)` softcapping. Only library ops are reused; no new `src/` ops are expected for the text path except where the gap table says so. See `DESIGN.md` for the authoritative math.
 - Memory: BF16 weights are ~60 GiB, so a full run needs a large-GPU or CPU-Kokkos build. The dense KV cache at the default `max_seq_len = 8192` is ~218 MiB BF16 per the `Config::kv_cache_bytes()` formula (52 layers × 8192 tokens × 2 K/V × 2 heads × 128 dim × 2 B); cap it with `--max-seq-len`.
 - TPL dispatch: GEMM via cuBLAS and full attention via cuDNN SDPA on CUDA builds with `KokkosDNN_ENABLE_CUBLAS`/`KokkosDNN_ENABLE_CUDNN`, native kernels otherwise (the sliding-window path always runs the native kernel: the cuDNN SDPA graph bakes in a full causal mask).
@@ -96,7 +96,7 @@ ctest --test-dir build --output-on-failure -R 'Glimmer'
 ./build/examples/glimmer/glimmer_generate --tiny --prompt "Hello" --max-new 8
 ```
 
-The tiny config plus the checked-in fixture parse are the unit-test path (`Test_GlimmerConfig.cpp`: presets, fixture, full-config wrapper, tiny preset). The end-to-end tiny generate smoke will move here once the Model stream lands.
+Unit tests: `Test_GlimmerConfig.cpp` (presets, fixture, full-config wrapper, tiny preset), `Test_GlimmerGenerate.cpp` (tiny forward/generate smoke, determinism, chunked-prefill equivalence, NoPE/RoPE branches), and `Test_GlimmerTokenizer.cpp`.
 
 ## Performance
 

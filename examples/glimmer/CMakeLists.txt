@@ -25,6 +25,12 @@ set_target_properties(glimmer_generate PROPERTIES CXX_STANDARD 20 CXX_STANDARD_R
 kokkosdnn_enable_compiler_warnings(glimmer_generate)
 
 if(KokkosDNN_ENABLE_TESTS)
+  add_executable(test_glimmer_config Test_GlimmerConfig.cpp)
+  target_link_libraries(test_glimmer_config PRIVATE KokkosDNN::glimmer KokkosDNN::gtest_main)
+  set_target_properties(test_glimmer_config PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+  kokkosdnn_enable_compiler_warnings(test_glimmer_config)
+  kokkosdnn_discover_tests(test_glimmer_config)
+
   add_executable(test_glimmer_generate Test_GlimmerGenerate.cpp)
   target_link_libraries(test_glimmer_generate PRIVATE KokkosDNN::glimmer KokkosDNN::gtest_main)
   set_target_properties(test_glimmer_generate PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)

@@ -309,8 +309,8 @@ inline bool get_string(const std::string& s, const std::string& key,
 // q_proj is [32*128, 6656], k/v_proj [2*128, 6656], o_proj [6656, 32*128]),
 // SwiGLU ffn 19968, 3x-sliding + 1x-full repeat (full layers at idx 3, 7,
 // ..., 51; 13 full, 39 sliding), sliding window 2048, per-layer
-// layer_rope_theta (500000 on sliding layers, 0 on full layers = use the
-// global rope_theta 500000), qk_scale_factor 3.87, output_multiplier
+// layer_rope_theta (500000 on sliding layers, 0 on full layers = NoPE: the
+// Model applies no rotary on those layers), qk_scale_factor 3.87, output_multiplier
 // ~0.19611, final_logit_softcapping 20, rms_norm_eps 1e-5 plus a tighter
 // post_norm_eps 1e-8, tie_word_embeddings false (separate lm_head),
 // vocab 202048, bos/eos 200000/200001, BF16 checkpoint dtype.
@@ -328,16 +328,19 @@ struct Config {
   float rms_norm_eps = 1e-5f;
   // Tighter epsilon for the post-attention / post-FFN RMSNorms.
   float post_norm_eps = 1e-8f;
-  // Global RoPE base frequency. Full-attention layers (whose
-  // layer_rope_theta entry is 0) use this value.
+  // Global RoPE base frequency for sliding-attention layers. Full-attention
+  // layers carry a 0 layer_rope_theta entry marking NoPE (the Model skips
+  // rotary there entirely); this value is only their
+  // rope_theta_for_layer() fallback for callers needing a numeric theta.
   float rope_theta   = 500000.0f;
   int sliding_window = 2048;    // sliding-layer causal window
   // Per-layer attention type: false = sliding, true = full. Default is the
   // 3x-sliding + 1x-full repeat (full layers at idx 3, 7, ..., 51).
   std::vector<char> is_full_layer;
-  // Per-layer RoPE theta, parallel to is_full_layer. A 0 entry means "use
-  // the global rope_theta" (this is how the HF checkpoint marks the 13
-  // full-attention layers); positive entries are used directly.
+  // Per-layer RoPE theta, parallel to is_full_layer. A 0 entry marks a NoPE
+  // layer (this is how the HF checkpoint marks the 13 full-attention layers;
+  // the HF model passes position_embeddings=None there, so the Model applies
+  // no rotary); positive entries are used directly as the RoPE theta.
   std::vector<double> layer_rope_theta;
   float final_logit_softcap = 20.0f;
   // Multiplicative factor applied to the QK-normalized attention scores.
@@ -380,8 +383,7 @@ struct Config {
   }
 
   // Default per-layer RoPE theta: sliding layers use `theta`, full layers
-  // are 0 (meaning "use the global rope_theta"), matching the HF
-  // layer_rope_theta array.
+  // are 0 (the NoPE marker), matching the HF layer_rope_theta array.
   static std::vector<double> default_layer_rope_theta(int num_layers,
                                                       double theta) {
     std::vector<double> t((size_t)num_layers, theta);
@@ -409,7 +411,10 @@ struct Config {
 
   bool is_full(int layer) const { return is_full_layer[(size_t)layer] != 0; }
   // Effective RoPE theta for a layer: the per-layer entry when positive,
-  // otherwise the global rope_theta (HF marks full layers with 0).
+  // otherwise the global rope_theta. NOTE: a 0 entry means NoPE (no rotary
+  // at all) — the Model keys off the raw layer_rope_theta entry and does
+  // NOT use this helper for rotary decisions; the fallback exists for
+  // callers that need a numeric theta.
   double rope_theta_for_layer(int layer) const {
     double per_layer = layer_rope_theta[(size_t)layer];
     return (per_layer > 0.0) ? per_layer : (double)rope_theta;
@@ -473,7 +478,7 @@ struct Config {
       double theta = layer_rope_theta[(size_t)l];
       if (!(theta >= 0.0) || !std::isfinite(theta))
         bad("layer_rope_theta[" + std::to_string(l) + "] must be >= 0 " +
-            "(0 selects the global rope_theta) and finite");
+            "(0 marks a NoPE layer) and finite");
     }
     if (!(final_logit_softcap > 0) || !std::isfinite(final_logit_softcap))
       bad("final_logit_softcapping must be positive and finite");
@@ -575,8 +580,8 @@ struct Config {
       c.is_full_layer = std::move(lt);
     }
     // layer_rope_theta: [500000.0, ..., 0, ...], parallel to layer_types.
-    // A 0 entry marks "use the global rope_theta" (the HF convention for
-    // full-attention layers). Length must match num_hidden_layers when
+    // A 0 entry marks a NoPE layer (the HF convention for full-attention
+    // layers: no rotary applied). Length must match num_hidden_layers when
     // present; otherwise defaults are rebuilt from the final rope_theta
     // after parsing (see below).
     bool have_layer_rope_theta = false;
@@ -601,8 +606,8 @@ struct Config {
         double theta    = parse_num(num, "layer_rope_theta");
         if (!(theta >= 0.0) || !std::isfinite(theta))
           throw std::runtime_error(
-              "config: 'layer_rope_theta' entries must be >= 0 (0 selects "
-              "the global rope_theta) and finite");
+              "config: 'layer_rope_theta' entries must be >= 0 (0 marks "
+              "a NoPE layer) and finite");
         rt.push_back(theta);
         p = e;
         skip_ws(t, p);
