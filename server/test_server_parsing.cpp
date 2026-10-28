@@ -21,7 +21,7 @@
 #include <KokkosDNN_LFM25Tokenizer.hpp>
 #endif
 #ifdef KOKKOSDNN_SERVER_HAVE_GLIMMER
-#include "GlimmerShim.hpp"
+#include <KokkosDNN_GlimmerTokenizer.hpp>
 #endif
 
 namespace {
