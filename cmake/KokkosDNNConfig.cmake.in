@@ -33,5 +33,17 @@ endif()
 # NOTE: KokkosDNN_ENABLE_ACCELERATE needs no find: Accelerate is an Apple
 # system framework linked by absolute path baked into the targets file.
 
+if(@KOKKOSDNN_ENABLE_CUDNN@ AND NOT TARGET cudnn_frontend)
+  # Header-only cuDNN graph API: FetchContent at build time, deliberately
+  # not in our export set. Define the link name the exported
+  # KokkosDNN::kokkosdnn target refers to, backed by the headers staged in
+  # <prefix>/include by the build (see CMakeLists.txt). A consumer that
+  # already provides cudnn_frontend keeps its own.
+  add_library(cudnn_frontend INTERFACE IMPORTED)
+  set_target_properties(cudnn_frontend PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_INCLUDEDIR@"
+    INTERFACE_COMPILE_FEATURES cxx_std_17)
+endif()
+
 include("${CMAKE_CURRENT_LIST_DIR}/KokkosDNNTargets.cmake")
 check_required_components(KokkosDNN)
