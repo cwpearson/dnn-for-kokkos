@@ -97,6 +97,14 @@
 #include "qwen_image_21_common.hpp"
 #include "KokkosDNN_ExampleReadline.hpp"
 
+// Converted host-staged weights (KokkosDNN library): the loop warms once
+// (disk -> host) and stages host->device per iteration.
+#if defined(QWEN21_DRIVER_HAVE_DIT) || \
+    (defined(QWEN21_DRIVER_HAVE_ENCODER) && \
+     defined(QWEN21_DRIVER_HAVE_TOKENIZER))
+#include "KokkosDNN_QwenImage21HostWeights.hpp"
+#endif
+
 void usage();
 template <class CfgT>
 int run_interactive_loop(const CfgT& cfg, const struct LoopFixedOpts& o);
@@ -185,76 +193,6 @@ inline bool try_size_command(std::string_view line, int& Hpx, int& Wpx,
   std::fflush(stdout);
   return true;
 }
-
-#ifdef QWEN21_DRIVER_HAVE_DIT
-// Host<->device Dit weight copy (both directions: instantiate with
-// DstExec/SrcExec as needed). Both sides must be allocated from the same
-// config; extents are checked by deep_copy.
-template <class DstExec, class SrcExec>
-void copy_dit_weights(
-    KokkosDNN::QwenImage21Dit::QwenImage21DitWeights<DstExec, DScalar>& dst,
-    const KokkosDNN::QwenImage21Dit::QwenImage21DitWeights<SrcExec, DScalar>&
-        src) {
-  if (dst.blocks.size() != src.blocks.size())
-    throw std::runtime_error("copy_dit_weights: block count mismatch");
-  Kokkos::deep_copy(dst.txt_norm, src.txt_norm);
-  Kokkos::deep_copy(dst.txt_in_W, src.txt_in_W);
-  Kokkos::deep_copy(dst.txt_out_W, src.txt_out_W);
-  Kokkos::deep_copy(dst.img_in_W, src.img_in_W);
-  Kokkos::deep_copy(dst.time1_W, src.time1_W);
-  Kokkos::deep_copy(dst.time2_W, src.time2_W);
-  Kokkos::deep_copy(dst.mod_W, src.mod_W);
-  Kokkos::deep_copy(dst.norm_out_W, src.norm_out_W);
-  Kokkos::deep_copy(dst.proj_out_W, src.proj_out_W);
-  for (size_t i = 0; i < dst.blocks.size(); ++i) {
-    auto& d = dst.blocks[i];
-    const auto& s = src.blocks[i];
-    Kokkos::deep_copy(d.to_q, s.to_q);
-    Kokkos::deep_copy(d.to_k, s.to_k);
-    Kokkos::deep_copy(d.to_v, s.to_v);
-    Kokkos::deep_copy(d.to_o, s.to_o);
-    Kokkos::deep_copy(d.norm_q, s.norm_q);
-    Kokkos::deep_copy(d.norm_k, s.norm_k);
-    Kokkos::deep_copy(d.proj, s.proj);
-    Kokkos::deep_copy(d.gate, s.gate);
-    Kokkos::deep_copy(d.out, s.out);
-  }
-  Kokkos::fence();
-}
-#endif
-
-#if defined(QWEN21_DRIVER_HAVE_ENCODER) && \
-    defined(QWEN21_DRIVER_HAVE_TOKENIZER)
-// Host<->device encoder weight copy (bhalf_t, matching run_qwen's
-// EncoderModel<Exec, bhalf_t>).
-template <class DstExec, class SrcExec>
-void copy_enc_weights(
-    KokkosDNN::QwenImage21Encoder::QwenImage21EncoderWeights<
-        DstExec, Kokkos::Experimental::bhalf_t>& dst,
-    const KokkosDNN::QwenImage21Encoder::QwenImage21EncoderWeights<
-        SrcExec, Kokkos::Experimental::bhalf_t>& src) {
-  if (dst.layers.size() != src.layers.size())
-    throw std::runtime_error("copy_enc_weights: layer count mismatch");
-  Kokkos::deep_copy(dst.embed, src.embed);
-  Kokkos::deep_copy(dst.final_norm, src.final_norm);
-  for (size_t i = 0; i < dst.layers.size(); ++i) {
-    auto& d = dst.layers[i];
-    const auto& s = src.layers[i];
-    Kokkos::deep_copy(d.q_W, s.q_W);
-    Kokkos::deep_copy(d.k_W, s.k_W);
-    Kokkos::deep_copy(d.v_W, s.v_W);
-    Kokkos::deep_copy(d.o_W, s.o_W);
-    Kokkos::deep_copy(d.qn, s.qn);
-    Kokkos::deep_copy(d.kn, s.kn);
-    Kokkos::deep_copy(d.in_norm, s.in_norm);
-    Kokkos::deep_copy(d.post_norm, s.post_norm);
-    Kokkos::deep_copy(d.gate_W, s.gate_W);
-    Kokkos::deep_copy(d.up_W, s.up_W);
-    Kokkos::deep_copy(d.down_W, s.down_W);
-  }
-  Kokkos::fence();
-}
-#endif
 
 // Fixed generation options shared by every loop iteration (prompt, output
 // path, and per-iteration seed vary).
@@ -423,50 +361,49 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
     vae_decode = false;
   }
 
+#if defined(QWEN21_DRIVER_HAVE_DIT) || \
+    (defined(QWEN21_DRIVER_HAVE_ENCODER) && \
+     defined(QWEN21_DRIVER_HAVE_TOKENIZER))
+  // Converted weights live in host memory from here on (warmed once,
+  // disk -> host, no device allocation); each iteration stages host->device
+  // and releases the device copy. bhalf_t matches both the DiT (DScalar)
+  // and the encoder device models.
+  KokkosDNN::QwenImage21::HostWeights<Kokkos::Experimental::bhalf_t>
+      host_weights;
+#endif
 #ifdef QWEN21_DRIVER_HAVE_DIT
-  // DiT weights live in host memory from here on; each iteration copies
-  // host->device, samples, and releases the device copy.
-  KokkosDNN::QwenImage21Dit::QwenImage21DitWeights<Kokkos::HostSpace, DScalar>
-      dit_host;
-  bool have_dit_host = false;
+  // DiT weights warmed once above; each iteration copies host->device,
+  // samples, and releases the device copy.
   if (!o.tiny) {
     const std::string dit_dir = ckpt_sub(o.ckpt, "transformer");
     const std::vector<std::string> shards =
         resolve_shard_list(dit_dir, "--ckpt");
-    KokkosDNN::QwenImage21Dit::QwenImage21DitModel<Exec, DScalar> tmp(cfg);
     if (shards.size() > 1)
       std::printf("[loading %zu shards]\n", shards.size());
     else
       std::printf("[loading %s]\n", dit_dir.c_str());
     try {
-      tmp.weights().load_safetensors(shards);
+      host_weights.warm_dit(cfg, shards);
     } catch (const std::exception& e) {
       throw std::runtime_error(std::string(e.what()) +
                                " (need Qwen-Image-2.1 weights or --tiny)");
     }
-    dit_host.allocate(cfg);
-    copy_dit_weights(dit_host, tmp.weights());
-    have_dit_host = true;
     std::printf("[loop] DiT weights resident in host memory: %.1f GB "
                 "(copied host->device each iteration%s)\n",
-                (double)tmp.weights().resident_bytes() / 1e9,
+                (double)host_weights.dit.resident_bytes() / 1e9,
                 o.staged ? ", staged" : "");
   }
 #endif
 
 #if defined(QWEN21_DRIVER_HAVE_ENCODER) && \
     defined(QWEN21_DRIVER_HAVE_TOKENIZER)
-  // In-process Qwen inputs preloaded once: BPE tables + host encoder
-  // weights. The per-iteration forward copies host->device into a fresh
-  // device model and drops it when the embeds are staged.
+  // In-process Qwen inputs preloaded once: BPE tables + converted host
+  // encoder weights. The per-iteration forward stages host->device into a
+  // fresh device model and drops it when the embeds are staged.
   RawQwenTables loop_tabs;
   std::vector<int> loop_head_ids;
   size_t loop_drop = 0;
   KokkosDNN::QwenImage21Encoder::Config loop_ecfg;
-  KokkosDNN::QwenImage21Encoder::QwenImage21EncoderWeights<
-      Kokkos::HostSpace, Kokkos::Experimental::bhalf_t>
-      enc_host;
-  bool have_enc_host = false;
   if (!o.tiny && !o.ckpt.empty()) {
     namespace QELoop = KokkosDNN::QwenImage21Encoder;
     require_ckpt_dir(o.ckpt);
@@ -505,9 +442,6 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
       throw std::runtime_error(
           "Qwen encoder hidden (" + std::to_string(loop_ecfg.hidden_dim) +
           ") != caption dim (" + std::to_string(be_caption_dim(cfg)) + ")");
-    KokkosDNN::QwenImage21Encoder::QwenImage21EncoderModel<
-        Exec, Kokkos::Experimental::bhalf_t>
-        enc_tmp(loop_ecfg);
     const std::vector<std::string> eshards =
         resolve_shard_list(ckpt_sub(o.ckpt, "text_encoder"), "--ckpt");
     if (eshards.size() != 1)
@@ -516,13 +450,15 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
           "model.safetensors (got " +
           std::to_string(eshards.size()) + " shards)");
     std::printf("[loading %s]\n", ckpt_sub(o.ckpt, "text_encoder").c_str());
-    enc_tmp.weights().load_safetensors(eshards[0]);
-    enc_host.allocate(loop_ecfg);
-    copy_enc_weights(enc_host, enc_tmp.weights());
-    have_enc_host = true;
+    try {
+      host_weights.warm_encoder(loop_ecfg, eshards[0]);
+    } catch (const std::exception& e) {
+      throw std::runtime_error(std::string(e.what()) +
+                               " (need Qwen-Image-2.1 weights or --tiny)");
+    }
     std::printf("[loop] Qwen encoder weights resident in host memory: %.1f "
                 "GB (copied host->device each iteration)\n",
-                (double)enc_tmp.weights().resident_bytes() / 1e9);
+                (double)host_weights.encoder.resident_bytes() / 1e9);
   }
   if (o.tiny && !o.ckpt.empty())
     std::printf("[encode] --tiny skips the Qwen forward (random-weights "
@@ -634,7 +570,7 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
     bool encoded = false;
 #if defined(QWEN21_DRIVER_HAVE_ENCODER) && \
     defined(QWEN21_DRIVER_HAVE_TOKENIZER)
-    if (have_enc_host) {
+    if (host_weights.has_encoder) {
       try {
         namespace QEIter = KokkosDNN::QwenImage21Encoder;
         const size_t max_len = be_max_seq(cfg);
@@ -646,7 +582,7 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
         KokkosDNN::QwenImage21Encoder::QwenImage21EncoderModel<
             Exec, Kokkos::Experimental::bhalf_t>
             enc_model(loop_ecfg);
-        copy_enc_weights(enc_model.weights(), enc_host);
+        host_weights.stage_encoder_to(enc_model.weights());
         Kokkos::View<int**, Kokkos::LayoutRight, Exec> toks("qwen21enc_toks",
                                                             1, ids.size());
         {
@@ -714,8 +650,8 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
         cfg);
     {
       auto& w = dit_model.weights();
-      if (have_dit_host) {
-        copy_dit_weights(w, dit_host);
+      if (host_weights.has_dit) {
+        host_weights.stage_dit_to(w);
         std::printf("[loading host->device %.1f GB]\n",
                     (double)w.resident_bytes() / 1e9);
       } else if (o.tiny) {
