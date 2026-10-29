@@ -462,7 +462,11 @@ struct QwenImage21VisionWeights {
   // Load the visual tower from the text_encoder shard (model.visual.* only;
   // every other key is skipped, not an error, so the text loader can own
   // the same file). Throws on missing/duplicate/dtype/shape mismatch.
-  void load_safetensors(const std::string& shard_path) {
+  // Pass a warmed QwenImage21::ShardCache to stream a staged shard from
+  // host RAM instead of disk (repeat loads); the default nullptr reads
+  // from disk, so existing one-argument callers are unchanged.
+  void load_safetensors(const std::string& shard_path,
+                        QwenImage21::ShardCache* cache = nullptr) {
     if (patch_W.extent(0) == 0)
       throw std::runtime_error(
           "QwenImage21VisionWeights::load_safetensors: allocate first");
@@ -476,7 +480,13 @@ struct QwenImage21VisionWeights {
     std::map<std::string, bool> found;
     for (const auto& s : specs) found[s.name] = false;
     std::ifstream f;
-    auto entries = QwenImage21::Impl::qwen21_open_shard(f, shard_path);
+    const QwenImage21::Impl::Qwen21ShardBlob* blob =
+        (cache != nullptr) ? cache->find(shard_path) : nullptr;
+    const std::map<std::string, QwenImage21::Impl::Qwen21SafeEntry> entries =
+        (blob != nullptr)
+            ? QwenImage21::Impl::qwen21_parse_shard_blob(blob->bytes,
+                                                        shard_path)
+            : QwenImage21::Impl::qwen21_open_shard(f, shard_path);
     for (const auto& kv : entries) {
       const std::string& full = kv.first;
       if (full.compare(0, 13, "model.visual.") != 0) continue;  // text tower
@@ -496,7 +506,11 @@ struct QwenImage21VisionWeights {
         throw std::runtime_error(
             "QwenImage21VisionWeights::load_safetensors: duplicate tensor '" +
             spec->name + "'");
-      load_one_tensor(f, full, en, *spec);
+      if (blob != nullptr) {
+        load_one_tensor(*blob, full, en, *spec);
+      } else {
+        load_one_tensor(f, full, en, *spec);
+      }
       found[spec->name] = true;
     }
     for (const auto& s : specs) {
@@ -617,7 +631,11 @@ struct QwenImage21VisionWeights {
   }
 
  private:
-  void load_one_tensor(std::ifstream& f, const std::string& full,
+  // Stream one file tensor into its device view (shape-checked). Source is
+  // either a disk stream or a staged shard image (overload resolution on
+  // the first argument picks the matching qwen21_stream_into).
+  template <class Source>
+  void load_one_tensor(Source& src, const std::string& full,
                        const QwenImage21::Impl::Qwen21SafeEntry& en,
                        const VisionTensorSpec& s) {
     const size_t elsize = QwenImage21::Impl::qwen21_entry_elsize(en, full);
@@ -641,7 +659,7 @@ struct QwenImage21VisionWeights {
             "QwenImage21VisionWeights::load_safetensors: view mismatch '" +
             full + "'");
       QwenImage21::Impl::qwen21_stream_into<ExecSpace, Scalar>(
-          f, en, want, elsize, (*dst).data());
+          src, en, want, elsize, (*dst).data());
     } else {
       V1* dst = resolve_vec(s.name);
       if (!dst || (*dst).extent(0) != (size_t)s.d0)
@@ -649,7 +667,7 @@ struct QwenImage21VisionWeights {
             "QwenImage21VisionWeights::load_safetensors: view mismatch '" +
             full + "'");
       QwenImage21::Impl::qwen21_stream_into<ExecSpace, Scalar>(
-          f, en, want, elsize, (*dst).data());
+          src, en, want, elsize, (*dst).data());
     }
   }
 

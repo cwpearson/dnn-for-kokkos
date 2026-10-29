@@ -568,6 +568,18 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
                 "for editing each time)\n");
   }
   std::fflush(stdout);
+#ifdef QWEN21_DRIVER_HAVE_VAE
+  // VAE shards staged once in host RAM: every iteration's decode streams
+  // from these bytes instead of disk (the DiT/encoder above use converted
+  // host staging instead; the VAE path is load-per-decode by design).
+  KokkosDNN::QwenImage21::ShardCache vae_cache;
+  if (!o.tiny && !o.ckpt.empty() && vae_decode) {
+    vae_cache.warm(resolve_shard_list(ckpt_sub(o.ckpt, "vae"), "--ckpt"));
+    std::printf("[shard-cache] vae staged: %zu shard(s), %.3f GB resident\n",
+                vae_cache.count(),
+                (double)vae_cache.bytes() / 1e9);
+  }
+#endif
   size_t iter = 0;
   std::string prev_prompt;
   while (true) {
@@ -798,7 +810,7 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
 #ifdef QWEN21_DRIVER_HAVE_VAE
       try {
         decoded = try_vae_decode_rgba(lat, C, (size_t)H, (size_t)W, o.ckpt,
-                                      pix, oH, oW, oCh);
+                                      pix, oH, oW, oCh, nullptr, &vae_cache);
         std::printf("[decode] VAE RGBA %zux%zux%d ready for output\n", oH, oW,
                     oCh);
       } catch (const std::exception& e) {

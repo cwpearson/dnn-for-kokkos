@@ -1259,7 +1259,8 @@ struct EncoderStage {
   template <class CfgT>
   static void run_qwen(EncoderStage& st, const CfgT& cfg,
                        const std::string& prompt,
-                       const std::string& ckpt_dir) {
+                       const std::string& ckpt_dir,
+                       KokkosDNN::QwenImage21::ShardCache* cache = nullptr) {
     namespace QE = KokkosDNN::QwenImage21Encoder;
     require_ckpt_dir(ckpt_dir);
     const std::string tok_json =
@@ -1316,7 +1317,7 @@ struct EncoderStage {
           "model.safetensors (got " +
           std::to_string(shards.size()) + " shards)");
     std::printf("[loading %s]\n", encoder_path.c_str());
-    enc.weights().load_safetensors(shards[0]);
+    enc.weights().load_safetensors(shards[0], cache);
     std::printf("[encode] Qwen weights resident: %.1f GB\n",
                 (double)enc.weights().resident_bytes() / 1e9);
     Kokkos::View<int**, Kokkos::LayoutRight, Exec> toks("qwen21enc_toks", 1, S);
@@ -1367,7 +1368,9 @@ struct EncoderStage {
                              const std::vector<int>& vis_rows,
                              const std::vector<int>& pos3,
                              const std::vector<float>& pixels, int Hp, int Wp,
-                             size_t drop, const std::string& ckpt_dir) {
+                             size_t drop, const std::string& ckpt_dir,
+                             KokkosDNN::QwenImage21::ShardCache* cache =
+                                 nullptr) {
     namespace QE = KokkosDNN::QwenImage21Encoder;
     namespace QV = KokkosDNN::QwenImage21Vision;
     require_ckpt_dir(ckpt_dir);
@@ -1409,7 +1412,7 @@ struct EncoderStage {
             "model.safetensors (got " +
             std::to_string(shards.size()) + " shards)");
       std::printf("[loading %s]\n", encoder_path.c_str());
-      vis.weights().load_safetensors(shards[0]);
+      vis.weights().load_safetensors(shards[0], cache);
       std::printf("[encode] vision weights resident: %.3f GB\n",
                   (double)vis.weights().resident_bytes() / 1e9);
     }
@@ -1445,7 +1448,7 @@ struct EncoderStage {
     {
       const std::vector<std::string> shards =
           resolve_shard_list(encoder_path, "--ckpt");
-      enc.weights().load_safetensors(shards[0]);
+      enc.weights().load_safetensors(shards[0], cache);
       std::printf("[encode] Qwen weights resident: %.1f GB\n",
                   (double)enc.weights().resident_bytes() / 1e9);
     }
@@ -1524,7 +1527,8 @@ struct EncoderStage {
       const std::vector<int>& vis_rows, const std::vector<int>& pos3,
       const std::vector<std::vector<float>>& pixels_list,
       const std::vector<int>& Hps, const std::vector<int>& Wps, size_t drop,
-      const std::string& ckpt_dir) {
+      const std::string& ckpt_dir,
+      KokkosDNN::QwenImage21::ShardCache* cache = nullptr) {
     namespace QE = KokkosDNN::QwenImage21Encoder;
     namespace QV = KokkosDNN::QwenImage21Vision;
     require_ckpt_dir(ckpt_dir);
@@ -1573,7 +1577,7 @@ struct EncoderStage {
             "model.safetensors (got " +
             std::to_string(shards.size()) + " shards)");
       std::printf("[loading %s]\n", encoder_path.c_str());
-      vis.weights().load_safetensors(shards[0]);
+      vis.weights().load_safetensors(shards[0], cache);
       std::printf("[encode] vision weights resident: %.3f GB\n",
                   (double)vis.weights().resident_bytes() / 1e9);
     }
@@ -1651,7 +1655,7 @@ struct EncoderStage {
     {
       const std::vector<std::string> shards =
           resolve_shard_list(encoder_path, "--ckpt");
-      enc.weights().load_safetensors(shards[0]);
+      enc.weights().load_safetensors(shards[0], cache);
       std::printf("[encode] Qwen weights resident: %.1f GB\n",
                   (double)enc.weights().resident_bytes() / 1e9);
     }
@@ -1744,7 +1748,8 @@ struct EncoderStage {
   static EncoderStage run(const CfgT& cfg, const std::string& prompt,
                           const std::string& caption_path,
                           const std::string& ckpt_dir, bool tiny,
-                          size_t max_seq_override = 0) {
+                          size_t max_seq_override = 0,
+                          KokkosDNN::QwenImage21::ShardCache* cache = nullptr) {
     EncoderStage st;
     st.L = be_max_seq(cfg);
     st.Cc = be_caption_dim(cfg);
@@ -1756,7 +1761,7 @@ struct EncoderStage {
     // file/null with a logged reason instead of failing.
     if (!tiny && !ckpt_dir.empty()) {
       try {
-        run_qwen(st, cfg, prompt, ckpt_dir);
+        run_qwen(st, cfg, prompt, ckpt_dir, cache);
         return st;
       } catch (const std::exception& e) {
         std::fprintf(stderr,
@@ -2248,7 +2253,8 @@ struct DitForward {
 // throws with a reason so the caller can fall back to file/null.
 inline std::vector<float> try_vae_encode_image(
     const std::vector<float>& rgba_chw, size_t H, size_t W,
-    const std::string& ckpt_dir) {
+    const std::string& ckpt_dir,
+    KokkosDNN::QwenImage21::ShardCache* cache = nullptr) {
   namespace QV = KokkosDNN::QwenImage21Vae;
   require_ckpt_dir(ckpt_dir);
   const std::string vae_dir = ckpt_sub(ckpt_dir, "vae");
@@ -2273,7 +2279,7 @@ inline std::vector<float> try_vae_encode_image(
         resolve_shard_list(vae_dir, "--ckpt");
     std::printf("[loading %s]%s\n", vae_dir.c_str(),
                 shards.size() > 1 ? " (shards)" : "");
-    enc.weights().load_safetensors(shards);
+    enc.weights().load_safetensors(shards, cache);
     std::printf("[vae-encode] weights resident: %.3f GB\n",
                 (double)enc.weights().resident_bytes() / 1e9);
   }
@@ -2316,7 +2322,9 @@ inline bool try_vae_decode_rgba(const std::vector<float>& lat, size_t C,
                                 const std::string& ckpt_dir,
                                 std::vector<unsigned char>& pix, size_t& oH,
                                 size_t& oW, int& oCh,
-                                std::vector<float>* rgba_f32 = nullptr) {
+                                std::vector<float>* rgba_f32 = nullptr,
+                                KokkosDNN::QwenImage21::ShardCache* cache =
+                                    nullptr) {
   namespace QV = KokkosDNN::QwenImage21Vae;
   require_ckpt_dir(ckpt_dir);
   const std::string vae_dir = ckpt_sub(ckpt_dir, "vae");
@@ -2340,7 +2348,7 @@ inline bool try_vae_decode_rgba(const std::vector<float>& lat, size_t C,
         resolve_shard_list(vae_dir, "--ckpt");
     std::printf("[loading %s]%s\n", vae_dir.c_str(),
                 shards.size() > 1 ? " (shards)" : "");
-    dec.weights().load_safetensors(shards);
+    dec.weights().load_safetensors(shards, cache);
     std::printf("[vae] weights resident: %.3f GB\n",
                 (double)dec.weights().resident_bytes() / 1e9);
   }

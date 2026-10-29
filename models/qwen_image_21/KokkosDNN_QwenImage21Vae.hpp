@@ -490,8 +490,12 @@ struct QwenImage21VaeWeights {
 
   // Load every tensor found in the shard(s) into device blobs (F32/BF16
   // file -> Scalar). Names outside both skeletons are accepted here;
-  // dtype/shape/slice errors throw.
-  void load_safetensors(const std::vector<std::string>& shard_paths) {
+  // dtype/shape/slice errors throw. Pass a warmed
+  // QwenImage21::ShardCache to stream staged shards from host RAM instead
+  // of disk (repeat loads); the default nullptr reads every shard from
+  // disk, so existing one-argument callers are unchanged.
+  void load_safetensors(const std::vector<std::string>& shard_paths,
+                        QwenImage21::ShardCache* cache = nullptr) {
     if (shard_paths.empty())
       throw std::invalid_argument(
           "QwenImage21VaeWeights::load_safetensors: no shards given");
@@ -502,7 +506,12 @@ struct QwenImage21VaeWeights {
                   "float or bhalf_t");
     for (const std::string& path : shard_paths) {
       std::ifstream f;
-      auto entries = QwenImage21::Impl::qwen21_open_shard(f, path);
+      const QwenImage21::Impl::Qwen21ShardBlob* blob =
+          (cache != nullptr) ? cache->find(path) : nullptr;
+      const std::map<std::string, QwenImage21::Impl::Qwen21SafeEntry> entries =
+          (blob != nullptr)
+              ? QwenImage21::Impl::qwen21_parse_shard_blob(blob->bytes, path)
+              : QwenImage21::Impl::qwen21_open_shard(f, path);
       for (const auto& kv : entries) {
         const std::string& full = kv.first;
         const QwenImage21::Impl::Qwen21SafeEntry& en = kv.second;
@@ -521,10 +530,15 @@ struct QwenImage21VaeWeights {
           throw std::runtime_error(
               "QwenImage21VaeWeights::load_safetensors: tensor '" + full +
               "' slice size mismatch");
-        V1 blob("qwen21vae_blob", (size_t)numel);
-        QwenImage21::Impl::qwen21_stream_into<ExecSpace, Scalar>(
-            f, en, (size_t)numel, elsize, blob.data());
-        blobs[full] = blob;
+        V1 dev_blob("qwen21vae_blob", (size_t)numel);
+        if (blob != nullptr) {
+          QwenImage21::Impl::qwen21_stream_into<ExecSpace, Scalar>(
+              *blob, en, (size_t)numel, elsize, dev_blob.data());
+        } else {
+          QwenImage21::Impl::qwen21_stream_into<ExecSpace, Scalar>(
+              f, en, (size_t)numel, elsize, dev_blob.data());
+        }
+        blobs[full] = dev_blob;
         shapes[full] = en.shape;
         dtypes[full] = en.dtype;
       }
@@ -534,8 +548,9 @@ struct QwenImage21VaeWeights {
           "QwenImage21VaeWeights::load_safetensors: no tensors loaded");
   }
 
-  void load_safetensors(const std::string& shard_path) {
-    load_safetensors(std::vector<std::string>{shard_path});
+  void load_safetensors(const std::string& shard_path,
+                        QwenImage21::ShardCache* cache = nullptr) {
+    load_safetensors(std::vector<std::string>{shard_path}, cache);
   }
 
   // Allocate exactly the decoder tensors decode() consumes (see
