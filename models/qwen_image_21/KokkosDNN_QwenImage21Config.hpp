@@ -44,10 +44,12 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include <Kokkos_Core.hpp>
@@ -397,6 +399,23 @@ inline int64_t qwen21_entry_numel(const Qwen21SafeEntry& en,
   return numel;
 }
 
+// Convert one chunk of file payload (F32/BF16) into Scalar outputs.
+template <class Scalar>
+void qwen21_convert_chunk(const char* raw, size_t elsize, Scalar* dst,
+                          size_t m) {
+  const bool fast_f32 = std::is_same_v<Scalar, float> && elsize == 4;
+  if (fast_f32) {
+    std::memcpy(dst, raw, m * 4);
+  } else if (elsize == 4) {  // F32 file -> Scalar (float or bhalf_t)
+    const float* src = reinterpret_cast<const float*>(raw);
+    for (size_t i = 0; i < m; ++i) dst[i] = static_cast<Scalar>(src[i]);
+  } else {  // BF16 file -> Scalar via FP32
+    const uint16_t* src = reinterpret_cast<const uint16_t*>(raw);
+    for (size_t i = 0; i < m; ++i)
+      dst[i] = static_cast<Scalar>(qwen21_bf16_to_float(src[i]));
+  }
+}
+
 // File bytes -> host mirror in bounded chunks, then one deep_copy.
 // No 2x device residency: only the destination view lives on device.
 template <class ExecSpace, class Scalar>
@@ -407,7 +426,6 @@ void qwen21_stream_into(std::ifstream& f, const Qwen21SafeEntry& en,
   constexpr size_t kChunk = size_t{1} << 18;
   std::vector<char> raw;
   raw.reserve(std::min(n, kChunk) * elsize);
-  const bool fast_f32 = std::is_same_v<Scalar, float> && elsize == 4;
   for (size_t o = 0; o < n;) {
     const size_t m = std::min(n - o, kChunk);
     raw.resize(m * elsize);
@@ -415,17 +433,141 @@ void qwen21_stream_into(std::ifstream& f, const Qwen21SafeEntry& en,
     f.read(raw.data(), (std::streamsize)(m * elsize));
     if (!f)
       throw std::runtime_error("QwenImage21: truncated tensor data");
-    if (fast_f32) {
-      std::memcpy(host.data() + o, raw.data(), m * 4);
-    } else if (elsize == 4) {  // F32 file -> Scalar (float or bhalf_t)
-      const float* src = reinterpret_cast<const float*>(raw.data());
-      for (size_t i = 0; i < m; ++i)
-        host(o + i) = static_cast<Scalar>(src[i]);
-    } else {  // BF16 file -> Scalar via FP32
-      const uint16_t* src = reinterpret_cast<const uint16_t*>(raw.data());
-      for (size_t i = 0; i < m; ++i)
-        host(o + i) = static_cast<Scalar>(qwen21_bf16_to_float(src[i]));
+    qwen21_convert_chunk<Scalar>(raw.data(), elsize, host.data() + o, m);
+    o += m;
+  }
+  Kokkos::View<Scalar*, ExecSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>> dev(
+      dev_ptr, n);
+  Kokkos::deep_copy(dev, host);
+}
+
+// ---- Host-staged shard bytes (repeat-load serving) -----------------------
+// A long-lived server (or a REPL driver) loads the same ~33 GB of
+// checkpoint shards on every run: text encoder (17.5 GB) + DiT (14.2 GB)
+// + VAE encode per image + VAE decode. Qwen21ShardCache stages the shard
+// *files* in host RAM once (warm() reads each file fully); later
+// Weights::load_safetensors(paths, &cache) calls stream tensors from the
+// staged bytes instead of disk. Device staging is unaffected (encoder and
+// DiT are still never co-resident); only the disk re-reads go away. The
+// cache holds whole-file images (~one checkpoint copy in host RAM) and
+// revalidates by path/size/mtime, so a swapped checkpoint is picked up on
+// the next warm(). A null cache (the default) preserves the old behavior
+// exactly: every load reads from disk.
+
+// One shard's whole-file image. Layout matches the file byte-for-byte, so
+// Qwen21SafeEntry begin/end offsets double as blob offsets.
+struct Qwen21ShardBlob {
+  std::string path;
+  std::vector<char> bytes;  // entire shard image (header + payloads)
+  uint64_t file_size = 0;   // bytes.size() at load time
+  std::filesystem::file_time_type mtime{};
+
+  // Read the whole file; throws with the path on any failure.
+  static Qwen21ShardBlob load_file(const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f)
+      throw std::runtime_error("QwenImage21: cannot open '" + path + "'");
+    const auto e = f.tellg();
+    if (e <= 0)
+      throw std::runtime_error("QwenImage21: too small '" + path + "'");
+    const size_t n = (size_t)e;
+    Qwen21ShardBlob b;
+    b.path = path;
+    b.bytes.resize(n);
+    f.seekg(0, std::ios::beg);
+    f.read(b.bytes.data(), (std::streamsize)n);
+    if (!f)
+      throw std::runtime_error("QwenImage21: short read '" + path + "'");
+    b.file_size = (uint64_t)n;
+    std::error_code ec;
+    const auto mt = std::filesystem::last_write_time(path, ec);
+    if (!ec) b.mtime = mt;
+    return b;
+  }
+
+  // True when the file on disk still matches this image (size + mtime).
+  // Never throws: stat failures report stale (fail open to a disk read).
+  bool fresh() const noexcept {
+    std::error_code ec;
+    const auto sz = std::filesystem::file_size(path, ec);
+    if (ec || sz != (uintmax_t)file_size) return false;
+    const auto mt = std::filesystem::last_write_time(path, ec);
+    if (ec || mt != mtime) return false;
+    return true;
+  }
+};
+
+// Host RAM staging for shard files. Not thread-safe (single-flight use,
+// like the drivers); warm() throws on unreadable files, everything else
+// is total. An entry whose file changed under it stops matching (find()
+// returns nullptr, so loads fall back to disk) until the next warm().
+class Qwen21ShardCache {
+ public:
+  // Read every listed shard fully into host RAM, skipping files that are
+  // already staged and fresh. Returns the number of (re)loaded files.
+  // Throws with the path on the first unreadable file (earlier files in
+  // this call stay staged).
+  size_t warm(const std::vector<std::string>& paths) {
+    size_t newly = 0;
+    for (const auto& p : paths) {
+      const auto it = blobs_.find(p);
+      if (it != blobs_.end() && it->second.fresh()) continue;
+      blobs_.insert_or_assign(p, Qwen21ShardBlob::load_file(p));
+      ++newly;
     }
+    return newly;
+  }
+
+  // Staged image for path, or nullptr when absent/stale (callers fall
+  // back to a disk read). Never throws.
+  const Qwen21ShardBlob* find(const std::string& path) const noexcept {
+    const auto it = blobs_.find(path);
+    if (it == blobs_.end() || !it->second.fresh()) return nullptr;
+    return &it->second;
+  }
+
+  void clear() { blobs_.clear(); }
+  size_t count() const { return blobs_.size(); }
+  unsigned long long bytes() const {
+    unsigned long long n = 0;
+    for (const auto& kv : blobs_) n += kv.second.file_size;
+    return n;
+  }
+
+ private:
+  std::map<std::string, Qwen21ShardBlob> blobs_;
+};
+
+// Parse a staged shard image (same header subset as qwen21_open_shard).
+inline std::map<std::string, Qwen21SafeEntry> qwen21_parse_shard_blob(
+    const std::vector<char>& bytes, const std::string& path) {
+  if (bytes.size() < 8)
+    throw std::runtime_error("QwenImage21: too small '" + path + "'");
+  const uint64_t hn = qwen21_ld64(bytes.data());
+  if (8 + hn > bytes.size())
+    throw std::runtime_error("QwenImage21: bad header in '" + path + "'");
+  std::string js(bytes.data() + 8, bytes.data() + 8 + (size_t)hn);
+  return qwen21_parse_header(js, 8 + hn);
+}
+
+// Staged-bytes twin of the file streamer above: same chunking, conversion,
+// and single deep_copy, but sourced from a Qwen21ShardBlob (no disk I/O).
+// Throws when a slice reaches outside the staged image (stale cache entry
+// that passed find() before the file changed).
+template <class ExecSpace, class Scalar>
+void qwen21_stream_into(const Qwen21ShardBlob& blob,
+                        const Qwen21SafeEntry& en, size_t n, size_t elsize,
+                        Scalar* dev_ptr) {
+  if (en.begin > en.end || en.end > blob.bytes.size())
+    throw std::runtime_error(
+        "QwenImage21: tensor slice out of staged range (stale shard cache?)");
+  using HostV = Kokkos::View<Scalar*, Kokkos::HostSpace>;
+  HostV host("qwen21_load", n);
+  constexpr size_t kChunk = size_t{1} << 18;
+  for (size_t o = 0; o < n;) {
+    const size_t m = std::min(n - o, kChunk);
+    qwen21_convert_chunk<Scalar>(blob.bytes.data() + en.begin + o * elsize,
+                                 elsize, host.data() + o, m);
     o += m;
   }
   Kokkos::View<Scalar*, ExecSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>> dev(
@@ -434,6 +576,12 @@ void qwen21_stream_into(std::ifstream& f, const Qwen21SafeEntry& en,
 }
 
 }  // namespace Impl
+
+// Host-staged shard bytes for repeat loads (see Impl above). Long-lived
+// processes hold one, warm() it once, and pass it to every
+// Weights::load_safetensors(paths, &cache) call; drivers and servers that
+// load per run get RAM-speed phase loads after the first run.
+using ShardCache = Impl::Qwen21ShardCache;
 }  // namespace QwenImage21
 }  // namespace KokkosDNN
 
