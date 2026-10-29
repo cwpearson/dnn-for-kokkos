@@ -53,6 +53,32 @@ bool webp_supported();
 bool has_webp_extension(const std::string& path);
 // Cheap non-throwing probe: true iff data holds a WebP bitstream.
 bool is_webp_memory(const unsigned char* data, size_t len);
+// Header-magic check that needs no libwebp: true iff the buffer starts
+// with RIFF....WEBP. Used only for diagnostics when WebP support is not
+// built in (decode_image_u8 has no filename to hint from).
+inline bool looks_like_webp(const unsigned char* data, size_t len) {
+  if (data == nullptr || len < 12) {
+    return false;
+  }
+  return data[0] == 'R' && data[1] == 'I' && data[2] == 'F' && data[3] == 'F' &&
+         data[8] == 'W' && data[9] == 'E' && data[10] == 'B' && data[11] == 'P';
+}
+// First up-to-16 bytes as lowercase hex (no libwebp/stb needed). Used only
+// to identify unsupported uploads (e.g. HEIC/AVIF) in decode errors.
+inline std::string format_magic_hex(const unsigned char* data, size_t len) {
+  static const char* const kHex = "0123456789abcdef";
+  if (data == nullptr || len == 0) {
+    return "(empty)";
+  }
+  const size_t n = (len < 16) ? len : 16;
+  std::string out;
+  out.reserve(n * 2);
+  for (size_t i = 0; i < n; ++i) {
+    out.push_back(kHex[(data[i] >> 4) & 0x0F]);
+    out.push_back(kHex[data[i] & 0x0F]);
+  }
+  return out;
+}
 ImageInfo webp_info_from_file(const std::string& path);
 HostImageU8 webp_decode_file(const std::string& path, int desired_channels);
 HostImageU8 webp_decode_memory(const unsigned char* data, size_t len,
@@ -165,7 +191,30 @@ inline HostImageU8 decode_image_u8(const unsigned char* data, size_t len,
       stbi_load_from_memory(data, static_cast<int>(len), &w, &h, &native, desired_channels);
   if (pix == nullptr) {
     std::string why = stbi_failure_reason() ? stbi_failure_reason() : "unknown error";
-    throw std::runtime_error("KokkosDNN::Image::decode_image_u8: decode failed: " + why);
+    if (Impl::webp_supported()) {
+      // Probe false negatives (or a build where is_webp_memory disagrees
+      // with the decoder) should still get a WebP attempt before giving
+      // up, mirroring load_image_u8's content fallback for misnamed files.
+      try {
+        return Impl::webp_decode_memory(data, len, desired_channels);
+      } catch (const std::exception& e) {
+        throw std::runtime_error(
+            "KokkosDNN::Image::decode_image_u8: decode failed: stb says '" + why +
+            "'; webp says '" + e.what() + "'");
+      }
+    }
+    if (Impl::looks_like_webp(data, len)) {
+      throw std::runtime_error(
+          "KokkosDNN::Image::decode_image_u8: decode failed: stb says '" + why +
+          "' (looks like WebP but WebP support is not built in; configure with "
+          "-DKokkosDNN_ENABLE_IMAGE_WEBP=ON)");
+    }
+    throw std::runtime_error(
+        "KokkosDNN::Image::decode_image_u8: decode failed: " + why + " (len=" +
+        std::to_string(len) + ", magic=" + Impl::format_magic_hex(data, len) +
+        "; supported: JPEG/PNG/BMP/GIF + WebP when built with "
+        "-DKokkosDNN_ENABLE_IMAGE_WEBP=ON; HEIC/HEIF/AVIF/JXL are not "
+        "supported - convert to PNG/JPEG first)");
   }
   const int c = (desired_channels != 0) ? desired_channels : native;
   HostImageU8 img("KokkosDNN::Image::decode", static_cast<size_t>(h),
