@@ -46,6 +46,15 @@
 # builds). Both -v layouts can be mounted at once; only the --weights /
 # --tokenizer paths passed on the command line decide what is served.
 #
+# Crash backtraces: run with `-e KOKKOSDNN_GDB=1` to execute the server
+# under `gdb --batch` (installed in the runtime image). A crash then dumps
+# `thread apply all bt full` for every thread to the container logs; unset
+# (or `0`) runs the binary directly. Example:
+#   docker run --gpus all -p 8000:8000 -e KOKKOSDNN_GDB=1 \
+#     -v /path/to/lfm:/models/lfm:ro \
+#     kokkosdnn-server:cuda \
+#     --weights /models/lfm/lfm2_5.gguf --tokenizer /models/lfm/tokenizer.json
+#
 # Cross-GPU note: CUDA_ARCH is a Kokkos CUDA arch name
 # (--build-arg CUDA_ARCH=HOPPER90, default AMPERE80) passed straight to
 # -DKokkos_ARCH_<arch>=ON. The default Ampere build also carries PTX, so
@@ -141,10 +150,12 @@ COPY --from=builder /opt/kokkosdnn/bin/kokkosdnn_server /usr/local/bin/kokkosdnn
 COPY server/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 # httplib links OpenSSL/zlib, so make sure the runtime image carries them
-# (tiny, no daemons). All other NEEDED entries (libcudart/libcublas/
+# (tiny, no daemons). gdb is included so -e KOKKOSDNN_GDB=1 can run the
+# server under `gdb --batch` with `thread apply all bt full` on crash (see
+# docker-entrypoint.sh). All other NEEDED entries (libcudart/libcublas/
 # libcudnn/libnvrtc, libstdc++) come from the base image.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends libssl3 zlib1g \
+ && apt-get install -y --no-install-recommends gdb libssl3 zlib1g \
  && rm -rf /var/lib/apt/lists/* \
  && chmod 755 /usr/local/bin/docker-entrypoint.sh \
  && mkdir -p /models/lfm /models/glimmer
@@ -153,7 +164,9 @@ EXPOSE 8000
 # The entrypoint passes everything through to kokkosdnn_server, so
 # `docker run ... <image> --weights ...` keeps working as before; with no
 # args (CMD) it prints the server help. Validates --weights/--tokenizer
-# early with a mount-oriented error (see the script).
+# early with a mount-oriented error (see the script). With -e
+# KOKKOSDNN_GDB=1 the entrypoint execs the server under gdb --batch with
+# `thread apply all bt full` on crash.
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["--help"]
 

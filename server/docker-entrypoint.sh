@@ -13,9 +13,42 @@
 # Back-compat: `docker run ... <image> --weights ... --tokenizer ... [...]`
 # keeps working exactly as before — every argument is passed through to
 # kokkosdnn_server untouched.
+#
+# Debug: `docker run -e KOKKOSDNN_GDB=1 ...` runs the server under
+# `gdb --batch` so a crash dumps `thread apply all bt full` for every
+# thread (see run_bin below).
 set -eu
 
 BIN=/usr/local/bin/kokkosdnn_server
+
+# run_bin "$@" : exec the server, optionally under gdb.
+# When KOKKOSDNN_GDB is set to a non-empty, non-"0" value (e.g.
+# `docker run -e KOKKOSDNN_GDB=1 ...`), the server runs under
+# `gdb --batch` so a crash (SIGSEGV/SIGABRT/...) prints
+# `thread apply all bt full` for every thread to container logs before
+# gdb exits. Unset (or "0") runs the binary directly with no overhead.
+run_bin() {
+  if [ -n "${KOKKOSDNN_GDB:-}" ] && [ "${KOKKOSDNN_GDB}" != "0" ]; then
+    if ! command -v gdb >/dev/null 2>&1; then
+      echo "error: KOKKOSDNN_GDB is set but gdb is not installed in the image" >&2
+      exit 127
+    fi
+    # --return-child-result propagates the server's exit code through gdb.
+    # The handle lines keep image-stop signals (docker stop, Ctrl-C) and
+    # SIGPIPE (httplib socket writes) flowing to the server instead of
+    # stopping inside gdb. On normal exit the trailing bt prints
+    # "No stack." and is harmless; on a crash it dumps all threads.
+    exec gdb --batch --return-child-result \
+      -ex "set pagination off" \
+      -ex "handle SIGINT nostop noprint pass" \
+      -ex "handle SIGTERM nostop noprint pass" \
+      -ex "handle SIGPIPE nostop noprint pass" \
+      -ex run \
+      -ex "thread apply all bt full" \
+      --args "$BIN" "$@"
+  fi
+  exec "$BIN" "$@"
+}
 
 has_opt() {
   # has_opt NAME -- "$@" : true if NAME appears as an argument.
@@ -32,11 +65,11 @@ has_opt() {
 if [ "$#" -eq 0 ]; then
   # CMD is ["--help"], so this only triggers if the caller overrides CMD
   # with an empty command; print the arch-aware server help either way.
-  exec "$BIN" --help
+  run_bin --help
 fi
 
 if has_opt --help -- "$@" || has_opt -h -- "$@" || has_opt --version -- "$@"; then
-  exec "$BIN" "$@"
+  run_bin "$@"
 fi
 
 _missing=""
@@ -79,4 +112,4 @@ EOF
   exit 2
 fi
 
-exec "$BIN" "$@"
+run_bin "$@"
