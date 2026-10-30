@@ -16,7 +16,9 @@
 // own prefix through the causal mask, so resuming mid-sequence reproduces
 // single-shot prefill token-for-token. Unlike LFM25 there is no short-conv
 // state to carry (Glimmer is dense attention only), so the snapshot is just
-// the per-layer KV rows [0, len) plus the stashed last-token logits.
+// the per-layer KV rows [0, len) — dense FP rows, or the symmetric-int8
+// pools plus FP32 scale rows when Config::kv_int8 is set — plus the
+// stashed last-token logits.
 //
 // Policy: single entry (see Session::kPrefixCacheCapacity). Lookup hits
 // when the cached entry is an exact prefix of the new prompt (and no
@@ -38,6 +40,8 @@
 #include <Kokkos_Core.hpp>
 
 #include <cstddef>
+#include <cstdint>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -121,15 +125,27 @@ class PrefixCache : public PrefixCacheCore {
   using ModelT = Model<ExecSpace, Scalar>;
   using View3 = Kokkos::View<Scalar***, Kokkos::LayoutRight, StoreSpace>;
   using View1 = Kokkos::View<Scalar*, StoreSpace>;
+  // int8 KV snapshot views (quantized mode): per-token per-head symmetric
+  // int8 values plus FP32 scales, mirroring Model::kq/vq/ks/vs pools.
+  using ViewI8 = Kokkos::View<int8_t***, Kokkos::LayoutRight, StoreSpace>;
+  using ViewScale = Kokkos::View<float**, Kokkos::LayoutRight, StoreSpace>;
 
   // Resident snapshot at one content prefix: the model state after
-  // forwarding exactly `tokens` (KV rows [0, len) and last-token logits
-  // for the first step()). `tokens` mirrors the base-class key at the
-  // same index.
+  // forwarding exactly `tokens` (`tokens` mirrors the base-class key at the
+  // same index). Dense mode stores the per-layer KV rows [0, len) plus the
+  // stashed last-token logits for the first step(); int8 mode
+  // (Config::kv_int8) stores the quantized pools plus the per-token
+  // per-head FP32 scale rows instead — the dense views stay empty and vice
+  // versa (the two modes never coexist, matching Model::kv_alloc_fresh).
   struct Entry {
     std::vector<int> tokens;
-    std::vector<View3> k;  // per-layer K cache prefix
-    std::vector<View3> v;  // per-layer V cache prefix
+    bool quant = false;  // snapshot mode: true = int8 pools + scales
+    std::vector<View3> k;  // per-layer dense K cache prefix
+    std::vector<View3> v;  // per-layer dense V cache prefix
+    std::vector<ViewI8> kq;  // per-layer int8 K pool prefix
+    std::vector<ViewI8> vq;  // per-layer int8 V pool prefix
+    std::vector<ViewScale> ks;  // per-layer K scale prefix
+    std::vector<ViewScale> vs;  // per-layer V scale prefix
     View1 logits;          // last-token logits at tokens.size()
   };
 
@@ -142,20 +158,48 @@ class PrefixCache : public PrefixCacheCore {
 
   // Restore entry `idx` into `model` (KV prefix, seq_len). The entry's
   // logits are NOT moved (the caller forwards the suffix and takes fresh
-  // logits, or copies entry logits itself on exact hits).
+  // logits, or copies entry logits itself on exact hits). The entry's KV
+  // mode must match the model's (dense vs Config::kv_int8); a mismatch
+  // (e.g. weights/config swapped without clear_prefix_cache()) throws
+  // rather than restoring rows into the wrong pools.
   void restore(size_t idx, ModelT& model) const {
     const Entry& e = entries_.at(idx);
+    if (e.quant != model.cfg.use_quant_kv())
+      throw std::runtime_error(
+          "PrefixCache::restore: entry KV mode (int8/dense) does not match "
+          "model config (call clear_prefix_cache() after changing kv_int8)");
     const size_t n = e.tokens.size();
     const size_t nl = static_cast<size_t>(model.cfg.n_layers);
-    for (size_t l = 0; l < nl; ++l) {
-      auto dst_k = Kokkos::subview(
-          model.k_cache[l],
-          std::make_pair(size_t(0), n), Kokkos::ALL, Kokkos::ALL);
-      Kokkos::deep_copy(dst_k, e.k[l]);
-      auto dst_v = Kokkos::subview(
-          model.v_cache[l],
-          std::make_pair(size_t(0), n), Kokkos::ALL, Kokkos::ALL);
-      Kokkos::deep_copy(dst_v, e.v[l]);
+    if (e.quant) {
+      for (size_t l = 0; l < nl; ++l) {
+        auto dst_kq = Kokkos::subview(
+            model.kq_cache[l],
+            std::make_pair(size_t(0), n), Kokkos::ALL, Kokkos::ALL);
+        Kokkos::deep_copy(dst_kq, e.kq[l]);
+        auto dst_vq = Kokkos::subview(
+            model.vq_cache[l],
+            std::make_pair(size_t(0), n), Kokkos::ALL, Kokkos::ALL);
+        Kokkos::deep_copy(dst_vq, e.vq[l]);
+        auto dst_ks = Kokkos::subview(model.ks_cache[l],
+                                      std::make_pair(size_t(0), n),
+                                      Kokkos::ALL);
+        Kokkos::deep_copy(dst_ks, e.ks[l]);
+        auto dst_vs = Kokkos::subview(model.vs_cache[l],
+                                      std::make_pair(size_t(0), n),
+                                      Kokkos::ALL);
+        Kokkos::deep_copy(dst_vs, e.vs[l]);
+      }
+    } else {
+      for (size_t l = 0; l < nl; ++l) {
+        auto dst_k = Kokkos::subview(
+            model.k_cache[l],
+            std::make_pair(size_t(0), n), Kokkos::ALL, Kokkos::ALL);
+        Kokkos::deep_copy(dst_k, e.k[l]);
+        auto dst_v = Kokkos::subview(
+            model.v_cache[l],
+            std::make_pair(size_t(0), n), Kokkos::ALL, Kokkos::ALL);
+        Kokkos::deep_copy(dst_v, e.v[l]);
+      }
     }
     model.seq_len = n;
   }
@@ -201,23 +245,53 @@ class PrefixCache : public PrefixCacheCore {
     }
     Entry e;
     e.tokens = tokens;
+    e.quant = model.cfg.use_quant_kv();
     const size_t n = tokens.size();
     const size_t nl = static_cast<size_t>(model.cfg.n_layers);
     const size_t nkv = static_cast<size_t>(model.cfg.n_kv_heads);
     const size_t hd = static_cast<size_t>(model.cfg.head_dim);
-    e.k.resize(nl);
-    e.v.resize(nl);
-    for (size_t l = 0; l < nl; ++l) {
-      e.k[l] = View3("KokkosDNN::Glimmer::PrefixCache::k", n, nkv, hd);
-      e.v[l] = View3("KokkosDNN::Glimmer::PrefixCache::v", n, nkv, hd);
-      auto src_k = Kokkos::subview(model.k_cache[l],
-                                   std::make_pair(size_t(0), n), Kokkos::ALL,
-                                   Kokkos::ALL);
-      Kokkos::deep_copy(e.k[l], src_k);
-      auto src_v = Kokkos::subview(model.v_cache[l],
-                                   std::make_pair(size_t(0), n), Kokkos::ALL,
-                                   Kokkos::ALL);
-      Kokkos::deep_copy(e.v[l], src_v);
+    if (e.quant) {
+      // Symmetric-int8 pools plus FP32 scale tables (no sharing, no paging;
+      // one pair per layer, mirroring Model::kv_alloc_fresh).
+      e.kq.resize(nl);
+      e.vq.resize(nl);
+      e.ks.resize(nl);
+      e.vs.resize(nl);
+      for (size_t l = 0; l < nl; ++l) {
+        e.kq[l] = ViewI8("KokkosDNN::Glimmer::PrefixCache::kq", n, nkv, hd);
+        e.vq[l] = ViewI8("KokkosDNN::Glimmer::PrefixCache::vq", n, nkv, hd);
+        e.ks[l] = ViewScale("KokkosDNN::Glimmer::PrefixCache::ks", n, nkv);
+        e.vs[l] = ViewScale("KokkosDNN::Glimmer::PrefixCache::vs", n, nkv);
+        auto src_kq = Kokkos::subview(model.kq_cache[l],
+                                      std::make_pair(size_t(0), n), Kokkos::ALL,
+                                      Kokkos::ALL);
+        Kokkos::deep_copy(e.kq[l], src_kq);
+        auto src_vq = Kokkos::subview(model.vq_cache[l],
+                                      std::make_pair(size_t(0), n), Kokkos::ALL,
+                                      Kokkos::ALL);
+        Kokkos::deep_copy(e.vq[l], src_vq);
+        auto src_ks = Kokkos::subview(model.ks_cache[l],
+                                      std::make_pair(size_t(0), n), Kokkos::ALL);
+        Kokkos::deep_copy(e.ks[l], src_ks);
+        auto src_vs = Kokkos::subview(model.vs_cache[l],
+                                      std::make_pair(size_t(0), n), Kokkos::ALL);
+        Kokkos::deep_copy(e.vs[l], src_vs);
+      }
+    } else {
+      e.k.resize(nl);
+      e.v.resize(nl);
+      for (size_t l = 0; l < nl; ++l) {
+        e.k[l] = View3("KokkosDNN::Glimmer::PrefixCache::k", n, nkv, hd);
+        e.v[l] = View3("KokkosDNN::Glimmer::PrefixCache::v", n, nkv, hd);
+        auto src_k = Kokkos::subview(model.k_cache[l],
+                                     std::make_pair(size_t(0), n), Kokkos::ALL,
+                                     Kokkos::ALL);
+        Kokkos::deep_copy(e.k[l], src_k);
+        auto src_v = Kokkos::subview(model.v_cache[l],
+                                     std::make_pair(size_t(0), n), Kokkos::ALL,
+                                     Kokkos::ALL);
+        Kokkos::deep_copy(e.v[l], src_v);
+      }
     }
     e.logits = View1("KokkosDNN::Glimmer::PrefixCache::logits",
                       logits.extent(0));

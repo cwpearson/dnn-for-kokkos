@@ -264,6 +264,8 @@ struct CliOptions {
   std::string tokenizer;
   std::string config_path;
   int max_seq_len = 0;  // 0 => keep the config file / preset value
+  int kv_quant_override = -1;  // -1 unset, 0 = dense FP, 1 = int8 KV (glimmer)
+  int prefill_chunk_override = -1;  // -1 unset, >=0 tokens, 0 single-shot
   bool prefix_cache_host = false;  // keep the KV-cache entry in host memory
 };
 
@@ -274,6 +276,7 @@ struct CliOptions {
     std::printf(
         "Usage: %s [--arch ARCH] [--port N] [--model ID] [--weights PATH ...]\n"
         "             [--tokenizer PATH] [--config PATH] [--max-seq-len N]\n"
+        "             [--kv-int8 | --kv-fp | --kv-quant MODE] [--prefill-chunk N]\n"
         "             [--help] [--version] [--prefix-cache-host]\n"
         "\n"
         "OpenAI-compatible inference server for KokkosDNN (multi-architecture).\n"
@@ -298,11 +301,22 @@ struct CliOptions {
         "                    a recognizable config is a startup error.\n"
         "  --max-seq-len N   context window to serve (overrides the config;\n"
         "                    the KV cache is allocated for N tokens)\n"
+        "  --kv-int8         symmetric-int8 KV cache (glimmer only; overrides\n"
+        "                    the config-file kv_int8/kv_quantized/kv_quant keys;\n"
+        "                    default is dense FP)\n"
+        "  --kv-fp           dense FP KV cache (glimmer only; overrides the\n"
+        "                    config-file KV keys)\n"
+        "  --kv-quant MODE   explicit KV precision: \"int8\" or \"none\"\n"
+        "                    (glimmer only; the last of --kv-int8/--kv-fp/\n"
+        "                    --kv-quant on the command line wins)\n"
+        "  --prefill-chunk N prefill chunk size in tokens (glimmer only;\n"
+        "                    0 = single-shot; overrides the config-file\n"
+        "                    prefill_chunk_size; caps prefill activations)\n"
         "  --prefix-cache-host\n"
         "                    keep the single prefix-cache KV entry in host\n"
         "                    memory instead of device memory (saves VRAM at\n"
         "                    the cost of host<->device copies per turn;\n"
-        "                    LFM2.5 only, ignored by glimmer)\n"
+        "                    applies to both architectures)\n"
         "  --help            print this message and exit\n"
         "  --version         print the server version and exit\n"
         "\n"
@@ -373,6 +387,37 @@ struct CliOptions {
         std::printf("--max-seq-len must be a positive integer\n");
         return 1;
       }
+    } else if (std::strcmp(a, "--kv-int8") == 0) {
+      out.kv_quant_override = 1;
+    } else if (std::strcmp(a, "--kv-fp") == 0) {
+      out.kv_quant_override = 0;
+    } else if (std::strcmp(a, "--kv-quant") == 0) {
+      if (i + 1 >= argc) {
+        std::printf("Missing value for --kv-quant\n");
+        return 1;
+      }
+      std::string m = argv[++i];
+      for (auto& ch : m)
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+      if (m == "int8" || m == "kv_int8" || m == "true" || m == "1") {
+        out.kv_quant_override = 1;
+      } else if (m == "none" || m == "fp" || m == "false" || m == "0") {
+        out.kv_quant_override = 0;
+      } else {
+        std::printf("error: --kv-quant '%s': expected \"int8\" or \"none\"\n",
+                    m.c_str());
+        return 1;
+      }
+    } else if (std::strcmp(a, "--prefill-chunk") == 0) {
+      if (i + 1 >= argc) {
+        std::printf("Missing value for --prefill-chunk\n");
+        return 1;
+      }
+      out.prefill_chunk_override = std::atoi(argv[++i]);
+      if (out.prefill_chunk_override < 0) {
+        std::printf("--prefill-chunk must be a non-negative integer\n");
+        return 1;
+      }
     } else if (std::strcmp(a, "--prefix-cache-host") == 0) {
       out.prefix_cache_host = true;
     } else {
@@ -441,6 +486,8 @@ void resolve_arch_and_model(const CliOptions& o, std::string& arch,
   lo.weights = o.weights;
   lo.tokenizer = o.tokenizer;
   lo.max_seq_len = o.max_seq_len;
+  lo.kv_quant_override = o.kv_quant_override;
+  lo.prefill_chunk_override = o.prefill_chunk_override;
   lo.prefix_cache_host = o.prefix_cache_host;
   if (!backend->load(lo, err)) return false;
   st.arch = backend->arch();
