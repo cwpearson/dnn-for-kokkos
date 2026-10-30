@@ -975,7 +975,11 @@ int test_stream_robustness() {
     const char* toks[] = {"<",    ">",    "|",    "/",    "t",   "hink",
                           "<think>", "</think>", "<|tool_call_start|>",
                           "<|tool_call_end|>", "<|im_end|>", "[f(x=1)]",
-                          " ",    "a",    "STOP", "\n",   "(",   ")"};
+                          "<thinking>", "</thinking>", "<tool_call>",
+                          "</tool_call>", "<function=f(x=1)>",
+                          "<parameter=a>", "</parameter>", "</function>",
+                          "function=f(x=1)", "<function>", " ",    "a",
+                          "STOP", "\n", "(",   ")"};
     const size_t ntoks = sizeof(toks) / sizeof(toks[0]);
     uint64_t rng = 0x12345678u;
     auto next = [&]() {

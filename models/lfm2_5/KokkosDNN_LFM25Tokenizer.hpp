@@ -47,6 +47,19 @@ inline constexpr const char* kToolCallStartToken = "<|tool_call_start|>";
 inline constexpr const char* kToolCallEndToken   = "<|tool_call_end|>";
 // Exact assistant tool-call wrapper used by the Instruct template:
 //   <|tool_call_start|>[name(k="v", ...), ...]<|tool_call_end|>
+//
+// Tolerated alternate spellings. The canonical model emits the native pair
+// above and the <think> trace, but fine-tunes and long degenerate turns
+// sometimes slide into the LFM3 / qwen3-coder grammar
+//   <tool_call><function=name><parameter=k>v</parameter></function></tool_call>
+// or a hybrid of the two (an XML opener with the native end token, and/or a
+// `function=` prefix on pythonic items). The parser accepts those as
+// aliases so a drifting turn still becomes a tool call instead of leaking
+// markup into the thinking trace. Rendering always uses the native pair.
+inline constexpr const char* kThinkStartAltToken = "<thinking>";
+inline constexpr const char* kThinkEndAltToken   = "</thinking>";
+inline constexpr const char* kToolCallStartAltToken = "<tool_call>";
+inline constexpr const char* kToolCallEndAltToken   = "</tool_call>";
 
 // Hugging Face `tokenizer.json` loader for LFM2.5 (byte-level BPE, 128k).
 //
@@ -282,6 +295,14 @@ std::vector<int> encode_chatml_with_tools(
 // mid-arguments recovers nothing and stays text. Recovery carries no
 // truncation marker, so validate arguments before executing.
 // Never throws on model output (malformed blocks are skipped).
+//
+// Tolerated spellings: <thinking>...</thinking> is accepted wherever
+// <think>/</think> is, and <tool_call>...</tool_call> (the LFM3 /
+// qwen3-coder wrapper) is accepted as a tool-call block with either the
+// native or the LFM3 body grammar — including hybrids such as an XML
+// opener closed by <|tool_call_end|> or pythonic items prefixed with
+// `function=`. These are parse-only aliases; the renderer always emits
+// the canonical native markers.
 struct ToolParseResult {
   std::string text;
   std::string reasoning;  // trace contents, openers excluded ("" when none)
@@ -291,10 +312,13 @@ ToolParseResult parse_tool_calls(
     const std::string& raw, const std::vector<std::string>& stops = {},
     bool start_in_reasoning = false);
 
-// Convert one native call-block body, e.g. `[f(a="1"), g(x=2)]` (brackets
-// optional), into calls. Arguments convert from the native pythonic form
-// (strings, numbers, True/False/None, lists, dicts, bare words) to a JSON
-// object string. Never throws; malformed entries are skipped.
+// Convert one call-block body into calls. The native form is
+// `[f(a="1"), g(x=2)]` (brackets optional), with arguments converted from
+// the pythonic form (strings, numbers, True/False/None, lists, dicts, bare
+// words) to a JSON object string. Also accepts the LFM3 / qwen3-coder body
+// `<function=f><parameter=a>1</parameter></function>` and hybrids that
+// prefix pythonic items with `function=`. Never throws; malformed entries
+// are skipped.
 std::vector<ToolCall> parse_tool_call_block(const std::string& block);
 
 // Incremental variant of parse_tool_calls for SSE streaming: feed raw

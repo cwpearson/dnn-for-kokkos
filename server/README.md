@@ -203,6 +203,14 @@ calls instead of leaking call markup into `content`. A recovered
 length-capped turn still reports `finish_reason:"tool_calls"` (the length
 cap is hidden), so validate the arguments before executing — they may be
 cut mid-list.
+The parser also tolerates the LFM3 / qwen3-coder wrapper
+`<tool_call>...</tool_call>` with `<function=name>` / `<parameter=k>v`
+`</parameter>` bodies, including hybrids with the native form (an XML
+opener closed by `<|tool_call_end|>`, pythonic items prefixed with
+`function=`, or a degenerate `<function>name</function>` head), plus
+`<thinking>...</thinking>` as a `<think>` alias, so a drifting turn still
+becomes a tool call instead of leaking markup into the thinking trace.
+Rendering always uses the canonical native markers.
 Turn boundaries: the `<|im_end|>` terminator always ends the turn, even
 with a custom `stop` list, and a length-capped turn ending mid-marker has
 only its longest trailing partial marker head stripped (an earlier `<`
@@ -216,6 +224,9 @@ reasoning even with no explicit opener in the bytes. A turn that reaches
 none of those terminators (cut by `max_tokens`, or a model that never
 closes the trace) is reported entirely as reasoning, so `content` is
 empty for that turn rather than the trace leaking into it.
+`<thinking>` / `</thinking>` are accepted wherever the canonical
+`<think>` / `</think>` pair is, and either closer ends either opener (a
+model that mixes the two still splits correctly).
 The trace never
 appears in `content`: streaming sends it as
 `reasoning_content` deltas (the DeepSeek/OpenRouter convention, which Zed
@@ -245,13 +256,79 @@ Limits to know:
 - Only `function` tools / `function` tool_choice targets are supported.
 - `response_format` fence-stripping applies to non-streaming replies;
   streamed JSON deltas arrive unmodified.
-- Zed (OpenAI-compatible provider, chat-completions path) is supported:
-  `parallel_tool_calls:false`, `stream_options:{"include_usage":true}`,
-  and `reasoning_content` replay all work; thinking surfaces in Zed's
-  thinking trace, tool calls execute normally. Prefer a generous
-  `max_completion_tokens` (thinking consumes completion budget — a cap
-  hit mid-call still returns the recoverable call, but with truncated
-  arguments and `finish_reason:"tool_calls"`).
+- Zed (OpenAI-compatible provider, chat-completions path) is supported;
+  see [Zed (LFM2.5)](#zed-lfm25) for the provider settings this server
+  expects (a couple of Zed defaults are wrong for a reasoning model and
+  will visibly degrade multi-turn agent threads).
+
+## Zed (LFM2.5)
+
+Zed's `openai_compatible` provider works with the chat-completions path.
+Add the server as a provider in `~/.config/zed/settings.json` (or via
+Agent Settings → Add Provider, then fill in the capabilities below):
+
+```json
+{
+  "language_models": {
+    "openai_compatible": {
+      "kokkosdnn": {
+        "api_url": "http://127.0.0.1:8000/v1",
+        "available_models": [
+          {
+            "name": "lfm2_5",
+            "display_name": "LFM2.5 24B-A2B (local)",
+            "max_tokens": 8192,
+            "max_output_tokens": 4096,
+            "capabilities": {
+              "tools": true,
+              "images": false,
+              "parallel_tool_calls": true,
+              "prompt_cache_key": false,
+              "chat_completions": true,
+              "interleaved_reasoning": true,
+              "max_tokens_parameter": false
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+Why these values (the defaults are not all right for this model):
+
+- `interleaved_reasoning: true` is **required**. With Zed's default
+  `false`, prior assistant `Thinking` content is not dropped and not sent
+  as `reasoning_content` — it is replayed as **plain assistant text**
+  (`crates/open_ai/src/completion.rs`), so the model sees its own trace
+  without the template's `<think>` wrapper and imitates whatever markup it
+  contained. That feedback loop is what makes a thread drift from the
+  native format into other tool grammars. With `true`, Zed sends the trace
+  back as `reasoning_content` and the server re-renders it inside the
+  `<think>` block the chat template expects.
+- `parallel_tool_calls: true` lets a multi-call turn through. With the
+  default `false`, the request carries `parallel_tool_calls:false` and the
+  server keeps only the first parsed call.
+- `max_tokens` is Zed's **context window**, not an output cap; set it to
+  the server's `--max-seq-len` (default `8192`). Zed compacts at 90% of
+  this value, so a larger number lets the thread grow past the server's
+  limit and every later request fails with an over-context 400.
+- `max_output_tokens` is the output cap, sent as `max_completion_tokens`.
+  Set it explicitly and generously: when unset, Zed sends no usable cap
+  (the field is absent or `null`), and the server then falls back to 256
+  completion tokens, which a model that always thinks first will often
+  exhaust before it finishes a tool call (the server clamps the value to
+  `max_seq_len - prompt_len` anyway).
+- `chat_completions` must stay `true`; the server has no `/v1/responses`.
+- `name` must match the server's `--model` (default `lfm2_5`), and
+  `api_url` must end in `/v1` (Zed appends `/chat/completions`).
+- `reasoning_effort` is optional and ignored by the server; setting a
+  non-`none` value only enables Zed's thinking controls for the model.
+
+After changing `interleaved_reasoning`, **start a new thread**: existing
+threads still carry the old, polluted history and may keep reproducing
+the old format.
 
 ## Errors
 
