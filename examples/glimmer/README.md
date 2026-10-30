@@ -35,6 +35,13 @@ hf download darkc0de/Muse-Glimmer-30B-heretic model.safetensors* tokenizer.json 
   tokenizer_config.json config.json generation_config.json \
   --local-dir weights/muse-glimmer-30b-text
 
+# Q4_K_M GGUF (~16.8 GB, ~17GB resident) for the 24GB recipe below.
+# The GGUF repo holds only .gguf files (no tokenizer.json); reuse the
+# tokenizer.json from the safetensors download above.
+hf download meta-models/Muse-Glimmer-30B-GGUF \
+  --include "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf" \
+  --local-dir weights/muse-glimmer-30b-text
+
 # Real checkpoint run (~60 GiB weights).
 ./build/examples/glimmer/glimmer_generate \
   --model glimmer-30b --config models/glimmer/config-glimmer-30b-text.json \
@@ -81,7 +88,7 @@ GGUF checkpoint run (llama.cpp naming, packed quant stays on device):
 ```bash
 ./build/examples/glimmer/glimmer_generate \
   --model glimmer-30b --config models/glimmer/config-glimmer-30b-text.json \
-  --weights weights/muse-glimmer-30b-text/model.gguf \
+  --weights weights/muse-glimmer-30b-text/Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf \
   --tokenizer weights/muse-glimmer-30b-text/tokenizer.json \
   --prompt "Hello" --max-new 64
 ```
@@ -93,7 +100,7 @@ A single `--weights` entry ending in `.gguf` (case-insensitive) selects the GGUF
 ```bash
 ./build/examples/glimmer/glimmer_generate \
   --model glimmer-30b --config models/glimmer/config-glimmer-30b-text.json \
-  --weights weights/muse-glimmer-30b-text/model.gguf \
+  --weights weights/muse-glimmer-30b-text/Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf \
   --tokenizer weights/muse-glimmer-30b-text/tokenizer.json \
   --prompt "Hello" --max-new 64 --kv-int8 --max-seq-len 131072 --prefill-chunk 512
 ```
