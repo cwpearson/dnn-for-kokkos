@@ -768,6 +768,106 @@ int test_assemble() {
   return 0;
 }
 
+int test_cli_glimmer_flags() {
+  // Weight-free CLI checks: --kv-*/--prefill-chunk parse into CliOptions
+  // with example-identical semantics (dense default, last explicit wins).
+  auto run = [](const std::vector<std::string>& args, CliOptions& out) {
+    std::vector<char*> argv;
+    argv.reserve(args.size());
+    for (const auto& s : args) argv.push_back(const_cast<char*>(s.c_str()));
+    return parse_cli(static_cast<int>(argv.size()), argv.data(), out);
+  };
+  {
+    CliOptions o;
+    CHECK(run({"prog"}, o) == 0);
+    CHECK(o.kv_quant_override == -1);
+    CHECK(o.prefill_chunk_override == -1);
+    CHECK(o.max_seq_len == 0);
+    CHECK(!o.prefix_cache_host);
+  }
+  {
+    CliOptions o;
+    CHECK(run({"prog", "--kv-int8"}, o) == 0);
+    CHECK(o.kv_quant_override == 1);
+  }
+  {
+    CliOptions o;
+    CHECK(run({"prog", "--kv-fp"}, o) == 0);
+    CHECK(o.kv_quant_override == 0);
+  }
+  {
+    CliOptions o;
+    CHECK(run({"prog", "--kv-quant", "int8"}, o) == 0);
+    CHECK(o.kv_quant_override == 1);
+  }
+  {
+    CliOptions o;
+    CHECK(run({"prog", "--kv-quant", "KV_INT8"}, o) == 0);
+    CHECK(o.kv_quant_override == 1);
+  }
+  {
+    CliOptions o;
+    CHECK(run({"prog", "--kv-quant", "none"}, o) == 0);
+    CHECK(o.kv_quant_override == 0);
+  }
+  // Last explicit source wins (mirrors the glimmer_generate driver).
+  for (const auto& args :
+       {std::vector<std::string>{"prog", "--kv-int8", "--kv-fp"},
+        std::vector<std::string>{"prog", "--kv-quant", "int8", "--kv-fp"}}) {
+    CliOptions o;
+    CHECK(run(args, o) == 0);
+    CHECK(o.kv_quant_override == 0);
+  }
+  for (const auto& args :
+       {std::vector<std::string>{"prog", "--kv-fp", "--kv-int8"},
+        std::vector<std::string>{"prog", "--kv-quant", "none", "--kv-int8"},
+        std::vector<std::string>{"prog", "--kv-int8", "--kv-quant", "none",
+                                 "--kv-quant", "int8"}}) {
+    CliOptions o;
+    CHECK(run(args, o) == 0);
+    CHECK(o.kv_quant_override == 1);
+  }
+  // Bad/missing values are startup errors, not silent defaults.
+  {
+    CliOptions o;
+    CHECK(run({"prog", "--kv-quant", "fp8"}, o) == 1);
+    CHECK(run({"prog", "--kv-quant"}, o) == 1);
+  }
+  {
+    CliOptions o;
+    CHECK(run({"prog", "--prefill-chunk", "512"}, o) == 0);
+    CHECK(o.prefill_chunk_override == 512);
+  }
+  {
+    CliOptions o;
+    CHECK(run({"prog", "--prefill-chunk", "0"}, o) == 0);
+    CHECK(o.prefill_chunk_override == 0);
+  }
+  {
+    CliOptions o;
+    CHECK(run({"prog", "--prefill-chunk", "-1"}, o) == 1);
+    CHECK(run({"prog", "--prefill-chunk"}, o) == 1);
+  }
+  // Combined with the existing overrides.
+  {
+    CliOptions o;
+    CHECK(run({"prog", "--max-seq-len", "4096", "--kv-int8",
+               "--prefill-chunk", "512", "--prefix-cache-host"},
+              o) == 0);
+    CHECK(o.max_seq_len == 4096);
+    CHECK(o.kv_quant_override == 1);
+    CHECK(o.prefill_chunk_override == 512);
+    CHECK(o.prefix_cache_host);
+  }
+  // LoadOptions carries the same unset sentinel (config file wins).
+  {
+    Server::LoadOptions lo;
+    CHECK(lo.kv_quant_override == -1);
+    CHECK(lo.prefill_chunk_override == -1);
+  }
+  return 0;
+}
+
 int test_error_shape() {
   const json e = openai_error("boom");
   CHECK(e.contains("error") && e["error"]["message"] == "boom");
@@ -1146,6 +1246,7 @@ int main() {
   if (test_common()) return 1;
   if (test_tool_helpers()) return 1;
   if (test_backends()) return 1;
+  if (test_cli_glimmer_flags()) return 1;
   if (test_assemble()) return 1;
 #ifdef KOKKOSDNN_SERVER_HAVE_LFM25
   if (test_lfm25_tool_wire()) return 1;

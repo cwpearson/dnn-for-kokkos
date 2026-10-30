@@ -23,10 +23,12 @@ cmake --build build --target kokkosdnn_server
     --tokenizer /path/to/tokenizer.json [--config overlay.json] \
     [--max-seq-len 16384] [--model lfm2_5] [--port 8000] \
     [--prefix-cache-host]
-# Glimmer (once KokkosDNN::glimmer exists):
+# Glimmer (packed `.gguf` for 24GB GPUs, or sharded safetensors):
 ./build/server/kokkosdnn_server --arch glimmer \
-    --weights '/path/to/model-*.safetensors' \
-    --tokenizer /path/to/tokenizer.json [--model glimmer-30b]
+    --weights /path/to/model.gguf \
+    --tokenizer /path/to/tokenizer.json [--model glimmer-30b] \
+    [--config config.json] [--max-seq-len 131072] [--kv-int8] \
+    [--prefill-chunk 512] [--prefix-cache-host]
 ```
 
 `--help` / `--version` work without Kokkos weights. `--arch` selects the
@@ -44,9 +46,19 @@ file; Glimmer takes one `.gguf` file or one or more safetensors shards
 `--config` is an optional model-config JSON overlay on top of the arch
 preset. `--max-seq-len N` overrides the context window (LFM2.5 default
 8192; Glimmer default 8192, arch max 131072), so prompts longer than the
-default need either this flag or a config overlay.
-`--prefix-cache-host` keeps the prefix-cache entry in host memory instead
-of device memory (LFM25 only; Glimmer has no prefix cache and ignores it).
+default need either this flag or a config overlay. Glimmer also takes
+`--kv-int8` / `--kv-fp` / `--kv-quant int8|none` (KV-cache precision;
+overrides the config-file `kv_int8`/`kv_quantized`/`kv_quant` keys, dense
+FP by default, last flag wins) and `--prefill-chunk N` (`0` =
+single-shot; overrides the config-file `prefill_chunk_size` and caps
+prefill activations) — same spelling and precedence as the
+`glimmer_generate` driver. `--prefix-cache-host` keeps the prefix-cache
+entry in host memory instead of device memory (applies to both
+architectures; saves VRAM at the cost of host<->device copies per turn).
+The server runs the BF16 path only (there is no `--fp32` flag); Glimmer
+weights load from one `.gguf` file (packed quant preserved: F32/F16/BF16
+exact, Q8_0/Q4_K/Q5_K/Q6_K stay packed, ~17GB resident for the Q4_K_M
+recipe) or sharded safetensors (~60 GiB BF16).
 
 Startup logs the execution space, the device actually in use (name, compute
 capability, SM count, memory, clocks) and the dispatch table (`cuBLAS
@@ -99,8 +111,9 @@ docker run --gpus all -p 8000:8000 \
 ```
 
 Glimmer from a single llama.cpp GGUF file instead (`--weights` ending in
-`.gguf` selects the GGUF loader; F32/F16/BF16 exact, Q8_0/Q4_K/Q6_K
-dequantized on the host):
+`.gguf` selects the GGUF loader; F32/F16/BF16 exact, Q8_0/Q4_K/Q5_K/Q6_K
+stay packed and dequantize on the fly — the Q4_K_M recipe is ~17GB
+resident):
 
 ```sh
 docker run --gpus all -p 8000:8000 \
@@ -111,13 +124,32 @@ docker run --gpus all -p 8000:8000 \
     --tokenizer /models/glimmer/tokenizer.json
 ```
 
+Glimmer on a 24GB GPU (packed GGUF + int8 KV + chunk cap): `--kv-int8`
+halves the KV cache (3432 MiB at `--max-seq-len 131072` vs ~6.5 GiB
+dense; 214.5 MiB vs 416 MiB at the 8192 default) and `--prefill-chunk N`
+caps prefill scratch (~440 MiB at the 2048 default, ~110 MiB at 512).
+~17GB weights + 3432 MiB int8 KV + ~614 MiB dequant staging + ~440 MiB
+scratch ≈ 21.4 GiB, fitting 24GB:
+
+```sh
+docker run --gpus all -p 8000:8000 \
+    -v /path/to/glimmer:/models/glimmer:ro \
+    kokkosdnn-server:cuda \
+    --arch glimmer --model glimmer-30b \
+    --weights /models/glimmer/model.gguf \
+    --tokenizer /models/glimmer/tokenizer.json \
+    --config /models/glimmer/config-glimmer-30b-text.json \
+    --max-seq-len 131072 --kv-int8 --prefill-chunk 512
+```
+
 Both `-v` layouts may be mounted at once (`-v /path/to/lfm:/models/lfm:ro
 -v /path/to/glimmer:/models/glimmer:ro`); only the `--weights` /
 `--tokenizer` paths on the command line decide what is served. With no
 args the container prints `kokkosdnn_server --help`; omitting `--weights`
 or `--tokenizer` fails fast with a mount-oriented error from the
-entrypoint. Note the ~60 GiB Glimmer weights need a large-GPU host (or a
-small `--max-seq-len` to cap the KV cache); see
+entrypoint. Note the ~60 GiB BF16 Glimmer weights need a large-GPU host —
+for 24GB GPUs use the packed-GGUF + `--kv-int8` recipe above (a small
+`--max-seq-len` also caps the KV cache); see
 [glimmer](../examples/glimmer/README.md) for checkpoint download and
 memory notes.
 
@@ -152,7 +184,7 @@ Route handlers are arch-agnostic: they parse OpenAI JSON once and drive the
 | Tools | native `<\|tool_call_start\|>` grammar, full `tools`/`tool_choice` support | none: `tools`/`tool_choice`/`tool_calls` history are rejected with 400 |
 | Weights | exactly one `--weights` GGUF | one `--weights` `.gguf` or sharded safetensors (globs expanded) |
 | Reasoning channel | `<think>` trace → `reasoning_content` | none (no thinking trace; assistant `thinking` replay is dropped) |
-| Prefix cache | single-entry content-state cache (exact-prefix reuse) | none: every turn re-prefills (`prefix_hit=0`) |
+| Prefix cache | single-entry content-state cache (exact-prefix reuse) | single-entry content-state cache (exact-prefix reuse; dense or int8 KV rows) |
 | Response format | JSON-mode system directive + fence stripping | JSON-mode directive prepended to the system message (no fence stripping on streams, same as LFM25); no grammar enforcement |
 
 ### Adding a third architecture (3-step recipe)

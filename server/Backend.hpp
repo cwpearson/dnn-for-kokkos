@@ -105,8 +105,10 @@ class StreamParser {
 
 // Everything load() needs: resolved arch + model id, optional config
 // overlay, one (LFM25 GGUF) or more (Glimmer sharded safetensors / globs)
-// weight paths, tokenizer path or directory, context override, and the
-// prefix-cache placement flag (backends without a prefix cache ignore it).
+// weight paths, tokenizer path or directory, context override, Glimmer KV
+// precision + prefill-chunk overrides (-1 = keep the config file / preset
+// value, matching the glimmer_generate driver), and the prefix-cache
+// placement flag (device vs host entry storage; both arches honor it).
 struct LoadOptions {
   std::string arch = kArchLFM25;
   std::string model_id;
@@ -114,6 +116,8 @@ struct LoadOptions {
   std::vector<std::string> weights;
   std::string tokenizer;
   int max_seq_len = 0;  // 0 => keep the config file / preset value
+  int kv_quant_override = -1;  // -1 unset, 0 = dense FP, 1 = int8 KV (glimmer)
+  int prefill_chunk_override = -1;  // -1 unset, >=0 chunk size, 0 single-shot
   bool prefix_cache_host = false;
 };
 

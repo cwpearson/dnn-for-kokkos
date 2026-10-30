@@ -48,6 +48,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <stdexcept>
 
 namespace KokkosDNN {
@@ -141,7 +142,28 @@ class GlimmerBackend final : public ChatBackend {
                                       : Glimmer::Config::from_json_file(
                                             opts.config_path);
       if (opts.max_seq_len > 0) cfg_.max_seq_len = opts.max_seq_len;
+      // Config-file keys first, CLI overrides win (mirrors the
+      // glimmer_generate driver: --prefill-chunk N, --kv-int8/--kv-fp/
+      // --kv-quant with last-explicit-wins already resolved in parse_cli).
+      // Dense FP stays the default; validated below.
+      if (opts.prefill_chunk_override >= 0)
+        cfg_.prefill_chunk_size = opts.prefill_chunk_override;
+      if (opts.kv_quant_override >= 0)
+        cfg_.kv_int8 = (opts.kv_quant_override != 0);
       cfg_.validate();
+      // Startup line mirrors the glimmer_generate driver (kv mode +
+      // full-window footprint) so a mis-provisioned 24GB run is visible
+      // before the first request.
+      {
+        const double mib =
+            static_cast<double>(cfg_.kv_cache_bytes(sizeof(Scalar))) /
+            (1024.0 * 1024.0);
+        std::fprintf(stderr,
+                     "  glimmer kv cache: %s, full-window %.1f MiB "
+                     "(max_seq_len=%d, prefill_chunk=%d)\n",
+                     cfg_.kv_int8 ? "int8" : "dense", mib, cfg_.max_seq_len,
+                     cfg_.prefill_chunk_size);
+      }
       weights_ = Glimmer::Weights<Exec, Scalar>{};
       weights_.allocate(cfg_);
       const std::vector<std::string> files =

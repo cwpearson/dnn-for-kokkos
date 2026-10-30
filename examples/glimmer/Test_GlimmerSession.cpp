@@ -53,8 +53,8 @@ Session<Exec, Scalar> make_session(const Config& cfg,
   return Session<Exec, Scalar>(cfg, w, Tokenizer{}, std::move(opts));
 }
 
-template <class Scalar>
-std::vector<int> run_steps(Session<Exec, Scalar>& s, int n) {
+template <class Scalar, class StoreSpace>
+std::vector<int> run_steps(Session<Exec, Scalar, StoreSpace>& s, int n) {
   std::vector<int> ids;
   for (int i = 0; i < n && !s.finished(); ++i) ids.push_back(s.step().id);
   return ids;
@@ -178,6 +178,58 @@ TEST(GlimmerSession, CachedPrefillEquivalence) {
       t.prefill_cached(full, std::vector<int>{9, 9, 9}, 5, true);
   EXPECT_FALSE(f.hit);
   EXPECT_EQ(run_steps(t, 4), ref_ids);
+}
+
+TEST(GlimmerSession, CachedPrefillEquivalenceInt8) {
+  // int8 KV prefix cache: snapshots/restores the quantized pools (kq/vq)
+  // plus FP32 scale rows (ks/vs), not the (empty) dense caches. Cached and
+  // uncached int8 prefills must agree token-for-token.
+  const std::vector<int> content{1, 2, 3, 4, 5, 6};
+  const std::vector<int> full{1, 2, 3, 4, 5, 6, 7, 8};
+  auto run = [&](const Config& cfg, auto make) {
+    // Reference: uncached int8 prefill + greedy steps.
+    auto ref = make(cfg, no_stop_opts(4));
+    ref.prefill(full, 5, true);
+    const std::vector<int> ref_ids = run_steps(ref, 4);
+
+    // Cached: first call misses and snapshots, second call hits.
+    auto s = make(cfg, no_stop_opts(4));
+    CachedPrefillOutcome m = s.prefill_cached(full, content, 5, true);
+    EXPECT_FALSE(m.hit);
+    EXPECT_EQ(m.reused, 0u);
+    EXPECT_EQ(s.prefix_cache_size(), 1u);
+    CachedPrefillOutcome h = s.prefill_cached(full, content, 5, true);
+    EXPECT_TRUE(h.hit);
+    EXPECT_EQ(h.reused, content.size());
+    EXPECT_EQ(run_steps(s, 4), ref_ids);
+
+    // Exact-hit path (full == content == cached): stashed logits reused.
+    auto e = make(cfg, no_stop_opts(4));
+    EXPECT_FALSE(e.prefill_cached(content, content, 5, true).hit);
+    CachedPrefillOutcome eh = e.prefill_cached(content, content, 5, true);
+    EXPECT_TRUE(eh.hit);
+    EXPECT_EQ(eh.reused, content.size());
+    auto er = make(cfg, no_stop_opts(4));
+    er.prefill(content, 5, true);
+    EXPECT_EQ(run_steps(e, 4), run_steps(er, 4));
+  };
+  auto device_make = [](const Config& cfg, SessionOptions o) {
+    return make_session<float>(cfg, std::move(o));
+  };
+  auto host_make = [](const Config& cfg, SessionOptions o) {
+    KokkosDNN::Glimmer::Weights<Exec, float> w;
+    KokkosDNN::Glimmer::random_init(cfg, w, 1234);
+    return Session<Exec, float, Kokkos::HostSpace>(cfg, w, Tokenizer{},
+                                                  std::move(o));
+  };
+  // Chunked + single-shot prefill, device + host entry storage.
+  for (int chunk : {0, 3}) {
+    Config cfg = tiny_cfg();
+    cfg.kv_int8 = true;
+    cfg.prefill_chunk_size = chunk;
+    run(cfg, device_make);
+    run(cfg, host_make);
+  }
 }
 
 TEST(GlimmerSession, PolymorphicFrontEnd) {
