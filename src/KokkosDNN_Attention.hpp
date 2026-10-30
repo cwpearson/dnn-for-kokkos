@@ -804,7 +804,7 @@ void launch_gqa_decode_small_scratch(const QView& q, const KView& k,
 //   * NG is the GQA group size Hq / Hkv -- 4 for LFM2.5-24B-A2B (32 / 8): one
 //     block covers every query head that shares a KV head, so a key's K and V
 //     rows are read once and reused NG times (4x less KV traffic: 30.7 MB per
-//     layer at Ktot = 15000). Geometries whose group is not 1/2/4/8 query
+//     layer at Ktot = 15000). Geometries whose group is not 1/2/4/8/16 query
 //     heads wide (Hq % Hkv != 0, or a wider MQA group) run this same kernel
 //     with NG == 1 and the h * Hkv / Hq mapping, so every geometry is exact
 //     and grouping is purely a traffic optimization.
@@ -1268,13 +1268,13 @@ void launch_gqa_decode(const DNNHandle<ExecSpace>& handle, const QView& q,
   if (khi > Ktot) khi = Ktot;
   const size_t len = (khi > klo) ? (khi - klo) : 0;
 
-  // Group width: all query heads sharing one KV head, when that is 1/2/4/8.
-  // Anything else (Hq % Hkv != 0, or an MQA group wider than 8) runs one head
+  // Group width: all query heads sharing one KV head, when that is 1/2/4/8/16.
+  // Anything else (Hq % Hkv != 0, or an MQA group wider than 16) runs one head
   // per block with the plain h * Hkv / Hq mapping.
   size_t ng = 1;
   if (Hq % Hkv == 0) {
     const size_t g = Hq / Hkv;
-    if (g == 2 || g == 4 || g == 8) ng = g;
+    if (g == 2 || g == 4 || g == 8 || g == 16) ng = g;
   }
   const int ngroups = static_cast<int>(Hq / ng);
   const int team_req = 128;
@@ -1338,6 +1338,11 @@ void launch_gqa_decode(const DNNHandle<ExecSpace>& handle, const QView& q,
   while (ktile > 8 && scratch_bytes(ktile) > budget) ktile /= 2;
 
   switch (ng) {
+    case 16:
+      launch_gqa_decode_split<ExecSpace, Scalar, QView, KView, VView, OView, 16>(
+          handle, q, k, v, klo, khi, nsplit, ksplit, ktile, team_size, out,
+          scale, label);
+      break;
     case 8:
       launch_gqa_decode_split<ExecSpace, Scalar, QView, KView, VView, OView, 8>(
           handle, q, k, v, klo, khi, nsplit, ksplit, ktile, team_size, out,
