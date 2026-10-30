@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -331,28 +332,33 @@ float host_vec_elem(const Kokkos::View<float*, Exec>& v, size_t i) {
   return h(i);
 }
 
-float host_mat_elem(
-    const Kokkos::View<float**, Kokkos::LayoutRight, Exec>& m, size_t i,
-    size_t j) {
-  auto h = Kokkos::create_mirror_view(m);
-  Kokkos::deep_copy(h, m);
-  return h(i, j);
-}
-
-void check_all_mat(const Kokkos::View<float**, Kokkos::LayoutRight, Exec>& m,
-                   float want) {
-  auto h = Kokkos::create_mirror_view(m);
-  Kokkos::deep_copy(h, m);
-  for (size_t i = 0; i < h.extent(0); ++i)
-    for (size_t j = 0; j < h.extent(1); ++j)
-      EXPECT_FLOAT_EQ(h(i, j), want) << "at (" << i << "," << j << ")";
-}
-
 void check_all_vec(const Kokkos::View<float*, Exec>& v, float want) {
   auto h = Kokkos::create_mirror_view(v);
   Kokkos::deep_copy(h, v);
   for (size_t i = 0; i < h.extent(0); ++i)
     EXPECT_FLOAT_EQ(h(i), want) << "at " << i;
+}
+
+// Packed-weight host read: dequantize once via Gguf::dequant_to_dense,
+// mirror, flatten row-major. All packed assertions below go through this
+// (one kernel launch per tensor, not per element).
+std::vector<float> packed_host(const Gguf::QuantWeight<Exec>& qw) {
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> Y("packed_host", qw.rows,
+                                                     qw.cols);
+  Gguf::dequant_to_dense(qw, Y);
+  Kokkos::fence();
+  auto h = Kokkos::create_mirror_view(Y);
+  Kokkos::deep_copy(h, Y);
+  std::vector<float> out(qw.rows * qw.cols);
+  for (size_t r = 0; r < qw.rows; ++r)
+    for (size_t c = 0; c < qw.cols; ++c) out[r * qw.cols + c] = h(r, c);
+  return out;
+}
+
+void check_packed_all(const Gguf::QuantWeight<Exec>& qw, float want) {
+  const auto v = packed_host(qw);
+  for (size_t i = 0; i < v.size(); ++i)
+    EXPECT_FLOAT_EQ(v[i], want) << "at " << i;
 }
 
 }  // namespace
@@ -385,9 +391,9 @@ TEST(GlimmerWeightsGGUF, ExactRoundtrip) {
   Gguf::write_synthetic_gguf(path, built.ts, default_kv(cfg));
   Weights<Exec, float> w;
   EXPECT_NO_THROW((load_gguf<Exec, float>(cfg, path, w)));
-  EXPECT_FLOAT_EQ(host_mat_elem(w.embed, 0, 0), 1.0f);
+  EXPECT_FLOAT_EQ(packed_host(w.embed)[0], 1.0f);
   EXPECT_FLOAT_EQ(host_vec_elem(w.final_norm, 0), 1.5f);  // shift 0: as-is
-  EXPECT_FLOAT_EQ(host_mat_elem(w.lm_head, 0, 0), 2.0f);
+  EXPECT_FLOAT_EQ(packed_host(w.lm_head)[0], 2.0f);
   // c-counter: token_embd 1.0, output_norm 1.5, output 2.5; layer 0 norms
   // are the constant 1.5 file value minus the loader's -1 shift.
   for (int l = 0; l < cfg.n_layers; ++l) {
@@ -402,15 +408,15 @@ TEST(GlimmerWeightsGGUF, ExactRoundtrip) {
     const size_t D = (size_t)cfg.dim;
     const size_t nq = (size_t)cfg.n_heads * (size_t)cfg.head_dim;
     const size_t nk = (size_t)cfg.n_kv_heads * (size_t)cfg.head_dim;
+    const auto wq = packed_host(b.wq);
     for (size_t i = 0; i < nq * D; ++i)
-      EXPECT_FLOAT_EQ(host_mat_elem(b.wq, i / D, i % D), hq[i])
-          << "layer " << l << " q elem " << i;
+      EXPECT_FLOAT_EQ(wq[i], hq[i]) << "layer " << l << " q elem " << i;
+    const auto wk = packed_host(b.wk);
     for (size_t i = 0; i < nk * D; ++i)
-      EXPECT_FLOAT_EQ(host_mat_elem(b.wk, i / D, i % D), hk[i])
-          << "layer " << l << " k elem " << i;
+      EXPECT_FLOAT_EQ(wk[i], hk[i]) << "layer " << l << " k elem " << i;
   }
   // Untied head: separate tensor, never aliased.
-  EXPECT_NE(w.lm_head.data(), w.embed.data());
+  EXPECT_NE(w.lm_head.data.data(), w.embed.data.data());
   // Forward smoke on the loaded weights (finite, softcap-bounded logits).
   Model<Exec, float> model(cfg, w);
   Kokkos::View<int*, Exec> toks("toks", 2);
@@ -437,9 +443,7 @@ TEST(GlimmerWeightsGGUF, ExactRoundtrip) {
   EXPECT_NO_THROW(
       (load_gguf<Exec, Kokkos::Experimental::bhalf_t>(cfg, path, wb)));
   {
-    auto h = Kokkos::create_mirror_view(wb.embed);
-    Kokkos::deep_copy(h, wb.embed);
-    EXPECT_NEAR(static_cast<float>(h(0, 0)), 1.0f, 1e-2f);
+    EXPECT_NEAR(packed_host(wb.embed)[0], 1.0f, 1e-2f);
     auto hn = Kokkos::create_mirror_view(wb.blocks[0].input_norm);
     Kokkos::deep_copy(hn, wb.blocks[0].input_norm);
     EXPECT_NEAR(static_cast<float>(hn(0)), 0.5f, 1e-2f);
@@ -456,12 +460,11 @@ TEST(GlimmerWeightsGGUF, SynthesizedNormsAbsent) {
   Gguf::write_synthetic_gguf(path, built.ts, default_kv(cfg));
   Weights<Exec, float> w;
   EXPECT_NO_THROW((load_gguf<Exec, float>(cfg, path, w)));
-  EXPECT_FLOAT_EQ(host_mat_elem(w.embed, 0, 0), 1.0f);
+  EXPECT_FLOAT_EQ(packed_host(w.embed)[0], 1.0f);
   check_all_vec(w.blocks[0].input_norm, 0.5f);
   const auto& hq = built.hf_q[0];
-  const size_t D = (size_t)cfg.dim;
-  for (size_t i = 0; i < hq.size(); ++i)
-    EXPECT_FLOAT_EQ(host_mat_elem(w.blocks[0].wq, i / D, i % D), hq[i]);
+  const auto wq0 = packed_host(w.blocks[0].wq);
+  for (size_t i = 0; i < hq.size(); ++i) EXPECT_FLOAT_EQ(wq0[i], hq[i]);
   std::remove(path.c_str());
 }
 
@@ -544,32 +547,34 @@ TEST(GlimmerWeightsGGUF, QuantizedMixed) {
   Gguf::write_synthetic_gguf(path, ts, default_kv(cfg));
   Weights<Exec, float> w;
   EXPECT_NO_THROW((load_gguf<Exec, float>(cfg, path, w)));
-  EXPECT_FLOAT_EQ(host_mat_elem(w.embed, 0, 0), 1.0f);
+  EXPECT_FLOAT_EQ(packed_host(w.embed)[0], 1.0f);
   EXPECT_FLOAT_EQ(host_vec_elem(w.final_norm, 3), 1.5f);
-  EXPECT_FLOAT_EQ(host_mat_elem(w.lm_head, 1, 2), 2.5f);  // BF16 exact
+  EXPECT_FLOAT_EQ(packed_host(w.lm_head)[1 * D + 2], 2.5f);  // BF16 exact
   for (int l = 0; l < cfg.n_layers; ++l) {
     const auto& b = w.blocks[(size_t)l];
     check_all_vec(b.input_norm, 0.5f);  // F16 file 1.5, shift removed
     check_all_vec(b.post_attn_norm, 0.5f);
     check_all_vec(b.pre_ffn_norm, 0.5f);
     check_all_vec(b.post_ffn_norm, 0.5f);
+    const auto wq = packed_host(b.wq);
     for (size_t i = 0; i < hq * D; ++i)
-      EXPECT_FLOAT_EQ(host_mat_elem(b.wq, i / D, i % D), hf_q[(size_t)l][i]);
+      EXPECT_FLOAT_EQ(wq[i], hf_q[(size_t)l][i]);
+    const auto wk = packed_host(b.wk);
     for (size_t i = 0; i < hkv * D; ++i)
-      EXPECT_FLOAT_EQ(host_mat_elem(b.wk, i / D, i % D), hf_k[(size_t)l][i]);
-    check_all_mat(b.wv, -32.0f);  // Q6_K constant
+      EXPECT_FLOAT_EQ(wk[i], hf_k[(size_t)l][i]);
+    check_packed_all(b.wv, -32.0f);  // Q6_K constant
+    const auto wo = packed_host(b.wo);
     for (size_t i = 0; i < D * hq; ++i)
-      EXPECT_FLOAT_EQ(host_mat_elem(b.wo, i / hq, i % hq),
-                      (float)(i % 32) - 16.0f);  // Q8_0
-    check_all_mat(b.wgate_attn, 4.0f);
+      EXPECT_FLOAT_EQ(wo[i], (float)(i % 32) - 16.0f);  // Q8_0
+    check_packed_all(b.wgate_attn, 4.0f);
     // Q4_K nibble pattern on ffn_gate; Q8_0 signed pattern on ffn_up.
+    const auto wgate = packed_host(b.wgate);
+    const auto wup = packed_host(b.wup);
     for (size_t i = 0; i < FF * D; ++i) {
-      EXPECT_FLOAT_EQ(host_mat_elem(b.wgate, i / D, i % D),
-                      (float)(i % 16));
-      EXPECT_FLOAT_EQ(host_mat_elem(b.wup, i / D, i % D),
-                      (float)((int)(i % 32) - 16));
+      EXPECT_FLOAT_EQ(wgate[i], (float)(i % 16));
+      EXPECT_FLOAT_EQ(wup[i], (float)((int)(i % 32) - 16));
     }
-    check_all_mat(b.wdown, 5.0f);
+    check_packed_all(b.wdown, 5.0f);
   }
   std::remove(path.c_str());
 }
@@ -644,4 +649,382 @@ TEST(GlimmerWeightsGGUF, ListTensors) {
   EXPECT_TRUE(std::find(names.begin(), names.end(),
                         "blk.3.post_ffw_norm.weight") != names.end());
   std::remove(path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// Packed-weights validation track (MERGE NOTE).
+//
+// Context: the GGUF loader above dequantizes everything to dense views
+// (~56 GB for the 30B Q4_K_M checkpoint: OOM on 24 GB VRAM / 31 GB RAM).
+// The conversion in progress replaces dense BlockWeights matrices with
+// Gguf::QuantWeight packed payloads + quant_gemv/quant_gemm. These tests are
+// ADDITIVE: they compile and pass both before and after the Weights struct
+// change (they build packed payloads directly, never touching the struct),
+// and they pin the contracts the new loader must satisfy:
+//
+//   PackedParity* : quant_gemv / quant_gemm / dequant_to_dense agree with a
+//     host-dequantized (double-accumulation) reference on exact-value
+//     synthetic packings. Mirrors the tests/Test_GGUF.cpp bit-parity
+//     approach (GgufQuantGemm.*, GgufDequantToDense.*).
+//   PackedPermute*: the Q/K RoPE layout fixup is a ROW permutation of the
+//     [rows, cols] matrix (see gguf_permute_qk_for_rope in
+//     models/glimmer/KokkosDNN_GlimmerWeights.cpp), so on packed row-major
+//     payloads it must be a memcpy of row_bytes chunks -- never a full-tensor
+//     dequantize. The new loader must permute packed rows, not dense values.
+//   PackedRealFileGate: header-only gate for the 17 GB real GGUF (no tensor
+//     data is read, so it cannot OOM). Post-merge end-to-end validation runs
+//     the real greedy decode; the expected IDs are recorded there.
+//
+// Do NOT delete or weaken ExactRoundtrip / QuantizedMixed for the struct
+// change: update them only if the Weights struct change requires it.
+// ---------------------------------------------------------------------------
+
+namespace packed_track {
+
+// Q5_K tensor with unit scale / zero min (mirrors the Q4_K helper above):
+// superblock scale 1.0, min 0.0, all sub-block (scale, min) = (1, 0), so the
+// dequantized value is the 5-bit quant (0..31). numel must be a multiple
+// of 256.
+Gguf::SyntheticTensor q5k_tensor(const std::string& name,
+                                 std::vector<uint64_t> dims,
+                                 const std::vector<float>& vals) {
+  Gguf::SyntheticTensor t;
+  t.name  = name;
+  t.dtype = Gguf::GgmlType::Q5_K;
+  t.dims  = std::move(dims);
+  if (vals.size() % 256 != 0)
+    throw std::runtime_error("q5k_tensor: numel not a multiple of 256");
+  t.raw.resize(vals.size() / 256 * sizeof(Gguf::BlockQ5K));
+  for (size_t b = 0; b < vals.size() / 256; ++b) {
+    Gguf::BlockQ5K blk{};
+    blk.d    = 0x3C00;  // fp16 1.0
+    blk.dmin = 0x0000;  // fp16 0.0
+    blk.scales[0] = blk.scales[1] = blk.scales[2] = blk.scales[3] = 1;
+    blk.scales[8] = blk.scales[9] = blk.scales[10] = blk.scales[11] = 1;
+    for (int iter = 0; iter < 4; ++iter)
+      for (int l = 0; l < 32; ++l) {
+        const float v0 = vals[b * 256 + (size_t)iter * 64 + (size_t)l];
+        const float v1 = vals[b * 256 + (size_t)iter * 64 + 32 + (size_t)l];
+        if (v0 < 0.0f || v0 > 31.0f || v0 != (float)(int)v0 ||
+            v1 < 0.0f || v1 > 31.0f || v1 != (float)(int)v1)
+          throw std::runtime_error("q5k_tensor: value not an exact 5-bit int");
+        blk.qs[iter * 32 + l] =
+            (uint8_t)(((int)v0 & 0xF) | (((int)v1 & 0xF) << 4));
+        blk.qh[l] = (uint8_t)(blk.qh[l] | ((((int)v0 >> 4) << (2 * iter)) |
+                                           (((int)v1 >> 4) << (2 * iter + 1))));
+      }
+    std::memcpy(t.raw.data() + b * sizeof(blk), &blk, sizeof(blk));
+  }
+  return t;
+}
+
+// Device-resident packed weight from a synthetic tensor's raw payload.
+Gguf::QuantWeight<Exec> make_packed(const Gguf::SyntheticTensor& t,
+                                    size_t rows, size_t cols) {
+  Gguf::QuantWeight<Exec> w;
+  w.dtype = t.dtype;
+  w.rows  = rows;
+  w.cols  = cols;
+  EXPECT_EQ(t.raw.size(), w.bytes());
+  w.data = Kokkos::View<uint8_t*, Exec>("packed_track", t.raw.size());
+  Kokkos::View<uint8_t*, Kokkos::HostSpace> h("packed_track_host",
+                                              t.raw.size());
+  std::memcpy(h.data(), t.raw.data(), t.raw.size());
+  Kokkos::deep_copy(w.data, h);
+  return w;
+}
+
+// Host dequantize of a packed row-major payload (independent of the device
+// kernels under test; uses the header's block fns).
+std::vector<float> host_dequant(Gguf::GgmlType dtype,
+                                const std::vector<uint8_t>& raw, size_t numel) {
+  std::vector<float> out(numel);
+  switch (dtype) {
+    case Gguf::GgmlType::F32:
+      std::memcpy(out.data(), raw.data(), numel * 4);
+      return out;
+    case Gguf::GgmlType::Q8_0:
+      for (size_t b = 0; b < numel / 32; ++b)
+        Gguf::dequant_q80_block(
+            reinterpret_cast<const Gguf::BlockQ80*>(raw.data() + b * 34),
+            out.data() + b * 32);
+      return out;
+    case Gguf::GgmlType::Q4_K:
+      for (size_t b = 0; b < numel / 256; ++b)
+        Gguf::dequant_q4k_block(
+            reinterpret_cast<const Gguf::BlockQ4K*>(raw.data() + b * 144),
+            out.data() + b * 256);
+      return out;
+    case Gguf::GgmlType::Q5_K:
+      for (size_t b = 0; b < numel / 256; ++b)
+        Gguf::dequant_q5k_block(
+            reinterpret_cast<const Gguf::BlockQ5K*>(raw.data() + b * 176),
+            out.data() + b * 256);
+      return out;
+    case Gguf::GgmlType::Q6_K:
+      for (size_t b = 0; b < numel / 256; ++b)
+        Gguf::dequant_q6k_block(
+            reinterpret_cast<const Gguf::BlockQ6K*>(raw.data() + b * 210),
+            out.data() + b * 256);
+      return out;
+    default: throw std::runtime_error("host_dequant: unsupported dtype");
+  }
+}
+
+// Byte-level row reorder of a packed payload: out row r = in row perm[r].
+// Rows are independent packed runs, so this is the operation the packed
+// Q/K loader must use for the RoPE re-permute (no dequantization).
+std::vector<uint8_t> permute_packed_rows(const std::vector<uint8_t>& raw,
+                                         size_t rows, size_t row_bytes,
+                                         const std::vector<size_t>& perm) {
+  std::vector<uint8_t> out(raw.size());
+  for (size_t r = 0; r < rows; ++r)
+    std::memcpy(out.data() + r * row_bytes, raw.data() + perm[r] * row_bytes,
+                row_bytes);
+  return out;
+}
+
+// quant_gemv + quant_gemm + dequant_to_dense vs the host-dequantized
+// reference (double accumulation, exact-value packings so quantization
+// error is zero by construction).
+void check_packed_parity(Gguf::GgmlType dtype, size_t rows, size_t cols,
+                         const std::vector<uint8_t>& raw,
+                         const std::vector<float>& ref_vals) {
+  const std::vector<float> wdq = host_dequant(dtype, raw, rows * cols);
+  ASSERT_EQ(wdq.size(), ref_vals.size());
+  for (size_t i = 0; i < wdq.size(); ++i)
+    EXPECT_FLOAT_EQ(wdq[i], ref_vals[i]) << "packing not exact at " << i;
+
+  Gguf::SyntheticTensor t;
+  t.dtype = dtype;
+  t.raw   = raw;
+  Gguf::QuantWeight<Exec> w = make_packed(t, rows, cols);
+
+  // dequant_to_dense reproduces the host reference bit-for-bit (float).
+  {
+    Kokkos::View<float**, Kokkos::LayoutRight, Exec> Y("Y", rows, cols);
+    Gguf::dequant_to_dense(w, Y);
+    Kokkos::fence();
+    auto got = Kokkos::create_mirror_view(Y);
+    Kokkos::deep_copy(got, Y);
+    for (size_t r = 0; r < rows; ++r)
+      for (size_t c = 0; c < cols; ++c)
+        EXPECT_FLOAT_EQ(got(r, c), wdq[r * cols + c])
+            << "dequant_to_dense (" << r << "," << c << ")";
+  }
+
+  // Input vector / matrix: exact-binary values.
+  std::vector<float> xf(cols);
+  for (size_t k = 0; k < cols; ++k)
+    xf[k] = 0.25f * (float)((int)(k % 5) - 2);
+
+  // quant_gemv vs double-accumulation reference on the dequantized weights.
+  {
+    Kokkos::View<float*, Exec> x("x", cols), y("y", rows);
+    auto hx = Kokkos::create_mirror_view(x);
+    for (size_t k = 0; k < cols; ++k) hx(k) = xf[k];
+    Kokkos::deep_copy(x, hx);
+    Gguf::quant_gemv(Exec{}, x, w, y);
+    Kokkos::fence();
+    auto got = Kokkos::create_mirror_view(y);
+    Kokkos::deep_copy(got, y);
+    for (size_t r = 0; r < rows; ++r) {
+      double acc = 0;
+      for (size_t k = 0; k < cols; ++k)
+        acc += (double)wdq[r * cols + k] * (double)xf[k];
+      EXPECT_NEAR(got(r), (float)acc, 1e-3f) << "quant_gemv row " << r;
+    }
+  }
+
+  // quant_gemm (M=2) vs the same reference.
+  {
+    const size_t M = 2;
+    Kokkos::View<float**, Kokkos::LayoutRight, Exec> X("X", M, cols), Y("Y", M,
+                                                                        rows);
+    auto hx = Kokkos::create_mirror_view(X);
+    for (size_t i = 0; i < M; ++i)
+      for (size_t k = 0; k < cols; ++k)
+        hx(i, k) = 0.25f * (float)((int)((i + k) % 5) - 2);
+    Kokkos::deep_copy(X, hx);
+    Gguf::quant_gemm(Exec{}, X, w, Y);
+    Kokkos::fence();
+    auto got = Kokkos::create_mirror_view(Y);
+    Kokkos::deep_copy(got, Y);
+    for (size_t i = 0; i < M; ++i)
+      for (size_t r = 0; r < rows; ++r) {
+        double acc = 0;
+        for (size_t k = 0; k < cols; ++k)
+          acc += (double)wdq[r * cols + k] * (double)(float)hx(i, k);
+        EXPECT_NEAR(got(i, r), (float)acc, 1e-3f)
+            << "quant_gemm (" << i << "," << r << ")";
+      }
+  }
+}
+
+}  // namespace packed_track
+
+TEST(GlimmerWeightsGGUF, PackedParityQ4K) {
+  // 2 rows x 256 cols, one K-block per row, exact nibble values.
+  const size_t rows = 2, cols = 256;
+  std::vector<float> vals(rows * cols);
+  for (size_t i = 0; i < vals.size(); ++i) vals[i] = (float)(i % 16);
+  auto t = q4k_tensor("wq", {cols, rows}, vals);
+  packed_track::check_packed_parity(Gguf::GgmlType::Q4_K, rows, cols, t.raw,
+                                    vals);
+}
+
+TEST(GlimmerWeightsGGUF, PackedParityQ5K) {
+  // 2 rows x 256 cols, exact 5-bit values (Q4_K_M uses Q5_K for the large
+  // vocab/output matrices).
+  const size_t rows = 2, cols = 256;
+  std::vector<float> vals(rows * cols);
+  for (size_t i = 0; i < vals.size(); ++i) vals[i] = (float)(i % 32);
+  auto t = packed_track::q5k_tensor("wq", {cols, rows}, vals);
+  packed_track::check_packed_parity(Gguf::GgmlType::Q5_K, rows, cols, t.raw,
+                                    vals);
+}
+
+TEST(GlimmerWeightsGGUF, PackedParityQ6K) {
+  // 2 rows x 256 cols, distinct exact constants per row (attention V /
+  // projections in the Q4_K_M recipe ship Q6_K).
+  const size_t rows = 2, cols = 256;
+  std::vector<float> vals(rows * cols);
+  for (size_t c = 0; c < cols; ++c) {
+    vals[c]        = -32.0f;
+    vals[cols + c] = 5.0f;
+  }
+  std::vector<Gguf::SyntheticTensor> ts;
+  {
+    // Row 0 constant -32, row 1 constant 5: build per-row blocks.
+    Gguf::SyntheticTensor t;
+    t.name  = "wv";
+    t.dtype = Gguf::GgmlType::Q6_K;
+    t.dims  = {cols, rows};
+    t.raw.resize(rows * sizeof(Gguf::BlockQ6K));
+    for (size_t r = 0; r < rows; ++r) {
+      std::vector<float> row(cols, r == 0 ? -32.0f : 5.0f);
+      auto one = q6k_const_tensor("row", {cols, 1}, (int)row[0]);
+      std::memcpy(t.raw.data() + r * sizeof(Gguf::BlockQ6K), one.raw.data(),
+                  sizeof(Gguf::BlockQ6K));
+    }
+    ts.push_back(t);
+  }
+  packed_track::check_packed_parity(Gguf::GgmlType::Q6_K, rows, cols,
+                                    ts[0].raw, vals);
+}
+
+TEST(GlimmerWeightsGGUF, PackedParityQ80) {
+  // 2 rows x 64 cols, exact int8-range values (scale 1.0 per 32-block).
+  const size_t rows = 2, cols = 64;
+  std::vector<float> vals(rows * cols);
+  for (size_t i = 0; i < vals.size(); ++i)
+    vals[i] = (float)((int)(i % 32) - 16);
+  auto t = q80_tensor("wo", {cols, rows}, vals);
+  packed_track::check_packed_parity(Gguf::GgmlType::Q8_0, rows, cols, t.raw,
+                                    vals);
+}
+
+// The packed Q/K RoPE fixup is a row permutation done with memcpys: build a
+// packed multi-row tensor with distinct per-row constants, permute the packed
+// rows with the loader's rope index map, dequantize, and check the result
+// equals the dense-permuted reference. Covers Q4_K (K-quant row_bytes) and
+// Q8_0 (non-K-quant row_bytes); the loader must do this instead of
+// dequantize -> permute -> (repack) for every q/k tensor.
+TEST(GlimmerWeightsGGUF, PackedPermuteQK) {
+  const size_t n_heads = 1, head_dim = 8, cols = 256;
+  const size_t rows = n_heads * head_dim;
+  // Each packed row holds its own index as the exact constant.
+  std::vector<float> vals(rows * cols);
+  for (size_t r = 0; r < rows; ++r)
+    for (size_t c = 0; c < cols; ++c) vals[r * cols + c] = (float)r;
+  auto t = q4k_tensor("q", {cols, rows}, vals);
+
+  // Row permutation the dense loader applies (GGUF interleave -> HF): derive
+  // the index map by permuting row ids through the same helper.
+  std::vector<float> ids(rows * cols);
+  for (size_t r = 0; r < rows; ++r)
+    for (size_t c = 0; c < cols; ++c) ids[r * cols + c] = (float)r;
+  std::vector<float> permuted = permute_for_rope(ids, n_heads, head_dim, cols);
+  std::vector<size_t> perm(rows);
+  for (size_t r = 0; r < rows; ++r) perm[r] = (size_t)permuted[r * cols];
+
+  const size_t row_bytes = Gguf::ggml_row_bytes(Gguf::GgmlType::Q4_K, cols);
+  std::vector<uint8_t> packed_perm =
+      packed_track::permute_packed_rows(t.raw, rows, row_bytes, perm);
+  std::vector<float> got =
+      packed_track::host_dequant(Gguf::GgmlType::Q4_K, packed_perm, rows * cols);
+  for (size_t r = 0; r < rows; ++r)
+    for (size_t c = 0; c < cols; ++c)
+      EXPECT_FLOAT_EQ(got[r * cols + c], (float)perm[r])
+          << "packed Q4_K permute (" << r << "," << c << ")";
+
+  // Same contract for Q8_0 (different row_bytes, same memcpy logic).
+  {
+    const size_t c8 = 64;
+    std::vector<float> v8(rows * c8);
+    for (size_t r = 0; r < rows; ++r)
+      for (size_t c = 0; c < c8; ++c) v8[r * c8 + c] = (float)((int)r - 4);
+    auto t8 = q80_tensor("q8", {c8, rows}, v8);
+    const size_t rb8 = Gguf::ggml_row_bytes(Gguf::GgmlType::Q8_0, c8);
+    std::vector<uint8_t> pp8 =
+        packed_track::permute_packed_rows(t8.raw, rows, rb8, perm);
+    std::vector<float> g8 = packed_track::host_dequant(Gguf::GgmlType::Q8_0,
+                                                       pp8, rows * c8);
+    for (size_t r = 0; r < rows; ++r)
+      for (size_t c = 0; c < c8; ++c)
+        EXPECT_FLOAT_EQ(g8[r * c8 + c], (float)((int)perm[r] - 4))
+            << "packed Q8_0 permute (" << r << "," << c << ")";
+  }
+}
+
+// Real-file gate (header-only: reads metadata + tensor infos, never tensor
+// data, so it cannot OOM pre-fix). Set KOKKOSDNN_GGUF_PATH to the 17 GB
+// Q4_K_M file to run; skips otherwise. Post-merge this gate grows into the
+// end-to-end greedy check -- see the expected-IDs comment below.
+//
+// POST-MERGE VALIDATION COMMAND LIST (24 GB GPU machine):
+//   1. Header:  KOKKOSDNN_GGUF_PATH=<17GB Q4_K_M file> test_glimmer_weights_gguf
+//                 --gtest_filter='GlimmerWeightsGGUF.PackedRealFileGate'
+//   2. Names:   list tensors via list_gguf_tensors (expect token_embd.weight,
+//               output_norm.weight, output.weight, blk.{0..51}.attn_{q,k,v,
+//               output,gate,norm...}, ffn_*, post_ffw_norm; Q4_K/Q6_K/Q5_K
+//               dtypes; NO full dequantize)
+//   3. Tiny run (synthetic, any machine):
+//               test_glimmer_weights_gguf --gtest_filter='GlimmerWeightsGGUF.PackedParity*:GlimmerWeightsGGUF.PackedPermute*'
+//   4. Real greedy (post-merge, packed weights resident, ~17 GB):
+//               KOKKOSDNN_TOKENIZER_JSON=<tokenizer.json> glimmer_generate
+//                 --gguf <file> --prompt "Hello" --temp 0 -n 8
+//               EXPECT: prompt ids [200000, 19873] (llama-tokenize oracle),
+//               first 8 new token ids [24, 372, 1045, 10016, 328, 2170, 262, 5091]
+//               i.e. text "Hello, I am trying to make a simple..." (llama.cpp
+//               CUDA greedy reference, --temp 0, -no-cnv). Any deviation is a
+//               conversion/numerics bug, not sampling noise (temp 0 = argmax).
+TEST(GlimmerWeightsGGUF, PackedRealFileGate) {
+  const char* p = std::getenv("KOKKOSDNN_GGUF_PATH");
+  if (!p || !*p)
+    GTEST_SKIP() << "set KOKKOSDNN_GGUF_PATH to the 17 GB Q4_K_M GGUF to run "
+                    "(header-only; reads no tensor data).";
+  Gguf::GgufFile f(p);  // throws -> FAIL (missing/corrupt file)
+  // Spot-check the llama.cpp tensor naming the packed loader depends on.
+  EXPECT_TRUE(f.contains("token_embd.weight"));
+  EXPECT_TRUE(f.contains("output_norm.weight"));
+  EXPECT_TRUE(f.contains("output.weight"));
+  EXPECT_TRUE(f.contains("blk.0.attn_q.weight"));
+  EXPECT_TRUE(f.contains("blk.0.attn_k.weight"));
+  // Q4_K_M recipe: most tensors Q4_K, some Q6_K (V/projections), large
+  // vocab/output matrices Q5_K; norms stay F32.
+  bool saw_q4k = false, saw_q6k = false, saw_q5k = false, saw_f32 = false;
+  for (const auto& t : f.tensors()) {
+    if (t.dtype == Gguf::GgmlType::Q4_K) saw_q4k = true;
+    if (t.dtype == Gguf::GgmlType::Q6_K) saw_q6k = true;
+    if (t.dtype == Gguf::GgmlType::Q5_K) saw_q5k = true;
+    if (t.dtype == Gguf::GgmlType::F32) saw_f32 = true;
+  }
+  EXPECT_TRUE(saw_q4k);
+  EXPECT_TRUE(saw_q6k);
+  EXPECT_TRUE(saw_q5k);
+  EXPECT_TRUE(saw_f32);
+  std::printf("[glimmer:packed-gate] %s: %zu tensors, Q4_K/Q6_K/Q5_K/F32=%d/%d/%d/%d\n",
+              p, f.tensors().size(), (int)saw_q4k, (int)saw_q6k,
+              (int)saw_q5k, (int)saw_f32);
 }

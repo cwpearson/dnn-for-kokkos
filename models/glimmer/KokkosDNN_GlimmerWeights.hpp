@@ -20,7 +20,9 @@ namespace Glimmer {
 // (Kokkos::Experimental::bhalf_t).
 using DefaultScalar = Kokkos::Experimental::bhalf_t;
 
-// One transformer block's weights (all row-major, device views).
+// One transformer block's weights: 2-D matrices stay packed
+// (Gguf::QuantWeight, per-tensor GGUF/safetensors dtype, never expanded on
+// the host); the four RMSNorms are dense device vectors in Scalar.
 //
 // Glimmer differences vs the Llama block: explicit head_dim 128 (q/k/v/o
 // shapes derive from it, not from dim / n_heads), a per-layer attention
@@ -31,55 +33,38 @@ using DefaultScalar = Kokkos::Experimental::bhalf_t;
 // projection carries no norm.
 template <class ExecSpace, class Scalar = DefaultScalar>
 struct BlockWeights {
-  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> wq, wk, wv, wo;
-  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> wgate_attn;
-  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> wgate, wup, wdown;
+  Gguf::QuantWeight<ExecSpace> wq, wk, wv, wo;
+  Gguf::QuantWeight<ExecSpace> wgate_attn;
+  Gguf::QuantWeight<ExecSpace> wgate, wup, wdown;
   Kokkos::View<Scalar*, ExecSpace> input_norm, post_attn_norm, pre_ffn_norm,
       post_ffn_norm;
 };
 
-// Full model weights. Device views in Scalar; the safetensors loader
-// converts on-disk BF16/FP16/F32 to Scalar automatically. The lm_head is
-// untied (tie_word_embeddings=false): the checkpoint carries a separate
-// lm_head tensor and the loader must NOT alias the embedding table.
+// Full model weights. 2-D matrices stay packed (Gguf::QuantWeight, one entry
+// per tensor, dtype fixed at load time); 1-D norms are dense device vectors
+// in Scalar. The safetensors loader packs on-disk BF16/FP16/F32 preserving
+// the dtype (identity packing: unquantized ggml layouts are dense
+// row-major). The lm_head is untied (tie_word_embeddings=false): the
+// checkpoint carries a separate lm_head tensor and the loader must NOT
+// alias the embedding table (a tied config still aliases the packed embed).
 template <class ExecSpace, class Scalar = DefaultScalar>
 struct Weights {
-  Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace> embed, lm_head;
+  Gguf::QuantWeight<ExecSpace> embed, lm_head;
   Kokkos::View<Scalar*, ExecSpace> final_norm;
   std::vector<BlockWeights<ExecSpace, Scalar>> blocks;
 
   void allocate(const Config& cfg);
 };
 
-// Allocate all views for a config (uninitialized contents).
+// Size the blocks vector and allocate the dense norm vectors for a config.
+// Packed 2-D matrices are NOT allocated here (their dtype is only known at
+// load time): loaders and random_init fill each QuantWeight entry.
 template <class ExecSpace, class Scalar>
 void Weights<ExecSpace, Scalar>::allocate(const Config& cfg) {
-  embed = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>(
-      "embed", cfg.vocab_size, cfg.dim);
-  lm_head = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>(
-      "lm_head", cfg.vocab_size, cfg.dim);
   final_norm = Kokkos::View<Scalar*, ExecSpace>("final_norm", cfg.dim);
   blocks.resize((size_t)cfg.n_layers);
-  const int hq  = cfg.n_heads * cfg.head_dim;
-  const int hkv = cfg.n_kv_heads * cfg.head_dim;
   for (int l = 0; l < cfg.n_layers; ++l) {
-    auto& b   = blocks[(size_t)l];
-    b.wq      = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>(
-        "wq", hq, cfg.dim);
-    b.wk = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>("wk", hkv,
-                                                                 cfg.dim);
-    b.wv = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>("wv", hkv,
-                                                                 cfg.dim);
-    b.wo = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>("wo",
-                                                                  cfg.dim, hq);
-    b.wgate_attn = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>(
-        "wgate_attn", hq, cfg.dim);
-    b.wgate = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>(
-        "wgate", cfg.ffn_dim, cfg.dim);
-    b.wup = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>(
-        "wup", cfg.ffn_dim, cfg.dim);
-    b.wdown = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>(
-        "wdown", cfg.dim, cfg.ffn_dim);
+    auto& b             = blocks[(size_t)l];
     b.input_norm      = Kokkos::View<Scalar*, ExecSpace>("input_norm", cfg.dim);
     b.post_attn_norm  = Kokkos::View<Scalar*, ExecSpace>("post_attn_norm", cfg.dim);
     b.pre_ffn_norm    = Kokkos::View<Scalar*, ExecSpace>("pre_ffn_norm", cfg.dim);
@@ -88,16 +73,19 @@ void Weights<ExecSpace, Scalar>::allocate(const Config& cfg) {
 }
 
 // Fill with small random values (for shape/forward tests without weights).
-// Centered norms are filled with 1.0 (the stored (1 + w) value matching a
-// raw zero init); the scaleless norms (embed/QK) store no weight.
+// 2-D matrices become F32 packed QuantWeights (raw-float packing is exact,
+// so quant_gemm() on them matches a dense reference bit-for-bit). Centered
+// norms are filled with 1.0 (the stored (1 + w) value matching a raw zero
+// init); the scaleless norms (embed/QK) store no weight.
 template <class ExecSpace, class Scalar = DefaultScalar>
 void random_init(const Config& cfg, Weights<ExecSpace, Scalar>& w,
                  uint64_t seed = 42);
 
-// Load HF safetensors checkpoint(s) into device views.
+// Load HF safetensors checkpoint(s) into packed device weights.
 //   files : one or more .safetensors shards (tensors are looked up across
 //           shards; later shards win on duplicate names).
-// On-disk dtypes BF16/FP16/F32 are all converted to Scalar. Shards are
+// On-disk dtypes BF16/FP16/F32 are packed preserving the dtype (identity
+// packing; only dtypes in Gguf::gguf_can_compute() are accepted). Shards are
 // mapped read-only (mmap; bounded chunked reads where mmap is unavailable)
 // and each tensor streams from the mapping through a small (~1 MiB) host
 // staging buffer — no full-tensor/host-F32 expansion. Loading is lazy
@@ -129,11 +117,12 @@ std::vector<std::string> list_checkpoint_tensors(
     const std::vector<std::string>& files);
 
 // Load a llama.cpp Muse-Glimmer GGUF checkpoint (single .gguf file) into
-// device views. Dense views hold dequantized values in Scalar (F32/F16/BF16
-// dequantize exactly; Q8_0/Q4_K/Q6_K dequantize on the host like
-// LFM25::load_gguf; anything else throws). Throws on missing tensors,
-// shape mismatch, or GGUF metadata (logit scale, softcap, sliding window
-// + pattern) that disagrees with cfg.
+// packed device weights (Gguf::QuantWeight, per-tensor dtype; Q4_K_M files
+// stay quantized, so VRAM scales with the packed payload, not an F32
+// expansion). Accepted 2-D dtypes are the Gguf::gguf_can_compute() set
+// (F32/F16/BF16/Q8_0/Q4_K/Q5_K/Q6_K; anything else throws). Throws on
+// missing tensors, shape mismatch, or GGUF metadata (logit scale, softcap,
+// sliding window + pattern) that disagrees with cfg.
 //
 // Expected GGUF names (llama.cpp `tn()` convention with the ".weight"
 // suffix; bare stems are also accepted):
@@ -149,8 +138,9 @@ std::vector<std::string> list_checkpoint_tensors(
 //     is untouched (shift 0). The loader subtracts 1 back from the four
 //     layer norms so the Model's one_plus path sees HF-centered weights.
 //   * Q/K RoPE layout: conversion unpermutes q/k into ggml interleaved
-//     (NORM) layout; the loader re-permutes rows back into the HF
-//     rotate_half layout consumed by rope_neoX_inplace.
+//     (NORM) layout; the loader re-permutes packed rows back into the HF
+//     rotate_half layout consumed by rope_neoX_inplace (whole packed-row
+//     swaps, no dequantization).
 //   * Synthesized QK norms: GGUF attn_q_norm (full qk_scale_factor) /
 //     attn_k_norm (ones) absorb the q pre-scale into a *scaled* RMSNorm,
 //     while the Model runs a *scaleless* QK norm plus the separate 3.87

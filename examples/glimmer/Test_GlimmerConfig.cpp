@@ -106,4 +106,59 @@ TEST(GlimmerConfig, FixtureFullWrapper) {
   check_glimmer_30b_dims(c);
 }
 
+TEST(GlimmerConfig, KvInt8DefaultOff) {
+  // Dense FP stays the default: enabling int8 is opt-in so existing runs
+  // keep bit-parity behavior.
+  auto c = KokkosDNN::Glimmer::Config::glimmer_30b();
+  EXPECT_FALSE(c.kv_int8);
+  EXPECT_FALSE(c.use_quant_kv());
+  auto tiny = KokkosDNN::Glimmer::Config::tiny_test();
+  EXPECT_FALSE(tiny.kv_int8);
+  EXPECT_FALSE(tiny.use_quant_kv());
+}
+
+TEST(GlimmerConfig, KvInt8JsonKeys) {
+  using KokkosDNN::Glimmer::Config;
+  // All three spellings enable int8 (mirrors the Llama/LFM2.5 keys).
+  EXPECT_TRUE(Config::from_json_string("{\"kv_int8\": true}").kv_int8);
+  EXPECT_TRUE(Config::from_json_string("{\"kv_quantized\": true}").kv_int8);
+  EXPECT_TRUE(
+      Config::from_json_string("{\"kv_quant\": \"int8\"}").kv_int8);
+  EXPECT_TRUE(
+      Config::from_json_string("{\"kv_quant\": \"INT8\"}").kv_int8);
+  // Explicit "none"/"fp" disables, even over a base that enables it.
+  Config on;
+  on.kv_int8 = true;
+  EXPECT_FALSE(Config::from_json_string("{\"kv_quant\": \"none\"}", on).kv_int8);
+  EXPECT_FALSE(Config::from_json_string("{\"kv_quant\": \"fp\"}", on).kv_int8);
+  EXPECT_FALSE(Config::from_json_string("{\"kv_int8\": false}", on).kv_int8);
+  EXPECT_THROW(Config::from_json_string("{\"kv_quant\": \"fp8\"}"),
+               std::runtime_error);
+}
+
+TEST(GlimmerConfig, KvCacheBytesAccounting) {
+  using KokkosDNN::Glimmer::Config;
+  auto tiny = Config::tiny_test();  // 4 layers, 2 KV heads, head_dim 8
+  tiny.max_seq_len = 32;
+  const size_t dense = tiny.kv_cache_bytes(sizeof(float));
+  // Dense: layers * toks * nkv * hd * 4B * (K+V).
+  EXPECT_EQ(dense, (size_t)4 * 32 * 2 * 8 * 4 * 2);
+  tiny.kv_int8 = true;
+  EXPECT_TRUE(tiny.use_quant_kv());
+  const size_t quant = tiny.kv_cache_bytes(sizeof(float));
+  // int8 values (1 B) + FP32 per-token-per-head scales, K and V.
+  EXPECT_EQ(quant, (size_t)4 * 32 * 2 * 8 * 1 * 2 +
+                      (size_t)4 * 32 * 2 * sizeof(float) * 2);
+  EXPECT_LT(quant, dense);
+  // Full-window 30B accounting sanity: int8 values are half the BF16
+  // bytes, plus ~3% for the scale tables (hd=128).
+  auto full = Config::glimmer_30b();  // max_seq_len 8192 default
+  const size_t full_dense = full.kv_cache_bytes(2);  // BF16 deployment dtype
+  full.kv_int8            = true;
+  const size_t full_quant = full.kv_cache_bytes(2);
+  EXPECT_LT(full_quant, full_dense);
+  EXPECT_GT(full_quant, full_dense / 2);
+  EXPECT_LT(full_quant, full_dense * 6 / 10);
+}
+
 }  // namespace

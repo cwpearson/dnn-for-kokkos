@@ -8,7 +8,9 @@
 
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -245,10 +247,162 @@ TEST(GlimmerGenerate, UntiedLmHead) {
   EXPECT_FALSE(cfg.tie_word_embeddings);
   KokkosDNN::Glimmer::Weights<Exec, float> w;
   KokkosDNN::Glimmer::random_init(cfg, w, 1234);
-  EXPECT_NE(w.lm_head.data(), w.embed.data());
+  EXPECT_NE(w.lm_head.data.data(), w.embed.data.data());
   KokkosDNN::Glimmer::Model<Exec, float> model(cfg, w);
   auto out = model.generate({2, 10, 20}, 2);
   EXPECT_EQ(out.size(), 5u);
+}
+
+// int8 KV vs dense FP: bounded drift, valid + deterministic decode. The
+// tiny config mixes sliding (window 8) and full layers, so both quantized
+// entry points run; the 12-token prompt plus 4 decodes push positions past
+// the window, exercising the windowed lower clamp.
+template <class Scalar>
+std::vector<float> forward_logits(
+    KokkosDNN::Glimmer::Model<Kokkos::DefaultExecutionSpace, Scalar>& m,
+    const std::vector<int>& ids) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  Kokkos::View<int*, Exec> toks("toks", ids.size());
+  auto h = Kokkos::create_mirror_view(toks);
+  for (size_t i = 0; i < ids.size(); ++i) h(i) = ids[i];
+  Kokkos::deep_copy(toks, h);
+  auto lg = m.forward(toks);
+  auto gh = Kokkos::create_mirror_view(lg);
+  Kokkos::deep_copy(gh, lg);
+  std::vector<float> out(gh.extent(0));
+  for (size_t i = 0; i < gh.extent(0); ++i)
+    out[i] = static_cast<float>(gh(i));
+  return out;
+}
+
+template <class Scalar>
+void check_quant_kv_close(float tol) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  using namespace KokkosDNN::Glimmer;
+  auto base = Config::tiny_test();
+  Weights<Exec, Scalar> w;
+  random_init(base, w, 1234);
+  std::vector<int> prompt = {2,  10, 20, 30, 40, 50,
+                             60, 70, 80, 90, 100, 110};
+  // Single-shot and chunked prefill both track dense within tolerance
+  // (quantized prefill is native-only while dense may use cuDNN SDPA, so
+  // this is a dispatched-vs-native comparison like Llama's).
+  for (int chunk : {0, 2}) {
+    auto based = base;
+    based.prefill_chunk_size = chunk;
+    Model<Exec, Scalar> dense(based, w);
+    auto cfgq              = base;
+    cfgq.kv_int8           = true;
+    cfgq.prefill_chunk_size = chunk;
+    Model<Exec, Scalar> quant(cfgq, w);
+    auto ld = forward_logits(dense, prompt);
+    auto lq = forward_logits(quant, prompt);
+    ASSERT_EQ(ld.size(), lq.size());
+    for (size_t i = 0; i < ld.size(); ++i)
+      EXPECT_NEAR(lq[i], ld[i], tol) << "logit mismatch at " << i;
+  }
+  // Quantized decode: valid ids, full length, deterministic.
+  auto cfgq    = base;
+  cfgq.kv_int8 = true;
+  Model<Exec, Scalar> q1(cfgq, w), q2(cfgq, w);
+  auto o1 = q1.generate(prompt, 4);
+  auto o2 = q2.generate(prompt, 4);
+  EXPECT_EQ(o1, o2);
+  ASSERT_EQ(o1.size(), prompt.size() + 4);
+  for (auto id : o1) {
+    EXPECT_GE(id, 0);
+    EXPECT_LT(id, base.vocab_size);
+  }
+  // Full-window bytes shrink (int8 values + scales < FP values).
+  EXPECT_LT(cfgq.kv_cache_bytes(sizeof(Scalar)),
+            base.kv_cache_bytes(sizeof(Scalar)));
+}
+
+TEST(GlimmerQuantKV, DenseCloseFloat) { check_quant_kv_close<float>(0.5f); }
+
+TEST(GlimmerQuantKV, DenseCloseBHalf) {
+  check_quant_kv_close<Kokkos::Experimental::bhalf_t>(1.0f);
+}
+
+// Standalone sliding-window quantized attention tracks dense sliding
+// attention within a tight bound (native-vs-native: cuDNN off).
+TEST(GlimmerQuantKVSliding, CloseToDense) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  KokkosDNN::DNNHandle<Exec> h;
+  h.use_cudnn = false;
+  const int T = 3, Hq = 4, Hkv = 2, D = 8, Ktot = 9;
+  const size_t q_off = 6;  // queries at absolute positions 6, 7, 8
+  const size_t window = 4;  // windowed range is [p - 3, p]; key 0 excluded
+  const float scale = 1.0f / 8.0f;
+  Kokkos::View<float***, Exec> q("q", T, Hq, D), out_d("od", T, Hq, D),
+      out_q("oq", T, Hq, D);
+  Kokkos::View<float***, Kokkos::LayoutRight, Exec> k("k", Ktot, Hkv, D),
+      v("v", Ktot, Hkv, D);
+  Kokkos::View<int8_t***, Kokkos::LayoutRight, Exec> kq("kq", Ktot, Hkv, D),
+      vq("vq", Ktot, Hkv, D);
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> ks("ks", Ktot, Hkv),
+      vs("vs", Ktot, Hkv);
+  auto hq = Kokkos::create_mirror_view(q);
+  auto hk = Kokkos::create_mirror_view(k);
+  auto hv = Kokkos::create_mirror_view(v);
+  for (int t = 0; t < T; ++t)
+    for (int hh = 0; hh < Hq; ++hh)
+      for (int d = 0; d < D; ++d)
+        hq(t, hh, d) = 0.05f * ((t * 7 + hh * 13 + d * 3) % 17) - 0.2f;
+  for (int n = 0; n < Ktot; ++n)
+    for (int hh = 0; hh < Hkv; ++hh)
+      for (int d = 0; d < D; ++d) {
+        hk(n, hh, d) = 0.05f * ((n * 5 + hh * 11 + d) % 19) - 0.2f;
+        hv(n, hh, d) = 0.05f * ((n * 3 + hh * 17 + d * 2) % 23) - 0.3f;
+      }
+  Kokkos::deep_copy(q, hq);
+  Kokkos::deep_copy(k, hk);
+  Kokkos::deep_copy(v, hv);
+  // Reference dense sliding-window.
+  KokkosDNN::attention_gqa_single_sliding<Exec, float>(h, q, k, v, q_off,
+                                                       out_d, scale, window);
+  // Quantize on host with the same symmetric scheme, then run the kernel.
+  auto hkq = Kokkos::create_mirror_view(kq);
+  auto hvq = Kokkos::create_mirror_view(vq);
+  auto hks = Kokkos::create_mirror_view(ks);
+  auto hvs = Kokkos::create_mirror_view(vs);
+  for (int n = 0; n < Ktot; ++n)
+    for (int hh = 0; hh < Hkv; ++hh) {
+      float kmax = 0, vmax = 0;
+      for (int d = 0; d < D; ++d) {
+        kmax = std::max(kmax, std::fabs(hk(n, hh, d)));
+        vmax = std::max(vmax, std::fabs(hv(n, hh, d)));
+      }
+      float ksc = kmax > 0 ? kmax / 127.0f : 1.0f;
+      float vsc = vmax > 0 ? vmax / 127.0f : 1.0f;
+      hks(n, hh) = ksc;
+      hvs(n, hh) = vsc;
+      for (int d = 0; d < D; ++d) {
+        int kqi = (int)std::round(hk(n, hh, d) / ksc);
+        int vqi = (int)std::round(hv(n, hh, d) / vsc);
+        kqi = std::max(-127, std::min(127, kqi));
+        vqi = std::max(-127, std::min(127, vqi));
+        hkq(n, hh, d) = (int8_t)kqi;
+        hvq(n, hh, d) = (int8_t)vqi;
+      }
+    }
+  Kokkos::deep_copy(kq, hkq);
+  Kokkos::deep_copy(vq, hvq);
+  Kokkos::deep_copy(ks, hks);
+  Kokkos::deep_copy(vs, hvs);
+  KokkosDNN::attention_gqa_quantized_sliding<Exec, float>(
+      h, q, kq, ks, vq, vs, q_off, out_q, scale, window);
+  Kokkos::fence();
+  auto gd = Kokkos::create_mirror_view(out_d);
+  auto gq = Kokkos::create_mirror_view(out_q);
+  Kokkos::deep_copy(gd, out_d);
+  Kokkos::deep_copy(gq, out_q);
+  for (int t = 0; t < T; ++t)
+    for (int hh = 0; hh < Hq; ++hh)
+      for (int d = 0; d < D; ++d)
+        EXPECT_NEAR(gq(t, hh, d), gd(t, hh, d), 2e-2f)
+            << "quant/dense mismatch at (" << t << "," << hh << "," << d
+            << ")";
 }
 
 // Real-weight check (gated; SKIP without files, never downloads).

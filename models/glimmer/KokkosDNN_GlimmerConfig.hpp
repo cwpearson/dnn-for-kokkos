@@ -356,6 +356,12 @@ struct Config {
   // tokens so activations stay O(chunk·dim) instead of O(T·dim). <= 0
   // means single-shot (one chunk of T).
   int prefill_chunk_size = 2048;
+  // KV-cache precision. kv_int8 selects symmetric int8 KV with per-token
+  // per-head FP32 scales (~2x fewer KV bytes plus a small scale table,
+  // small numerical drift); false keeps the model Scalar (dense FP, the
+  // default). JSON keys: "kv_int8" / "kv_quantized" (bool),
+  // "kv_quant" ("int8"/"none").
+  bool kv_int8 = false;
   // HF text_config: tie_word_embeddings (Glimmer 30B: false). The checkpoint
   // carries a separate lm_head tensor; a loader must NOT alias the
   // embedding table (unlike the tied Gemma4/Llama-3.2-1B case).
@@ -425,13 +431,22 @@ struct Config {
   // Config; intentionally a no-op.
   void recompute_derived() {}
 
+  bool use_quant_kv() const { return kv_int8; }
+
   // Total K+V bytes across all layers for the full context window, given
   // the unquantized element size (e.g. sizeof(Scalar)). Dense cache:
   // every layer rents its own [max_seq_len, n_kv_heads, head_dim] K and V.
+  // Quantized cache: int8 values plus one FP32 scale per token per KV head
+  // per K/V.
   size_t kv_cache_bytes(size_t elem_bytes) const {
     const size_t toks   = (size_t)max_seq_len;
-    const size_t per_tok = (size_t)n_kv_heads * (size_t)head_dim * elem_bytes;
-    return (size_t)n_layers * toks * per_tok * 2;  // K + V
+    const size_t per_tok =
+        (size_t)n_kv_heads * (size_t)head_dim * (kv_int8 ? 1 : elem_bytes);
+    size_t bytes = (size_t)n_layers * toks * per_tok * 2;  // K + V
+    if (kv_int8)
+      bytes += (size_t)n_layers * toks * (size_t)n_kv_heads * sizeof(float) *
+               2;  // K + V scale tables
+    return bytes;
   }
 
   // Throw std::invalid_argument/std::runtime_error on incompatible dims or
@@ -711,6 +726,24 @@ struct Config {
       if (iv < 0 || iv > 1000000000LL)
         throw std::runtime_error("config: 'prefill_chunk_size' out of range");
       c.prefill_chunk_size = (int)iv;
+    }
+    if (get_bool(text, "kv_int8", bv)) c.kv_int8 = bv;
+    if (get_bool(text, "kv_quantized", bv)) c.kv_int8 = c.kv_int8 || bv;
+    if (get_raw(text, "kv_quant", v)) {
+      std::string t = trim(v);
+      if (t.size() >= 2 && t.front() == '"' && t.back() == '"') {
+        size_t p = 0;
+        t = parse_string(t, p);
+      }
+      if (t == "int8" || t == "INT8" || t == "kv_int8" || t == "true" ||
+          t == "1")
+        c.kv_int8 = true;
+      else if (t == "none" || t == "fp" || t == "false" || t == "0" ||
+               t == "null")
+        c.kv_int8 = false;
+      else
+        throw std::runtime_error(
+            "config: 'kv_quant' must be \"int8\" or \"none\"");
     }
     // With no explicit per-layer thetas, rebuild the 3+1 defaults from the
     // final global rope_theta (a config-level rope_theta override must apply

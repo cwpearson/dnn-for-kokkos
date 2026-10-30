@@ -34,41 +34,6 @@ namespace Glimmer {
 namespace {
 
 // ---- half-precision conversions (host side, loader only) ----
-float fp16_to_fp32(uint16_t h) {
-  uint32_t sign = (h & 0x8000u) << 16;
-  uint32_t exp  = (h & 0x7C00u) >> 10;
-  uint32_t mant = (h & 0x03FFu);
-  uint32_t f;
-  if (exp == 0) {
-    if (mant == 0) {
-      f = sign;
-    } else {
-      // subnormal -> normalize
-      exp = 1;
-      while (!(mant & 0x0400u)) {
-        mant <<= 1;
-        exp--;
-      }
-      mant &= 0x03FFu;
-      f = sign | ((exp + 112) << 23) | (mant << 13);
-    }
-  } else if (exp == 31) {
-    f = sign | 0x7F800000u | (mant << 13);  // inf/nan
-  } else {
-    f = sign | ((exp + 112) << 23) | (mant << 13);
-  }
-  float out;
-  std::memcpy(&out, &f, 4);
-  return out;
-}
-
-inline float bf16_to_fp32(uint16_t h) {
-  uint32_t f = (uint32_t)h << 16;
-  float out;
-  std::memcpy(&out, &f, 4);
-  return out;
-}
-
 #if !KOKKOSDNN_HAS_MMAP
 // Only the non-mmap (ifstream) checkpoint path uses this; guard the
 // definition so mmap builds do not see an unused function.
@@ -365,8 +330,8 @@ size_t check_tensor(const ShardFile& sh, const std::string& name,
   return es;
 }
 
-// Convert n on-disk elements at raw pointer `src` (dtype `is_f32`) into
-// host staging `dst`. BF16->bhalf_t and F32->float are bit-exact memcpys;
+// Convert n on-disk elements at raw pointer `src` into host staging `dst`
+// (dense 1-D norm path). BF16->bhalf_t and F32->float are bit-exact memcpys;
 // other pairs go through an exact F32 intermediate (BF16/F16->F32 is exact,
 // then a single host-side cast to Scalar, same rounding as before).
 template <class Scalar>
@@ -377,10 +342,10 @@ void convert_block(const char* src, const std::string& dtype, Scalar* dst,
       std::memcpy(dst, src, n * 4);
     } else if (dtype == "BF16") {
       auto* h = reinterpret_cast<const uint16_t*>(src);
-      for (size_t i = 0; i < n; ++i) dst[i] = bf16_to_fp32(h[i]);
+      for (size_t i = 0; i < n; ++i) dst[i] = Gguf::bf16_to_float_host(h[i]);
     } else {  // F16
       auto* h = reinterpret_cast<const uint16_t*>(src);
-      for (size_t i = 0; i < n; ++i) dst[i] = fp16_to_fp32(h[i]);
+      for (size_t i = 0; i < n; ++i) dst[i] = Gguf::fp16_to_float_host(h[i]);
     }
   } else {
     static_assert(sizeof(Scalar) == 2, "half-precision Scalar must be 2B");
@@ -393,55 +358,64 @@ void convert_block(const char* src, const std::string& dtype, Scalar* dst,
     } else {  // F16 via exact F32 intermediate
       auto* h = reinterpret_cast<const uint16_t*>(src);
       for (size_t i = 0; i < n; ++i)
-        dst[i] = static_cast<Scalar>(fp16_to_fp32(h[i]));
+        dst[i] = static_cast<Scalar>(Gguf::fp16_to_float_host(h[i]));
     }
   }
 }
 
-// Stream one [rows, cols] tensor into a device matrix view in row chunks.
-template <class ExecSpace, class Scalar>
-void stream_to_mat(const ShardFile& sh, const std::string& name,
-                   const TensorMeta& m, size_t rows, size_t cols,
-                   const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>&
-                       dst) {
-  if (dst.extent(0) != rows || dst.extent(1) != cols)
-    throw std::runtime_error("copy_host_to_device: shape mismatch");
-  check_tensor(sh, name, m, {rows, cols});
+// Map a safetensors dtype tag to the packed ggml dtype (identity packing:
+// F32/F16/BF16 payloads are already dense row-major, which is exactly the
+// packed layout for unquantized dtypes).
+Gguf::GgmlType packed_dtype_for(const std::string& dtype,
+                                const std::string& name) {
+  if (dtype == "F32") return Gguf::GgmlType::F32;
+  if (dtype == "F16") return Gguf::GgmlType::F16;
+  if (dtype == "BF16") return Gguf::GgmlType::BF16;
+  throw std::runtime_error("unsupported safetensors dtype '" + dtype +
+                           "' for tensor '" + name + "'");
+}
+
+// Stream one [rows, cols] tensor into a packed device weight, preserving the
+// on-disk dtype (no conversion: the packed layout of F32/F16/BF16 is dense
+// row-major). Chunked like the 1-D norm path below so at most ~1 MiB of host
+// staging plus one target-sized device deep_copy chunk is live at a time.
+template <class ExecSpace>
+void stream_to_packed(const ShardFile& sh, const std::string& name,
+                      const TensorMeta& m, size_t rows, size_t cols,
+                      Gguf::QuantWeight<ExecSpace>& dst) {
+  const size_t es = check_tensor(sh, name, m, {rows, cols});
+  const Gguf::GgmlType dt = packed_dtype_for(m.dtype, name);
+  const size_t rb         = Gguf::ggml_row_bytes(dt, cols);
+  if (rb != cols * es)
+    throw std::runtime_error("packing mismatch for '" + name + "'");
+  dst.dtype = dt;
+  dst.rows  = rows;
+  dst.cols  = cols;
+  dst.data =
+      Kokkos::View<uint8_t*, ExecSpace>("safetensors_packed", rows * rb);
   if (rows == 0 || cols == 0) return;
-  size_t rows_per_chunk =
+  const size_t rows_per_chunk =
       std::max<size_t>(1, kStreamChunkElems / std::max<size_t>(cols, 1));
+  for (size_t r0 = 0; r0 < rows; r0 += rows_per_chunk) {
+    const size_t r1 = std::min(rows, r0 + rows_per_chunk);
+    const size_t n  = (r1 - r0) * cols * es;
+    auto sub        = Kokkos::subview(
+        dst.data, std::make_pair(r0 * rb, r1 * rb));
 #if KOKKOSDNN_HAS_MMAP
-  for (size_t r0 = 0; r0 < rows; r0 += rows_per_chunk) {
-    size_t r1 = std::min(rows, r0 + rows_per_chunk);
-    size_t n  = (r1 - r0) * cols;
-    Kokkos::View<Scalar**, Kokkos::LayoutRight, Kokkos::HostSpace> stage(
-        "safetensors_chunk", r1 - r0, cols);
-    convert_block<Scalar>(sh.data_ptr(m.begin + r0 * cols *
-                                                  dtype_elem_bytes(m.dtype,
-                                                                   name)),
-                          m.dtype, stage.data(), n);
-    auto sub = Kokkos::subview(
-        dst, std::make_pair(r0, r1),
-        Kokkos::ALL());
+    const auto* bytes = reinterpret_cast<const uint8_t*>(
+        sh.data_ptr(m.begin + r0 * cols * es));
+    Kokkos::View<const uint8_t*, Kokkos::HostSpace,
+                 Kokkos::MemoryTraits<Kokkos::Unmanaged>>
+        stage(bytes, n);
     Kokkos::deep_copy(sub, stage);
-  }
 #else
-  size_t es = dtype_elem_bytes(m.dtype, name);
-  std::vector<char> raw;
-  for (size_t r0 = 0; r0 < rows; r0 += rows_per_chunk) {
-    size_t r1 = std::min(rows, r0 + rows_per_chunk);
-    size_t n  = (r1 - r0) * cols;
-    raw.resize(n * es);
-    sh.read_bytes(m.begin + r0 * cols * es, raw.data(), n * es);
-    Kokkos::View<Scalar**, Kokkos::LayoutRight, Kokkos::HostSpace> stage(
-        "safetensors_chunk", r1 - r0, cols);
-    convert_block<Scalar>(raw.data(), m.dtype, stage.data(), n);
-    auto sub = Kokkos::subview(
-        dst, std::make_pair(r0, r1),
-        Kokkos::ALL());
+    std::vector<char> raw(n);
+    sh.read_bytes(m.begin + r0 * cols * es, raw.data(), n);
+    Kokkos::View<uint8_t*, Kokkos::HostSpace> stage("safetensors_chunk", n);
+    std::memcpy(stage.data(), raw.data(), n);
     Kokkos::deep_copy(sub, stage);
-  }
 #endif
+  }
 }
 
 // Stream one [n] tensor into a device vector view in chunks.
@@ -512,12 +486,19 @@ void random_init(const Config& cfg, Weights<ExecSpace, Scalar>& w,
   w.allocate(cfg);
   std::mt19937_64 rng(seed);
   std::normal_distribution<float> dist(0.0f, 0.02f);
-  auto fill_mat = [&](auto& v) {
-    auto h = Kokkos::create_mirror_view(v);
-    for (size_t i = 0; i < h.extent(0); ++i)
-      for (size_t j = 0; j < h.extent(1); ++j)
-        h(i, j) = static_cast<Scalar>(dist(rng));
-    Kokkos::deep_copy(v, h);
+  // Packed F32 2-D weight with small random values (raw-float packing is
+  // exact, so quant_gemm() on it matches a dense reference bit-for-bit).
+  auto fill_packed = [&](Gguf::QuantWeight<ExecSpace>& qw, size_t rows,
+                         size_t cols) {
+    qw.dtype = Gguf::GgmlType::F32;
+    qw.rows  = rows;
+    qw.cols  = cols;
+    const size_t nbytes = qw.bytes();
+    qw.data = Kokkos::View<uint8_t*, ExecSpace>("random_init", nbytes);
+    Kokkos::View<uint8_t*, Kokkos::HostSpace> h("random_init_host", nbytes);
+    float* f = reinterpret_cast<float*>(h.data());
+    for (size_t i = 0; i < rows * cols; ++i) f[i] = dist(rng);
+    Kokkos::deep_copy(qw.data, h);
   };
   auto fill_vec = [&](auto& v) {
     auto h = Kokkos::create_mirror_view(v);
@@ -525,18 +506,22 @@ void random_init(const Config& cfg, Weights<ExecSpace, Scalar>& w,
       h(i) = static_cast<Scalar>(1.0f);
     Kokkos::deep_copy(v, h);
   };
-  fill_mat(w.embed);
-  fill_mat(w.lm_head);
+  const size_t D = (size_t)cfg.dim, V = (size_t)cfg.vocab_size;
+  const size_t hq = (size_t)cfg.n_heads * (size_t)cfg.head_dim;
+  const size_t hkv = (size_t)cfg.n_kv_heads * (size_t)cfg.head_dim;
+  const size_t FF  = (size_t)cfg.ffn_dim;
+  fill_packed(w.embed, V, D);
+  fill_packed(w.lm_head, V, D);
   fill_vec(w.final_norm);
   for (auto& b : w.blocks) {
-    fill_mat(b.wq);
-    fill_mat(b.wk);
-    fill_mat(b.wv);
-    fill_mat(b.wo);
-    fill_mat(b.wgate_attn);
-    fill_mat(b.wgate);
-    fill_mat(b.wup);
-    fill_mat(b.wdown);
+    fill_packed(b.wq, hq, D);
+    fill_packed(b.wk, hkv, D);
+    fill_packed(b.wv, hkv, D);
+    fill_packed(b.wo, D, hq);
+    fill_packed(b.wgate_attn, hq, D);
+    fill_packed(b.wgate, FF, D);
+    fill_packed(b.wup, FF, D);
+    fill_packed(b.wdown, D, FF);
     fill_vec(b.input_norm);
     fill_vec(b.post_attn_norm);
     fill_vec(b.pre_ffn_norm);
@@ -590,11 +575,10 @@ void load_safetensors(const Config& cfg,
     return it->second;
   };
   auto load_mat = [&](const std::string& name, size_t rows, size_t cols,
-                      const Kokkos::View<Scalar**, Kokkos::LayoutRight,
-                                         ExecSpace>& dst) {
+                      Gguf::QuantWeight<ExecSpace>& dst) {
     Loc l = locate(name);
-    stream_to_mat<ExecSpace, Scalar>(shards[l.shard], name, *l.meta, rows,
-                                    cols, dst);
+    stream_to_packed<ExecSpace>(shards[l.shard], name, *l.meta, rows, cols,
+                               dst);
   };
   auto load_vec = [&](const std::string& name,
                       const Kokkos::View<Scalar*, ExecSpace>& dst) {
@@ -688,33 +672,38 @@ const Gguf::GgufTensorInfo& gguf_require(const Gguf::GgufFile& file,
                            ".weight' (also tried '" + stem + "')");
 }
 
+namespace Impl {
+
 // Invert the llama.cpp conversion _unpermute_for_rope
-// (conversion/muse_glimmer.py): GGUF q/k rows are stored in ggml
-// interleaved (NORM) layout while the model consumes the HF permuted
+// (conversion/muse_glimmer.py) on PACKED rows: GGUF q/k rows are stored in
+// ggml interleaved (NORM) layout while the model consumes the HF permuted
 // (rotate_half) layout matched by rope_neoX_inplace. This is transformers'
 // _permute_for_rope:
 //   out[h*hd + i*(hd/2)+j, :] = in[h*hd + j*2+i, :], i in {0,1}.
-// m is row-major [n_heads*head_dim, cols]; rewritten via a scratch buffer
-// (no in-place cycle chasing). head_dim must be even (Config enforces it).
-void gguf_permute_qk_for_rope(std::vector<float>& m, size_t n_heads,
-                              size_t head_dim, size_t cols) {
-  const size_t rows = n_heads * head_dim;
-  if (rows == 0 || cols == 0 || head_dim % 2 != 0 ||
-      m.size() != rows * cols)
-    throw std::runtime_error("permute_qk_for_rope: bad dims");
+// Whole packed rows of `row_bytes` each are swapped through a scratch
+// buffer (no dequantization). head_dim must be even (Config enforces it).
+inline void permute_packed_rows_for_rope(uint8_t* data, size_t rows,
+                                         size_t row_bytes, size_t n_heads,
+                                         size_t head_dim) {
+  if (rows != n_heads * head_dim || rows == 0 || row_bytes == 0 ||
+      head_dim == 0 || head_dim % 2 != 0)
+    throw std::runtime_error("permute_packed_rows_for_rope: bad dims");
   const size_t half = head_dim / 2;
-  std::vector<float> out(m.size());
+  std::vector<uint8_t> out(rows * row_bytes);
   for (size_t h = 0; h < n_heads; ++h) {
     for (size_t i = 0; i < 2; ++i) {
       for (size_t j = 0; j < half; ++j) {
-        const size_t dst = (h * head_dim + i * half + j) * cols;
-        const size_t src = (h * head_dim + j * 2 + i) * cols;
-        for (size_t k = 0; k < cols; ++k) out[dst + k] = m[src + k];
+        const size_t dst = h * head_dim + i * half + j;
+        const size_t src = h * head_dim + j * 2 + i;
+        std::memcpy(out.data() + dst * row_bytes, data + src * row_bytes,
+                    row_bytes);
       }
     }
   }
-  m.swap(out);
+  std::memcpy(data, out.data(), out.size());
 }
+
+}  // namespace Impl
 
 // Dequantize one GGUF tensor to host FP32 with an informative error when
 // the dtype is outside the compute set (F32/F16/BF16/Q8_0/Q4_K/Q5_K/Q6_K).
@@ -729,23 +718,46 @@ std::vector<float> gguf_dequant_rows(const Gguf::GgufFile& file,
   return tmp;
 }
 
-template <class ExecSpace, class Scalar>
+// Load one 2-D tensor into a packed device weight (no host dequantization:
+// the payload moves verbatim and stays quantized for quant_gemv/quant_gemm).
+// Throws when the dtype is outside the compute set, with the tensor name in
+// the message (mirrors the old dequant path's error context).
+template <class ExecSpace>
 void gguf_load_mat(const Gguf::GgufFile& file, const std::string& stem,
                    size_t rows, size_t cols,
-                   const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>&
-                       dst,
-                   bool permute_rope = false, size_t rope_heads = 0,
-                   size_t rope_head_dim = 0) {
+                   Gguf::QuantWeight<ExecSpace>& dst, bool permute_rope = false,
+                   size_t rope_heads = 0, size_t rope_head_dim = 0) {
   const auto& info = gguf_require(file, stem);
   if (info.n_dims != 2 || info.rows() != rows || info.cols() != cols)
     throw std::runtime_error("shape mismatch for '" + info.name +
                              "': checkpoint has " + gguf_shape_str(info) +
                              ", expected [" + std::to_string(rows) + "," +
                              std::to_string(cols) + "]");
-  std::vector<float> tmp = gguf_dequant_rows(file, info);
+  try {
+    Gguf::Impl::quant_check(info.dtype, rows, cols, info.nbytes,
+                            "gguf_load_mat");
+  } catch (const std::exception& e) {
+    throw std::runtime_error("cannot decode '" + info.name + "': " + e.what());
+  }
+  std::vector<uint8_t> host(info.nbytes);
+  if (!host.empty())
+    std::memcpy(host.data(), file.payload(info), host.size());
   if (permute_rope)
-    gguf_permute_qk_for_rope(tmp, rope_heads, rope_head_dim, cols);
-  copy_host_to_device<ExecSpace, Scalar>(tmp, rows, cols, dst);
+    Impl::permute_packed_rows_for_rope(host.data(), rows,
+                                       Gguf::ggml_row_bytes(info.dtype, cols),
+                                       rope_heads, rope_head_dim);
+  Gguf::QuantWeight<ExecSpace> w;
+  w.dtype = info.dtype;
+  w.rows  = rows;
+  w.cols  = cols;
+  w.data  = Kokkos::View<uint8_t*, ExecSpace>("Glimmer::weight", host.size());
+  if (!host.empty()) {
+    Kokkos::View<uint8_t*, Kokkos::HostSpace> stage("Glimmer::weight_host",
+                                                    host.size());
+    std::memcpy(stage.data(), host.data(), host.size());
+    Kokkos::deep_copy(w.data, stage);
+  }
+  dst = w;
 }
 
 // Load one 1-D norm tensor, subtracting the conversion-time norm shift.
@@ -865,14 +877,14 @@ void load_gguf(const Config& cfg, const std::string& path,
   Gguf::GgufFile file(path);  // throws on missing/corrupt file
   gguf_validate_metadata(file, cfg);
   const size_t D = (size_t)cfg.dim, V = (size_t)cfg.vocab_size;
-  gguf_load_mat<ExecSpace, Scalar>(file, "token_embd", V, D, w.embed);
+  gguf_load_mat<ExecSpace>(file, "token_embd", V, D, w.embed);
   // Final norm: the conversion shift is 0 (only *layernorm names shift).
   gguf_load_norm<ExecSpace, Scalar>(file, "output_norm", w.final_norm, 0.0f);
   // Untied head (tie_word_embeddings=false): the checkpoint carries a
   // separate output tensor; a missing tensor is an error (never aliased).
   // A tied config still falls back to aliasing the embedding table.
   if (gguf_resolve(file, "output") != nullptr) {
-    gguf_load_mat<ExecSpace, Scalar>(file, "output", V, D, w.lm_head);
+    gguf_load_mat<ExecSpace>(file, "output", V, D, w.lm_head);
   } else if (cfg.tie_word_embeddings) {
     w.lm_head = w.embed;  // tied: alias the embedding table
   } else {
@@ -885,26 +897,26 @@ void load_gguf(const Config& cfg, const std::string& path,
     auto& b = w.blocks[(size_t)l];
     gguf_load_norm<ExecSpace, Scalar>(file, gguf_blk(l, "attn_norm"),
                                       b.input_norm, 1.0f);
-    gguf_load_mat<ExecSpace, Scalar>(file, gguf_blk(l, "attn_q"), hq, D, b.wq,
+    gguf_load_mat<ExecSpace>(file, gguf_blk(l, "attn_q"), hq, D, b.wq,
                                      true, (size_t)cfg.n_heads, HD);
-    gguf_load_mat<ExecSpace, Scalar>(file, gguf_blk(l, "attn_k"), hkv, D,
+    gguf_load_mat<ExecSpace>(file, gguf_blk(l, "attn_k"), hkv, D,
                                      b.wk, true, (size_t)cfg.n_kv_heads, HD);
-    gguf_load_mat<ExecSpace, Scalar>(file, gguf_blk(l, "attn_v"), hkv, D,
+    gguf_load_mat<ExecSpace>(file, gguf_blk(l, "attn_v"), hkv, D,
                                      b.wv);
-    gguf_load_mat<ExecSpace, Scalar>(file, gguf_blk(l, "attn_output"), D, hq,
+    gguf_load_mat<ExecSpace>(file, gguf_blk(l, "attn_output"), D, hq,
                                      b.wo);
     // Attention output gate: sigmoid(gate) * attn_out before o_proj.
-    gguf_load_mat<ExecSpace, Scalar>(file, gguf_blk(l, "attn_gate"), hq, D,
+    gguf_load_mat<ExecSpace>(file, gguf_blk(l, "attn_gate"), hq, D,
                                      b.wgate_attn);
     gguf_load_norm<ExecSpace, Scalar>(file, gguf_blk(l, "post_attention_norm"),
                                       b.post_attn_norm, 1.0f);
     gguf_load_norm<ExecSpace, Scalar>(file, gguf_blk(l, "ffn_norm"),
                                       b.pre_ffn_norm, 1.0f);
-    gguf_load_mat<ExecSpace, Scalar>(file, gguf_blk(l, "ffn_gate"),
+    gguf_load_mat<ExecSpace>(file, gguf_blk(l, "ffn_gate"),
                                      (size_t)cfg.ffn_dim, D, b.wgate);
-    gguf_load_mat<ExecSpace, Scalar>(file, gguf_blk(l, "ffn_down"), D,
+    gguf_load_mat<ExecSpace>(file, gguf_blk(l, "ffn_down"), D,
                                      (size_t)cfg.ffn_dim, b.wdown);
-    gguf_load_mat<ExecSpace, Scalar>(file, gguf_blk(l, "ffn_up"),
+    gguf_load_mat<ExecSpace>(file, gguf_blk(l, "ffn_up"),
                                      (size_t)cfg.ffn_dim, D, b.wup);
     gguf_load_norm<ExecSpace, Scalar>(file, gguf_blk(l, "post_ffw_norm"),
                                       b.post_ffn_norm, 1.0f);

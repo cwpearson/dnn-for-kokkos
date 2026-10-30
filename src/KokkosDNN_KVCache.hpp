@@ -78,7 +78,8 @@ void copy_prefix_3(const DstView& dst, const SrcView& src) {
 //
 // Dense (contiguous, FP) remains the default path in attention_gqa_single;
 // the kernels below are used by the Llama Model when Config::kv_page_size
-// > 0 and/or Config::kv_int8 are set. All kernels accumulate in FP32 and
+// > 0 and/or Config::kv_int8 are set, and by the Glimmer Model in
+// quantized mode (full + sliding). All kernels accumulate in FP32 and
 // are Scalar-agnostic (float, bhalf_t) like the dense path. Paged/quant
 // paths always run the native streaming kernel (no cuDNN dispatch: cuDNN
 // SDPA has no paged/int8 form); TPL GEMMs elsewhere are unaffected.
@@ -254,11 +255,15 @@ struct PagedQuantLoader {
 // Shared streaming core shape: one thread per (query token, query head),
 // online softmax over keys, O(1) extra memory. Loaders differ per cache
 // kind; each loader resolves logical key kk to a (k, v) float pair.
+// sliding_window == 0 attends the full causal prefix [0, q_off + t];
+// otherwise query t at absolute position p = q_off + t attends the windowed
+// range [max(0, p + 1 - sliding_window), q_off + t] (same convention as
+// gqa_key_window in KokkosDNN_Attention.hpp).
 template <class ExecSpace, class Scalar, class QView, class OView, class Loader>
 void attention_streaming_loader(const QView& q, size_t q_off, const OView& out,
                                 float scale, size_t Hq, size_t D, size_t Hkv,
-                                Loader loader,
-                                const std::string& label) {
+                                Loader loader, const std::string& label,
+                                size_t sliding_window = 0) {
   const size_t T = q.extent(0);
   if (T == 0 || Hq == 0 || D == 0) return;
   Kokkos::parallel_for(
@@ -267,11 +272,20 @@ void attention_streaming_loader(const QView& q, size_t q_off, const OView& out,
         size_t klen = q_off + t + 1;
         size_t kmax = loader.tokens();
         if (klen > kmax) klen = kmax;
+        // Windowed lower clamp (mirrors gqa_key_window): keys below the
+        // sliding window are never streamed, so long prefixes stay O(window)
+        // in work here too.
+        size_t klo = 0;
+        if (sliding_window > 0) {
+          const size_t p     = q_off + t;  // absolute position of query t
+          const size_t start = (p + 1 >= sliding_window) ? (p + 1 - sliding_window) : 0;
+          if (start > klo) klo = start;
+        }
         const size_t hkv = (h * Hkv) / Hq;
         for (size_t d = 0; d < D; ++d) out(t, h, d) = static_cast<Scalar>(0);
         if (klen == 0) return;
         float m = -1e30f, l = 0.0f;
-        for (size_t kk = 0; kk < klen; ++kk) {
+        for (size_t kk = klo; kk < klen; ++kk) {
           float s = 0;
           for (size_t d = 0; d < D; ++d)
             s += static_cast<float>(q(t, h, d)) * loader.k(kk, hkv, d);
@@ -313,6 +327,28 @@ void attention_gqa_quantized(
       q, q_off, out, scale, Hq, D, Hkv,
       Impl::QuantLoader<KQView, KSView, VQView, VSView>{kq, ks, vq, vs, Ktot},
       label);
+}
+
+// Sliding-window causal int8 KV attention. Same contract as
+// attention_gqa_quantized, except query t at absolute position
+// p = q_off + t attends keys [max(0, p + 1 - sliding_window), p] instead of
+// the full prefix [0, p] (same convention as attention_gqa_single_sliding;
+// sliding_window == 0 degrades to the full-causal form). Native kernel only
+// (no cuDNN int8 form), like the full-causal quantized path below.
+template <class ExecSpace, class Scalar, class QView, class KQView, class KSView,
+          class VQView, class VSView, class OView>
+void attention_gqa_quantized_sliding(
+    const DNNHandle<ExecSpace>& handle, const QView& q, const KQView& kq,
+    const KSView& ks, const VQView& vq, const VSView& vs, size_t q_off,
+    const OView& out, float scale, size_t sliding_window,
+    const std::string& label = "KokkosDNN::attn_gqa_qs") {
+  (void)handle;  // native kernel only (no cuDNN paged/int8 form)
+  const size_t Hq = q.extent(1), D = q.extent(2), Hkv = kq.extent(1);
+  const size_t Ktot = kq.extent(0);
+  Impl::attention_streaming_loader<ExecSpace, Scalar>(
+      q, q_off, out, scale, Hq, D, Hkv,
+      Impl::QuantLoader<KQView, KSView, VQView, VSView>{kq, ks, vq, vs, Ktot},
+      label, sliding_window);
 }
 
 // Paged dense attention. Pools [P, page, Hkv, D]; table maps logical page
