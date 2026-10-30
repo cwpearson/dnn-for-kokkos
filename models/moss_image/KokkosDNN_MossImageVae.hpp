@@ -657,7 +657,7 @@ void silu_inplace_3d(const V3& v, const std::string& label) {
         const size_t h = rem / W, w = rem % W;
         const float x = static_cast<float>(v(c, h, w));
         v(c, h, w) = static_cast<typename V3::value_type>(
-            x / (1.0f + expf(-x)));
+            x / (1.0f + Kokkos::expf(-x)));
       });
 }
 

@@ -108,8 +108,8 @@ void kv_write_quantized_contiguous(const K3View& k3, const V3View& v3,
       KOKKOS_LAMBDA(size_t t, size_t h) {
         float kmax = 0.0f, vmax = 0.0f;
         for (size_t d = 0; d < D; ++d) {
-          float a = fabsf(static_cast<float>(k3(t, h, d)));
-          float b = fabsf(static_cast<float>(v3(t, h, d)));
+          float a = Kokkos::fabsf(static_cast<float>(k3(t, h, d)));
+          float b = Kokkos::fabsf(static_cast<float>(v3(t, h, d)));
           if (a > kmax) kmax = a;
           if (b > vmax) vmax = b;
         }
@@ -121,8 +121,8 @@ void kv_write_quantized_contiguous(const K3View& k3, const V3View& v3,
         for (size_t d = 0; d < D; ++d) {
           float kf = static_cast<float>(k3(t, h, d)) * kinv;
           float vf = static_cast<float>(v3(t, h, d)) * vinv;
-          int kqi = int(roundf(kf));
-          int vqi = int(roundf(vf));
+          int kqi = int(Kokkos::roundf(kf));
+          int vqi = int(Kokkos::roundf(vf));
           if (kqi > KvInt8Max) kqi = KvInt8Max;
           if (kqi < -KvInt8Max) kqi = -KvInt8Max;
           if (vqi > KvInt8Max) vqi = KvInt8Max;
@@ -174,8 +174,8 @@ void kv_write_paged_quantized(
       KOKKOS_LAMBDA(size_t t, size_t h) {
         float kmax = 0.0f, vmax = 0.0f;
         for (size_t d = 0; d < D; ++d) {
-          float a = fabsf(static_cast<float>(k3(t, h, d)));
-          float b = fabsf(static_cast<float>(v3(t, h, d)));
+          float a = Kokkos::fabsf(static_cast<float>(k3(t, h, d)));
+          float b = Kokkos::fabsf(static_cast<float>(v3(t, h, d)));
           if (a > kmax) kmax = a;
           if (b > vmax) vmax = b;
         }
@@ -189,8 +189,8 @@ void kv_write_paged_quantized(
         vscales(phys, slot, h) = vsc;
         float kinv = 1.0f / ksc, vinv = 1.0f / vsc;
         for (size_t d = 0; d < D; ++d) {
-          int kqi = int(roundf(static_cast<float>(k3(t, h, d)) * kinv));
-          int vqi = int(roundf(static_cast<float>(v3(t, h, d)) * vinv));
+          int kqi = int(Kokkos::roundf(static_cast<float>(k3(t, h, d)) * kinv));
+          int vqi = int(Kokkos::roundf(static_cast<float>(v3(t, h, d)) * vinv));
           if (kqi > KvInt8Max) kqi = KvInt8Max;
           if (kqi < -KvInt8Max) kqi = -KvInt8Max;
           if (vqi > KvInt8Max) vqi = KvInt8Max;
@@ -296,8 +296,8 @@ void attention_streaming_loader(const QView& q, size_t q_off, const OView& out,
             s += static_cast<float>(q(t, h, d)) * loader.k(kk, hkv, d);
           s *= scale;
           const float m_new = (m > s) ? m : s;
-          const float a = expf(m - m_new);
-          const float g = expf(s - m_new);
+          const float a = Kokkos::expf(m - m_new);
+          const float g = Kokkos::expf(s - m_new);
           const float la = l * a;
           const float l_new = la + g;
           const float inv = 1.0f / l_new;
@@ -479,7 +479,7 @@ struct GqaDecodeSplitQuantFunctor {
             },
             Kokkos::Max<float>(tmax));
         const float mnew = (tmax > m[h]) ? tmax : m[h];
-        aa[h] = expf(m[h] - mnew);
+        aa[h] = Kokkos::expf(m[h] - mnew);
         m[h] = mnew;
       }
       // Weights for the owner's keys: exp(s - m) in the (possibly updated)
@@ -487,7 +487,7 @@ struct GqaDecodeSplitQuantFunctor {
       for (int kw_i = rank; kw_i < kw; kw_i += team_n) {
         for (int h = 0; h < NG; ++h)
           base[wo + static_cast<size_t>(h) * KT + static_cast<size_t>(kw_i)] =
-              expf(base[wo + static_cast<size_t>(h) * KT +
+              Kokkos::expf(base[wo + static_cast<size_t>(h) * KT +
                          static_cast<size_t>(kw_i)] -
                    m[h]);
       }

@@ -178,7 +178,7 @@ void rope_neoX_inplace(
         float pos = (float)positions(t);
         for (size_t d = 0; d < Hd; ++d) {
           float ang = pos * inv_freq(d);
-          float c = cosf(ang), s = sinf(ang);
+          float c = Kokkos::cosf(ang), s = Kokkos::sinf(ang);
           float a = static_cast<float>(q(t, h, d)),
                 b = static_cast<float>(q(t, h, d + Hd));
           q(t, h, d)      = static_cast<Scalar>(a * c - b * s);
@@ -193,7 +193,7 @@ void rope_neoX_inplace(
         float pos = (float)positions(t);
         for (size_t d = 0; d < Hd; ++d) {
           float ang = pos * inv_freq(d);
-          float c = cosf(ang), s = sinf(ang);
+          float c = Kokkos::cosf(ang), s = Kokkos::sinf(ang);
           float a = static_cast<float>(k(t, h, d)),
                 b = static_cast<float>(k(t, h, d + Hd));
           k(t, h, d)      = static_cast<Scalar>(a * c - b * s);
@@ -228,13 +228,13 @@ KOKKOS_INLINE_FUNCTION void rope2d_rotate_token(const XView& x, const YView& y,
   constexpr float two_pi = 6.283185307179586f;
   for (size_t d = 0; d < Qh; ++d) {
     const float ah = two_pi * ch * inv_freq(d);
-    const float chh = cosf(ah), shh = sinf(ah);
+    const float chh = Kokkos::cosf(ah), shh = Kokkos::sinf(ah);
     const float h1 = static_cast<float>(x(t, h, d));
     const float h2 = static_cast<float>(x(t, h, d + 2 * Qh));
     y(t, h, d) = static_cast<Scalar>(h1 * chh - h2 * shh);
     y(t, h, d + 2 * Qh) = static_cast<Scalar>(h1 * shh + h2 * chh);
     const float aw = two_pi * cw * inv_freq(d);
-    const float cww = cosf(aw), sww = sinf(aw);
+    const float cww = Kokkos::cosf(aw), sww = Kokkos::sinf(aw);
     const float w1 = static_cast<float>(x(t, h, d + Qh));
     const float w2 = static_cast<float>(x(t, h, d + 3 * Qh));
     y(t, h, d + Qh) = static_cast<Scalar>(w1 * cww - w2 * sww);

@@ -174,7 +174,7 @@ void qwen21dit_zero_center_norm(
           float v = static_cast<float>(x(i, d));
           ss += v * v;
         }
-        float inv = 1.0f / sqrtf(ss / (float)D + eps);
+        float inv = 1.0f / Kokkos::sqrtf(ss / (float)D + eps);
         y(i, j) = static_cast<Scalar>(static_cast<float>(x(i, j)) * inv *
                                       (static_cast<float>(w(j)) + 1.0f));
       });
@@ -192,7 +192,7 @@ void qwen21dit_gelu_tanh_inplace(
       KOKKOS_LAMBDA(size_t i, size_t j) {
         float v = static_cast<float>(y(i, j));
         float c = 0.7978845608028654f * (v + 0.044715f * v * v * v);
-        y(i, j) = static_cast<Scalar>(0.5f * v * (1.0f + tanhf(c)));
+        y(i, j) = static_cast<Scalar>(0.5f * v * (1.0f + Kokkos::tanhf(c)));
       });
 }
 
@@ -215,7 +215,7 @@ void qwen21dit_swiglu(
       KOKKOS_LAMBDA(size_t n) {
         const size_t i = n / G, j = n % G;
         float g = static_cast<float>(gate(i, j));
-        float s = g / (1.0f + expf(-g));
+        float s = g / (1.0f + Kokkos::expf(-g));
         out(i, j) =
             static_cast<Scalar>(s * static_cast<float>(up(i, j)));
       });
@@ -252,7 +252,7 @@ struct Qwen21ditQkRmsnormFunctor {
           acc += v * v;
         },
         ss);
-    const float inv = 1.0f / sqrtf(ss / (float)DD + E);
+    const float inv = 1.0f / Kokkos::sqrtf(ss / (float)DD + E);
     Kokkos::parallel_for(
         Kokkos::TeamThreadRange(member, DD), KOKKOS_LAMBDA(size_t d) {
           X(t, h, d) = static_cast<Scalar>(static_cast<float>(X(t, h, d)) *
@@ -327,7 +327,7 @@ Kokkos::View<float*, ExecSpace> qwen21dit_rope_inv_table(
           j = 2 * (p - n0);
         }
         // Same expression as the per-fiber loop (was evaluated per fiber).
-        inv(p) = powf((float)theta, -((float)j) / (float)ds);
+        inv(p) = Kokkos::powf((float)theta, -((float)j) / (float)ds);
       });
   return inv;
 }
@@ -360,7 +360,7 @@ KOKKOS_INLINE_FUNCTION void qwen21dit_rope_fiber(
     const int ds = as[s];
     for (int j = 0; j < ds; j += 2) {
       float ang = (float)ps[s] * inv[pbase + (size_t)(j / 2)];
-      float co = cosf(ang), si = sinf(ang);
+      float co = Kokkos::cosf(ang), si = Kokkos::sinf(ang);
       float x0 = static_cast<float>(x(t, h, base + (size_t)j));
       float x1 = static_cast<float>(x(t, h, base + (size_t)j + 1));
       x(t, h, base + (size_t)j) = static_cast<Scalar>(x0 * co - x1 * si);
@@ -470,7 +470,7 @@ void qwen21dit_rope_3axis_dual(
           }
         }
         const float ang = (float)pos * invp[pp];
-        const float co = cosf(ang), si = sinf(ang);
+        const float co = Kokkos::cosf(ang), si = Kokkos::sinf(ang);
         const size_t ebase = (s == 0) ? 2 * kk : (s == 1) ? e1 + 2 * kk
                                                           : e2 + 2 * kk;
         float q0 = static_cast<float>(q(t, h, ebase));
@@ -534,7 +534,7 @@ void qwen21dit_rope_3axis_dual_pos(
         const long pos =
             (s == 0) ? (long)p0(t) : (s == 1) ? (long)p1(t) : (long)p2(t);
         const float ang = (float)pos * invp[pp];
-        const float co = cosf(ang), si = sinf(ang);
+        const float co = Kokkos::cosf(ang), si = Kokkos::sinf(ang);
         const size_t ebase = (s == 0) ? 2 * kk : (s == 1) ? e1 + 2 * kk
                                                           : e2 + 2 * kk;
         float q0 = static_cast<float>(q(t, h, ebase));
@@ -837,8 +837,8 @@ void qwen21dit_gated_residual_split_mask(
   Kokkos::parallel_for(
       label + "_tanh", Kokkos::RangePolicy<ExecSpace>(0, 2 * D),
       KOKKOS_LAMBDA(size_t k) {
-        tg(k) = (k < D) ? tanhf(static_cast<float>(g_txt(k)))
-                        : tanhf(static_cast<float>(g_img(k - D)));
+        tg(k) = (k < D) ? Kokkos::tanhf(static_cast<float>(g_txt(k)))
+                        : Kokkos::tanhf(static_cast<float>(g_img(k - D)));
       });
   Kokkos::parallel_for(
       label, Kokkos::RangePolicy<ExecSpace>(0, R * D),
@@ -985,7 +985,7 @@ void qwen21dit_gated_residual(
   Kokkos::parallel_for(
       label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {R, D}),
       KOKKOS_LAMBDA(size_t i, size_t j) {
-        float g = tanhf(static_cast<float>(gate(j)));
+        float g = Kokkos::tanhf(static_cast<float>(gate(j)));
         x(i, j) = static_cast<Scalar>(static_cast<float>(x(i, j)) +
                                       g * static_cast<float>(upd(i, j)));
       });
@@ -1017,8 +1017,8 @@ void qwen21dit_gated_residual_split(
   Kokkos::parallel_for(
       label + "_tanh", Kokkos::RangePolicy<ExecSpace>(0, 2 * D),
       KOKKOS_LAMBDA(size_t k) {
-        tg(k) = (k < D) ? tanhf(static_cast<float>(g_txt(k)))
-                        : tanhf(static_cast<float>(g_img(k - D)));
+        tg(k) = (k < D) ? Kokkos::tanhf(static_cast<float>(g_txt(k)))
+                        : Kokkos::tanhf(static_cast<float>(g_img(k - D)));
       });
   Kokkos::parallel_for(
       label, Kokkos::RangePolicy<ExecSpace>(0, R * D),

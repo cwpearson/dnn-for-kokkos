@@ -522,7 +522,7 @@ void qwen21_rope_inplace(const XView& x, const FView& inv_freq,
         const float pos = static_cast<float>(t);
         for (size_t j = 0; j < Rh; ++j) {
           const float ang = pos * inv_freq(j);
-          const float c = cosf(ang), s = sinf(ang);
+          const float c = Kokkos::cosf(ang), s = Kokkos::sinf(ang);
           const float a = static_cast<float>(x(t, h, j));
           const float b = static_cast<float>(x(t, h, j + Rh));
           x(t, h, j) = static_cast<Scalar>(a * c - b * s);
@@ -571,7 +571,7 @@ void qwen21_mrope_inplace(const XView& x, const PView& pos,
             r = 2;
           const float p = static_cast<float>(pos(r, s));
           const float ang = p * inv_freq(j);
-          const float c = cosf(ang), s_ = sinf(ang);
+          const float c = Kokkos::cosf(ang), s_ = Kokkos::sinf(ang);
           const float a = static_cast<float>(x(s, h, j));
           const float b = static_cast<float>(x(s, h, j + Rh));
           x(s, h, j) = static_cast<Scalar>(a * c - b * s_);
@@ -606,7 +606,7 @@ void qwen21_rmsnorm(
           float v = static_cast<float>(x(t, k));
           ss += v * v;
         }
-        float inv = 1.0f / sqrtf(ss / (float)D + eps);
+        float inv = 1.0f / Kokkos::sqrtf(ss / (float)D + eps);
         Scalar nb =
             static_cast<Scalar>(static_cast<float>(x(t, d)) * inv);
         y(t, d) = static_cast<Scalar>(static_cast<float>(nb) *
@@ -634,7 +634,7 @@ void qwen21_qk_rmsnorm(
           float v = static_cast<float>(flat(t, h * D + d));
           ss += v * v;
         }
-        float inv = 1.0f / sqrtf(ss / (float)D + eps);
+        float inv = 1.0f / Kokkos::sqrtf(ss / (float)D + eps);
         for (size_t d = 0; d < D; ++d) {
           Scalar nb = static_cast<Scalar>(
               static_cast<float>(flat(t, h * D + d)) * inv);
@@ -662,7 +662,7 @@ void qwen21_swiglu(
       label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, F}),
       KOKKOS_LAMBDA(size_t t, size_t f) {
         float g = static_cast<float>(gate(t, f));
-        Scalar sg = static_cast<Scalar>(g / (1.0f + expf(-g)));
+        Scalar sg = static_cast<Scalar>(g / (1.0f + Kokkos::expf(-g)));
         out(t, f) = static_cast<Scalar>(static_cast<float>(sg) *
                                         static_cast<float>(up(t, f)));
       });

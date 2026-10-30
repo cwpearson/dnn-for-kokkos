@@ -10,13 +10,13 @@
 namespace KokkosDNN {
 
 KOKKOS_INLINE_FUNCTION float silu(float x) {
-  return x / (1.0f + expf(-x));
+  return x / (1.0f + Kokkos::expf(-x));
 }
 
 template <class Scalar>
 KOKKOS_INLINE_FUNCTION Scalar silu_cast(Scalar x) {
   float f = static_cast<float>(x);
-  return static_cast<Scalar>(f / (1.0f + expf(-f)));
+  return static_cast<Scalar>(f / (1.0f + Kokkos::expf(-f)));
 }
 
 // SwiGLU MLP activation: out[i,:] = silu(gate[i,:]) * up[i,:].
@@ -32,7 +32,7 @@ void swiglu(const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& gate,
       KOKKOS_LAMBDA(size_t t, size_t f) {
         float g = static_cast<float>(gate(t, f));
         out(t, f) =
-            static_cast<Scalar>((g / (1.0f + expf(-g))) *
+            static_cast<Scalar>((g / (1.0f + Kokkos::expf(-g))) *
                                 static_cast<float>(up(t, f)));
       });
 }

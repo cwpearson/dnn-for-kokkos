@@ -22,10 +22,10 @@ void softmax_rows(
       label, Kokkos::RangePolicy<ExecSpace>(0, R), KOKKOS_LAMBDA(size_t r) {
         float m = static_cast<float>(x(r, 0));
         for (size_t c = 1; c < C; ++c)
-          m = fmaxf(m, static_cast<float>(x(r, c)));
+          m = Kokkos::fmaxf(m, static_cast<float>(x(r, c)));
         float s = 0;
         for (size_t c = 0; c < C; ++c) {
-          float e = expf(static_cast<float>(x(r, c)) - m);
+          float e = Kokkos::expf(static_cast<float>(x(r, c)) - m);
           y(r, c) = static_cast<Scalar>(e);
           s += e;
         }
@@ -47,10 +47,10 @@ void softmax_rows_causal(
       label, Kokkos::RangePolicy<ExecSpace>(0, R), KOKKOS_LAMBDA(size_t r) {
         float m = static_cast<float>(x(r, 0));
         for (size_t c = 1; c < len; ++c)
-          m = fmaxf(m, static_cast<float>(x(r, c)));
+          m = Kokkos::fmaxf(m, static_cast<float>(x(r, c)));
         float s = 0;
         for (size_t c = 0; c < len; ++c) {
-          float e = expf(static_cast<float>(x(r, c)) - m);
+          float e = Kokkos::expf(static_cast<float>(x(r, c)) - m);
           y(r, c) = static_cast<Scalar>(e);
           s += e;
         }

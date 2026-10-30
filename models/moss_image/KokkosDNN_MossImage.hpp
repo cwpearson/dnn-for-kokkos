@@ -126,8 +126,8 @@ namespace Impl {
 //   situ(h, g) = (4 * tanh(g/4) * sigmoid(g)) * (25 * tanh(h/25)).
 // FP32 in/out; callers cast to/from Scalar.
 KOKKOS_INLINE_FUNCTION float moss_situ_scalar(float h, float g) {
-  const float sig = 1.0f / (1.0f + expf(-g));
-  return (4.0f * tanhf(g / 4.0f) * sig) * (25.0f * tanhf(h / 25.0f));
+  const float sig = 1.0f / (1.0f + Kokkos::expf(-g));
+  return (4.0f * Kokkos::tanhf(g / 4.0f) * sig) * (25.0f * Kokkos::tanhf(h / 25.0f));
 }
 
 // Team functor for moss_rmsnorm_modulate_forward: one team per (b, t) row.
@@ -437,7 +437,7 @@ void moss_rope_build_forward(
       label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {S, nb}),
       KOKKOS_LAMBDA(size_t s, size_t k) {
         const float band =
-            1.0f / powf(base, static_cast<float>(k) / static_cast<float>(nb));
+            1.0f / Kokkos::powf(base, static_cast<float>(k) / static_cast<float>(nb));
         float coord[4];
         if (s < img) {
           const size_t r = s / static_cast<size_t>(width);
@@ -456,8 +456,8 @@ void moss_rope_build_forward(
         }
         for (int m = 0; m < 4; ++m) {
           const float ph = coord[m] * band;
-          out(0, s, (size_t)m * nb + k) = sinf(ph);
-          out(0, s, 4 * nb + (size_t)m * nb + k) = cosf(ph);
+          out(0, s, (size_t)m * nb + k) = Kokkos::sinf(ph);
+          out(0, s, 4 * nb + (size_t)m * nb + k) = Kokkos::cosf(ph);
         }
       });
 }
@@ -734,7 +734,7 @@ void moss_vae_denormalize_forward(
       Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<4>>({0, 0, 0, 0},
                                                        {B, C, H, W}),
       KOKKOS_LAMBDA(size_t b, size_t c, size_t h, size_t w) {
-        const float rstd = sqrtf(var(c) + eps);
+        const float rstd = Kokkos::sqrtf(var(c) + eps);
         out(b, c, h, w) = static_cast<Scalar>(static_cast<float>(z(b, c, h, w)) *
                                                   rstd +
                                               mean(c));

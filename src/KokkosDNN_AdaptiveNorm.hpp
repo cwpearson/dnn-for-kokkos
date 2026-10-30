@@ -59,7 +59,7 @@ struct InstanceNormStatsFunctor {
         },
         sq);
     mean(c) = mu;
-    inv(c) = 1.0f / sqrtf(sq / (float)T + eps);
+    inv(c) = 1.0f / Kokkos::sqrtf(sq / (float)T + eps);
   }
 };
 

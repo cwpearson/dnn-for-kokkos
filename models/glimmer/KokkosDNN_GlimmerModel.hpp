@@ -54,7 +54,7 @@ void flatten_gate_sigmoid_mul(
       Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, H * D}),
       KOKKOS_LAMBDA(size_t t, size_t i) {
         float gv = static_cast<float>(g(t, i));
-        float s  = 1.0f / (1.0f + expf(-gv));
+        float s  = 1.0f / (1.0f + Kokkos::expf(-gv));
         out(t, i) = static_cast<Scalar>(
             static_cast<float>(attn(t, i / D, i % D)) * s);
       });

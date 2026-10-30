@@ -36,7 +36,7 @@ float bce_with_logits_loss(
         float z = static_cast<float>(logits(i, j));
         float t = static_cast<float>(targets(i, j));
         float m = z > 0.0f ? z : 0.0f;
-        acc += m - z * t + logf(1.0f + expf(-fabsf(z)));
+        acc += m - z * t + Kokkos::logf(1.0f + Kokkos::expf(-Kokkos::fabsf(z)));
       },
       total);
   return total / static_cast<float>(B * O);
@@ -60,7 +60,7 @@ void bce_with_logits_backward(
       label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {B, O}),
       KOKKOS_LAMBDA(size_t i, size_t j) {
         float z = static_cast<float>(logits(i, j));
-        float s = 1.0f / (1.0f + expf(-z));
+        float s = 1.0f / (1.0f + Kokkos::expf(-z));
         dlogits(i, j) = static_cast<Scalar>(
             (s - static_cast<float>(targets(i, j))) * inv);
       });
