@@ -6,6 +6,7 @@
 #include <cctype>
 #include <cstdint>
 #include <fstream>
+#include <initializer_list>
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
@@ -1371,9 +1372,60 @@ std::string tool_format_call(const ToolCall& c) {
 // whole-text output (a length-capped turn can end mid-marker, and a chunk
 // boundary can split one). Kept in one place so the whole-text parse and
 // the streaming hold-back agree byte-for-byte.
-const char* const kHoldMarkers[] = {kThinkStartToken, kThinkEndToken,
-                                    kToolCallStartToken, kToolCallEndToken,
-                                    kEosToken};
+const char* const kHoldMarkers[] = {
+    kThinkStartToken,       kThinkEndToken,
+    kToolCallStartToken,    kToolCallEndToken,
+    kThinkStartAltToken,    kThinkEndAltToken,
+    kToolCallStartAltToken, kToolCallEndAltToken,
+    kEosToken};
+
+// Earliest occurrence of any of the alternative markers at/after `from`.
+// Returns npos when none match; `which` (optional) points at the matched
+// literal so callers can advance by its length. Ties resolve in argument
+// order, which keeps the native marker preferred over an alias at the same
+// position (they never actually collide).
+size_t find_earliest(const std::string& b, size_t from,
+                     std::initializer_list<const char*> markers,
+                     const char** which = nullptr) {
+  size_t best = std::string::npos;
+  for (const char* m : markers) {
+    const size_t p = b.find(m, from);
+    if (p != std::string::npos && (best == std::string::npos || p < best)) {
+      best = p;
+      if (which) *which = m;
+    }
+  }
+  return best;
+}
+
+// Length of the think opener (`<think>` or `<thinking>`) at `p`, else 0.
+size_t think_opener_at(const std::string& b, size_t p) {
+  const char* m = nullptr;
+  const size_t s =
+      find_earliest(b, p, {kThinkStartToken, kThinkStartAltToken}, &m);
+  return (s == p && m) ? std::string(m).size() : 0;
+}
+
+// Earliest think terminator (closing tag, tool-call start, or turn end).
+// kind 0 = an explicit closing tag (consumed as part of the trace), kind 1 =
+// an implicit terminator left in the display for the call/stop stages.
+size_t find_think_terminator(const std::string& b, size_t from, size_t& len,
+                             int& kind) {
+  const char* m = nullptr;
+  const size_t p =
+      find_earliest(b, from,
+                    {kThinkEndToken, kThinkEndAltToken, kToolCallStartToken,
+                     kToolCallStartAltToken, kEosToken},
+                    &m);
+  if (p == std::string::npos) {
+    len = 0;
+    kind = 0;
+    return p;
+  }
+  len = std::string(m).size();
+  kind = (m == kThinkEndToken || m == kThinkEndAltToken) ? 0 : 1;
+  return p;
+}
 
 // Length of the trailing partial marker head at the end of b (0 when the
 // end is marker-clean). Only proper prefixes count: a complete marker is
@@ -1437,18 +1489,21 @@ struct SplitThink {
 // streaming layer so both classify a gap identically.
 bool blank_ignoring_tool_blocks(const std::string& b, size_t pos,
                                 size_t end) {
-  const std::string sl_s(kToolCallStartToken);
-  const std::string el_s(kToolCallEndToken);
-  const size_t sl = sl_s.size();
-  const size_t el = el_s.size();
   while (pos < end) {
-    const size_t st = b.find(kToolCallStartToken, pos);
+    const char* sm = nullptr;
+    const size_t st =
+        find_earliest(b, pos, {kToolCallStartToken, kToolCallStartAltToken},
+                      &sm);
     if (st == std::string::npos || st >= end) break;
     for (size_t i = pos; i < st; ++i)
       if (!std::isspace(static_cast<unsigned char>(b[i]))) return false;
-    const size_t en = b.find(kToolCallEndToken, st + sl);
-    if (en == std::string::npos || en + el > end) return false;
-    pos = en + el;
+    const char* em = nullptr;
+    const size_t en =
+        find_earliest(b, st + std::string(sm).size(),
+                      {kToolCallEndToken, kToolCallEndAltToken}, &em);
+    if (en == std::string::npos || en + std::string(em).size() > end)
+      return false;
+    pos = en + std::string(em).size();
   }
   for (size_t i = pos; i < end; ++i)
     if (!std::isspace(static_cast<unsigned char>(b[i]))) return false;
@@ -1458,10 +1513,6 @@ bool blank_ignoring_tool_blocks(const std::string& b, size_t pos,
 SplitThink split_think_blocks(const std::string& raw,
                               bool start_in_reasoning) {
   SplitThink out;
-  const std::string open = kThinkStartToken;
-  const std::string close = kThinkEndToken;
-  const std::string tool_start = kToolCallStartToken;
-  const std::string eos = kEosToken;
   // An explicit opener only counts before any non-whitespace display
   // content (tool blocks excluded); anything already emitted plus the gap
   // before the opener must be blank. Tracks incrementally: prior_out_ws is
@@ -1484,20 +1535,11 @@ SplitThink split_think_blocks(const std::string& raw,
     while (ws_end < raw.size() &&
            std::isspace(static_cast<unsigned char>(raw[ws_end])))
       ++ws_end;
-    const bool had_opener = raw.compare(ws_end, open.size(), open) == 0;
-    const size_t seg = had_opener ? ws_end + open.size() : ws_end;
-    size_t term = std::string::npos;
-    size_t term_kind = 0;  // 0 = close tag, 1 = implicit terminator
-    for (const auto& cand :
-         {std::make_pair(raw.find(close, seg), size_t(0)),
-          std::make_pair(raw.find(tool_start, seg), size_t(1)),
-          std::make_pair(raw.find(eos, seg), size_t(1))}) {
-      if (cand.first != std::string::npos &&
-          (term == std::string::npos || cand.first < term)) {
-        term = cand.first;
-        term_kind = cand.second;
-      }
-    }
+    const size_t opener = think_opener_at(raw, ws_end);
+    const size_t seg = ws_end + opener;
+    size_t term_len = 0;
+    int term_kind = 0;  // 0 = close tag, 1 = implicit terminator
+    const size_t term = find_think_terminator(raw, seg, term_len, term_kind);
     out.reasoning += raw.substr(0, ws_end);
     if (term == std::string::npos) {
       // No terminator: cut mid-thought (or a degenerate turn that never
@@ -1507,14 +1549,17 @@ SplitThink split_think_blocks(const std::string& raw,
       return out;
     }
     out.reasoning += raw.substr(seg, term - seg);
-    pos = (term_kind == 0) ? term + close.size() : term;
+    pos = (term_kind == 0) ? term + term_len : term;
   }
   while (true) {
-    const size_t s = raw.find(open, pos);
+    const char* open_m = nullptr;
+    const size_t s = find_earliest(
+        raw, pos, {kThinkStartToken, kThinkStartAltToken}, &open_m);
     if (s == std::string::npos) {
       out.display += raw.substr(pos);
       break;
     }
+    const size_t open_len = std::string(open_m).size();
     // Gap blank (and nothing non-blank emitted yet), ignoring excised
     // tool blocks?
     bool gap_ws =
@@ -1522,31 +1567,22 @@ SplitThink split_think_blocks(const std::string& raw,
     if (!gap_ws) {
       // Literal `<think>` inside content (or a tool-call argument): keep
       // the marker and keep scanning after it.
-      out.display += raw.substr(pos, s - pos + open.size());
+      out.display += raw.substr(pos, s - pos + open_len);
       prior_out_ws = false;
-      pos = s + open.size();
+      pos = s + open_len;
       continue;
     }
     out.display += raw.substr(pos, s - pos);
-    const size_t inner = s + open.size();
-    size_t e = std::string::npos;
-    size_t e_kind = 0;  // 0 = close tag, 1 = implicit terminator
-    for (const auto& cand :
-         {std::make_pair(raw.find(close, inner), size_t(0)),
-          std::make_pair(raw.find(tool_start, inner), size_t(1)),
-          std::make_pair(raw.find(eos, inner), size_t(1))}) {
-      if (cand.first != std::string::npos &&
-          (e == std::string::npos || cand.first < e)) {
-        e = cand.first;
-        e_kind = cand.second;
-      }
-    }
+    const size_t inner = s + open_len;
+    size_t e_len = 0;
+    int e_kind = 0;  // 0 = close tag, 1 = implicit terminator
+    const size_t e = find_think_terminator(raw, inner, e_len, e_kind);
     if (e == std::string::npos) {
       out.reasoning += raw.substr(inner);
       break;
     }
     out.reasoning += raw.substr(inner, e - inner);
-    pos = (e_kind == 0) ? e + close.size() : e;
+    pos = (e_kind == 0) ? e + e_len : e;
   }
   return out;
 }
@@ -1644,6 +1680,156 @@ std::string args_json_to_pythonic(const std::string& args_json) {
   }
 }
 
+namespace {
+
+// Index of the ')' matching the '(' at `open` (quotes respected), or npos
+// when the list is truncated.
+size_t tool_matching_paren(const std::string& t, size_t open) {
+  int depth = 0;
+  char quote = 0;
+  bool esc = false;
+  for (size_t i = open; i < t.size(); ++i) {
+    const char c = t[i];
+    if (quote) {
+      if (esc) {
+        esc = false;
+      } else if (c == '\\') {
+        esc = true;
+      } else if (c == quote) {
+        quote = 0;
+      }
+      continue;
+    }
+    if (c == '"' || c == '\'') {
+      quote = c;
+    } else if (c == '(') {
+      ++depth;
+    } else if (c == ')' && --depth == 0) {
+      return i;
+    }
+  }
+  return std::string::npos;
+}
+
+// `<parameter=k>value</parameter>` pairs (LFM3 / qwen3-coder grammar) to a
+// JSON object string. Values are raw text (newlines trimmed).
+std::string tool_xml_params_to_json(const std::string& body) {
+  std::string out = "{";
+  bool first = true;
+  size_t pos = 0;
+  while ((pos = body.find("<parameter", pos)) != std::string::npos) {
+    const size_t tag_end = body.find('>', pos);
+    const size_t eq = body.find('=', pos);
+    if (tag_end == std::string::npos || eq == std::string::npos ||
+        eq > tag_end) {
+      break;
+    }
+    const std::string key = tool_trim(body.substr(eq + 1, tag_end - eq - 1));
+    if (!tool_is_ident(key)) {
+      pos = tag_end + 1;
+      continue;
+    }
+    const size_t vs = tag_end + 1;
+    size_t ve = body.find("</parameter>", vs);
+    const bool closed = ve != std::string::npos;
+    if (!closed) ve = body.size();
+    const std::string val = tool_trim(body.substr(vs, ve - vs));
+    std::string jk, jv;
+    tool_append_json_string(key, jk);
+    tool_append_json_string(val, jv);
+    if (!first) out += ",";
+    first = false;
+    out += jk + ":" + jv;
+    pos = closed ? ve + 12 : body.size();
+  }
+  return out + "}";
+}
+
+// Lenient scanner for the LFM3 / qwen3-coder grammar and hybrids of it with
+// the native pythonic form:
+//   <function=name><parameter=k>v</parameter></function>
+//   <function>name</function><parameter=k>v</parameter></function>
+//   <function=name(args)>
+//   name(args)                     (only when reached after a `function=`)
+// Each call is consumed whole, so commas inside a parameter value or an
+// argument list cannot split it.
+void tool_scan_marked_calls(const std::string& t,
+                            std::vector<ToolCall>& calls) {
+  const std::string head = "function";
+  const std::string fn_close = "</function>";
+  size_t pos = 0;
+  while ((pos = t.find(head, pos)) != std::string::npos) {
+    size_t q = pos + head.size();
+    while (q < t.size() && std::isspace(static_cast<unsigned char>(t[q])))
+      ++q;
+    if (q < t.size() && t[q] == '>') {
+      // Degenerate `<function>NAME</function>` form: the name is element
+      // text and any parameter tags follow its own closing tag.
+      const size_t ne = t.find(fn_close, q + 1);
+      if (ne == std::string::npos) break;
+      const std::string name = tool_trim(t.substr(q + 1, ne - q - 1));
+      if (!tool_is_ident(name)) {
+        pos = ne + fn_close.size();
+        continue;
+      }
+      const size_t ps = ne + fn_close.size();
+      const size_t pe = t.find(fn_close, ps);
+      ToolCall c;
+      c.name = name;
+      c.arguments = tool_xml_params_to_json(
+          t.substr(ps, pe == std::string::npos ? std::string::npos : pe - ps));
+      calls.push_back(std::move(c));
+      pos = (pe == std::string::npos) ? t.size() : pe + fn_close.size();
+      continue;
+    }
+    if (q >= t.size() || t[q] != '=') {
+      pos = std::max(q, pos + 1);  // unrelated prose mentioning "function"
+      continue;
+    }
+    ++q;
+    while (q < t.size() && std::isspace(static_cast<unsigned char>(t[q])))
+      ++q;
+    const size_t ns = q;
+    while (q < t.size() &&
+           (std::isalnum(static_cast<unsigned char>(t[q])) || t[q] == '_' ||
+            t[q] == '-' || t[q] == '.'))
+      ++q;
+    const std::string name = t.substr(ns, q - ns);
+    if (!tool_is_ident(name)) {
+      pos = q;
+      continue;
+    }
+    size_t r = q;
+    while (r < t.size() && std::isspace(static_cast<unsigned char>(t[r])))
+      ++r;
+    if (r < t.size() && t[r] == '(') {
+      const size_t close = tool_matching_paren(t, r);
+      if (close == std::string::npos) break;  // truncated argument list
+      ToolCall c;
+      c.name = name;
+      c.arguments = args_pythonic_to_json(t.substr(r + 1, close - r - 1));
+      calls.push_back(std::move(c));
+      pos = close + 1;
+      continue;
+    }
+    if (r < t.size() && t[r] == '>') {
+      const size_t fs = r + 1;
+      const size_t fe = t.find(fn_close, fs);
+      ToolCall c;
+      c.name = name;
+      c.arguments = tool_xml_params_to_json(
+          t.substr(fs, fe == std::string::npos ? std::string::npos : fe - fs));
+      calls.push_back(std::move(c));
+      if (fe == std::string::npos) break;
+      pos = fe + fn_close.size();
+      continue;
+    }
+    pos = std::max(q, pos + 1);
+  }
+}
+
+}  // namespace
+
 std::vector<ToolCall> parse_tool_call_block(const std::string& block) {
   std::vector<ToolCall> calls;
   try {
@@ -1654,6 +1840,18 @@ std::vector<ToolCall> parse_tool_call_block(const std::string& block) {
     if (!t.empty() && t.front() == '[') t = tool_trim(t.substr(1));
     if (!t.empty() && t.back() == ']') t = tool_trim(t.substr(0, t.size() - 1));
     if (t.empty()) return calls;
+    // Marked (LFM3 / qwen3-coder or `function=`-prefixed hybrid) bodies use
+    // the structural scanner; plain native bodies use the pythonic list.
+    // Gate on the body *starting* with a marked head (or carrying parameter
+    // tags) so a native argument string that merely contains "function=" is
+    // not mistaken for a call.
+    const bool marked = t.compare(0, 9, "<function") == 0 ||
+                        t.compare(0, 9, "function=") == 0 ||
+                        t.find("<parameter") != std::string::npos;
+    if (marked) {
+      tool_scan_marked_calls(t, calls);
+      if (!calls.empty()) return calls;
+    }
     for (const std::string& item : tool_split_top(t, ',')) {
       const std::string e = tool_trim(item);
       if (e.empty()) continue;
@@ -1688,24 +1886,28 @@ ToolParseResult parse_tool_calls(const std::string& raw,
       input.erase(input.size() - hold);
     const SplitThink th = split_think_blocks(input, start_in_reasoning);
     r.reasoning = th.reasoning;
-    const std::string start = kToolCallStartToken;
-    const std::string end = kToolCallEndToken;
     const std::string& text_in = th.display;
     std::string text;
     size_t pos = 0;
     while (true) {
-      const size_t s = text_in.find(start, pos);
+      const char* sm = nullptr;
+      const size_t s = find_earliest(
+          text_in, pos, {kToolCallStartToken, kToolCallStartAltToken}, &sm);
       if (s == std::string::npos) {
         text += text_in.substr(pos);
         break;
       }
+      const size_t start_len = std::string(sm).size();
       text += text_in.substr(pos, s - pos);
-      const size_t e = text_in.find(end, s + start.size());
+      const char* em = nullptr;
+      const size_t e =
+          find_earliest(text_in, s + start_len,
+                        {kToolCallEndToken, kToolCallEndAltToken}, &em);
       if (e == std::string::npos) {
         // Truncated tail (length-capped inside a call block): recover
         // best-effort so a cut-off call still executes instead of leaking
         // call markup into the display text. Unparseable tails stay text.
-        const std::string inner = text_in.substr(s + start.size());
+        const std::string inner = text_in.substr(s + start_len);
         bool recovered = false;
         for (auto& c : parse_tool_call_block(inner)) {
           r.calls.push_back(std::move(c));
@@ -1714,11 +1916,13 @@ ToolParseResult parse_tool_calls(const std::string& raw,
         if (!recovered) text += inner;
         break;
       }
-      for (auto& c :
-           parse_tool_call_block(text_in.substr(s + start.size(),
-                                                e - s - start.size())))
+      // The opener and closer may be different spellings (an XML opener
+      // with the native end token, a hybrid observed in the wild), so the
+      // body is just the bytes between the matched pair.
+      for (auto& c : parse_tool_call_block(
+               text_in.substr(s + start_len, e - s - start_len)))
         r.calls.push_back(std::move(c));
-      pos = e + end.size();
+      pos = e + std::string(em).size();
     }
     // The turn ends at the first stop: anything from it onward is not
     // content. The turn terminator is unioned in (see with_turn_terminator)
@@ -1837,30 +2041,35 @@ size_t stream_trailing_partial_utf8(const std::string& b, size_t end) {
 // heads stay in raw_ (l1_delivered_ lags) until they complete or are
 // disproven, so a chunk boundary never splits a marker across the layer.
 void ToolCallStreamParser::l1_drive() {
-  const std::string start = kToolCallStartToken;
-  const std::string end = kToolCallEndToken;
+  const size_t max_end = std::string(kToolCallEndToken).size();
   const size_t n = raw_.size();
   while (true) {
     if (l1_in_block_) {
-      const size_t e = raw_.find(end, l1_end_search_);
+      const char* em = nullptr;
+      const size_t e = find_earliest(
+          raw_, l1_end_search_, {kToolCallEndToken, kToolCallEndAltToken}, &em);
       if (e == std::string::npos) {
         // Keep a bounded overlap so an end marker split across the chunk
         // boundary is still found next time; each byte is scanned O(1).
-        const size_t floor = (n >= end.size() - 1) ? n - (end.size() - 1) : 0;
+        const size_t floor = (n >= max_end - 1) ? n - (max_end - 1) : 0;
         l1_end_search_ = std::max(l1_end_search_, floor);
         return;
       }
+      const size_t end_len = std::string(em).size();
       // The block closed: deliver the held head bytes (if any) plus the
       // whole block, in order, then keep scanning for what follows.
       std::string piece = l1_prehold_;
       l1_prehold_.clear();
-      piece += raw_.substr(l1_block_start_, e + end.size() - l1_block_start_);
-      l1_delivered_ = e + end.size();
+      piece += raw_.substr(l1_block_start_, e + end_len - l1_block_start_);
+      l1_delivered_ = e + end_len;
       l1_in_block_ = false;
       l2_consume(piece);
       continue;
     }
-    const size_t s = raw_.find(start, l1_delivered_);
+    const char* sm = nullptr;
+    const size_t s = find_earliest(
+        raw_, l1_delivered_, {kToolCallStartToken, kToolCallStartAltToken},
+        &sm);
     if (s == std::string::npos) {
       // Block-free tail: deliver everything but the single trailing
       // partial control-marker head (same single-head helper as the
@@ -1886,7 +2095,7 @@ void ToolCallStreamParser::l1_drive() {
     l1_delivered_ = s;
     l1_in_block_ = true;
     l1_block_start_ = s;
-    l1_end_search_ = s + start.size();
+    l1_end_search_ = s + std::string(sm).size();
   }
 }
 
@@ -1899,10 +2108,6 @@ void ToolCallStreamParser::l1_drive() {
 // reasoning bytes accumulate in out_r_ (both append-only).
 void ToolCallStreamParser::l2_consume(const std::string& piece) {
   if (piece.empty()) return;
-  const std::string open = kThinkStartToken;
-  const std::string close = kThinkEndToken;
-  const std::string tool_start = kToolCallStartToken;
-  const std::string eos = kEosToken;
   std::string buf = l2_pend_ + piece;
   l2_pend_.clear();
   // Firm frontier: everything before a trailing partial control-marker
@@ -1935,9 +2140,9 @@ void ToolCallStreamParser::l2_consume(const std::string& piece) {
         ++ws_end;
       out_r_ += buf.substr(0, ws_end);
       seg = ws_end;
-      if (ws_end + open.size() <= f &&
-          buf.compare(ws_end, open.size(), open) == 0) {
-        seg = ws_end + open.size();
+      const size_t opener = think_opener_at(buf, ws_end);
+      if (opener > 0 && ws_end + opener <= f) {
+        seg = ws_end + opener;
         l2_lead_fresh_ = false;
       } else if (ws_end < f) {
         l2_lead_fresh_ = false;  // a non-blank byte: no opener can follow
@@ -1949,21 +2154,9 @@ void ToolCallStreamParser::l2_consume(const std::string& piece) {
         return;
       }
     }
-    size_t e = std::string::npos;
-    size_t e_kind = 0;
     size_t e_len = 0;
-    for (const auto& cand :
-         {std::make_tuple(buf.find(close, seg), size_t(0), close.size()),
-          std::make_tuple(buf.find(tool_start, seg), size_t(1),
-                          tool_start.size()),
-          std::make_tuple(buf.find(eos, seg), size_t(1), eos.size())}) {
-      const size_t p = std::get<0>(cand);
-      if (p != std::string::npos && (e == std::string::npos || p < e)) {
-        e = p;
-        e_kind = std::get<1>(cand);
-        e_len = std::get<2>(cand);
-      }
-    }
+    int e_kind = 0;
+    const size_t e = find_think_terminator(buf, seg, e_len, e_kind);
     if (e == std::string::npos || e >= f) {
       if (f > seg) out_r_ += buf.substr(seg, f - seg);
       // Undecided tail (possibly the terminator itself) is held.
@@ -1979,21 +2172,9 @@ void ToolCallStreamParser::l2_consume(const std::string& piece) {
     if (l2_in_think_) {
       // Earliest of close / implicit terminators (same order and
       // tie-break as the whole-text split).
-      size_t e = std::string::npos;
-      size_t e_kind = 0;
       size_t e_len = 0;
-      for (const auto& cand :
-           {std::make_tuple(buf.find(close, pos), size_t(0), close.size()),
-            std::make_tuple(buf.find(tool_start, pos), size_t(1),
-                            tool_start.size()),
-            std::make_tuple(buf.find(eos, pos), size_t(1), eos.size())}) {
-        const size_t p = std::get<0>(cand);
-        if (p != std::string::npos && (e == std::string::npos || p < e)) {
-          e = p;
-          e_kind = std::get<1>(cand);
-          e_len = std::get<2>(cand);
-        }
-      }
+      int e_kind = 0;
+      const size_t e = find_think_terminator(buf, pos, e_len, e_kind);
       if (e == std::string::npos || e >= f) {
         // No terminator decided yet: everything before the frontier stays
         // reasoning whatever follows (a later close only appends). pos may
@@ -2010,7 +2191,10 @@ void ToolCallStreamParser::l2_consume(const std::string& piece) {
       l2_in_think_ = false;
       continue;
     }
-    const size_t s = buf.find(open, pos);
+    const char* open_m = nullptr;
+    const size_t s =
+        find_earliest(buf, pos, {kThinkStartToken, kThinkStartAltToken},
+                      &open_m);
     if (s == std::string::npos || s >= f) {
       if (f > pos) {
         const std::string seg = buf.substr(pos, f - pos);
@@ -2023,17 +2207,18 @@ void ToolCallStreamParser::l2_consume(const std::string& piece) {
       pos = std::max(pos, f);
       break;
     }
+    const size_t open_len = std::string(open_m).size();
     if (l2_ws_ && blank_ignoring_tool_blocks(buf, pos, s)) {
       disp += buf.substr(pos, s - pos);
-      pos = s + open.size();
+      pos = s + open_len;
       l2_in_think_ = true;
       continue;
     }
     // Literal `<think>` inside content (or a tool-call argument): kept in
     // the display, and thinking is over for this turn.
-    disp += buf.substr(pos, s - pos + open.size());
+    disp += buf.substr(pos, s - pos + open_len);
     l2_ws_ = false;
-    pos = s + open.size();
+    pos = s + open_len;
   }
   l2_pend_ = buf.substr(pos);
   l3_consume(disp);
@@ -2047,8 +2232,6 @@ void ToolCallStreamParser::l2_consume(const std::string& piece) {
 // or backfilled as text by finish()) they never reach the display view.
 void ToolCallStreamParser::l3_consume(const std::string& piece) {
   if (piece.empty()) return;
-  const std::string start = kToolCallStartToken;
-  const std::string end = kToolCallEndToken;
   std::string buf = l3_pend_ + piece;
   l3_pend_.clear();
   // Firm frontier (same rule as layer 2): a block marker starting before
@@ -2058,23 +2241,27 @@ void ToolCallStreamParser::l3_consume(const std::string& piece) {
   size_t pos = 0;
   while (true) {
     if (l3_in_call_) {
-      const size_t e = buf.find(end, pos);
+      const char* em = nullptr;
+      const size_t e = find_earliest(
+          buf, pos, {kToolCallEndToken, kToolCallEndAltToken}, &em);
       if (e == std::string::npos || e >= f) {
         pos = std::max(pos, f);
         break;
       }
-      pos = e + end.size();
+      pos = e + std::string(em).size();
       l3_in_call_ = false;
       continue;
     }
-    const size_t s = buf.find(start, pos);
+    const char* sm = nullptr;
+    const size_t s = find_earliest(
+        buf, pos, {kToolCallStartToken, kToolCallStartAltToken}, &sm);
     if (s == std::string::npos || s >= f) {
       if (f > pos) out_e_ += buf.substr(pos, f - pos);
       pos = std::max(pos, f);
       break;
     }
     out_e_ += buf.substr(pos, s - pos);
-    pos = s + start.size();
+    pos = s + std::string(sm).size();
     l3_in_call_ = true;
   }
   l3_pend_ = buf.substr(pos);

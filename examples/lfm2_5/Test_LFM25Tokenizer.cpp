@@ -507,6 +507,76 @@ TEST(LFM25Tokenizer, ToolParse) {  using KokkosDNN::LFM25::kEosToken;
   EXPECT_EQ(th_two.calls[1].name, "g");
 }
 
+TEST(LFM25Tokenizer, ToolParseAliases) {
+  using KokkosDNN::LFM25::kToolCallEndToken;
+  using KokkosDNN::LFM25::kToolCallStartToken;
+  using KokkosDNN::LFM25::parse_tool_calls;
+  using KokkosDNN::LFM25::ToolParseResult;
+
+  // <thinking>/</thinking> is accepted as a <think> alias: the trace is
+  // reasoning, never content, and the opener/closer do not leak.
+  ToolParseResult th = parse_tool_calls("<thinking>hmm</thinking>answer");
+  EXPECT_EQ(th.reasoning, "hmm");
+  EXPECT_EQ(th.text, "answer");
+  // Hybrid closer (the model opens <thinking> and closes </think>).
+  ToolParseResult th_hy = parse_tool_calls("<thinking>hmm</think>answer");
+  EXPECT_EQ(th_hy.reasoning, "hmm");
+  EXPECT_EQ(th_hy.text, "answer");
+  // Under the prompt-opened flag a leading <thinking> is redundant too.
+  ToolParseResult th_lead =
+      parse_tool_calls("<thinking>hmm</thinking>answer", {}, true);
+  EXPECT_EQ(th_lead.reasoning, "hmm");
+  EXPECT_EQ(th_lead.text, "answer");
+
+  // LFM3 / qwen3-coder grammar: <tool_call> + <function=...> +
+  // <parameter=...> becomes a native call instead of leaking markup.
+  ToolParseResult xml = parse_tool_calls(
+      "<tool_call>\n<function=list_directory>\n<parameter=path>\n/Users/x\n"
+      "</parameter>\n</function>\n</tool_call>\nDone");
+  ASSERT_EQ(xml.calls.size(), 1u);
+  EXPECT_EQ(xml.calls[0].name, "list_directory");
+  EXPECT_EQ(xml.calls[0].arguments, "{\"path\":\"/Users/x\"}");
+  EXPECT_EQ(xml.text, "\nDone");
+
+  // Hybrid observed from a drifting LFM2.5 turn: an XML opener, a
+  // `function=` prefix on each pythonic item, and the native end token.
+  ToolParseResult hy = parse_tool_calls(
+      "<tool_call>\n<function=read_file(path=\"/a\"),\n"
+      "function=read_file(path=\"/b\")]" + std::string(kToolCallEndToken));
+  ASSERT_EQ(hy.calls.size(), 2u);
+  EXPECT_EQ(hy.calls[0].name, "read_file");
+  EXPECT_EQ(hy.calls[0].arguments, "{\"path\":\"/a\"}");
+  EXPECT_EQ(hy.calls[1].arguments, "{\"path\":\"/b\"}");
+  // A `function=` prefix is also tolerated inside a native block.
+  ToolParseResult fn = parse_tool_calls(
+      std::string(kToolCallStartToken) +
+      "[function=grep(pattern=\"x\")]" + kToolCallEndToken);
+  ASSERT_EQ(fn.calls.size(), 1u);
+  EXPECT_EQ(fn.calls[0].name, "grep");
+  EXPECT_EQ(fn.calls[0].arguments, "{\"pattern\":\"x\"}");
+  // ...but a native argument string that merely contains "function=" is
+  // not mistaken for a marked call.
+  ToolParseResult lit = parse_tool_calls(
+      std::string(kToolCallStartToken) +
+      "[grep(pattern=\"function=bar()\")]" + kToolCallEndToken);
+  ASSERT_EQ(lit.calls.size(), 1u);
+  EXPECT_EQ(lit.calls[0].name, "grep");
+  EXPECT_EQ(lit.calls[0].arguments, "{\"pattern\":\"function=bar()\"}");
+
+  // Degenerate `<function>NAME</function>` + trailing parameter tags.
+  ToolParseResult elem = parse_tool_calls(
+      "<tool_call>\n<function>list_directory</function>\n\n"
+      "<parameter=path>/Users/x</parameter>\n</function>\n</tool_call>");
+  ASSERT_EQ(elem.calls.size(), 1u);
+  EXPECT_EQ(elem.calls[0].name, "list_directory");
+  EXPECT_EQ(elem.calls[0].arguments, "{\"path\":\"/Users/x\"}");
+
+  // Truncated alias markers are stripped like the native ones (a cut turn
+  // must not leak a partial <tool_call> into content).
+  EXPECT_EQ(parse_tool_calls("hello <tool_cal").text, "hello ");
+  EXPECT_EQ(parse_tool_calls("hello <thinkin").text, "hello ");
+}
+
 TEST(LFM25Tokenizer, ToolArgsConvert) {
   using KokkosDNN::LFM25::args_json_to_pythonic;
   using KokkosDNN::LFM25::args_pythonic_to_json;
@@ -634,6 +704,53 @@ TEST(LFM25Tokenizer, ToolStreamImplicitLead) {
       r += t.reasoning;
       EXPECT_EQ(a, w.text) << "raw=" << case_raw << " chunk=" << chunk;
       EXPECT_EQ(r, w.reasoning) << "raw=" << case_raw << " chunk=" << chunk;
+    }
+  }
+}
+
+TEST(LFM25Tokenizer, ToolStreamAliases) {
+  using KokkosDNN::LFM25::kToolCallEndToken;
+  using KokkosDNN::LFM25::kToolCallStartToken;
+  using KokkosDNN::LFM25::parse_tool_calls;
+  using KokkosDNN::LFM25::ToolCallStreamParser;
+  using KokkosDNN::LFM25::ToolParseResult;
+  // The tolerated spellings must stream in lockstep with the whole-text
+  // parse at every chunk boundary (the frontier hold-back has to know the
+  // longer alias markers, not just the native pair).
+  const std::vector<std::string> cases = {
+      "<thinking>hmm</thinking>answer",
+      "<thinking>hmm</think>answer",
+      "<tool_call>\n<function=list_directory>\n<parameter=path>\n/Users/x\n"
+      "</parameter>\n</function>\n</tool_call>\nDone",
+      "<tool_call>\n<function=read_file(path=\"/a\"),\n"
+      "function=read_file(path=\"/b\")]" + std::string(kToolCallEndToken),
+      std::string("Hi ") + kToolCallStartToken +
+          "[function=f(x=1)]" + kToolCallEndToken + " bye",
+      "<thinking>unclosed trace"};
+  for (const std::string& raw : cases) {
+    for (int lead = 0; lead <= 1; ++lead) {
+      const bool sr = lead != 0;
+      const ToolParseResult whole = parse_tool_calls(raw, {}, sr);
+      for (size_t chunk = 1; chunk <= 3; ++chunk) {
+        ToolCallStreamParser s({}, sr);
+        std::string a, r;
+        for (size_t p = 0; p < raw.size(); p += chunk) {
+          a += s.push(raw.substr(p, chunk));
+          r += s.poll_reasoning();
+          EXPECT_TRUE(whole.text.find(a) == 0) << "raw=" << raw;
+          EXPECT_TRUE(whole.reasoning.find(r) == 0) << "raw=" << raw;
+        }
+        ToolParseResult t = s.finish();
+        a += t.text;
+        r += t.reasoning;
+        EXPECT_EQ(a, whole.text) << "raw=" << raw << " chunk=" << chunk;
+        EXPECT_EQ(r, whole.reasoning) << "raw=" << raw << " chunk=" << chunk;
+        ASSERT_EQ(t.calls.size(), whole.calls.size());
+        for (size_t i = 0; i < t.calls.size(); ++i) {
+          EXPECT_EQ(t.calls[i].name, whole.calls[i].name);
+          EXPECT_EQ(t.calls[i].arguments, whole.calls[i].arguments);
+        }
+      }
     }
   }
 }
