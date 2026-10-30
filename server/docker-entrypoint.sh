@@ -16,7 +16,19 @@
 #
 # Debug: `docker run -e KOKKOSDNN_GDB=1 ...` runs the server under
 # `gdb --batch` so a crash dumps `thread apply all bt full` for every
-# thread (see run_bin below).
+# thread, plus the registers/disassembly that identify a null indirect
+# call (see run_bin below).
+#
+# `docker run -e KOKKOSDNN_SANITIZER=1 ...` runs it under
+# `compute-sanitizer` instead (memcheck by default) to catch out-of-bounds
+# / misaligned / leaked device accesses and CUDA API errors. The two are
+# MUTUALLY EXCLUSIVE and setting both is an error: compute-sanitizer
+# injects into the target and drives it over its own frontend/target
+# channel, and its `--mode attach` explicitly requires an application "to
+# which no other tool is attached". Composing it with gdb yields results
+# from neither tool. Knobs: KOKKOSDNN_SANITIZER_TOOL (default memcheck;
+# racecheck/initcheck/synccheck also valid), KOKKOSDNN_SANITIZER_ARGS
+# (extra raw compute-sanitizer options).
 set -eu
 
 # GPU sanity first: log driver/GPU state before anything else so the
@@ -30,14 +42,57 @@ fi
 
 BIN=/usr/local/bin/kokkosdnn_server
 
-# run_bin "$@" : exec the server, optionally under gdb.
-# When KOKKOSDNN_GDB is set to a non-empty, non-"0" value (e.g.
-# `docker run -e KOKKOSDNN_GDB=1 ...`), the server runs under
-# `gdb --batch` so a crash (SIGSEGV/SIGABRT/...) prints
-# `thread apply all bt full` for every thread to container logs before
-# gdb exits. Unset (or "0") runs the binary directly with no overhead.
+# is_on VALUE : true for a non-empty value other than "0".
+is_on() {
+  [ -n "${1:-}" ] && [ "$1" != "0" ]
+}
+
+# run_bin "$@" : exec the server, optionally under gdb or compute-sanitizer.
+# The two debug modes are mutually exclusive (see the header comment): both
+# take over the target process, so combining them reports garbage.
 run_bin() {
-  if [ -n "${KOKKOSDNN_GDB:-}" ] && [ "${KOKKOSDNN_GDB}" != "0" ]; then
+  if is_on "${KOKKOSDNN_GDB:-}" && is_on "${KOKKOSDNN_SANITIZER:-}"; then
+    cat >&2 <<'EOF'
+error: KOKKOSDNN_GDB and KOKKOSDNN_SANITIZER are mutually exclusive.
+compute-sanitizer injects into the target and drives it over its own
+frontend/target channel, and its --mode attach requires an application to
+which no other tool is attached; running it under gdb yields results from
+neither. Pick one:
+  -e KOKKOSDNN_GDB=1        crash backtrace + null-call registers
+  -e KOKKOSDNN_SANITIZER=1  memcheck for device OOB/misaligned/leak
+EOF
+    exit 2
+  fi
+
+  # compute-sanitizer on a 30B model is slow (memcheck serializes and
+  # instruments every access: expect 10-100x, i.e. minutes for a short
+  # prompt). Source-level attribution additionally needs the binary built
+  # with -lineinfo or -G; a RelWithDebInfo build gives it.
+  if is_on "${KOKKOSDNN_SANITIZER:-}"; then
+    if ! command -v compute-sanitizer >/dev/null 2>&1; then
+      cat >&2 <<'EOF'
+error: KOKKOSDNN_SANITIZER is set but compute-sanitizer is not installed.
+It ships with the CUDA toolkit, not with the cudnn-runtime base image.
+Rebuild with -DKokkosDNN_ENABLE_SERVER=ON and
+  --build-arg INSTALL_COMPUTE_SANITIZER=ON
+or run the builder (devel) image instead.
+EOF
+      exit 127
+    fi
+    _tool="${KOKKOSDNN_SANITIZER_TOOL:-memcheck}"
+    echo "compute-sanitizer: tool=$_tool (expect 10-100x slowdown; use a short prompt)" >&2
+    # KOKKOSDNN_SANITIZER_ARGS is intentionally word-split so callers can
+    # pass several raw options, e.g. --force-blocking-launches --padding 32.
+    # shellcheck disable=SC2086
+    exec compute-sanitizer \
+      --tool "$_tool" \
+      --print-limit 25 \
+      --error-exitcode 99 \
+      ${KOKKOSDNN_SANITIZER_ARGS:-} \
+      "$BIN" "$@"
+  fi
+
+  if is_on "${KOKKOSDNN_GDB:-}"; then
     if ! command -v gdb >/dev/null 2>&1; then
       echo "error: KOKKOSDNN_GDB is set but gdb is not installed in the image" >&2
       exit 127

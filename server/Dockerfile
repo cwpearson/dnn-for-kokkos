@@ -74,6 +74,11 @@ ARG CUDA_VERSION=13.0.0
 ARG UBUNTU_VERSION=24.04
 ARG CUDA_ARCH=AMPERE80
 ARG CMAKE_BUILD_TYPE=Release
+# Install compute-sanitizer into the runtime image (opt-in: the
+# cudnn-runtime base image does not ship the CUDA toolkit, and the tool plus
+# its injection libraries add a few hundred MB). Needed only for
+# `-e KOKKOSDNN_SANITIZER=1`; see docker-entrypoint.sh.
+ARG INSTALL_COMPUTE_SANITIZER=OFF
 
 # ---------------------------------------------------------------------------
 # Builder: full CUDA toolkit + cuDNN headers, Kokkos + server compiled here.
@@ -157,6 +162,12 @@ RUN test -x /opt/kokkosdnn/bin/kokkosdnn_server \
 # ---------------------------------------------------------------------------
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu${UBUNTU_VERSION}
 
+# Re-declare stage-local build args (ARGs reset at each FROM).
+ARG CUDA_VERSION
+ARG INSTALL_COMPUTE_SANITIZER
+# Empty derives cuda-sanitizer-<maj>-<min> from CUDA_VERSION.
+ARG CUDA_SANITIZER_PKG=""
+
 COPY --from=builder /opt/kokkosdnn/bin/kokkosdnn_server /usr/local/bin/kokkosdnn_server
 COPY server/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
@@ -165,8 +176,24 @@ COPY server/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 # server under `gdb --batch` with `thread apply all bt full` on crash (see
 # docker-entrypoint.sh). All other NEEDED entries (libcudart/libcublas/
 # libcudnn/libnvrtc, libstdc++) come from the base image.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends gdb libssl3 zlib1g \
+#
+# INSTALL_COMPUTE_SANITIZER=ON adds the sanitizer (-e KOKKOSDNN_SANITIZER=1).
+# Its apt package is versioned per CUDA minor (cuda-sanitizer-<maj>-<min>),
+# derived from CUDA_VERSION so the two cannot drift; override with
+# CUDA_SANITIZER_PKG if a future toolkit renames it. The NVIDIA apt repo is
+# already configured by the base image.
+RUN _pkgs="gdb libssl3 zlib1g"; \
+    if [ "$INSTALL_COMPUTE_SANITIZER" = "ON" ]; then \
+      if [ -n "$CUDA_SANITIZER_PKG" ]; then \
+        _pkg="$CUDA_SANITIZER_PKG"; \
+      else \
+        _maj="${CUDA_VERSION%%.*}"; _rest="${CUDA_VERSION#*.}"; \
+        _pkg="cuda-sanitizer-${_maj}-${_rest%%.*}"; \
+      fi; \
+      _pkgs="$_pkgs $_pkg"; \
+    fi; \
+    apt-get update \
+ && apt-get install -y --no-install-recommends $_pkgs \
  && rm -rf /var/lib/apt/lists/* \
  && chmod 755 /usr/local/bin/docker-entrypoint.sh \
  && mkdir -p /models/lfm /models/glimmer
