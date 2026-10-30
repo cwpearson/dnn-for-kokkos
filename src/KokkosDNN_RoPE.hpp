@@ -140,9 +140,38 @@ void rope_neoX_inplace(
     const FView& inv_freq, int head_dim,
     const PView& positions,  // [T] absolute pos
     const std::string& label = "KokkosDNN::rope") {
+  if (head_dim <= 0 || head_dim % 2 != 0)
+    throw std::invalid_argument(
+        "rope_neoX: head_dim must be positive and even (got " +
+        std::to_string(head_dim) + ")");
   const size_t T  = q.extent(0), Hq = q.extent(1);
   const size_t Hk = k.extent(0) ? k.extent(1) : 0;
   const size_t Hd = inv_freq.extent(0);  // head_dim/2
+  if (Hd != (size_t)head_dim / 2)
+    throw std::invalid_argument(
+        "rope_neoX: inv_freq length must be head_dim/2 (got " +
+        std::to_string(Hd) + " for head_dim " + std::to_string(head_dim) +
+        ")");
+  if (q.extent(2) != (size_t)head_dim)
+    throw std::invalid_argument("rope_neoX: q head dim mismatch (got " +
+                                std::to_string(q.extent(2)) + ", expected " +
+                                std::to_string(head_dim) + ")");
+  if (k.extent(0) != 0) {
+    if (k.extent(0) != T)
+      throw std::invalid_argument("rope_neoX: q and k token counts differ (got " +
+                                  std::to_string(q.extent(0)) + " vs " +
+                                  std::to_string(k.extent(0)) + ")");
+    if (k.extent(2) != (size_t)head_dim)
+      throw std::invalid_argument("rope_neoX: k head dim mismatch (got " +
+                                  std::to_string(k.extent(2)) + ", expected " +
+                                  std::to_string(head_dim) + ")");
+  }
+  if (positions.extent(0) != T)
+    throw std::invalid_argument(
+        "rope_neoX: positions length must match q token count (got " +
+        std::to_string(positions.extent(0)) + " for T=" + std::to_string(T) +
+        ")");
+  if (T == 0 || Hq == 0) return;
   Kokkos::parallel_for(
       label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, Hq}),
       KOKKOS_LAMBDA(size_t t, size_t h) {
@@ -156,6 +185,7 @@ void rope_neoX_inplace(
           q(t, h, d + Hd) = static_cast<Scalar>(a * s + b * c);
         }
       });
+  if (Hk == 0) return;
   Kokkos::parallel_for(
       label + "_k",
       Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, Hk}),
@@ -170,7 +200,6 @@ void rope_neoX_inplace(
           k(t, h, d + Hd) = static_cast<Scalar>(a * s + b * c);
         }
       });
-  (void)head_dim;
 }
 
 namespace Impl {
