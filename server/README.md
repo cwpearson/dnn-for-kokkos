@@ -153,6 +153,19 @@ for 24GB GPUs use the packed-GGUF + `--kv-int8` recipe above (a small
 [glimmer](../examples/glimmer/README.md) for checkpoint download and
 memory notes.
 
+Crash backtraces: the runtime image ships `gdb`, and the entrypoint
+honors `KOKKOSDNN_GDB` — run with `-e KOKKOSDNN_GDB=1` to execute the
+server under `gdb --batch` so a crash dumps `thread apply all bt full`
+for every thread to the container logs (`0`/unset runs the binary
+directly):
+
+```sh
+docker run --gpus all -p 8000:8000 -e KOKKOSDNN_GDB=1 \
+    -v /path/to/lfm:/models/lfm:ro \
+    kokkosdnn-server:cuda \
+    --weights /models/lfm/lfm2_5.gguf --tokenizer /models/lfm/tokenizer.json
+```
+
 For a non-Ampere GPU, target it natively with
 `--build-arg CUDA_ARCH=HOPPER90` (any `Kokkos_ARCH_*` suffix works). The
 default `AMPERE80` build also carries compute_80 PTX, so it runs on Hopper
