@@ -179,11 +179,11 @@ Route handlers are arch-agnostic: they parse OpenAI JSON once and drive the
 
 | Concern | `lfm2.5` (`BackendLFM25.cpp`) | `glimmer` (`BackendGlimmer.cpp`) |
 |---|---|---|
-| Chat template | LFM2.5-Instruct ChatML + `<think>` generation prompt, `List of tools:` system block, tool history turns | Muse-style `<\|begin_of_text\|>` + `<\|start\|>{role}<\|message\|>{content}<\|eot\|>` blocks + open assistant header (upstream ships no chat template; ASSUMPTION, see `examples/glimmer`) |
-| Default stops | ids `{cfg.eos}`, strings `["<\|im_end\|>"]` | ids `{eos, eot}`, strings `[eot literal]` (decoded from the tokenizer file when present) |
-| Tools | native `<\|tool_call_start\|>` grammar, full `tools`/`tool_choice` support | none: `tools`/`tool_choice`/`tool_calls` history are rejected with 400 |
+| Chat template | LFM2.5-Instruct ChatML + `<think>` generation prompt, `List of tools:` system block, tool history turns | Muse-style `<\|begin_of_text\|>` + `<\|start\|>{role}<\|message\|>{content}<\|eot\|>` blocks with `to=self` (reasoning) / `to=<tool>` (ATEM tool calls) / `to=user` channels, tool catalogue + valid recipients in the system turn, `<|eom|>`/`<|eot|>` closers, bare `<|start|>assistant` generation prompt (upstream `chat_template.jinja`) |
+| Default stops | ids `{cfg.eos}`, strings `["<\|im_end\|>"]` | ids `{eos, eot}`, strings `["<|eot|>"]` (`<|eom|>` ends a message while the turn continues, so it is structural, never a stop) |
+| Tools | native `<\|tool_call_start\|>` grammar, full `tools`/`tool_choice` support | ATEM `<atem:invoke>` grammar, full `tools`/`tool_choice` support (one call per turn upstream; `parallel_tool_calls:false` keeps the first) |
 | Weights | exactly one `--weights` GGUF | one `--weights` `.gguf` or sharded safetensors (globs expanded) |
-| Reasoning channel | `<think>` trace → `reasoning_content` | none (no thinking trace; assistant `thinking` replay is dropped) |
+| Reasoning channel | `<think>` trace → `reasoning_content` | `to=self` trace → `reasoning_content` |
 | Prefix cache | single-entry content-state cache (exact-prefix reuse) | single-entry content-state cache (exact-prefix reuse; dense or int8 KV rows) |
 | Response format | JSON-mode system directive + fence stripping | JSON-mode directive prepended to the system message (no fence stripping on streams, same as LFM25); no grammar enforcement |
 
@@ -204,8 +204,8 @@ Route handlers are arch-agnostic: they parse OpenAI JSON once and drive the
 
 | Param | Mapping |
 |---|---|
-| `messages[]` | `role` in `system,user,assistant,tool` (`developer`→`user`, `function`→`tool`); string `content` (text-part arrays joined); assistant turns may carry `tool_calls` (validated, `content` may be `null`) plus `thinking`/`reasoning`/`reasoning_content` (trace replay, first non-empty wins); rendered via `render_lfm25_chatml_with_tools` + `encode_chatml_with_tools` |
-| `tools[]` | `[{type:"function", function:{name, description?, parameters?, strict?}}]` validated, then injected as `List of tools: [...]` JSON in the system prompt (native LFM2.5 tool format); `[]` = no-op |
+| `messages[]` | `role` in `system,user,assistant,tool` (`developer`→`user`, `function`→`tool`); string `content` (text-part arrays joined); assistant turns may carry `tool_calls` (validated, `content` may be `null`) plus `thinking`/`reasoning`/`reasoning_content` (trace replay, first non-empty wins); rendered via the arch backend (`render_lfm25_chatml_with_tools` / `render_glimmer_chatml_with_tools`) |
+| `tools[]` | `[{type:"function", function:{name, description?, parameters?, strict?}}]` validated, then injected into the system prompt (arch-native tool format: LFM2.5 `List of tools: [...]` JSON, Glimmer ATEM catalogue); `[]` = no-op |
 | `tool_choice` | `"auto"` (default) \| `"none"` (no injection) \| `"required"` / `{"type":"function","function":{"name"}}` (best-effort `MUST call` system directive — prompted, not constrained) |
 | `parallel_tool_calls` | `false` keeps only the first parsed call (default `true`) |
 | `response_format` | `{"type":"text"}` (default) \| `{"type":"json_object"}` \| `{"type":"json_schema", json_schema:{...}}`: adds a JSON-only system instruction and strips ``` fences (non-streaming); the schema is recorded but **not enforced** (no grammar-constrained decoding — validate client-side) |
@@ -382,12 +382,12 @@ Agent Settings → Add Provider, then fill in the capabilities below):
             "max_tokens": 8192,
             "max_output_tokens": 4096,
             "capabilities": {
-              "tools": false,
+              "tools": true,
               "images": false,
               "parallel_tool_calls": false,
               "prompt_cache_key": false,
               "chat_completions": true,
-              "interleaved_reasoning": false,
+              "interleaved_reasoning": true,
               "max_tokens_parameter": false
             }
           }
@@ -398,18 +398,24 @@ Agent Settings → Add Provider, then fill in the capabilities below):
 }
 ```
 
-Why these values (several differ from the LFM2.5 settings above):
+Why these values (only `parallel_tool_calls` differs from the LFM2.5
+settings above):
 
-- `tools: false` is **required**. Glimmer has no native tool grammar:
-  the server rejects `tools` and `tool_calls`/`tool` history turns with a
-  400. With Zed's default `true`, the agent attaches tools and every
-  tool-using thread fails.
-- `parallel_tool_calls: false` matches `tools: false` (the Zed default);
-  there is nothing to parallelize.
-- `interleaved_reasoning: false` (the Zed default) is correct here.
-  Glimmer emits no thinking trace, so there is no `reasoning_content` to
-  replay; the server drops any `thinking`/`reasoning`/`reasoning_content`
-  history field. Do not copy the LFM2.5 `true` value over.
+- `tools: true` is **required** for agentic threads. The server speaks the
+  upstream ATEM tool protocol and exposes standard OpenAI `tool_calls`;
+  with Zed's default `true` nothing changes, but flipping it to `false`
+  (as an older revision of this section advised) silently disables tools
+  and every tool-using thread degrades to plain text.
+- `interleaved_reasoning: true` is **required**. With Zed's default
+  `false`, prior assistant `Thinking` content is sent back as plain
+  assistant text instead of `reasoning_content`, so the model sees its own
+  trace outside the `to=self` channel the template expects (the same
+  feedback loop documented for LFM2.5 above). With `true`, Zed sends the
+  trace back as `reasoning_content` and the server re-renders it inside
+  the `to=self` channel.
+- `parallel_tool_calls: false` matches the upstream single-call norm: the
+  model emits one tool call per turn, and the server keeps only the first
+  parsed call when the request carries `parallel_tool_calls:false`.
 - `max_tokens` is Zed's **context window**, not an output cap; set it to
   the server's `--max-seq-len` (default `8192`, arch max `131072`). Zed
   compacts at 90% of this value, so a larger number lets the thread grow
@@ -423,8 +429,8 @@ Why these values (several differ from the LFM2.5 settings above):
 - `chat_completions` must stay `true`; the server has no `/v1/responses`.
 - `name` must match the server's `--model` (default `glimmer-30b`), and
   `api_url` must end in `/v1` (Zed appends `/chat/completions`).
-- Do not set `reasoning_effort`: the server ignores it, and enabling
-  Zed's thinking controls for a non-reasoning model only adds confusion.
+- Do not set `reasoning_effort`: the server ignores it; setting a
+  non-`none` value only enables Zed's thinking controls for the model.
 
 ## Errors
 

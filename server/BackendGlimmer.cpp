@@ -7,20 +7,17 @@
 // glimmer_generate driver. Chat template: the Muse-style framing from
 // KokkosDNN_GlimmerTokenizer.hpp (<|begin_of_text|> + <|start|>role
 // <|message|> blocks + open assistant header; an ASSUMPTION documented
-// there — no upstream chat_template ships in tokenizer_config.json).
-// Glimmer has no native tool grammar: supports_tools() is false and the
-// handlers reject tools/tool_calls for it; the stream parser is a
-// stop-cutting pass-through (Common::IncrementalDetokenizer).
+// there — upstream chat_template.jinja, see KokkosDNN_GlimmerTokenizer.hpp).
+// Glimmer speaks the ATEM tool protocol: supports_tools() is true and the
+// stream parser splits `to=self` reasoning from `to=<tool>` ATEM calls.
 //
 // Session mechanics: all inference, sampling, and chat logic runs through
 // models/glimmer (Glimmer::Session behind Glimmer::ISession); this file
 // only translates the neutral server vocabulary to/from it, mirroring
 // BackendLFM25.cpp (long-lived session, device/host cache placement from
-// --prefix-cache-host). Caveat: the promoted Session's empty-stop policy
-// is {cfg.eos} + default_stop_strings() ("<|eot|>", "<|eom|>"); the server
-// always seeds stop_ids from default_stop_ids() ({eos, eot}), and an empty
-// request stop list resolves stop strings to default_stop_strings(), so
-// the session and the stream parser agree.
+// --prefix-cache-host). The Session stops at {cfg.eos} + "<|eot|>";
+// `<|eom|>` is a structural channel boundary handled by the stream parser,
+// never a stop, so agentic turns survive their reasoning channel.
 //
 // Without KOKKOSDNN_SERVER_HAVE_GLIMMER this TU compiles to a stub backend
 // whose load() fails with a clear message, so "glimmer" still resolves in
@@ -95,26 +92,30 @@ bool is_gguf_path(const std::string& p) {
   return ext == ".gguf";
 }
 
-// Stop-cutting pass-through parser: no native tool grammar, so display is
-// the raw pieces cut at the request stops (the turn terminator is unioned
-// in at construction). Backed by Common::IncrementalDetokenizer for
-// stop/UTF-8 safety, like the LFM25 parser's stop layer.
-class PassthroughParser final : public StreamParser {
+// ATEM channel parser: splits the `to=self` reasoning trace from display
+// text and parses `to=<tool>` ATEM invoke blocks into tool calls. Channel
+// headers/footers never leak into either view.
+class GlimmerStreamParser final : public StreamParser {
  public:
-  explicit PassthroughParser(const std::vector<std::string>& stops)
-      : detok_(stops) {}
+  explicit GlimmerStreamParser(const std::vector<std::string>& stops)
+      : p_(stops) {}
   StepDeltas feed(const std::string& raw_piece) override {
-    const auto s = detok_.push(0, raw_piece);
-    return {std::move(s.delta), ""};
+    const Glimmer::StreamDeltas d = p_.feed(raw_piece);
+    return {std::move(d.display), std::move(d.reasoning)};
   }
   ParsedTail finish() override {
+    const Glimmer::ToolParseResult t = p_.finish();
     ParsedTail out;
-    out.text = detok_.flush();
+    out.text = std::move(t.text);
+    out.reasoning = std::move(t.reasoning);
+    out.calls.reserve(t.calls.size());
+    for (const auto& c : t.calls)
+      out.calls.push_back({c.id, c.name, c.arguments});
     return out;
   }
 
  private:
-  ::KokkosDNN::Common::IncrementalDetokenizer detok_;
+  Glimmer::ToolCallStreamParser p_;
 };
 
 class GlimmerBackend final : public ChatBackend {
@@ -202,7 +203,7 @@ class GlimmerBackend final : public ChatBackend {
   std::vector<std::string> default_stop_strings() const override {
     return Glimmer::default_stop_strings();
   }
-  bool supports_tools() const override { return false; }
+  bool supports_tools() const override { return true; }
 
   std::vector<ServerChatMessage> make_single_turn(
       const std::string& prompt) const override {
@@ -220,39 +221,9 @@ class GlimmerBackend final : public ChatBackend {
                           const std::string& tools_json,
                           const std::string& system_suffix,
                           bool add_generation_prompt) const override {
-    if (!tools_json.empty())
-      throw std::invalid_argument(
-          "'tools' is not supported for arch 'glimmer' (no native tool "
-          "grammar)");
-    std::vector<Glimmer::ChatMessage> native;
-    native.reserve(messages.size());
-    for (const auto& m : messages) {
-      if (!m.tool_calls.empty() || m.role == "tool")
-        throw std::invalid_argument(
-            "'tool_calls'/'tool' history turns are not supported for arch "
-            "'glimmer' (no native tool grammar)");
-      Glimmer::ChatMessage n;
-      n.role = m.role;
-      n.content = m.content;  // thinking traces have no Glimmer rendering
-      native.push_back(std::move(n));
-    }
-    if (!system_suffix.empty()) {
-      bool found = false;
-      for (auto& n : native) {
-        if (n.role == "system") {
-          n.content += "\n" + system_suffix;
-          found = true;
-          break;
-        }
-      }
-      if (!found) {
-        Glimmer::ChatMessage sys;
-        sys.role = "system";
-        sys.content = system_suffix;
-        native.insert(native.begin(), std::move(sys));
-      }
-    }
-    return Glimmer::encode_chat(tok_, native, add_generation_prompt, true);
+    return Glimmer::encode_chatml_with_tools(tok_, to_native(messages),
+                                             tools_json, system_suffix,
+                                             add_generation_prompt, true);
   }
 
   void set_turn_options(const ServerSessionOptions& opts) override {
@@ -304,11 +275,38 @@ class GlimmerBackend final : public ChatBackend {
   std::unique_ptr<StreamParser> new_stream_parser(
       const std::vector<std::string>& stops,
       bool /*start_in_reasoning*/) const override {
-    // Glimmer has no thinking trace: every byte is display.
-    return std::make_unique<PassthroughParser>(stops);
+    // Channels are self-delimiting (`to=self` / `to=<tool>` headers), so
+    // there is no prompt-provided open thinker to mirror here.
+    return std::make_unique<GlimmerStreamParser>(stops);
   }
 
  private:
+  static Glimmer::ChatMessage to_native_msg(const ServerChatMessage& m) {
+    Glimmer::ChatMessage n;
+    n.role = m.role;
+    n.content = m.content;
+    n.thinking = m.thinking;
+    n.tool_calls.reserve(m.tool_calls.size());
+    for (const auto& c : m.tool_calls) {
+      Glimmer::ToolCall t;
+      t.id = c.id;
+      t.name = c.name;
+      t.arguments = c.arguments;
+      n.tool_calls.push_back(std::move(t));
+    }
+    n.tool_call_id = m.tool_call_id;
+    n.name = m.name;
+    return n;
+  }
+
+  static std::vector<Glimmer::ChatMessage> to_native(
+      const std::vector<ServerChatMessage>& v) {
+    std::vector<Glimmer::ChatMessage> out;
+    out.reserve(v.size());
+    for (const auto& m : v) out.push_back(to_native_msg(m));
+    return out;
+  }
+
   // Reuse one long-lived Session: avoids re-renting the KV cache and
   // re-copying the tokenizer on every request. set_turn_options() +
   // prefill_cached() reset all turn state; the reseed below reproduces

@@ -1050,6 +1050,14 @@ bool parse_messages(const json& body, std::vector<ServerChatMessage>& out,
           }
           msg.tool_call_id = idit->get<std::string>();
         }
+        auto nit = m.find("name");
+        if (nit != m.end() && !nit->is_null()) {
+          if (!nit->is_string()) {
+            err = "'name' must be a string";
+            return false;
+          }
+          msg.name = nit->get<std::string>();
+        }
       }
     }
     out.push_back(std::move(msg));
@@ -1307,8 +1315,9 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
 // Route handlers
 // ---------------------------------------------------------------------------
 
-// Agentic fields need a native tool grammar. Backends without one (Glimmer)
-// reject instead of silently dropping calls/history turns.
+// Agentic fields need a native tool grammar (LFM25 native markers, Glimmer
+// ATEM). Backends without one reject instead of silently dropping
+// calls/history turns.
 bool check_tools_support(const ChatBackend& backend, const ParsedRequest& pr,
                          std::string& err) {
   if (backend.supports_tools()) return true;

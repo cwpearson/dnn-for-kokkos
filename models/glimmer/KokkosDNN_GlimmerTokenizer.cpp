@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -1367,8 +1369,8 @@ std::vector<ChatMessage> make_chat_messages(const std::string& prompt,
                                             const std::string& system,
                                             const std::string& role) {
   std::vector<ChatMessage> msgs;
-  if (!system.empty()) msgs.push_back({"system", system, "", {}, ""});
-  msgs.push_back({role.empty() ? "user" : role, prompt, "", {}, ""});
+  if (!system.empty()) msgs.push_back({"system", system, "", {}, "", ""});
+  msgs.push_back({role.empty() ? "user" : role, prompt, "", {}, "", ""});
   return msgs;
 }
 
@@ -1427,37 +1429,824 @@ std::string truncate_at_stop_strings(
   return text.substr(0, p);
 }
 
+namespace {
+
+// ---- Minimal JSON scanning (no third-party dependency) ----
+// The renderer and the ATEM converters below only need structural scans
+// (array splitting, key lookup, string unescaping) over small inputs
+// (tool catalogues, argument objects), so a tiny local scanner beats a
+// dependency. All helpers are total (never throw).
+
+bool is_json_ws(char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+std::string trim_json_ws(const std::string& s) {
+  size_t a = 0;
+  while (a < s.size() && is_json_ws(s[a])) ++a;
+  size_t b = s.size();
+  while (b > a && is_json_ws(s[b - 1])) --b;
+  return s.substr(a, b - a);
+}
+
+// Advance p past one JSON value starting at p (string-aware, nesting
+// aware). Returns false on malformed input.
+bool skip_json_value(const std::string& s, size_t& p) {
+  while (p < s.size() && is_json_ws(s[p])) ++p;
+  if (p >= s.size()) return false;
+  char c = s[p];
+  if (c == '"') {
+    ++p;
+    while (p < s.size()) {
+      char k = s[p++];
+      if (k == '\\') {
+        if (p >= s.size()) return false;
+        ++p;
+      } else if (k == '"') {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (c == '{' || c == '[') {
+    const char open = c;
+    const char close = (c == '{') ? '}' : ']';
+    ++p;
+    int depth = 1;
+    bool in_str = false;
+    while (p < s.size()) {
+      const char k = s[p];
+      if (in_str) {
+        if (k == '\\') {
+          p += 2;
+          continue;
+        }
+        if (k == '"') in_str = false;
+        ++p;
+      } else {
+        if (k == '"') {
+          in_str = true;
+          ++p;
+        } else if (k == open) {
+          ++depth;
+          ++p;
+        } else if (k == close) {
+          ++p;
+          if (--depth == 0) return true;
+        } else {
+          ++p;
+        }
+      }
+    }
+    return false;
+  }
+  // Literal / number: run to the next structural character.
+  const size_t start = p;
+  while (p < s.size() && s[p] != ',' && s[p] != '}' && s[p] != ']' &&
+         !is_json_ws(s[p]))
+    ++p;
+  return p > start;
+}
+
+// Split a JSON array literal (including brackets) into top-level element
+// spans. Returns false on malformed input.
+bool split_json_array(const std::string& arr,
+                      std::vector<std::string>& out) {
+  out.clear();
+  size_t p = 0;
+  while (p < arr.size() && is_json_ws(arr[p])) ++p;
+  if (p >= arr.size() || arr[p] != '[') return false;
+  ++p;
+  while (true) {
+    while (p < arr.size() && is_json_ws(arr[p])) ++p;
+    if (p >= arr.size()) return false;
+    if (arr[p] == ']') return true;
+    const size_t start = p;
+    if (!skip_json_value(arr, p)) return false;
+    out.push_back(arr.substr(start, p - start));
+    while (p < arr.size() && is_json_ws(arr[p])) ++p;
+    if (p >= arr.size()) return false;
+    if (arr[p] == ',') {
+      ++p;
+      continue;
+    }
+    if (arr[p] == ']') return true;
+    return false;
+  }
+}
+
+// Find the value span [vs, ve) of `key` in a JSON object literal (with or
+// without the outer braces). Returns false when absent or malformed.
+bool find_key_span(const std::string& obj, const std::string& key,
+                   size_t& vs, size_t& ve) {
+  size_t p = 0;
+  while (p < obj.size() && is_json_ws(obj[p])) ++p;
+  const bool braced = (p < obj.size() && obj[p] == '{');
+  if (braced) ++p;
+  while (true) {
+    while (p < obj.size() && is_json_ws(obj[p])) ++p;
+    if (p >= obj.size()) return false;
+    if (braced && obj[p] == '}') return false;
+    if (obj[p] != '"') return false;
+    ++p;
+    std::string k;
+    while (p < obj.size() && obj[p] != '"') {
+      if (obj[p] == '\\' && p + 1 < obj.size()) {
+        k += obj[p + 1];
+        p += 2;
+      } else {
+        k += obj[p++];
+      }
+    }
+    if (p >= obj.size() || obj[p] != '"') return false;
+    ++p;
+    while (p < obj.size() && is_json_ws(obj[p])) ++p;
+    if (p >= obj.size() || obj[p] != ':') return false;
+    ++p;
+    const size_t vstart = p;
+    if (!skip_json_value(obj, p)) return false;
+    if (k == key) {
+      vs = vstart;
+      ve = p;
+      return true;
+    }
+    while (p < obj.size() && is_json_ws(obj[p])) ++p;
+    if (p >= obj.size()) return false;
+    if (obj[p] == ',') {
+      ++p;
+      continue;
+    }
+    return false;
+  }
+}
+
+// Decode a JSON string literal (including quotes) into out. Returns false
+// on malformed input.
+bool unescape_json_string(const std::string& lit, std::string& out) {
+  out.clear();
+  const std::string t = trim_json_ws(lit);
+  if (t.size() < 2 || t.front() != '"' || t.back() != '"') return false;
+  for (size_t i = 1; i + 1 < t.size();) {
+    const char c = t[i];
+    if (c != '\\') {
+      out += c;
+      ++i;
+      continue;
+    }
+    if (++i >= t.size() - 1) return false;
+    const char e = t[i++];
+    switch (e) {
+      case '"': out += '"'; break;
+      case '\\': out += '\\'; break;
+      case '/': out += '/'; break;
+      case 'b': out += '\b'; break;
+      case 'f': out += '\f'; break;
+      case 'n': out += '\n'; break;
+      case 'r': out += '\r'; break;
+      case 't': out += '\t'; break;
+      case 'u': {
+        if (i + 4 > t.size() - 1) return false;
+        unsigned cp = 0;
+        for (int k = 0; k < 4; ++k) {
+          const char h = t[i++];
+          cp <<= 4;
+          if (h >= '0' && h <= '9') cp |= static_cast<unsigned>(h - '0');
+          else if (h >= 'a' && h <= 'f')
+            cp |= static_cast<unsigned>(h - 'a' + 10);
+          else if (h >= 'A' && h <= 'F')
+            cp |= static_cast<unsigned>(h - 'A' + 10);
+          else
+            return false;
+        }
+        // Surrogate pair: combine, else emit a replacement character for
+        // lone halves (tool text is almost always BMP).
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 <= t.size() - 1 &&
+            t[i] == '\\' && t[i + 1] == 'u') {
+          unsigned lo = 0;
+          bool ok = true;
+          for (int k = 0; k < 4; ++k) {
+            const char h = t[i + 2 + k];
+            lo <<= 4;
+            if (h >= '0' && h <= '9') lo |= static_cast<unsigned>(h - '0');
+            else if (h >= 'a' && h <= 'f')
+              lo |= static_cast<unsigned>(h - 'a' + 10);
+            else if (h >= 'A' && h <= 'F')
+              lo |= static_cast<unsigned>(h - 'A' + 10);
+            else
+              ok = false;
+          }
+          if (ok && lo >= 0xDC00 && lo <= 0xDFFF) {
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+            i += 6;
+          } else {
+            cp = 0xFFFD;
+          }
+        } else if (cp >= 0xD800 && cp <= 0xDFFF) {
+          cp = 0xFFFD;
+        }
+        if (cp < 0x80) {
+          out += static_cast<char>(cp);
+        } else if (cp < 0x800) {
+          out += static_cast<char>(0xC0 | (cp >> 6));
+          out += static_cast<char>(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+          out += static_cast<char>(0xE0 | (cp >> 12));
+          out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+          out += static_cast<char>(0x80 | (cp & 0x3F));
+        } else {
+          out += static_cast<char>(0xF0 | (cp >> 18));
+          out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+          out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+          out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+        break;
+      }
+      default:
+        return false;
+    }
+  }
+  return true;
+}
+
+std::string escape_json_string(const std::string& s) {
+  std::string out = "\"";
+  for (const unsigned char c : s) {
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\b': out += "\\b"; break;
+      case '\f': out += "\\f"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if (c < 0x20) {
+          char buf[7];
+          std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+          out += buf;
+        } else {
+          out += static_cast<char>(c);
+        }
+        break;
+    }
+  }
+  out += '"';
+  return out;
+}
+
+// Recursive-descent JSON value validator (no allocation).
+struct JsonCursor {
+  const char* p;
+  const char* end;
+  void ws() {
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+      ++p;
+  }
+};
+
+bool j_string(JsonCursor& c) {
+  if (c.p >= c.end || *c.p != '"') return false;
+  ++c.p;
+  while (c.p < c.end) {
+    const char ch = *c.p++;
+    if (ch == '"') return true;
+    if (ch == '\\') {
+      if (c.p >= c.end) return false;
+      const char e = *c.p++;
+      if (e == 'u') {
+        for (int k = 0; k < 4; ++k) {
+          if (c.p >= c.end) return false;
+          const char h = *c.p++;
+          const bool hex = (h >= '0' && h <= '9') ||
+                           (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F');
+          if (!hex) return false;
+        }
+      } else if (e != '"' && e != '\\' && e != '/' && e != 'b' && e != 'f' &&
+                 e != 'n' && e != 'r' && e != 't') {
+        return false;
+      }
+    }
+  }
+  return false;
+}
+
+bool j_number(JsonCursor& c) {
+  const char* s = c.p;
+  if (c.p < c.end && *c.p == '-') ++c.p;
+  if (c.p >= c.end) return false;
+  if (*c.p == '0') {
+    ++c.p;
+  } else if (*c.p >= '1' && *c.p <= '9') {
+    while (c.p < c.end && *c.p >= '0' && *c.p <= '9') ++c.p;
+  } else {
+    return false;
+  }
+  if (c.p < c.end && *c.p == '.') {
+    ++c.p;
+    if (c.p >= c.end || *c.p < '0' || *c.p > '9') return false;
+    while (c.p < c.end && *c.p >= '0' && *c.p <= '9') ++c.p;
+  }
+  if (c.p < c.end && (*c.p == 'e' || *c.p == 'E')) {
+    ++c.p;
+    if (c.p < c.end && (*c.p == '+' || *c.p == '-')) ++c.p;
+    if (c.p >= c.end || *c.p < '0' || *c.p > '9') return false;
+    while (c.p < c.end && *c.p >= '0' && *c.p <= '9') ++c.p;
+  }
+  return c.p > s;
+}
+
+bool j_value(JsonCursor& c) {
+  c.ws();
+  if (c.p >= c.end) return false;
+  const char ch = *c.p;
+  if (ch == '"') return j_string(c);
+  if (ch == '{') {
+    ++c.p;
+    c.ws();
+    if (c.p < c.end && *c.p == '}') {
+      ++c.p;
+      return true;
+    }
+    while (true) {
+      if (!j_string(c)) return false;
+      c.ws();
+      if (c.p >= c.end || *c.p != ':') return false;
+      ++c.p;
+      if (!j_value(c)) return false;
+      c.ws();
+      if (c.p >= c.end) return false;
+      if (*c.p == ',') {
+        ++c.p;
+        continue;
+      }
+      if (*c.p == '}') {
+        ++c.p;
+        return true;
+      }
+      return false;
+    }
+  }
+  if (ch == '[') {
+    ++c.p;
+    c.ws();
+    if (c.p < c.end && *c.p == ']') {
+      ++c.p;
+      return true;
+    }
+    while (true) {
+      if (!j_value(c)) return false;
+      c.ws();
+      if (c.p >= c.end) return false;
+      if (*c.p == ',') {
+        ++c.p;
+        continue;
+      }
+      if (*c.p == ']') {
+        ++c.p;
+        return true;
+      }
+      return false;
+    }
+  }
+  if (ch == 't') {
+    if (c.end - c.p < 4 || c.p[1] != 'r' || c.p[2] != 'u' || c.p[3] != 'e')
+      return false;
+    c.p += 4;
+    return true;
+  }
+  if (ch == 'f') {
+    if (c.end - c.p < 5 || c.p[1] != 'a' || c.p[2] != 'l' ||
+        c.p[3] != 's' || c.p[4] != 'e')
+      return false;
+    c.p += 5;
+    return true;
+  }
+  if (ch == 'n') {
+    if (c.end - c.p < 4 || c.p[1] != 'u' || c.p[2] != 'l' || c.p[3] != 'l')
+      return false;
+    c.p += 4;
+    return true;
+  }
+  return j_number(c);
+}
+
+// True when the whole span is one JSON value (surrounding whitespace ok).
+bool json_text_is_value(const std::string& s) {
+  JsonCursor c{s.data(), s.data() + s.size()};
+  if (!j_value(c)) return false;
+  c.ws();
+  return c.p == c.end;
+}
+
+// Extract a double-quoted attribute value from a tag head
+// (`<atem:invoke name="f">` -> "f"). Returns "" when absent.
+std::string xml_attr(const std::string& tag, const std::string& attr) {
+  size_t p = 0;
+  while ((p = tag.find(attr, p)) != std::string::npos) {
+    if (p > 0) {
+      const char b = tag[p - 1];
+      if (b != ' ' && b != '\t' && b != '\n' && b != '\r' && b != '<' &&
+          b != '/') {
+        p += attr.size();
+        continue;
+      }
+    }
+    size_t q = p + attr.size();
+    while (q < tag.size() &&
+           (tag[q] == ' ' || tag[q] == '\t' || tag[q] == '\n' ||
+            tag[q] == '\r'))
+      ++q;
+    if (q >= tag.size() || tag[q] != '=') {
+      p = q;
+      continue;
+    }
+    ++q;
+    while (q < tag.size() &&
+           (tag[q] == ' ' || tag[q] == '\t' || tag[q] == '\n' ||
+            tag[q] == '\r'))
+      ++q;
+    if (q >= tag.size() || tag[q] != '"') {
+      p = q;
+      continue;
+    }
+    ++q;
+    const size_t e = tag.find('"', q);
+    if (e == std::string::npos) return "";
+    return tag.substr(q, e - q);
+  }
+  return "";
+}
+
+// ---- ATEM tool-catalogue parsing (upstream chat-template parity) ----
+
+struct GlimmerToolDef {
+  std::string name;
+  std::string desc_json;    // raw JSON (or "null")
+  std::string params_json;  // raw JSON (or "null")
+};
+
+// Parse the OpenAI tools array into per-function defs plus the distinct
+// namespaces (first `.`-separated component, in order). Never throws;
+// returns false when tools_json is not a parseable array (caller then
+// renders no catalogue).
+bool parse_tools_defs(const std::string& tools_json,
+                      std::vector<GlimmerToolDef>& defs,
+                      std::vector<std::string>& namespaces) {
+  defs.clear();
+  namespaces.clear();
+  try {
+    std::vector<std::string> elems;
+    if (!split_json_array(trim_json_ws(tools_json), elems)) return false;
+    for (auto& e : elems) {
+      std::string scope = trim_json_ws(e);
+      size_t vs = 0;
+      size_t ve = 0;
+      // The template reads `tool.function` when present, else the tool
+      // object itself.
+      if (!scope.empty() && scope.front() == '{' &&
+          find_key_span(scope, "function", vs, ve))
+        scope = trim_json_ws(scope.substr(vs, ve - vs));
+      if (scope.empty() || scope.front() != '{') continue;
+      if (!find_key_span(scope, "name", vs, ve)) continue;
+      std::string name;
+      if (!unescape_json_string(scope.substr(vs, ve - vs), name) ||
+          name.empty())
+        continue;
+      std::string desc = "null";
+      std::string params = "null";
+      if (find_key_span(scope, "description", vs, ve)) {
+        const std::string d = trim_json_ws(scope.substr(vs, ve - vs));
+        if (!d.empty()) desc = d;
+      }
+      if (find_key_span(scope, "parameters", vs, ve)) {
+        const std::string prm = trim_json_ws(scope.substr(vs, ve - vs));
+        if (!prm.empty()) params = prm;
+      }
+      GlimmerToolDef d;
+      d.name = name;
+      d.desc_json = desc;
+      d.params_json = params;
+      defs.push_back(d);
+      std::string ns = name;
+      const size_t dot = ns.find('.');
+      if (dot != std::string::npos) ns = ns.substr(0, dot);
+      if (std::find(namespaces.begin(), namespaces.end(), ns) ==
+          namespaces.end())
+        namespaces.push_back(ns);
+    }
+    return true;
+  } catch (...) {
+    defs.clear();
+    namespaces.clear();
+    return false;
+  }
+}
+
+// The upstream tool-catalogue block, byte-for-byte after the function
+// schemas (which re-serialize the parsed defs).
+std::string render_tool_defs_block(const std::vector<GlimmerToolDef>& defs,
+                                   const std::vector<std::string>& namespaces) {
+  std::string out =
+      "In this environment you have access to a set of tools you can use to "
+      "answer the user's question.\n\n"
+      "You can invoke a function by writing a \"<atem:function_calls>\" block "
+      "like the following:\n"
+      "<atem:function_calls>\n"
+      "<atem:invoke name=\"$FUNCTION_NAME\">\n"
+      "<atem:parameter "
+      "name=\"$PARAMETER_NAME\">$PARAMETER_VALUE</atem:parameter>\n"
+      "...\n"
+      "</atem:invoke>\n"
+      "</atem:function_calls>\n\n"
+      "String and scalar parameters should be specified as is, while lists "
+      "and objects should use JSON format. Note that spaces for string "
+      "values "
+      "are not stripped. The output is not expected to be valid XML and is "
+      "parsed with regular expressions.\n"
+      "Here are the functions available in JSONSchema format:\n"
+      "// Tool metadata\n";
+  for (const auto& ns : namespaces)
+    out += "{\"name\": " + escape_json_string(ns) +
+           ", \"description\": \"\"}\n";
+  out += "// Function schemas";
+  for (const auto& d : defs)
+    out += "\n{\"name\": " + escape_json_string(d.name) +
+           ", \"description\": " + d.desc_json +
+           ", \"parameters\": " + d.params_json + "}";
+  out +=
+      "\n\nHere's an example of how to call a function in the tool set:\n"
+      "(If the tool namespace is not specified, invoke the function directly "
+      "as `example_function_name` rather than "
+      "`example_tool_name.example_function_name`)\n\n"
+      "to=example_tool_name.example_function_name\n\n"
+      "<atem:function_calls>\n"
+      "<atem:invoke name=\"example_tool_name.example_function_name\">\n"
+      "<atem:parameter name=\"example_parameter_1\">value_1</atem:parameter>\n"
+      "<atem:parameter name=\"example_parameter_2\">This is the value for "
+      "the second parameter\n"
+      "that can span\n"
+      "\"multiple\" lines\n"
+      "</atem:parameter>\n"
+      "</atem:invoke>\n"
+      "</atem:function_calls>";
+  return out;
+}
+
+std::string render_system_meta(
+    const std::vector<std::string>& namespaces) {
+  std::string out = "# Valid recipients: \"self\"";
+  for (const auto& ns : namespaces) out += ", \"" + ns + ".*\"";
+  out += ", \"user\".";
+  return out;
+}
+
+bool has_reasoning_strength(const std::string& s) {
+  std::string lo = s;
+  for (auto& ch : lo)
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  return lo.find("reasoning strength") != std::string::npos;
+}
+
+// Resolve a "tool"-role message to its function name: the explicit `name`
+// wins, else the earlier assistant `tool_calls` entry with the same
+// `tool_call_id` (mirroring the upstream template), else the id itself,
+// else "tool".
+std::string resolve_tool_name(const std::vector<ChatMessage>& messages,
+                              size_t idx) {
+  const ChatMessage& m = messages[idx];
+  if (!m.name.empty()) return m.name;
+  if (!m.tool_call_id.empty()) {
+    for (size_t j = 0; j < idx; ++j) {
+      if (messages[j].role != "assistant") continue;
+      for (const auto& tc : messages[j].tool_calls) {
+        if (!tc.id.empty() && tc.id == m.tool_call_id && !tc.name.empty())
+          return tc.name;
+      }
+    }
+    return m.tool_call_id;
+  }
+  return "tool";
+}
+
+}  // namespace
+
+std::string atem_value_to_json(const std::string& value) {
+  try {
+    if (json_text_is_value(value)) return value;
+  } catch (...) {
+  }
+  return escape_json_string(value);
+}
+
+std::string args_json_to_atem(const std::string& args_json) {
+  try {
+    const std::string t = trim_json_ws(args_json);
+    if (t.empty() || t == "{}") return "";
+    if (t.front() != '{') return "";
+    size_t p = 1;
+    std::string out;
+    while (true) {
+      while (p < t.size() && is_json_ws(t[p])) ++p;
+      if (p >= t.size()) return "";
+      if (t[p] == '}') return out;
+      if (t[p] != '"') return "";
+      std::string key;
+      {
+        // Reuse the literal decoder by slicing the span first.
+        size_t r = p;
+        if (!skip_json_value(t, r)) return "";
+        if (!unescape_json_string(t.substr(p, r - p), key)) return "";
+        p = r;
+      }
+      while (p < t.size() && is_json_ws(t[p])) ++p;
+      if (p >= t.size() || t[p] != ':') return "";
+      ++p;
+      const size_t vstart = p;
+      if (!skip_json_value(t, p)) return "";
+      const std::string vraw = t.substr(vstart, p - vstart);
+      std::string vtext;
+      {
+        const std::string vt = trim_json_ws(vraw);
+        if (!vt.empty() && vt.front() == '"') {
+          if (!unescape_json_string(vt, vtext)) return "";
+        } else {
+          vtext = vt;
+        }
+      }
+      out += "<atem:parameter name=\"" + key + "\">" + vtext +
+             "</atem:parameter>\n";
+      while (p < t.size() && is_json_ws(t[p])) ++p;
+      if (p >= t.size()) return "";
+      if (t[p] == ',') {
+        ++p;
+        continue;
+      }
+      if (t[p] == '}') return out;
+      return "";
+    }
+  } catch (...) {
+    return "";
+  }
+}
+
+std::string atem_invoke_block(const ToolCall& call) {
+  std::string out = "<atem:function_calls>\n<atem:invoke name=\"";
+  out += call.name;
+  out += "\">\n";
+  out += args_json_to_atem(call.arguments);
+  out += "</atem:invoke>\n</atem:function_calls>";
+  return out;
+}
+
+std::vector<ToolCall> parse_atem_invokes(const std::string& text) {
+  std::vector<ToolCall> out;
+  try {
+    static const char* kClose = "</atem:invoke>";
+    static const size_t kCloseLen = 14;  // strlen("</atem:invoke>")
+    static const char* kParamClose = "</atem:parameter>";
+
+    static const size_t kParamCloseLen = 17;
+    size_t pos = 0;
+    while (true) {
+      const size_t s = text.find("<atem:invoke", pos);
+      if (s == std::string::npos) break;
+      const size_t gt = text.find('>', s);
+      if (gt == std::string::npos) break;  // unclosed trailing: drop
+      const std::string head = text.substr(s, gt - s + 1);
+      if (head.find('<', 1) != std::string::npos) {
+        pos = s + 1;  // '<' inside the head: not a tag, keep scanning
+        continue;
+      }
+      const std::string name = xml_attr(head, "name");
+      const size_t body_start = gt + 1;
+      const size_t ce = text.find(kClose, body_start);
+      if (ce == std::string::npos) break;  // unclosed trailing: drop
+      if (name.empty()) {
+        pos = ce + kCloseLen;  // nameless element: skip, never a call
+        continue;
+      }
+      const std::string body = text.substr(body_start, ce - body_start);
+      std::string args = "{";
+      bool first = true;
+      bool any_param = false;
+      bool malformed = false;
+      size_t pp = 0;
+      while (true) {
+        const size_t ps = body.find("<atem:parameter", pp);
+        if (ps == std::string::npos) break;
+        any_param = true;
+        const size_t pgt = body.find('>', ps);
+        if (pgt == std::string::npos ||
+            body.substr(ps, pgt - ps + 1).find('<', 1) !=
+                std::string::npos) {
+          malformed = true;
+          break;
+        }
+        const std::string key =
+            xml_attr(body.substr(ps, pgt - ps + 1), "name");
+        const size_t pce = body.find(kParamClose, pgt);
+        if (pce == std::string::npos) {
+          malformed = true;
+          break;
+        }
+        const std::string val = body.substr(pgt + 1, pce - pgt - 1);
+        pp = pce + kParamCloseLen;
+        if (key.empty()) continue;  // keyless parameter: skip
+        if (!first) args += ",";
+        first = false;
+        args += escape_json_string(key) + ":" + atem_value_to_json(val);
+      }
+      pos = ce + kCloseLen;
+      if (malformed) continue;  // garbled element: drop, never a call
+      if (any_param && first) continue;  // params present but none usable
+      args += "}";
+      ToolCall c;
+      c.name = name;
+      c.arguments = args;
+      out.push_back(std::move(c));
+    }
+  } catch (...) {
+  }
+  return out;
+}
+
 std::string render_glimmer_chatml_with_tools(
     const std::vector<ChatMessage>& messages, const std::string& tools_json,
     const std::string& system_suffix, bool add_generation_prompt,
     const std::string& default_system) {
-  // Effective system block: first system message (if any) + default +
-  // tools catalogue + caller directives. With no system content anywhere
-  // this renders byte-identical to render_chat_template().
-  std::string sys;
+  // Tool catalogue + recipient set (upstream apply_chat_template parity).
+  std::vector<GlimmerToolDef> defs;
+  std::vector<std::string> namespaces;
+  const bool have_tools = !tools_json.empty() &&
+                          parse_tools_defs(tools_json, defs, namespaces);
+
+  // Effective system block: first system message (if any), else the
+  // upstream default; then the reasoning-strength line (once), the tool
+  // catalogue, and the valid-recipient list.
+  std::string sys_text;
   bool has_system = false;
-  for (const auto& m : messages)
+  for (const auto& m : messages) {
     if (m.role == "system") {
       has_system = true;
-      if (!m.content.empty()) sys += (sys.empty() ? "" : "\n") + m.content;
+      if (!m.content.empty())
+        sys_text += (sys_text.empty() ? "" : "\n") + m.content;
     }
-  if (!has_system && !default_system.empty()) sys = default_system;
-  if (!tools_json.empty())
-    sys += (sys.empty() ? "" : "\n") + std::string("List of tools: ") +
-           tools_json;
-  if (!system_suffix.empty())
-    sys += (sys.empty() ? "" : "\n") + system_suffix;
+  }
+  if (!has_system) {
+    sys_text = default_system.empty()
+                   ? "You are a helpful AI assistant.\nKnowledge cutoff: "
+                     "2026-01-04."
+                   : default_system;
+  }
+  if (!has_reasoning_strength(sys_text)) sys_text += "\n\nReasoning strength: high.";
+  if (have_tools) sys_text += "\n\n" + render_tool_defs_block(defs, namespaces);
+  if (!system_suffix.empty()) sys_text += "\n\n" + system_suffix;
+  sys_text += "\n\n" + render_system_meta(namespaces);
 
   std::string out = "<|begin_of_text|>";
-  if (has_system || !sys.empty())
-    out += "<|start|>system<|message|>" + sys + "<|eot|>";
-  for (const auto& m : messages) {
+  out += "<|start|>system<|message|>" + sys_text + "<|eot|>";
+  for (size_t i = 0; i < messages.size(); ++i) {
+    const auto& m = messages[i];
     if (m.role == "system") continue;  // folded into the block above
-    out += "<|start|>" + m.role + "<|message|>";
-    out += m.content;
-    out += "<|eot|>";
+    // Next non-system role: an assistant tool-call block ends with <|eom|>
+    // when another assistant turn follows, else <|eot|> (upstream rule).
+    std::string next_role;
+    for (size_t j = i + 1; j < messages.size(); ++j) {
+      if (messages[j].role != "system") {
+        next_role = messages[j].role;
+        break;
+      }
+    }
+    if (m.role == "user") {
+      out += "<|start|>user<|message|>" + m.content + "<|eot|>";
+    } else if (m.role == "tool") {
+      const std::string tname = resolve_tool_name(messages, i);
+      out += "<|start|>tool " + tname + "<|message|><tool_output name=\"" +
+             tname + "\">\n" + m.content + "\n</tool_output><|eot|>";
+    } else if (m.role == "assistant") {
+      if (!m.thinking.empty())
+        out += "<|start|>assistant to=self<|message|>" + m.thinking +
+               "<|eom|>";
+      if (!m.tool_calls.empty()) {
+        // Upstream drops plain content when tool_calls are present.
+        for (size_t k = 0; k < m.tool_calls.size(); ++k) {
+          const auto& tc = m.tool_calls[k];
+          if (tc.name.empty()) continue;
+          out += "<|start|>assistant to=" + tc.name + "<|message|>" +
+                 atem_invoke_block(tc);
+          const bool last = (k + 1 == m.tool_calls.size());
+          out += (last && next_role != "assistant") ? "<|eot|>" : "<|eom|>";
+        }
+      } else {
+        out += "<|start|>assistant to=user<|message|>" + m.content +
+               "<|eot|>";
+      }
+    } else {
+      // Unknown role: verbatim block (lenient; upstream would fail).
+      out += "<|start|>" + m.role + "<|message|>" + m.content + "<|eot|>";
+    }
   }
-  if (add_generation_prompt) out += "<|start|>assistant<|message|>";
+  if (add_generation_prompt) out += "<|start|>assistant";
   return out;
 }
 
@@ -1472,40 +2261,67 @@ std::vector<int> encode_chatml_with_tools(
       add_bos);
 }
 
-std::vector<std::string> default_stop_strings() {
-  return {"<|eot|>", "<|eom|>"};
-}
+std::vector<std::string> default_stop_strings() { return {"<|eot|>"}; }
 
 ToolParseResult parse_tool_calls(const std::string& raw,
                                  const std::vector<std::string>& stops) {
-  // No native markers: the whole (stop-truncated) completion is display
-  // text, with no calls and no reasoning.
-  size_t p = find_stop_string(raw, stops);
-  const std::string text = (p == std::string::npos) ? raw : raw.substr(0, p);
-  return ToolParseResult{text, std::string{}, std::vector<ToolCall>{}};
+  // Whole-text parse shares the incremental machine (single feed +
+  // finish), so streaming deltas agree with it by construction.
+  ToolCallStreamParser p(stops);
+  StreamDeltas d = p.feed(raw);
+  ToolParseResult t = p.finish();
+  t.text = d.display + t.text;
+  t.reasoning = d.reasoning + t.reasoning;
+  return t;
 }
 
 namespace {
-// Length of a trailing incomplete UTF-8 sequence (0 when the tail ends on
-// a character boundary). Hold-back keeps multi-byte characters from
-// splitting across stream deltas.
-size_t trailing_partial_utf8(const std::string& s) {
-  size_t n = 0;
-  for (size_t i = s.size(); i > 0 && n < 4; --i, ++n) {
-    const unsigned char c = static_cast<unsigned char>(s[i - 1]);
-    if ((c & 0x80) == 0) return 0;  // ASCII boundary
-    if ((c & 0xC0) == 0xC0) {
-      // Lead byte: the sequence needs (expected - available) more bytes.
-      size_t need = 1;
-      if ((c & 0xE0) == 0xC0) need = 2;
-      else if ((c & 0xF0) == 0xE0) need = 3;
-      else if ((c & 0xF8) == 0xF0) need = 4;
-      return (n + 1 >= need) ? 0 : (n + 1);
-    }
-    // Continuation byte: keep scanning back toward the lead.
-  }
-  return s.size();  // all continuation bytes: hold everything
+
+// Structural markers of the ATEM channel framing. `<atem:invoke`,
+// `<atem:parameter` and `<tool_output` need `>` completion (attributes);
+// the rest are fixed literals.
+bool is_recip_char(char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+         (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-';
 }
+
+bool starts_with_at(const std::string& s, size_t pos, const char* prefix,
+                     size_t len) {
+  return s.size() - pos >= len && s.compare(pos, len, prefix, len) == 0;
+}
+
+// Remove `<atem:...>`, `</atem:...>`, `<tool_output...>` and
+// `</tool_output>` tags from s (malformed-markup fallback: keep the inner
+// text, drop the framing).
+std::string strip_atem_tags(const std::string& s) {
+  static const char* kTags[] = {"<atem:", "</atem", "<tool_output",
+                                "</tool_output"};
+  std::string out;
+  size_t p = 0;
+  while (p < s.size()) {
+    if (s[p] != '<') {
+      out += s[p++];
+      continue;
+    }
+    bool tag = false;
+    for (const char* t : kTags) {
+      const size_t n = std::strlen(t);
+      if (starts_with_at(s, p, t, n)) {
+        tag = true;
+        break;
+      }
+    }
+    if (!tag) {
+      out += s[p++];
+      continue;
+    }
+    const size_t gt = s.find('>', p);
+    if (gt == std::string::npos) break;  // trailing partial: drop
+    p = gt + 1;
+  }
+  return out;
+}
+
 }  // namespace
 
 ToolCallStreamParser::ToolCallStreamParser(
@@ -1513,53 +2329,522 @@ ToolCallStreamParser::ToolCallStreamParser(
   for (const auto& s : stop_strings) {
     if (s.empty()) continue;
     stops_.push_back(s);
-    if (s.size() > max_stop_len_) max_stop_len_ = s.size();
+  }
+  // <|eot|> always ends the turn, even with custom stops (mirrors the
+  // Session stop policy union).
+  if (std::find(stops_.begin(), stops_.end(), "<|eot|>") == stops_.end())
+    stops_.push_back("<|eot|>");
+  max_stop_len_ = 1;
+  for (const auto& s : stops_) max_stop_len_ = std::max(max_stop_len_, s.size());
+  static const char* kHold[] = {
+      "<|begin_of_text|>", "<|start|>assistant", "<|message|>", "<|eot|>",
+      "<|eom|>", "<atem:function_calls>", "</atem:function_calls>",
+      "<atem:invoke", "</atem:invoke>", "<atem:parameter",
+      "</atem" ":parameter>", "<tool_output", "</tool_output>", "</"};
+  for (const char* h : kHold) marker_hold_.push_back(h);
+}
+
+void ToolCallStreamParser::route_text(const std::string& s) {
+  if (s.empty()) return;
+  if (cur_ == Channel::kSelf) {
+    acc_r_ += s;
+    return;
+  }
+  if (stopped_) {
+    tool_pend_.clear();
+    return;
+  }
+  if (cur_ == Channel::kTool) {
+    // The tool channel carries ATEM only: hold whitespace (structural
+    // newlines around the invoke blocks) and drop it at the next
+    // structural boundary; anything else is model chatter -> display.
+    tool_pend_ += s;
+    for (char c : tool_pend_) {
+      if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
+        acc_d_ += tool_pend_;
+        tool_pend_.clear();
+        break;
+      }
+    }
+    return;
+  }
+  acc_d_ += s;
+}
+
+void ToolCallStreamParser::switch_to(const std::string& recip) {
+  tool_pend_.clear();  // held tool whitespace never crosses a channel
+  if (recip == "self") {
+    cur_ = Channel::kSelf;
+  } else if (recip == "user" || recip.empty()) {
+    cur_ = Channel::kDisplay;
+  } else {
+    cur_ = Channel::kTool;
+  }
+}
+
+void ToolCallStreamParser::close_atem() {
+  // atem_buf_ holds the full "<atem:invoke ...>body" span (closer
+  // consumed). Exactly one complete element parses to one call; anything
+  // else keeps its inner text as channel content (markup stripped).
+  const std::string full = atem_buf_ + "</atem:invoke>";
+  atem_buf_.clear();
+  in_atem_ = false;
+  const std::vector<ToolCall> v = parse_atem_invokes(full);
+  if (v.size() == 1) {
+    calls_.push_back(v[0]);
+    return;
+  }
+  route_text(strip_atem_tags(full));
+}
+
+// Longest suffix of s that is a strict prefix of any token in toks
+// (bounded by max_len). Used for hold-backs and length-cap stripping.
+size_t suffix_prefix_overlap(const std::string& s,
+                             const std::vector<std::string>& toks,
+                             size_t max_len) {
+  const size_t n = s.size();
+  if (n == 0) return 0;
+  size_t best = 0;
+  const size_t cap = std::min(n, max_len);
+  for (size_t k = 1; k <= cap; ++k) {
+    for (const auto& t : toks) {
+      if (t.size() > k && t.compare(0, k, s, n - k, k) == 0) {
+        best = k;
+        break;
+      }
+    }
+  }
+  return best;
+}
+
+// Length of a trailing incomplete UTF-8 sequence (0 when the tail ends on
+// a character boundary).
+size_t stream_utf8_hold(const std::string& s) {
+  size_t n = 0;
+  for (size_t i = s.size(); i > 0 && n < 4; --i, ++n) {
+    const unsigned char c = static_cast<unsigned char>(s[i - 1]);
+    if ((c & 0x80) == 0) return 0;
+    if ((c & 0xC0) == 0xC0) {
+      size_t need = 1;
+      if ((c & 0xE0) == 0xC0)
+        need = 2;
+      else if ((c & 0xF0) == 0xE0)
+        need = 3;
+      else if ((c & 0xF8) == 0xF0)
+        need = 4;
+      return (n + 1 >= need) ? 0 : (n + 1);
+    }
+  }
+  return s.size();
+}
+
+// Bound on the release hold-back for marker-prefix tails (longest marker
+// is 18 chars; 64 leaves ample margin).
+constexpr size_t kMarkerHoldMax = 64;
+
+void ToolCallStreamParser::release_display() {
+  // The turn ends at the earliest of a custom stop and the `<|eot|>`
+  // terminator: when `<|eot|>` fired first (eot_at_ set), a custom stop
+  // earlier in the turn still wins. (Without this, a single-feed parse
+  // would keep text that incremental feeding cuts, since the structural
+  // `<|eot|>` suppresses the stop search.)
+  const size_t limit =
+      (eot_at_ == std::string::npos) ? acc_d_.size() : std::min(eot_at_, acc_d_.size());
+  const size_t from =
+      (rel_d_ >= max_stop_len_) ? rel_d_ - max_stop_len_ + 1 : 0;
+  size_t best = std::string::npos;
+  for (const auto& s : stops_) {
+    const size_t p = acc_d_.find(s, from);
+    if (p != std::string::npos && p < limit &&
+        (best == std::string::npos || p < best))
+      best = p;
+  }
+  if (best != std::string::npos) {
+    acc_d_.resize(best);
+    stopped_ = true;
+    rel_d_ = acc_d_.size();
+    if (emitted_d_ > rel_d_) emitted_d_ = rel_d_;
+    return;
+  }
+  if (stopped_) {
+    rel_d_ = acc_d_.size();
+    return;
+  }
+  const size_t hold_stop = suffix_prefix_overlap(acc_d_, stops_, max_stop_len_);
+  const size_t hold_mark =
+      suffix_prefix_overlap(acc_d_, marker_hold_, kMarkerHoldMax);
+  const size_t hold =
+      std::max(hold_stop, std::max(hold_mark, stream_utf8_hold(acc_d_)));
+  const size_t rel = acc_d_.size() - hold;
+  if (rel > rel_d_) rel_d_ = rel;
+}
+
+void ToolCallStreamParser::release_reasoning() {
+  // Stops apply to display only; reasoning holds back partial UTF-8 plus
+  // marker-prefix tails (same strip agreement as display).
+  const size_t hold = std::max(
+      suffix_prefix_overlap(acc_r_, marker_hold_, kMarkerHoldMax),
+      stream_utf8_hold(acc_r_));
+  const size_t rel = acc_r_.size() - hold;
+  if (rel > rel_r_) rel_r_ = rel;
+}
+
+StreamDeltas ToolCallStreamParser::emit_deltas() {
+  release_display();
+  release_reasoning();
+  StreamDeltas out;
+  out.display = acc_d_.substr(emitted_d_, rel_d_ - emitted_d_);
+  out.reasoning = acc_r_.substr(emitted_r_, rel_r_ - emitted_r_);
+  emitted_d_ = rel_d_;
+  emitted_r_ = rel_r_;
+  return out;
+}
+
+namespace {
+
+// Fixed structural markers (consumed, never emitted), longest first so a
+// shared prefix resolves to the longest match.
+const char* kFixedMarkers[] = {
+    "<|begin_of_text|>", "<|start|>assistant", "<|message|>", "</atem:invoke>",
+    "<atem:function_calls>", "</atem:function_calls>", "</atem:parameter>",
+    "<|eot|>", "<|eom|>", "</tool_output>"};
+
+const size_t kNumFixedMarkers = 10;
+
+// True when suf could still grow into a `to=` channel header: optional
+// whitespace, then a prefix of "to=" or "to=" plus a recipient prefix.
+// Used to hold the tail across pushes so a header split across pieces is
+// never emitted as display text.
+bool is_header_prefix(const std::string& suf) {
+  if (suf.empty() || suf.size() > 72) return false;
+  size_t p = 0;
+  while (p < suf.size() && (suf[p] == ' ' || suf[p] == '\t' ||
+                            suf[p] == '\n' || suf[p] == '\r'))
+    ++p;
+  static const char* kNeedle = "to=";
+  size_t q = 0;
+  while (p < suf.size() && q < 3 && suf[p] == kNeedle[q]) {
+    ++p;
+    ++q;
+  }
+  if (p == suf.size()) return true;  // partial "t"/"to"/"to=" (or just ws)
+  if (q < 3) return false;  // diverged before completing "to="
+  while (p < suf.size() && is_recip_char(suf[p])) ++p;
+  return p == suf.size();
+}
+
+}  // namespace
+
+// Drive the incremental scan over hold_. With end_of_input=false, returns
+// when more input is needed; with true, resolves everything (partials
+// dropped or flushed per the length-cap rules).
+void ToolCallStreamParser::drive(bool end_of_input) {
+  static const size_t kHdrMax = 512;
+  static const size_t kHeadMax = 1024;
+  static const size_t kAtemMax = 4u << 20;
+  while (true) {
+    if (eot_seen_) {
+      hold_.clear();
+      atem_buf_.clear();
+      return;
+    }
+    if (in_atem_) {
+      // Accumulate first so a closer split across the previous boundary
+      // is still found (search the combined buffer, not hold_ alone).
+      atem_buf_ += hold_;
+      hold_.clear();
+      const size_t ce = atem_buf_.find("</atem:invoke>");
+      if (ce != std::string::npos) {
+        hold_ = atem_buf_.substr(ce + 14);
+        atem_buf_.resize(ce);
+        close_atem();
+        continue;
+      }
+      if (end_of_input) {
+        // Unclosed trailing invoke: dropped (never a call, never display).
+        atem_buf_.clear();
+        hold_.clear();
+        in_atem_ = false;
+        return;
+      }
+      if (atem_buf_.size() + hold_.size() > kAtemMax) {
+        atem_buf_.clear();
+        hold_.clear();
+        in_atem_ = false;
+        continue;
+      }
+      atem_buf_ += hold_;
+      hold_.clear();
+      return;
+    }
+    if (in_hdr_) {
+      const size_t me = hold_.find("<|message|>");
+      if (me != std::string::npos) {
+        const std::string hdr = hold_.substr(0, me);
+        hold_.erase(0, me + 11);
+        in_hdr_ = false;
+        // Validate ^\s*(to=RECIP)?\s*$; anything else flushes literally.
+        size_t p = 0;
+        while (p < hdr.size() && (hdr[p] == ' ' || hdr[p] == '\t' ||
+                                  hdr[p] == '\n' || hdr[p] == '\r'))
+          ++p;
+        std::string recip;
+        bool valid = true;
+        if (hdr.compare(p, 3, "to=") == 0) {
+          p += 3;
+          const size_t r0 = p;
+          while (p < hdr.size() && is_recip_char(hdr[p])) ++p;
+          recip = hdr.substr(r0, p - r0);
+          if (recip.empty() || recip.size() > 64) valid = false;
+        }
+        while (valid && p < hdr.size() &&
+               (hdr[p] == ' ' || hdr[p] == '\t' || hdr[p] == '\n' ||
+                hdr[p] == '\r'))
+          ++p;
+        if (p != hdr.size()) valid = false;
+        if (valid) {
+          switch_to(recip);
+        } else {
+          route_text("<|start|>assistant" + hdr + "<|message|>");
+        }
+        continue;
+      }
+      if (end_of_input || hold_.size() > kHdrMax) {
+        route_text("<|start|>assistant" + hold_);
+        hold_.clear();
+        in_hdr_ = false;
+        continue;
+      }
+      return;
+    }
+    // Bare `to=RECIP<|message|>` header at the hold start (the generation
+    // prompt `<|start|>assistant` echo form): leading whitespace is part of
+    // the header, anything before it stays text (handled by falling
+    // through to the '<' scan when the prefix is not whitespace-only).
+    {
+      size_t p = 0;
+      while (p < hold_.size() &&
+             (hold_[p] == ' ' || hold_[p] == '\t' || hold_[p] == '\n' ||
+              hold_[p] == '\r'))
+        ++p;
+      if (hold_.compare(p, 3, "to=") == 0 && p <= 64) {
+        size_t r = p + 3;
+        size_t re = r;
+        while (re < hold_.size() && is_recip_char(hold_[re]) &&
+               re - r < 64)
+          ++re;
+        if (re > r && starts_with_at(hold_, re, "<|message|>", 11)) {
+          switch_to(hold_.substr(r, re - r));
+          hold_.erase(0, re + 11);
+          continue;
+        }
+        if (!end_of_input && re == hold_.size()) return;  // split header
+      }
+    }
+    // Route text before the next '<', holding back a possible split
+    // `to=` header tail (longest match, bounded).
+    const size_t lt = hold_.find('<');
+    {
+      const std::string run =
+          (lt == std::string::npos) ? hold_ : hold_.substr(0, lt);
+      size_t route_len = run.size();
+      if (!end_of_input) {
+        const size_t cap = std::min(run.size(), size_t(72));
+        for (size_t k = cap; k >= 1; --k) {
+          if (is_header_prefix(run.substr(run.size() - k))) {
+            route_len = run.size() - k;
+            break;
+          }
+          if (k == 1) break;  // size_t underflow guard
+        }
+      }
+      if (route_len > 0) {
+        route_text(run.substr(0, route_len));
+        hold_.erase(0, route_len);
+        continue;
+      }
+      if (lt == std::string::npos) return;  // all held, no marker yet
+      if (!run.empty()) return;  // held a `to=` tail: wait for more
+    }
+    if (lt == std::string::npos) {
+      hold_.clear();
+      return;
+    }
+    // hold_ starts with '<' here (text before it was routed above).
+    // Fixed markers, longest first.
+    bool consumed = false;
+    for (size_t m = 0; m < kNumFixedMarkers; ++m) {
+      const size_t n = std::strlen(kFixedMarkers[m]);
+      if (!starts_with_at(hold_, 0, kFixedMarkers[m], n)) continue;
+      consumed = true;
+      const std::string mark(kFixedMarkers[m]);
+      hold_.erase(0, n);
+      if (mark == "<|start|>assistant") {
+        in_hdr_ = true;
+      } else if (mark == "<|message|>") {
+        // Lone message marker: structural, dropped.
+      } else if (mark == "<|eot|>") {
+        stopped_ = true;
+        eot_seen_ = true;
+        eot_at_ = acc_d_.size();
+        hold_.clear();
+        tool_pend_.clear();
+        return;
+      } else if (mark == "<|eom|>") {
+        cur_ = Channel::kDisplay;
+        tool_pend_.clear();
+      }
+      // <|begin_of_text|>, ATEM wrappers and </tool_output> drop silently.
+      break;
+    }
+    if (consumed) continue;
+    // Head tags with attributes.
+    const char* kHeads[] = {"<atem:invoke", "<atem:parameter",
+                             "<tool_output"};
+    bool head_hit = false;
+    for (const char* h : kHeads) {
+      const size_t n = std::strlen(h);
+      if (!starts_with_at(hold_, 0, h, n)) continue;
+      head_hit = true;
+      const size_t gt = hold_.find('>', n);
+      const size_t bad = hold_.find('<', n);
+      if (gt != std::string::npos && (bad == std::string::npos || gt < bad) &&
+          gt - n <= kHeadMax) {
+        const std::string tag = hold_.substr(0, gt + 1);
+        hold_.erase(0, gt + 1);
+        if (h[1] == 'a' && h[2] == 't' && h[6] == 'i') {
+          // <atem:invoke ...>: accumulate until its closer.
+          atem_buf_ = tag;
+          in_atem_ = true;
+        }
+        // <atem:parameter ...> / <tool_output ...> heads drop; their
+        // inner text flows to the channel, their closers drop below.
+      } else if (!end_of_input && gt == std::string::npos &&
+                 (bad == std::string::npos || bad - n > kHeadMax) &&
+                 hold_.size() - n <= kHeadMax) {
+        return;  // split head: wait for more
+      } else {
+        // Malformed head (no `>` in bound, or `<` first): literal text.
+        route_text("<");
+        hold_.erase(0, 1);
+      }
+      break;
+    }
+    if (head_hit) continue;
+    // `</...>` closers handled above are consumed; anything left starting
+    // with `</` is dropped as structural when recognized...
+    if (starts_with_at(hold_, 0, "</", 2)) {
+      const size_t gt = hold_.find('>', 2);
+      const size_t bad = hold_.find('<', 2);
+      if (gt != std::string::npos && (bad == std::string::npos || gt < bad) &&
+          gt <= kHeadMax) {
+        hold_.erase(0, gt + 1);  // unknown closer: drop
+        continue;
+      }
+      if (!end_of_input && gt == std::string::npos &&
+          (bad == std::string::npos || bad > kHeadMax) &&
+          hold_.size() <= kHeadMax)
+        return;  // split closer: wait
+      // Malformed: literal text below.
+    }
+    // Prefix hold-back: a strict marker/stop prefix waits for more input
+    // (dropped at end_of_input as a length-cap fragment).
+    {
+      bool prefix = false;
+      for (size_t m = 0; m < kNumFixedMarkers && !prefix; ++m)
+        if (std::strlen(kFixedMarkers[m]) > hold_.size() &&
+            std::string(kFixedMarkers[m]).compare(0, hold_.size(), hold_) ==
+                0)
+          prefix = true;
+      const char* kHeadPrefixes[] = {"<atem:invoke", "<atem:parameter",
+                                     "<tool_output"};
+      for (const char* h : kHeadPrefixes) {
+        if (std::strlen(h) > hold_.size() &&
+            std::string(h).compare(0, hold_.size(), hold_) == 0)
+          prefix = true;
+      }
+      for (const auto& s : stops_) {
+        if (s.size() > hold_.size() && s.compare(0, hold_.size(), hold_) == 0)
+          prefix = true;
+      }
+      if (prefix) {
+        if (end_of_input) {
+          hold_.clear();  // length-cap fragment: stripped
+          continue;
+        }
+        return;
+      }
+    }
+    // Not a marker: literal text.
+    route_text(hold_.substr(0, 1));
+    hold_.erase(0, 1);
   }
 }
 
 StreamDeltas ToolCallStreamParser::feed(const std::string& raw_piece) {
-  StreamDeltas out;
-  out.display = push(raw_piece);
-  return out;
+  hold_ += raw_piece;
+  drive(false);
+  return emit_deltas();
 }
 
 std::string ToolCallStreamParser::push(const std::string& raw_piece) {
-  if (stopped_) return std::string{};
-  buf_ += raw_piece;
-  std::string hit;
-  const size_t p = find_stop_string(buf_, stops_, &hit);
-  if (p != std::string::npos) {
-    // Stop fires: emit everything before it, latch, discard the rest.
-    std::string out = buf_.substr(0, p);
-    buf_.clear();
-    stopped_ = true;
-    matched_ = std::move(hit);
-    return out;
+  hold_ += raw_piece;
+  drive(false);
+  release_display();
+  release_reasoning();
+  std::string out;
+  if (rel_d_ > emitted_d_) {
+    out = acc_d_.substr(emitted_d_, rel_d_ - emitted_d_);
+    emitted_d_ = rel_d_;
   }
-  // No stop yet: emit everything except a bounded tail (a stop completing
-  // on a later push must never split) plus any trailing partial UTF-8.
-  const size_t hold_stop = (max_stop_len_ > 1) ? max_stop_len_ - 1 : 0;
-  const size_t hold_utf8 = trailing_partial_utf8(buf_);
-  const size_t hold = (hold_stop > hold_utf8) ? hold_stop : hold_utf8;
-  if (buf_.size() <= hold) return std::string{};
-  std::string out = buf_.substr(0, buf_.size() - hold);
-  buf_.erase(0, buf_.size() - hold);
+  if (rel_r_ > emitted_r_) {
+    stash_r_ += acc_r_.substr(emitted_r_, rel_r_ - emitted_r_);
+    emitted_r_ = rel_r_;
+  }
   return out;
 }
 
-std::string ToolCallStreamParser::poll_reasoning() { return std::string{}; }
+std::string ToolCallStreamParser::poll_reasoning() {
+  std::string out = stash_r_;
+  stash_r_.clear();
+  return out;
+}
 
 ToolParseResult ToolCallStreamParser::finish() {
-  // Drained tail: run the same stop cut over whatever was held back so the
-  // concatenated stream (deltas + finish().text) agrees with a whole-text
-  // parse_tool_calls() on the same input.
-  if (stopped_) return ToolParseResult{std::string{}, std::string{},
-                                       std::vector<ToolCall>{}};
-  const bool cut = find_stop_string(buf_, stops_) != std::string::npos;
-  ToolParseResult out = parse_tool_calls(buf_, stops_);
-  buf_.clear();
-  if (cut) stopped_ = true;
-  return out;
+  if (!finished_) {
+    drive(true);
+    tool_pend_.clear();  // held tool whitespace is dropped with the tail
+    if (!stopped_) {
+      // Length-cap strip: longest trailing strict marker/stop prefix goes.
+      static const char* kStripFixed[] = {
+          "<|begin_of_text|>", "<|start|>assistant", "<|message|>",
+          "<atem:function_calls>", "</atem:function_calls>", "<atem:invoke",
+          "</atem:invoke>", "<atem:parameter", "</atem:parameter>",
+          "<tool_output", "</tool_output>", "<|eot|>", "<|eom|>"};
+      std::vector<std::string> dtoks(kStripFixed,
+                                     kStripFixed + 13);
+      dtoks.insert(dtoks.end(), stops_.begin(), stops_.end());
+      std::vector<std::string> rtoks(kStripFixed, kStripFixed + 13);
+      const size_t dd =
+          suffix_prefix_overlap(acc_d_, dtoks, max_stop_len_ + 64);
+      if (dd > 0) acc_d_.resize(acc_d_.size() - dd);
+      const size_t rd = suffix_prefix_overlap(acc_r_, rtoks, 64);
+      if (rd > 0) acc_r_.resize(acc_r_.size() - rd);
+      release_display();
+      release_reasoning();
+    }
+    rel_d_ = acc_d_.size();
+    rel_r_ = acc_r_.size();
+    ToolParseResult t;
+    t.text = acc_d_.substr(emitted_d_);
+    t.reasoning = acc_r_.substr(emitted_r_);
+    t.calls = calls_;
+    emitted_d_ = rel_d_;
+    emitted_r_ = rel_r_;
+    tail_ = t;
+    finished_ = true;
+  }
+  return tail_;
 }
 
 }  // namespace Glimmer
