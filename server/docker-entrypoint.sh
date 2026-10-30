@@ -1,3 +1,4 @@
+#!/bin/sh
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 # SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 # docker-entrypoint.sh: thin wrapper so one image serves EITHER LFM2.5 OR
