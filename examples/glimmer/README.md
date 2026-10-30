@@ -2,7 +2,7 @@
 
 Muse Glimmer 30B text-path inference built on the core library: 30B text config defaults, a safetensors checkpoint loader, a BPE `tokenizer.json` loader, a hybrid sliding/full KV-cache autoregressive model, and a `glimmer_generate` driver.
 
-Scope: **text only** (`text_config`); vision tower and multimodal glue are out of scope. **Inference only** with **bfloat16 storage/compute by default** (`--fp32` opts in). Safetensors weights load at full precision; a `.gguf` checkpoint instead dequantizes on the host (F32/F16/BF16 exact, Q8_0/Q4_K/Q6_K supported). KV caches are dense FP by default (`--kv-int8` selects the symmetric-int8 cache). The driver encodes raw prompts directly.
+Scope: **text only** (`text_config`); vision tower and multimodal glue are out of scope. **Inference only** with **bfloat16 storage/compute by default** (`--fp32` opts in). Safetensors weights load at full precision; a `.gguf` checkpoint keeps its packing on device (F32/F16/BF16 exact, Q8_0/Q4_K/Q5_K/Q6_K stay packed — the Q4_K_M recipe is ~17GB resident — with on-the-fly `quant_gemv` decode and dequant-once + dense GEMM prefill). KV caches are dense FP by default (`--kv-int8` selects the symmetric-int8 cache). The driver encodes raw prompts directly.
 
 > Status: **driver implemented**. `glimmer_generate` runs tiny random models (`--tiny`), full-size shapes with random weights (`--model glimmer-30b`), and real checkpoints (`--weights`, `--tokenizer`); the model library (`KokkosDNN_Glimmer{Config,Weights,Model,Tokenizer,Session,PrefixCache}.hpp`, `KokkosDNN::glimmer` in `models/glimmer/`) is functional and covered by `test_glimmer_generate` + `test_glimmer_session` + `test_glimmer_tokenizer`. Tensor names and the chat template carry ASSUMPTION markers (see `DESIGN.md` and the headers); confirm them against `modeling_muse_glimmer.py` and the upstream chat template when published.
 
@@ -76,7 +76,7 @@ FP32 comparison run:
   --prompt "Hello" --max-new 64 --fp32
 ```
 
-GGUF checkpoint run (llama.cpp naming, dequantized on the host):
+GGUF checkpoint run (llama.cpp naming, packed quant stays on device):
 
 ```bash
 ./build/examples/glimmer/glimmer_generate \
@@ -86,7 +86,19 @@ GGUF checkpoint run (llama.cpp naming, dequantized on the host):
   --prompt "Hello" --max-new 64
 ```
 
-A single `--weights` entry ending in `.gguf` (case-insensitive) selects the GGUF path (`KokkosDNN::Glimmer::load_gguf`); F32/F16/BF16 decode exactly, Q8_0/Q4_K/Q6_K (i.e. the Q4_K_M recipe, which stores those per-tensor dtypes) dequantize on the host, anything else throws. Mixing `.gguf` with safetensors shards is an error. `--list-tensors` works on `.gguf` files too.
+A single `--weights` entry ending in `.gguf` (case-insensitive) selects the GGUF path (`KokkosDNN::Glimmer::load_gguf`); F32/F16/BF16 decode exactly, Q8_0/Q4_K/Q5_K/Q6_K (i.e. the Q4_K_M recipe, which stores those per-tensor dtypes) stay packed on device with on-the-fly dequant (decode) / dequant-once + dense GEMM (prefill chunks), anything else throws. Mixing `.gguf` with safetensors shards is an error. `--list-tensors` works on `.gguf` files too.
+
+24GB recipe (packed GGUF + int8 KV + chunk cap): `--kv-int8` halves the KV cache (214.5 MiB at the 8192 default, 3432 MiB at the 131072 arch max vs 416 MiB / ~6.5 GiB dense) and `--prefill-chunk N` caps prefill scratch (~440 MiB at the 2048 default, ~110 MiB at 512). ~17GB Q4_K_M weights + 3432 MiB int8 KV + ~614 MiB dequant staging + scratch ≈ 21.4 GiB, fitting 24GB:
+
+```bash
+./build/examples/glimmer/glimmer_generate \
+  --model glimmer-30b --config models/glimmer/config-glimmer-30b-text.json \
+  --weights weights/muse-glimmer-30b-text/model.gguf \
+  --tokenizer weights/muse-glimmer-30b-text/tokenizer.json \
+  --prompt "Hello" --max-new 64 --kv-int8 --max-seq-len 131072 --prefill-chunk 512
+```
+
+The same flags exist on `kokkosdnn_server --arch glimmer` (see `server/README.md`); the one-entry prefix cache works in both dense and int8 modes for agentic loops.
 
 GGUF conversion-trap handling (verified against llama.cpp `conversion/muse_glimmer.py` + `src/models/muse-glimmer.cpp`):
 
