@@ -18,12 +18,14 @@
 #include "KokkosDNN_Embedding.hpp"
 #include "KokkosDNN_Gemm.hpp"
 #include "KokkosDNN_Handle.hpp"
+#include "KokkosDNN_KVCache.hpp"
 #include "KokkosDNN_LayerScale.hpp"
 #include "KokkosDNN_RMSNorm.hpp"
 #include "KokkosDNN_RoPE.hpp"
 #include "KokkosDNN_Sampler.hpp"
 #include "KokkosDNN_SwiGLU.hpp"
 #include "KokkosDNN_GlimmerConfig.hpp"
+#include "KokkosDNN_GlimmerQuantDispatch.hpp"
 #include "KokkosDNN_GlimmerWeights.hpp"
 
 namespace KokkosDNN {
@@ -100,8 +102,10 @@ void scale_inplace_3d(
 // means NoPE (no rotary at all on that layer), not "use the global theta".
 // The Model keys off the raw layer_rope_theta entry instead.
 //
-// KV caches are dense FP: every layer owns its own [max_seq, n_kv, head_dim]
-// K/V pair (no sharing, no paging, no quantization in this step).
+// KV caches are dense FP by default: every layer owns its own
+// [max_seq, n_kv, head_dim] K/V pair (no sharing, no paging). With
+// Config::kv_int8 every layer instead owns symmetric-int8 pools plus
+// [max_seq, n_kv] FP32 scale tables (no sharing, no paging in this step).
 template <class ExecSpace, class Scalar = DefaultScalar>
 class Model {
  public:
@@ -110,6 +114,11 @@ class Model {
   using View1 = Kokkos::View<Scalar*, ExecSpace>;
   using ViewInt = Kokkos::View<int*, ExecSpace>;
   using HostInt = typename ViewInt::host_mirror_type;
+  // int8 KV pools (quantized mode): per-token per-head symmetric int8
+  // values plus FP32 scales, one [max_seq, n_kv, head_dim] K/V pair and one
+  // [max_seq, n_kv] scale pair per layer.
+  using ViewI8 = Kokkos::View<int8_t***, Kokkos::LayoutRight, ExecSpace>;
+  using ViewScale = Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>;
 
   Config cfg;
   Weights<ExecSpace, Scalar> weights;
@@ -121,8 +130,13 @@ class Model {
   // upstream): qk_rmsnorm(flat, ones, eps, out) == scaleless per-head norm.
   View1 qk_ones_;
   // Dense KV caches, one [max_seq, n_kv, head_dim] K/V pair per layer.
+  // Quantized mode (Config::kv_int8) rents the int8 pools + FP32 scale
+  // tables below instead; the two modes never coexist (kv_alloc_fresh
+  // clears the inactive pair).
   std::vector<Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>> k_cache,
       v_cache;
+  std::vector<ViewI8> kq_cache, vq_cache;
+  std::vector<ViewScale> ks_cache, vs_cache;
   size_t seq_len = 0;
 
   // Persistent scratch: all T-sized temporaries are carved (via subview,
@@ -133,6 +147,17 @@ class Model {
   MatR h_buf_, tmp_buf_, tmp2_buf_, proj_buf_, down_buf_, hn_buf_;
   MatR q2_buf_, k2_buf_, v2_buf_, attn_flat_buf_, gate_attn_buf_;
   MatR gate_buf_, up_buf_, act_buf_;
+  // Dequantized-weight staging for the packed-quant path (see
+  // KokkosDNN_GlimmerQuantDispatch.hpp): one exact-size dense buffer per
+  // distinct projection shape, reused across layers. Exact sizing matters:
+  // the cuBLAS path requires weight row pitch == K, so carved subviews of
+  // an oversized buffer would silently fall back to the native kernel.
+  // Shapes: q/gate_attn [HqD, DIM], kv [HkvD, DIM], o [DIM, HqD],
+  // ffn gate/up [FFN, DIM], down [DIM, FFN]. lm_head/embed need no staging
+  // (single-row quant_gemv / packed-row gather). These stay empty while
+  // Weights holds dense views (ensure_deq_staging keys off the block weight
+  // type), so dense builds pay no extra memory.
+  MatR deq_q_, deq_kv_, deq_o_, deq_ffn_, deq_down_;
   View3 q3_buf_, k3_buf_, v3_buf_, attn_out_buf_;
   ViewInt pos_buf_;
   View1 last_buf_, logits_buf_;
@@ -190,13 +215,27 @@ class Model {
   void reset() { seq_len = 0; }
 
  private:
-  // (Re)allocate KV caches: one dense [max_seq, n_kv, head_dim] K/V pair
-  // per layer.
+  // (Re)allocate KV caches for the configured mode: dense FP
+  // [max_seq, n_kv, head_dim] K/V pairs, or symmetric-int8 pools plus
+  // [max_seq, n_kv] FP32 scale tables when Config::kv_int8 is set.
   void kv_alloc_fresh() {
     const size_t MS  = (size_t)cfg.max_seq_len;
     const size_t NKV = (size_t)cfg.n_kv_heads, HD = (size_t)cfg.head_dim;
     k_cache.clear();
     v_cache.clear();
+    kq_cache.clear();
+    vq_cache.clear();
+    ks_cache.clear();
+    vs_cache.clear();
+    if (cfg.use_quant_kv()) {
+      for (int l = 0; l < cfg.n_layers; ++l) {
+        kq_cache.emplace_back("kq_cache", MS, NKV, HD);
+        vq_cache.emplace_back("vq_cache", MS, NKV, HD);
+        ks_cache.emplace_back("ks_cache", MS, NKV);
+        vs_cache.emplace_back("vs_cache", MS, NKV);
+      }
+      return;
+    }
     for (int l = 0; l < cfg.n_layers; ++l) {
       k_cache.emplace_back("k_cache", MS, NKV, HD);
       v_cache.emplace_back("v_cache", MS, NKV, HD);
@@ -259,6 +298,36 @@ class Model {
     tok_cap_ = n;
   }
 
+  // Rent exact-size dequant staging for the packed-quant path (see member
+  // docs above). Compiles away for dense Weights: the trait keys off the
+  // block weight type, so dense builds skip every allocation here.
+  // INTEGRATION POINT for the Weights stream: once BlockWeights::wq et al.
+  // become Gguf::QuantWeight<ExecSpace>, this starts renting automatically;
+  // no change needed here unless field names differ (then update the
+  // decltype below plus the linear_chunk staging args in forward()).
+  void ensure_deq_staging() {
+    using WqT = decltype(std::declval<BlockWeights<ExecSpace, Scalar>>().wq);
+    if constexpr (!Impl::is_packed_weight_v<WqT>) {
+      return;
+    } else {
+      const size_t DIM = (size_t)cfg.dim;
+      const size_t HqD = (size_t)cfg.n_heads * (size_t)cfg.head_dim;
+      const size_t HkvD = (size_t)cfg.n_kv_heads * (size_t)cfg.head_dim;
+      const size_t FFN = (size_t)cfg.ffn_dim;
+      // Exact-size (repair on dim change, mirroring ensure_scratch).
+      if (deq_q_.extent(0) != HqD || deq_q_.extent(1) != DIM)
+        deq_q_ = MatR("deq_q", HqD, DIM);
+      if (deq_kv_.extent(0) != HkvD || deq_kv_.extent(1) != DIM)
+        deq_kv_ = MatR("deq_kv", HkvD, DIM);
+      if (deq_o_.extent(0) != DIM || deq_o_.extent(1) != HqD)
+        deq_o_ = MatR("deq_o", DIM, HqD);
+      if (deq_ffn_.extent(0) != FFN || deq_ffn_.extent(1) != DIM)
+        deq_ffn_ = MatR("deq_ffn", FFN, DIM);
+      if (deq_down_.extent(0) != DIM || deq_down_.extent(1) != FFN)
+        deq_down_ = MatR("deq_down", DIM, FFN);
+    }
+  }
+
  public:
   // Forward T prompt tokens starting at absolute position seq_len.
   // Returns logits [vocab] for the LAST token. Updates KV caches and
@@ -295,6 +364,10 @@ class Model {
     const float OUT_MULT = (float)cfg.output_multiplier;
     const float SOFTCAP = cfg.final_logit_softcap;
     const size_t SWIN = (size_t)cfg.sliding_window;
+    // Construction-time KV mode (hoisted: indexing the member cache vectors
+    // inside a device lambda would capture `this`, illegal on CUDA; the
+    // copied View handles below are device-safe).
+    const bool kvq = cfg.use_quant_kv();
     // Resolve chunk size: <= 0 means single-shot.
     size_t Cmax = cfg.prefill_chunk_size <= 0
                       ? T
@@ -302,6 +375,7 @@ class Model {
     if (Cmax == 0) Cmax = T;
     if (Cmax > T) Cmax = T;
     ensure_scratch(Cmax);
+    ensure_deq_staging();
     if (last_buf_.extent(0) != (size_t)DIM) last_buf_ = View1("last", DIM);
     if (logits_buf_.extent(0) != (size_t)VS)
       logits_buf_ = View1("logits", VS);
@@ -364,8 +438,9 @@ class Model {
           Kokkos::subview(tokens, std::make_pair(off, off + C));
 
       // Scaleless-normed embedding (no output multiplier here: upstream
-      // applies it to logits, not to hidden states).
-      embedding_gather<ExecSpace, Scalar>(weights.embed, toks, h);
+      // applies it to logits, not to hidden states). Packed embed (if the
+      // Weights stream packs it) goes through the packed-row gather.
+      Impl::embed_forward<ExecSpace, Scalar>(weights.embed, toks, h);
       rmsnorm_noscale<ExecSpace, Scalar>(h, EPS, h);
 
       Kokkos::parallel_for(
@@ -379,12 +454,13 @@ class Model {
         // 1. Attention block: input norm, QK projs + scaleless per-head
         // norms, q pre-scale, (optional) RoPE, KV write + GQA.
         rmsnorm_one_plus<ExecSpace, Scalar>(h, b.input_norm, EPS, tmp);
-        gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), tmp, b.wq,
-                                static_cast<Scalar>(0), q2);
-        gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), tmp, b.wk,
-                                static_cast<Scalar>(0), k2);
-        gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), tmp, b.wv,
-                                static_cast<Scalar>(0), v2);
+        // Linear dispatch (see KokkosDNN_GlimmerQuantDispatch.hpp): decode
+        // chunks (C == 1) run quant_gemv on packed weights, prefill chunks
+        // dequantize-once into exact staging + dense gemm. Dense Weights
+        // take the plain gemm path in both cases (staging ignored).
+        Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp, b.wq, deq_q_, q2, "wq");
+        Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp, b.wk, deq_kv_, k2, "wk");
+        Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp, b.wv, deq_kv_, v2, "wv");
         qk_rmsnorm<ExecSpace, Scalar>(q2, ones, EPS, q3);
         qk_rmsnorm<ExecSpace, Scalar>(k2, ones, EPS, k3);
         Kokkos::parallel_for(
@@ -399,7 +475,18 @@ class Model {
           auto inv = rope_inv_[(size_t)l];
           rope_neoX_inplace<ExecSpace, Scalar>(q3, k3, inv, HD, pos);
         }
-        {
+        // KV write + attention, branched once per layer on the
+        // construction-time mode (views hoisted to locals above: indexing
+        // the member vectors inside a device lambda would capture `this`).
+        //   dense FP: legacy contiguous write + prefix-subview attention.
+        //   int8: quantizing write + dequant-on-the-fly native attention
+        //     (full and sliding forms). The quantized entry points ignore
+        //     the handle -- they always run the native streaming kernel
+        //     (cuDNN SDPA has no int8 form) -- so cuDNN is bypassed in
+        //     code, not just docs; TPL GEMMs elsewhere are unaffected.
+        // Dense is bit-identical to the pre-quant path; int8 drifts
+        // slightly (symmetric per-token per-head rounding).
+        if (!kvq) {
           auto kc = k_cache[(size_t)l];
           auto vc = v_cache[(size_t)l];
           Kokkos::parallel_for(
@@ -427,6 +514,25 @@ class Model {
             attention_gqa_single<ExecSpace, Scalar>(handle, q3, kp, vp, cpos,
                                                     attn_out, ATTN_SCALE);
           }
+        } else {
+          auto kqc = kq_cache[(size_t)l];
+          auto vqc = vq_cache[(size_t)l];
+          auto ksc = ks_cache[(size_t)l];
+          auto vsc = vs_cache[(size_t)l];
+          kv_write_quantized_contiguous<ExecSpace, Scalar>(k3, v3, cpos, kqc,
+                                                           ksc, vqc, vsc);
+          // Full pools (not prefix subviews): the quantized loaders cap the
+          // key range at q_off + t + 1 themselves, so the full pool plus the
+          // chunk start is exact for both prefill chunks and decode steps.
+          if (!full) {
+            attention_gqa_quantized_sliding<ExecSpace, Scalar>(
+                handle, q3, kqc, ksc, vqc, vsc, cpos, attn_out, ATTN_SCALE,
+                SWIN);
+          } else {
+            attention_gqa_quantized<ExecSpace, Scalar>(handle, q3, kqc, ksc,
+                                                       vqc, vsc, cpos,
+                                                       attn_out, ATTN_SCALE);
+          }
         }
         Kokkos::parallel_for(
             "flatten",
@@ -436,12 +542,10 @@ class Model {
               attn_flat(t, i) = attn_out(t, i / HD, i % HD);
             });
         // Output gating (sigmoid on the normed-input gate proj) + o_proj.
-        gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), tmp,
-                                b.wgate_attn, static_cast<Scalar>(0),
-                                gate_attn);
+        Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp, b.wgate_attn, deq_q_, gate_attn,
+                           "wgate_attn");
         Impl::gate_sigmoid_mul<ExecSpace, Scalar>(attn_flat, gate_attn);
-        gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), attn_flat,
-                                b.wo, static_cast<Scalar>(0), proj);
+        Impl::linear_chunk<ExecSpace, Scalar>(handle, attn_flat, b.wo, deq_o_, proj, "wo");
         rmsnorm_one_plus<ExecSpace, Scalar>(proj, b.post_attn_norm, POST_EPS,
                                             tmp2);
         Kokkos::parallel_for(
@@ -451,13 +555,10 @@ class Model {
             KOKKOS_LAMBDA(size_t t, size_t d) { h(t, d) += tmp2(t, d); });
         // 2. SwiGLU MLP under the pre-FFN norm + post-FFN norm.
         rmsnorm_one_plus<ExecSpace, Scalar>(h, b.pre_ffn_norm, EPS, tmp2);
-        gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), tmp2, b.wgate,
-                                static_cast<Scalar>(0), gate);
-        gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), tmp2, b.wup,
-                                static_cast<Scalar>(0), up);
+        Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp2, b.wgate, deq_ffn_, gate, "wgate");
+        Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp2, b.wup, deq_ffn_, up, "wup");
         swiglu<ExecSpace, Scalar>(gate, up, act);
-        gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), act, b.wdown,
-                                static_cast<Scalar>(0), down);
+        Impl::linear_chunk<ExecSpace, Scalar>(handle, act, b.wdown, deq_down_, down, "wdown");
         rmsnorm_one_plus<ExecSpace, Scalar>(down, b.post_ffn_norm, POST_EPS,
                                             tmp2);
         Kokkos::parallel_for(
@@ -473,11 +574,10 @@ class Model {
       Kokkos::parallel_for(
           "gather_last", Kokkos::RangePolicy<ExecSpace>(0, (size_t)DIM),
           KOKKOS_LAMBDA(size_t d) { last(d) = hn(C - 1, d); });
-      // Untied lm_head through the shared gemv dispatch, then the
-      // output-multiplier + tanh softcap head:
+      // Untied lm_head through the shared head dispatch (dense gemv /
+      // packed quant_gemv), then the output-multiplier + tanh softcap head:
       // logits = cap * tanh((lm_head(h) * mult) / cap).
-      gemv<ExecSpace, Scalar>(handle, last, weights.lm_head, logits,
-                              "lm_head");
+      Impl::lm_head_forward<ExecSpace, Scalar>(handle, last, weights.lm_head, logits, "lm_head");
       scale_by_scalar<ExecSpace, Scalar>(logits, OUT_MULT, logits);
       logit_softcap_forward<ExecSpace, Scalar>(logits, SOFTCAP, logits);
     }

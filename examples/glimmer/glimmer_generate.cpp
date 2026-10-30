@@ -66,7 +66,8 @@ bool is_gguf_path(const std::string& p) {
 //                    [--tokenizer tokenizer.json] [--prompt "text"]
 //                    [--max-new N] [--stop <id> ...] [--fp32]
 //                    [--prefill-chunk N] [--config config.json]
-//                    [--max-seq-len N] [--list-tensors]
+//                    [--max-seq-len N] [--kv-int8 | --kv-fp | --kv-quant MODE]
+//                    [--list-tensors]
 //                    [--chat] [--system "text"] [--role user]
 //                    [--add-bos | --no-add-bos] [--stop-string "str" ...]
 //                    [--temperature T] [--top-k K] [--top-p P] [--min-p P]
@@ -93,6 +94,11 @@ bool is_gguf_path(const std::string& p) {
 // --config overlays an HF config.json onto the selected base config
 // (present keys win, missing keys keep hardcoded defaults); --max-seq-len
 // caps the KV-cache context (validated against [1, 131072], the arch max).
+// --kv-int8 selects the symmetric-int8 KV cache (per-token per-head FP32
+// scales, ~2x fewer KV bytes plus a small scale table, small numerical
+// drift); --kv-fp restores dense FP; --kv-quant takes "int8"/"none"
+// explicitly. Config-file keys kv_int8 / kv_quantized / kv_quant agree;
+// the last explicit source on the command line wins over the file.
 // --list-tensors prints the tensor names stored in --weights files
 // (useful to inspect partial/sharded downloads) and exits. A single
 // --weights entry ending in .gguf (case-insensitive) instead loads a
@@ -124,7 +130,7 @@ int run_model(KokkosDNN::Glimmer::Config cfg,
               const std::vector<std::string>& wfiles, bool tiny,
               const std::string& tok_path, const std::string& prompt,
               int max_new, const std::vector<int>& extra_stops,
-              int prefill_chunk_override, bool chat_mode,
+              int prefill_chunk_override, int kv_quant_override, bool chat_mode,
               const std::string& system_prompt, const std::string& role,
               bool want_bos, const std::vector<std::string>& stop_strings,
               KokkosDNN::SampleOptions samp_opt) {
@@ -197,6 +203,7 @@ int run_model(KokkosDNN::Glimmer::Config cfg,
   std::printf("\n");
   if (prefill_chunk_override >= 0) cfg.prefill_chunk_size = prefill_chunk_override;
   std::printf("prefill chunk: %d\n", cfg.prefill_chunk_size);
+  if (kv_quant_override >= 0) cfg.kv_int8 = (kv_quant_override != 0);
   try {
     cfg.validate();
   } catch (const std::exception& e) {
@@ -206,7 +213,8 @@ int run_model(KokkosDNN::Glimmer::Config cfg,
   {
     const double mib =
         (double)cfg.kv_cache_bytes(sizeof(Scalar)) / (1024.0 * 1024.0);
-    std::printf("kv cache: dense, full-window %.1f MiB\n", mib);
+    std::printf("kv cache: %s, full-window %.1f MiB\n",
+                cfg.kv_int8 ? "int8" : "dense", mib);
   }
   if (prompt_ids.size() > (size_t)cfg.max_seq_len) {
     std::fprintf(stderr,
@@ -296,6 +304,7 @@ int main(int argc, char** argv) {
     std::vector<int> extra_stops;
     int prefill_chunk_override = -1;
     int max_seq_len_override = -1;
+    int kv_quant_override = -1;  // -1 unset, 0 = dense FP, 1 = int8 KV
     bool chat_mode = false;
     std::string system_prompt;
     std::string role = "user";
@@ -369,6 +378,24 @@ int main(int argc, char** argv) {
           stop_strings.push_back(argv[++i]);
       } else if (a == "--prefill-chunk" && i + 1 < argc) {
         prefill_chunk_override = std::stoi(argv[++i]);
+      } else if (a == "--kv-int8") {
+        kv_quant_override = 1;
+      } else if (a == "--kv-fp") {
+        kv_quant_override = 0;
+      } else if (a == "--kv-quant" && i + 1 < argc) {
+        std::string m = argv[++i];
+        for (auto& ch : m) ch = (char)std::tolower((unsigned char)ch);
+        if (m == "int8" || m == "kv_int8" || m == "true" || m == "1")
+          kv_quant_override = 1;
+        else if (m == "none" || m == "fp" || m == "false" || m == "0")
+          kv_quant_override = 0;
+        else {
+          std::fprintf(stderr,
+                       "error: --kv-quant '%s': expected \"int8\" or \"none\"\n",
+                       argv[i]);
+          Kokkos::finalize();
+          return 1;
+        }
       } else if (a == "--list-tensors") {
         list_tensors = true;
       } else if (a == "--config" && i + 1 < argc) {
@@ -463,15 +490,15 @@ int main(int argc, char** argv) {
     if (fp32) {
       std::printf("[dtype fp32]\n");
       rc = run_model<float>(cfg, wfiles, tiny, tok_path, prompt, max_new,
-                            extra_stops, prefill_chunk_override, chat_mode,
-                            system_prompt, role, want_bos, stop_strings,
-                            samp_opt);
+                            extra_stops, prefill_chunk_override,
+                            kv_quant_override, chat_mode, system_prompt, role,
+                            want_bos, stop_strings, samp_opt);
     } else {
       std::printf("[dtype bfloat16]\n");
       rc = run_model<KokkosDNN::Glimmer::DefaultScalar>(
           cfg, wfiles, tiny, tok_path, prompt, max_new, extra_stops,
-          prefill_chunk_override, chat_mode, system_prompt, role, want_bos,
-          stop_strings, samp_opt);
+          prefill_chunk_override, kv_quant_override, chat_mode, system_prompt,
+          role, want_bos, stop_strings, samp_opt);
     }
     Kokkos::finalize();
     return rc;
