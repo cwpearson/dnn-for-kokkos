@@ -115,11 +115,11 @@ bool is_gguf_path(const std::string& p) {
 // Muse-style template (<|begin_of_text|> + <|start|>{role}<|message|>
 // {content}<|eot|> blocks + open assistant header); --system prepends a
 // system turn (implies chat); --messages is a minimal alias wrapping its
-// value as the user turn (implies chat). NOTE: upstream ships no
-// chat_template in tokenizer_config.json, so this framing is an ASSUMPTION
-// inferred from the tokenizer_config.json `response_template` (documented
-// in KokkosDNN_GlimmerTokenizer.hpp); raw mode (default) encodes --prompt
-// directly.
+// value as the user turn (implies chat). NOTE: the driver keeps the minimal
+// one-block-per-turn framing here; the upstream `chat_template.jinja` (ATEM
+// tool protocol with `to=self`/`to=<tool>` channels, documented in
+// KokkosDNN_GlimmerTokenizer.hpp) is what kokkosdnn_server --arch glimmer
+// serves. Raw mode (default) encodes --prompt directly.
 //
 // Stopping: by default the generation_config stop set {eos 200001,
 // eot 200008} (resolved through the tokenizer where possible);

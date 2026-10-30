@@ -50,6 +50,8 @@ struct ServerChatMessage {
   std::string thinking;  // assistant reasoning trace (may be empty)
   std::vector<ServerToolCall> tool_calls;
   std::string tool_call_id;
+  std::string name;  // tool message function name (may be empty; Glimmer
+                     // resolves it against earlier tool_calls)
 };
 
 // Per-turn sampling/stop/seed policy. Mirrors LFM25::SessionOptions field

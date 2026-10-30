@@ -74,6 +74,17 @@ int test_messages() {
       out, err));
   CHECK(out.back().role == "tool" && out.back().content == "42" &&
         out.back().tool_call_id == "c1");
+  // Tool function name is captured when present (Glimmer renders
+  // <tool_output> turns under it).
+  CHECK(parse_messages(
+      json::parse(R"({"messages":[{"role":"tool","content":"ok",
+        "tool_call_id":"c2","name":"f"}]})"),
+      out, err));
+  CHECK(out.back().name == "f" && out.back().tool_call_id == "c2");
+  CHECK(!parse_messages(
+      json::parse(R"({"messages":[{"role":"tool","content":"ok",
+        "name":42}]})"),
+      out, err));
   CHECK(parse_messages(
       json::parse(R"({"messages":[{"role":"function","content":"42"}]})"),
       out, err));
@@ -567,6 +578,177 @@ int test_glimmer_render_tiny() {
 }
 #endif  // KOKKOSDNN_SERVER_HAVE_GLIMMER
 
+#ifdef KOKKOSDNN_SERVER_HAVE_GLIMMER
+// Glimmer ATEM tool wire: argument conversion, invoke blocks, channel
+// render/parse round trips, and streaming agreement.
+int test_glimmer_tool_wire() {
+  using KokkosDNN::Glimmer::args_json_to_atem;
+  using KokkosDNN::Glimmer::atem_invoke_block;
+  using KokkosDNN::Glimmer::atem_value_to_json;
+  using KokkosDNN::Glimmer::ChatMessage;
+  using KokkosDNN::Glimmer::default_stop_strings;
+  using KokkosDNN::Glimmer::parse_atem_invokes;
+  using KokkosDNN::Glimmer::parse_tool_calls;
+  using KokkosDNN::Glimmer::render_glimmer_chatml_with_tools;
+  using KokkosDNN::Glimmer::StreamDeltas;
+  using KokkosDNN::Glimmer::ToolCall;
+  using KokkosDNN::Glimmer::ToolCallStreamParser;
+  using KokkosDNN::Glimmer::ToolParseResult;
+  // The turn terminator is <|eot|> only: <|eom|> ends a message while the
+  // turn continues (reasoning channel), so it must not stop the turn.
+  CHECK(default_stop_strings() == std::vector<std::string>{"<|eot|>"});
+  // ATEM value conversion: JSON passes through, bare words become strings.
+  CHECK(atem_value_to_json("123") == "123");
+  CHECK(atem_value_to_json("-1.5e3") == "-1.5e3");
+  CHECK(atem_value_to_json("true") == "true");
+  CHECK(atem_value_to_json("null") == "null");
+  CHECK(atem_value_to_json("{\"a\":1}") == "{\"a\":1}");
+  CHECK(atem_value_to_json("[1, \"x\"]") == "[1, \"x\"]");
+  CHECK(atem_value_to_json("\"s\"") == "\"s\"");
+  CHECK(atem_value_to_json("Tokyo") == "\"Tokyo\"");
+  CHECK(atem_value_to_json("") == "\"\"");
+  // args object -> ATEM params.
+  CHECK(args_json_to_atem("") == "");
+  CHECK(args_json_to_atem("{}") == "");
+  CHECK(args_json_to_atem("oops") == "");
+  {
+    const std::string p =
+        args_json_to_atem("{\"city\":\"Tokyo\",\"n\":3,\"ok\":true}");
+    CHECK(p.find("<atem:parameter name=\"city\">Tokyo</atem:parameter>") !=
+          std::string::npos);
+    CHECK(p.find("<atem:parameter name=\"n\">3</atem:parameter>") !=
+          std::string::npos);
+    CHECK(p.find("<atem:parameter name=\"ok\">true</atem:parameter>") !=
+          std::string::npos);
+  }
+  // Nested JSON values round-trip verbatim.
+  {
+    const std::string args = "{\"a\":{\"b\":[1,2]},\"s\":\"x y\"}";
+    const std::string p = args_json_to_atem(args);
+    CHECK(p.find("<atem:parameter name=\"a\">{\"b\":[1,2]}</atem:parameter>") !=
+          std::string::npos);
+    CHECK(p.find("<atem:parameter name=\"s\">x y</atem:parameter>") !=
+          std::string::npos);
+  }
+  // Invoke block shape + parse back.
+  {
+    ToolCall c;
+    c.name = "get_weather";
+    c.arguments = "{\"city\":\"Tokyo\"}";
+    const std::string b = atem_invoke_block(c);
+    CHECK(b.find("<atem:invoke name=\"get_weather\">") != std::string::npos);
+    const std::vector<ToolCall> v = parse_atem_invokes(b);
+    CHECK(v.size() == 1 && v[0].name == "get_weather" &&
+          v[0].arguments == "{\"city\":\"Tokyo\"}");
+  }
+  // Unclosed trailing invoke: dropped, never a call.
+  CHECK(parse_atem_invokes("x <atem:invoke name=\"f\">").empty());
+  // Full completion parse: reasoning + tool + (no) display channels.
+  {
+    const std::string raw =
+        std::string(" to=self<|message|>let me check<|eom|>") +
+        "<|start|>assistant to=get_weather<|message|>" +
+        "<atem:function_calls>\n<atem:invoke name=\"get_weather\">\n"
+        "<atem:parameter name=\"city\">Tokyo</atem:parameter>\n"
+        "</atem:invoke>\n</atem:function_calls><|eot|>";
+    const ToolParseResult r = parse_tool_calls(raw);
+    CHECK(r.calls.size() == 1 && r.calls[0].name == "get_weather");
+    CHECK(r.calls[0].arguments == "{\"city\":\"Tokyo\"}");
+    CHECK(r.reasoning == "let me check");
+    CHECK(r.text.empty());
+  }
+  // Plain reply channel.
+  {
+    const ToolParseResult r =
+        parse_tool_calls(" to=user<|message|>Hi there<|eot|>junk");
+    CHECK(r.text == "Hi there");
+    CHECK(r.reasoning.empty() && r.calls.empty());
+  }
+  // No channels at all: plain display, cut at the turn end.
+  {
+    const ToolParseResult r = parse_tool_calls("Hello<|eot|>junk");
+    CHECK(r.text == "Hello" && r.calls.empty());
+  }
+  // Tool result + reasoning history render in the upstream framing, and
+  // the tool name resolves through the matching tool_call_id.
+  {
+    ToolCall c;
+    c.id = "c1";
+    c.name = "get_weather";
+    c.arguments = "{\"city\":\"Tokyo\"}";
+    ChatMessage sys;
+    sys.role = "system";
+    sys.content = "Be brief.";
+    ChatMessage a;
+    a.role = "assistant";
+    a.thinking = "check weather";
+    a.tool_calls.push_back(c);
+    ChatMessage tool_msg;
+    tool_msg.role = "tool";
+    tool_msg.content = "{\"temp\": 72}";
+    tool_msg.tool_call_id = "c1";
+    const std::string tools =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\","
+        "\"description\":\"d\",\"parameters\":{\"type\":\"object\"}}}]";
+    const std::string r = render_glimmer_chatml_with_tools(
+        {sys, a, tool_msg}, tools, "", true);
+    CHECK(r.find("Reasoning strength: high.") != std::string::npos);
+    CHECK(r.find("# Valid recipients: \"self\", \"get_weather.*\", "
+                 "\"user\".") != std::string::npos);
+    CHECK(r.find("In this environment you have access to a set of tools") !=
+          std::string::npos);
+    CHECK(r.find("<|start|>assistant to=self<|message|>check "
+                 "weather<|eom|>") != std::string::npos);
+    CHECK(r.find("<|start|>assistant to=get_weather<|message|>") !=
+          std::string::npos);
+    CHECK(r.find("<tool_output name=\"get_weather\">\n{\"temp\": "
+                 "72}\n</tool_output>") != std::string::npos);
+    // History tool call re-parses losslessly.
+    const size_t s = r.find("<|start|>assistant to=get_weather");
+    CHECK(s != std::string::npos);
+    const ToolParseResult back = parse_tool_calls(r.substr(s));
+    CHECK(back.calls.size() == 1 &&
+          back.calls[0].arguments == "{\"city\":\"Tokyo\"}");
+  }
+  // Unclosed trailing invoke test block.
+  {
+    const std::string raw = std::string(" to=self<|message|>hmm<|eom|>");
+    const ToolParseResult whole = parse_tool_calls(raw);
+    CHECK(whole.calls.empty());
+    CHECK(whole.reasoning == "hmm");
+    CHECK(whole.text.empty());
+  }
+  // Streaming agrees with the whole-text parse, even fed one byte at a
+  // time (headers, markers and stops split across pushes included).
+  {
+    const std::string raw =
+        std::string(" to=self<|message|>thinking...<|eom|>") +
+        "<|start|>assistant to=user<|message|>The answer is 42<|eot|>";
+    const ToolParseResult whole = parse_tool_calls(raw);
+    CHECK(whole.text == "The answer is 42");
+    CHECK(whole.reasoning == "thinking...");
+    ToolCallStreamParser fed;
+    std::string acc, racc;
+    for (char ch : raw) {
+      StreamDeltas d = fed.feed(std::string(1, ch));
+      acc += d.display;
+      racc += d.reasoning;
+      CHECK(whole.text.find(acc) == 0);
+      CHECK(whole.reasoning.find(racc) == 0);
+    }
+    ToolParseResult tail = fed.finish();
+    acc += tail.text;
+    racc += tail.reasoning;
+    CHECK(acc == whole.text);
+    CHECK(racc == whole.reasoning);
+    CHECK(tail.calls.empty());
+    CHECK(fed.finish().text == tail.text);
+    (void)tail;
+  }
+  return 0;
+}
+#endif
+
 int test_backends() {
   using KokkosDNN::Server::available_backends;
   using KokkosDNN::Server::create_backend;
@@ -592,7 +774,7 @@ int test_backends() {
     CHECK(lfm->default_model_id() == "lfm2_5");
     CHECK(gli->default_model_id() == "glimmer-30b");
     CHECK(lfm->supports_tools());
-    CHECK(!gli->supports_tools());
+    CHECK(gli->supports_tools());
     // Load-free defaults (no weights/tokenizer): parse_common seeds from
     // these, so they must be sane before load().
     CHECK(!lfm->default_stop_ids().empty());
@@ -611,7 +793,7 @@ int test_backends() {
   CHECK(normalize_arch_name("darkc0de-muse-glimmer-30b") == "glimmer");
   CHECK(normalize_arch_name("llama") == "");
   CHECK(normalize_arch_name("") == "");
-  // Tools gate: LFM25 accepts, Glimmer rejects (no native tool grammar).
+  // Tools gate: both archs accept (LFM25 native grammar, Glimmer ATEM).
   {
     std::unique_ptr<ChatBackend> lfm = create_backend("lfm2.5");
     std::unique_ptr<ChatBackend> gli = create_backend("glimmer");
@@ -620,8 +802,7 @@ int test_backends() {
     pr.tools_json = "[{}]";
     std::string err;
     CHECK(check_tools_support(*lfm, pr, err));
-    CHECK(!check_tools_support(*gli, pr, err));
-    CHECK(!err.empty());
+    CHECK(check_tools_support(*gli, pr, err));
     pr.tools_active = false;
     pr.tools_json.clear();
     ServerToolCall c;
@@ -632,7 +813,7 @@ int test_backends() {
     m.tool_calls.push_back(c);
     pr.messages.push_back(m);
     CHECK(check_tools_support(*lfm, pr, err));
-    CHECK(!check_tools_support(*gli, pr, err));
+    CHECK(check_tools_support(*gli, pr, err));
     pr.messages.clear();
     CHECK(check_tools_support(*gli, pr, err));
   }
@@ -1256,6 +1437,7 @@ int main() {
 #endif
 #ifdef KOKKOSDNN_SERVER_HAVE_GLIMMER
   if (test_glimmer_render_tiny()) return 1;
+  if (test_glimmer_tool_wire()) return 1;
 #endif
   if (test_error_shape()) return 1;
   std::cout << "server parsing tests passed (" << g_checks << " checks)\n";

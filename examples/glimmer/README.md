@@ -4,7 +4,7 @@ Muse Glimmer 30B text-path inference built on the core library: 30B text config 
 
 Scope: **text only** (`text_config`); vision tower and multimodal glue are out of scope. **Inference only** with **bfloat16 storage/compute by default** (`--fp32` opts in). Safetensors weights load at full precision; a `.gguf` checkpoint keeps its packing on device (F32/F16/BF16 exact, Q8_0/Q4_K/Q5_K/Q6_K stay packed — the Q4_K_M recipe is ~17GB resident — with on-the-fly `quant_gemv` decode and dequant-once + dense GEMM prefill). KV caches are dense FP by default (`--kv-int8` selects the symmetric-int8 cache). The driver encodes raw prompts directly.
 
-> Status: **driver implemented**. `glimmer_generate` runs tiny random models (`--tiny`), full-size shapes with random weights (`--model glimmer-30b`), and real checkpoints (`--weights`, `--tokenizer`); the model library (`KokkosDNN_Glimmer{Config,Weights,Model,Tokenizer,Session,PrefixCache}.hpp`, `KokkosDNN::glimmer` in `models/glimmer/`) is functional and covered by `test_glimmer_generate` + `test_glimmer_session` + `test_glimmer_tokenizer`. Tensor names and the chat template carry ASSUMPTION markers (see `DESIGN.md` and the headers); confirm them against `modeling_muse_glimmer.py` and the upstream chat template when published.
+> Status: **driver implemented**. `glimmer_generate` runs tiny random models (`--tiny`), full-size shapes with random weights (`--model glimmer-30b`), and real checkpoints (`--weights`, `--tokenizer`); the model library (`KokkosDNN_Glimmer{Config,Weights,Model,Tokenizer,Session,PrefixCache}.hpp`, `KokkosDNN::glimmer` in `models/glimmer/`) is functional and covered by `test_glimmer_generate` + `test_glimmer_session` + `test_glimmer_tokenizer`. Tensor names carry ASSUMPTION markers (see `DESIGN.md` and the headers); confirm them against `modeling_muse_glimmer.py`. The chat template follows the upstream `chat_template.jinja` (ATEM tool protocol with `to=self` reasoning and `to=<tool>` tool channels); the `kokkosdnn_server --arch glimmer` front-end serves it with full OpenAI tools support.
 
 ## Quickstart (0 to working)
 
@@ -144,7 +144,7 @@ ctest --test-dir build --output-on-failure -R 'Glimmer'
 ./build/examples/glimmer/glimmer_generate --tiny --prompt "Hello" --max-new 8
 ```
 
-Unit tests: `Test_GlimmerConfig.cpp` (presets, fixture, full-config wrapper, tiny preset), `Test_GlimmerGenerate.cpp` (tiny forward/generate smoke, determinism, chunked-prefill equivalence, NoPE/RoPE branches), `Test_GlimmerSession.cpp` (prefill/step termination, stop-id policy, reseed determinism, prefix-cache equivalence, `ISession` front-end), `Test_GlimmerWeightsGGUF.cpp` (synthetic-GGUF loader roundtrip: norm shift, Q/K re-permute, synthesized-norm handling, mixed dtypes, metadata validation), and `Test_GlimmerTokenizer.cpp` (fixture BPE/pre-tokenizer, chat template + tool-aware render parity, plain-text tool shim).
+Unit tests: `Test_GlimmerConfig.cpp` (presets, fixture, full-config wrapper, tiny preset), `Test_GlimmerGenerate.cpp` (tiny forward/generate smoke, determinism, chunked-prefill equivalence, NoPE/RoPE branches), `Test_GlimmerSession.cpp` (prefill/step termination, stop-id policy, reseed determinism, prefix-cache equivalence, `ISession` front-end), `Test_GlimmerWeightsGGUF.cpp` (synthetic-GGUF loader roundtrip: norm shift, Q/K re-permute, synthesized-norm handling, mixed dtypes, metadata validation), and `Test_GlimmerTokenizer.cpp` (fixture BPE/pre-tokenizer, ATEM chat template render/parse, channel stream parser).
 
 ## Performance
 

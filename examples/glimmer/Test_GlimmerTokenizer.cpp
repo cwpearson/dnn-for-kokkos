@@ -148,83 +148,89 @@ TEST(GlimmerTokenizer, FixtureChat) {
   EXPECT_EQ(ensure_bos({200000, 0}, 200000, false), (std::vector<int>{0}));
 }
 
-TEST(GlimmerTokenizer, ChatWithToolsParity) {
+TEST(GlimmerTokenizer, ChatWithToolsAtem) {
   using namespace KokkosDNN::Glimmer;
-  // No tools/system extras: byte-identical to the plain template.
+  // Tool-aware rendering follows the upstream ATEM template (not the
+  // plain minimal framing): default system block, reasoning-strength
+  // line, tool catalogue, valid recipients, to=self/to=tool channels.
   auto msgs = make_chat_messages("abc", "sys", "user");
-  EXPECT_EQ(render_glimmer_chatml_with_tools(msgs, ""),
-            render_chat_template(msgs, true));
-  EXPECT_EQ(render_glimmer_chatml_with_tools({msgs[1]}, "", "", false),
-            render_chat_template({msgs[1]}, false));
-  // Tools catalogue + suffix fold into the system block.
+  ToolCall c;
+  c.id = "c1";
+  c.name = "get_weather";
+  c.arguments = "{\"city\":\"SF\"}";
+  ChatMessage asst;
+  asst.role = "assistant";
+  asst.thinking = "check sky";
+  asst.tool_calls.push_back(c);
+  ChatMessage tool_msg;
+  tool_msg.role = "tool";
+  tool_msg.content = "sunny";
+  tool_msg.tool_call_id = "c1";
+  const std::string tools =
+      "[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\"}}]";
   std::string rendered = render_glimmer_chatml_with_tools(
-      msgs, R"([{"type":"function"}])", "Always answer.", true);
-  EXPECT_EQ(rendered,
-            "<|begin_of_text|>"
-            "<|start|>system<|message|>sys\n"
-            "List of tools: [{\"type\":\"function\"}]\n"
-            "Always answer.<|eot|>"
-            "<|start|>user<|message|>abc<|eot|>"
-            "<|start|>assistant<|message|>");
-  // System injected when no system message exists.
-  std::string injected = render_glimmer_chatml_with_tools(
-      {msgs[1]}, R"([{"type":"function"}])", "", true, "be nice");
-  EXPECT_EQ(injected,
-            "<|begin_of_text|>"
-            "<|start|>system<|message|>be nice\n"
-            "List of tools: [{\"type\":\"function\"}]<|eot|>"
-            "<|start|>user<|message|>abc<|eot|>"
-            "<|start|>assistant<|message|>");
-  // Encode path matches the render path: the framing literals must split
-  // as specials, so the check runs on a fixture extended with them (the
-  // base fixture only carries begin/end_of_text) and fixture-safe content.
-  // The role words also need their missing letters as base singletons.
-  std::string chat_fixture = fixture_json();
-  const std::string vocab_anchor = "\"e\": 16, \":\": 17,";
-  ASSERT_NE(chat_fixture.find(vocab_anchor), std::string::npos);
-  chat_fixture.replace(chat_fixture.find(vocab_anchor), vocab_anchor.size(),
-                       "\"e\": 16, \":\": 17, \"y\": 100, \"u\": 101, "
-                       "\"r\": 102, \"i\": 103, \"n\": 104, \"m\": 105,");
-  const std::string anchor =
-      "{\"id\": 200001, \"content\": \"<|end_of_text|>\", \"special\": true}";
-  ASSERT_NE(chat_fixture.find(anchor), std::string::npos);
-  chat_fixture.replace(
-      chat_fixture.find(anchor), anchor.size(),
-      anchor +
-          ",\n    {\"id\": 200007, \"content\": \"<|eom|>\", "
-          "\"special\": true},\n"
-          "    {\"id\": 200008, \"content\": \"<|eot|>\", \"special\": true},\n"
-          "    {\"id\": 200010, \"content\": \"<|start|>\", "
-          "\"special\": true},\n"
-          "    {\"id\": 200011, \"content\": \"<|message|>\", "
-          "\"special\": true}");
-  Tokenizer tok(write_tmp(chat_fixture));
-  auto enc_msgs = make_chat_messages("abc", "cab", "user");
-  EXPECT_EQ(encode_chatml_with_tools(tok, enc_msgs, "", "", true, true),
-            encode_chat(tok, enc_msgs, true, true));
+      {msgs[0], msgs[1], asst, tool_msg}, tools, "", true);
+  EXPECT_NE(rendered.find("Reasoning strength: high."), std::string::npos);
+  EXPECT_NE(rendered.find("# Valid recipients: \"self\", "
+                          "\"get_weather.*\", \"user\"."),
+            std::string::npos);
+  EXPECT_NE(rendered.find(
+                "In this environment you have access to a set of tools"),
+            std::string::npos);
+  EXPECT_NE(rendered.find("<|start|>assistant to=self<|message|>check "
+                          "sky<|eom|>"),
+            std::string::npos);
+  EXPECT_NE(rendered.find("<|start|>assistant to=get_weather<|message|>"
+                           "<atem:function_calls>"),
+            std::string::npos);
+  EXPECT_NE(rendered.find("<atem:parameter name=\"city\">SF</atem:parameter>"),
+            std::string::npos);
+  // The tool name resolves through the matching tool_call_id.
+  EXPECT_NE(rendered.find("<|start|>tool get_weather<|message|>"
+                           "<tool_output name=\"get_weather\">\nsunny\n"
+                           "</tool_output><|eot|>"),
+            std::string::npos);
+  EXPECT_EQ(rendered.rfind("<|start|>assistant"),
+            rendered.size() - std::string("<|start|>assistant").size());
+  // An explicit default_system still seeds the system block.
+  std::string injected = render_glimmer_chatml_with_tools({msgs[1]}, "", "",
+                                                          true, "be nice");
+  EXPECT_NE(injected.find("<|start|>system<|message|>be nice\n\n"
+                           "Reasoning strength: high."),
+            std::string::npos);
 }
 
-TEST(GlimmerTokenizer, DefaultStopsAndPlainTextTools) {
+TEST(GlimmerTokenizer, DefaultStopsAndAtemTools) {
   using namespace KokkosDNN::Glimmer;
-  EXPECT_EQ(default_stop_strings(),
-            (std::vector<std::string>{"<|eot|>", "<|eom|>"}));
-  // No native markers: everything before the stop cut is display text,
-  // calls and reasoning stay empty.
-  ToolParseResult r = parse_tool_calls("hello <|eot|> tail",
-                                       default_stop_strings());
-  EXPECT_EQ(r.text, "hello ");
-  EXPECT_TRUE(r.reasoning.empty());
-  EXPECT_TRUE(r.calls.empty());
-
-  // Streaming shim agrees with the whole-text parse.
+  // Only <|eot|> ends the turn: <|eom|> ends a message (e.g. the
+  // reasoning channel) while the turn continues.
+  EXPECT_EQ(default_stop_strings(), (std::vector<std::string>{"<|eot|>"}));
+  // Reasoning channel + tool call parse out; display is the user channel.
+  const std::string raw =
+      std::string(" to=self<|message|>thinking<|eom|>") +
+      "<|start|>assistant to=user<|message|>hi<|eom|>" +
+      "<|start|>assistant to=f<|message|>" +
+      "<atem:function_calls>\n<atem:invoke name=\"f\">\n"
+      "<atem:parameter name=\"x\">1</atem:parameter>\n"
+      "</atem:invoke>\n</atem:function_calls><|eot|>tail";
+  ToolParseResult r = parse_tool_calls(raw, default_stop_strings());
+  EXPECT_EQ(r.text, "hi");
+  EXPECT_EQ(r.reasoning, "thinking");
+  ASSERT_EQ(r.calls.size(), 1u);
+  EXPECT_EQ(r.calls[0].name, "f");
+  EXPECT_EQ(r.calls[0].arguments, "{\"x\":1}");
+  // Streaming agrees byte-at-a-time.
   ToolCallStreamParser p(default_stop_strings());
-  std::string streamed;
-  for (const char* piece : {"hel", "lo ", "<|e", "ot|> tail"})
-    streamed += p.feed(piece).display;
+  std::string streamed, rstreamed;
+  for (size_t i = 0; i < raw.size(); ++i) {
+    StreamDeltas d = p.feed(raw.substr(i, 1));
+    streamed += d.display;
+    rstreamed += d.reasoning;
+  }
   ToolParseResult tail = p.finish();
-  EXPECT_EQ(streamed + tail.text, "hello ");
-  EXPECT_TRUE(tail.calls.empty());
-  EXPECT_EQ(p.poll_reasoning(), "");
+  EXPECT_EQ(streamed + tail.text, r.text);
+  EXPECT_EQ(rstreamed + tail.reasoning, r.reasoning);
+  EXPECT_EQ(tail.calls.size(), r.calls.size());
 }
 
 TEST(GlimmerTokenizer, MissingFileThrows) {
@@ -294,4 +300,28 @@ TEST(GlimmerTokenizer, RealFileOracle) {
   EXPECT_EQ(tok.decode(chat_ids), "userHiassistant");
   // keep-specials also renders the add_bos <|begin_of_text|>
   EXPECT_EQ(tok.decode(chat_ids, false), "<|begin_of_text|>" + chat);
+}
+
+
+TEST(GlimmerTokenizer, RealFileEncodeTools) {
+  const char* p = std::getenv("KOKKOSDNN_TOKENIZER_JSON");
+  if (!p || !*p) GTEST_SKIP() << "set KOKKOSDNN_TOKENIZER_JSON to run";
+  using namespace KokkosDNN::Glimmer;
+  Tokenizer tok(p);
+  // The tool-aware renderer output round-trips through the real BPE:
+  // framing literals split as specials, exactly-one-BOS holds.
+  auto msgs = make_chat_messages("Hi", "", "user");
+  const std::string tools =
+      "[{\"type\":\"function\",\"function\":{\"name\":\"f\"}}]";
+  const std::string rendered =
+      render_glimmer_chatml_with_tools(msgs, tools, "", true);
+  EXPECT_NE(rendered.find("<|start|>user<|message|>Hi<|eot|>"),
+            std::string::npos);
+  EXPECT_EQ(rendered.rfind("<|start|>assistant"),
+            rendered.size() - std::string("<|start|>assistant").size());
+  const std::vector<int> ids =
+      encode_chatml_with_tools(tok, msgs, tools, "", true, true);
+  EXPECT_FALSE(ids.empty());
+  EXPECT_EQ(ids.front(), tok.bos());
+  EXPECT_EQ(ids, encode_rendered_chat(tok, rendered, true));
 }
