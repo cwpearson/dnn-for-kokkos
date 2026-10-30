@@ -46,7 +46,7 @@ void fill_hann_window(const Kokkos::View<float*, ExecSpace>& w,
   if (N == 0) return;
   Kokkos::parallel_for(
       label, Kokkos::RangePolicy<ExecSpace>(0, N), KOKKOS_LAMBDA(size_t n) {
-        w(n) = 0.5f - 0.5f * cosf(2.0f * KOKKOSDNN_PI_F *
+        w(n) = 0.5f - 0.5f * Kokkos::cosf(2.0f * KOKKOSDNN_PI_F *
                                   (float)n / (float)N);
       });
 }
@@ -92,11 +92,11 @@ void stft_forward(const Kokkos::View<float*, ExecSpace>& x,
           const float s = x(reflect_index(j, N)) * win(n);
           const float ang =
               -2.0f * KOKKOSDNN_PI_F * (float)(k * n) / (float)W;
-          re += s * cosf(ang);
-          im += s * sinf(ang);
+          re += s * Kokkos::cosf(ang);
+          im += s * Kokkos::sinf(ang);
         }
-        mag(f, k) = sqrtf(re * re + im * im);
-        ph(f, k) = atan2f(im, re);
+        mag(f, k) = Kokkos::sqrtf(re * re + im * im);
+        ph(f, k) = Kokkos::atan2f(im, re);
       });
 }
 
@@ -140,16 +140,16 @@ void istft_inverse(
           // x[n] = (1/W)(X0 + 2*sum_{k=1}^{B-2} |Xk|cos(2pi k n/W + ph)
           //              + |X_{B-1}|cos(pi n + ph))  (W even; bins 0 and
           //              B-1 are real).
-          float acc = mag(f, 0) * cosf(ph(f, 0));
+          float acc = mag(f, 0) * Kokkos::cosf(ph(f, 0));
           for (size_t k = 1; k + 1 < B; ++k) {
             const float ang = 2.0f * KOKKOSDNN_PI_F * (float)(k * n) /
                               (float)W +
                               ph(f, k);
-            acc += 2.0f * mag(f, k) * cosf(ang);
+            acc += 2.0f * mag(f, k) * Kokkos::cosf(ang);
           }
           {
             const float ang = KOKKOSDNN_PI_F * (float)n + ph(f, B - 1);
-            acc += mag(f, B - 1) * cosf(ang);
+            acc += mag(f, B - 1) * Kokkos::cosf(ang);
           }
           acc /= (float)W;
           const float wv = win(n);

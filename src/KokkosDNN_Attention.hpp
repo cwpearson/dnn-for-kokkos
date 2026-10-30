@@ -371,7 +371,7 @@ struct GqaStreamingFunctor {
           const float s =
               ((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7)) + stail;
           float ss = s;
-          if (cap > 0) ss = cap * tanhf(ss / cap);
+          if (cap > 0) ss = cap * Kokkos::tanhf(ss / cap);
           // m == -1e30 on the first key => a = exp(-1e30) = 0, as desired.
           // (Runtime cap check: plain passes softcap == 0, so the tanh is
           // skipped there exactly as with if constexpr.)
@@ -379,7 +379,7 @@ struct GqaStreamingFunctor {
           // expf(0) == 1): a new max rescales acc by aa, otherwise acc only
           // accumulates (aa == 1, bit-identical to the fused form).
           if (ss > m) {
-            const float aa = expf(m - ss);
+            const float aa = Kokkos::expf(m - ss);
             const float l_new = l * aa + 1.0f;
             for (size_t b = 0; b < nbu; ++b) {
               const size_t bb = b * UF;
@@ -391,7 +391,7 @@ struct GqaStreamingFunctor {
             m = ss;
             l = l_new;
           } else {
-            const float gg = expf(ss - m);
+            const float gg = Kokkos::expf(ss - m);
             const float l_new = l + gg;
             for (size_t b = 0; b < nbu; ++b) {
               const size_t bb = b * UF;
@@ -683,11 +683,11 @@ struct GqaDecodeFunctor {
           },
           Kokkos::Max<float>(tmax));
       const float mnew = (tmax > m) ? tmax : m;
-      const float aa = expf(m - mnew);
+      const float aa = Kokkos::expf(m - mnew);
       // Weights for this thread's keys, and its rescaled partial denominator.
       float lsum = 0.0f;
       for (int kki = rank; kki < kw; kki += team_n) {
-        const float wt = expf(base[wo + kki] - mnew);
+        const float wt = Kokkos::expf(base[wo + kki] - mnew);
         base[wo + kki] = wt;
         lsum += wt;
       }
@@ -1036,7 +1036,7 @@ struct GqaDecodeSplitFunctor {
             },
             Kokkos::Max<float>(tmax));
         const float mnew = (tmax > m[h]) ? tmax : m[h];
-        aa[h] = expf(m[h] - mnew);
+        aa[h] = Kokkos::expf(m[h] - mnew);
         m[h] = mnew;
       }
       // Weights for the owner's keys: exp(s - m) in the (updated) running
@@ -1044,7 +1044,7 @@ struct GqaDecodeSplitFunctor {
       // consume.
       for (int kw_i = rank; kw_i < kw; kw_i += team_n) {
         for (int h = 0; h < NG; ++h)
-          base[wo + h * KT + kw_i] = expf(base[wo + h * KT + kw_i] - m[h]);
+          base[wo + h * KT + kw_i] = Kokkos::expf(base[wo + h * KT + kw_i] - m[h]);
       }
       member.team_barrier();
       // Pre-tile denominator in the (possibly updated) max scale. Hoisted
@@ -1196,7 +1196,7 @@ struct GqaDecodeCombineFunctor {
     // Merge weights per split (nsplit is at most 64, so one smem plane).
     for (size_t s = static_cast<size_t>(rank); s < NS;
          s += static_cast<size_t>(team_n))
-      wt[s] = expf(pb[s * rec] - M);
+      wt[s] = Kokkos::expf(pb[s * rec] - M);
     member.team_barrier();
     // Merged denominator: every thread sums the same few terms, so this needs
     // no reduction. l == 0 (no contributing key anywhere) keeps zeros.
@@ -2164,7 +2164,7 @@ void launch_bidir_naive(const QP* qbase, const KP* kbase, const VP* vbase,
             s += static_cast<float>(qbase[t * qs0 + h * qs1 + d]) *
                  static_cast<float>(kbase[kk * ks0 + kvh * ks1 + d]);
           s *= scale;
-          const float w = expf(s - m);
+          const float w = Kokkos::expf(s - m);
           l += w;
           for (size_t d = 0; d < D; ++d)
             acc(t, h, d) +=

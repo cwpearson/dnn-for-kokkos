@@ -157,16 +157,16 @@ namespace Impl {
 
 // -- FP32 scalars (device-callable) ---------------------------------------
 KOKKOS_INLINE_FUNCTION float qwen_sigmoid(float x) {
-  return 1.0f / (1.0f + expf(-x));
+  return 1.0f / (1.0f + Kokkos::expf(-x));
 }
 KOKKOS_INLINE_FUNCTION float qwen_softplus(float x) {
-  return x > 20.0f ? x : logf(1.0f + expf(x));
+  return x > 20.0f ? x : Kokkos::logf(1.0f + Kokkos::expf(x));
 }
 KOKKOS_INLINE_FUNCTION float qwen_silu(float x) {
   return x * qwen_sigmoid(x);
 }
 KOKKOS_INLINE_FUNCTION float qwen_l2inv(float ss, int n, float eps) {
-  return 1.0f / sqrtf(ss / static_cast<float>(n) + eps);
+  return 1.0f / Kokkos::sqrtf(ss / static_cast<float>(n) + eps);
 }
 
 // FLA sum-based L2 norm (NOT an RMSNorm): 1/sqrt(sum + eps), matching the
@@ -239,7 +239,7 @@ void qwen_partial_rope_inplace(const XView& x, const FView& inv_freq,
         const float pos = static_cast<float>(t);
         for (size_t j = 0; j < Rh; ++j) {
           const float ang = pos * inv_freq(j);
-          const float c = cosf(ang), s = sinf(ang);
+          const float c = Kokkos::cosf(ang), s = Kokkos::sinf(ang);
           const float a = static_cast<float>(x(t, h, j));
           const float b = static_cast<float>(x(t, h, j + Rh));
           x(t, h, j) = static_cast<Scalar>(a * c - b * s);
@@ -315,7 +315,7 @@ void qwen_gdn_gates(const AView& a, const BView& b, const PView& a_log,
       KOKKOS_LAMBDA(size_t t, size_t h) {
         const float av = static_cast<float>(a(t, h));
         const float bv = static_cast<float>(b(t, h));
-        const float A = expf(static_cast<float>(a_log(h)));
+        const float A = Kokkos::expf(static_cast<float>(a_log(h)));
         beta(t, h) = qwen_sigmoid(bv);
         g(t, h) = -A * qwen_softplus(av + static_cast<float>(dt(h)));
       });
@@ -360,7 +360,7 @@ void qwen_qk_l2norm(const XView& x, float eps, float scale,
           float v = static_cast<float>(x(t, h, d));
           ss += v * v;
         }
-        float inv = (1.0f / sqrtf(ss + eps)) * scale;
+        float inv = (1.0f / Kokkos::sqrtf(ss + eps)) * scale;
         for (size_t d = 0; d < D; ++d)
           x(t, h, d) =
               static_cast<Scalar>(static_cast<float>(x(t, h, d)) * inv);
@@ -424,7 +424,7 @@ struct GatedDeltaTeam {
           shq[e - Ku] = static_cast<float>(q(t, h, e - Ku));
       }
       team.team_barrier();
-      const float decay = expf(gg(t, h));
+      const float decay = Kokkos::expf(gg(t, h));
       const float bt = beta(t, h);
       // Pointer-walked kk loops with 4 accumulators per dot so the FMA
       // chains pipeline (combine order differs from sequential by fp32

@@ -62,7 +62,7 @@ using MoeScoreScratch =
 
 // Sigmoid helper for the LFM2-MoE router (host- and device-callable).
 KOKKOS_INLINE_FUNCTION float moe_sigmoid(float s) {
-  return 1.0f / (1.0f + expf(-s));
+  return 1.0f / (1.0f + Kokkos::expf(-s));
 }
 
 // Gather the K selected experts of one token in descending score order, ties
@@ -95,7 +95,7 @@ KOKKOS_INLINE_FUNCTION void moe_select_from_scores(
   if (!sigmoid_weights && !norm_topk) {
     for (size_t e = 0; e < E; ++e)
       if (score(e) > gmx) gmx = score(e);
-    for (size_t e = 0; e < E; ++e) gsum += expf(score(e) - gmx);
+    for (size_t e = 0; e < E; ++e) gsum += Kokkos::expf(score(e) - gmx);
   }
   // -- greedy top-k (descending; ties keep the lower expert id) --
   for (int k = 0; k < K; ++k) {
@@ -137,12 +137,12 @@ KOKKOS_INLINE_FUNCTION void moe_select_from_scores(
     for (int k = 0; k < K; ++k)
       if (logit(k) > mx) mx = logit(k);
     float sum = 0.0f;
-    for (int k = 0; k < K; ++k) sum += expf(logit(k) - mx);
+    for (int k = 0; k < K; ++k) sum += Kokkos::expf(logit(k) - mx);
     for (int k = 0; k < K; ++k)
-      top_w(t, k) = expf(logit(k) - mx) / sum * routed_scale;
+      top_w(t, k) = Kokkos::expf(logit(k) - mx) / sum * routed_scale;
   } else {
     for (int k = 0; k < K; ++k)
-      top_w(t, k) = expf(logit(k) - gmx) / gsum * routed_scale;
+      top_w(t, k) = Kokkos::expf(logit(k) - gmx) / gsum * routed_scale;
   }
 }
 

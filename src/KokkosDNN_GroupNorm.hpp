@@ -120,7 +120,7 @@ void groupnorm_finalize_stats(
         const double mean = sum / Md;
         double var = ssq / Md - mean * mean;
         if (var < 0.0 && var > -1e-12) var = 0.0;  // sumsq roundoff guard
-        const float inv = 1.0f / sqrtf(static_cast<float>(var) + eps_);
+        const float inv = 1.0f / Kokkos::sqrtf(static_cast<float>(var) + eps_);
         scratch[2 * (NP_ + g)] = static_cast<float>(mean);
         scratch[2 * (NP_ + g) + 1] = inv;
       });

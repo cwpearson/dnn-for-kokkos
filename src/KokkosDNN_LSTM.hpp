@@ -77,12 +77,12 @@ struct LstmBidirStepFunctor {
       // only its own 4 gates and its own state/output slots).
       Kokkos::parallel_for(
           Kokkos::TeamThreadRange(m, H), KOKKOS_LAMBDA(size_t h) {
-            const float i = 1.0f / (1.0f + expf(-gates_(r, h)));
-            const float f = 1.0f / (1.0f + expf(-gates_(r, H_ + h)));
-            const float g = tanhf(gates_(r, 2 * H_ + h));
-            const float o = 1.0f / (1.0f + expf(-gates_(r, 3 * H_ + h)));
+            const float i = 1.0f / (1.0f + Kokkos::expf(-gates_(r, h)));
+            const float f = 1.0f / (1.0f + Kokkos::expf(-gates_(r, H_ + h)));
+            const float g = Kokkos::tanhf(gates_(r, 2 * H_ + h));
+            const float o = 1.0f / (1.0f + Kokkos::expf(-gates_(r, 3 * H_ + h)));
             const float c = f * hc_(r, h) + i * g;
-            const float hh = o * tanhf(c);
+            const float hh = o * Kokkos::tanhf(c);
             hc_(r, h) = c;
             hc_(r, H_ + h) = hh;
             y_(b, t, dir * H_ + h) = hh;

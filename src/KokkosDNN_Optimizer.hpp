@@ -63,8 +63,8 @@ void adam_step(
   if (step < 1) throw std::invalid_argument("adam_step: step must be >= 1");
   const size_t R = param.extent(0), C = param.extent(1);
   if (R == 0 || C == 0) return;
-  const float bc1 = 1.0f - powf(beta1, static_cast<float>(step));
-  const float bc2 = 1.0f - powf(beta2, static_cast<float>(step));
+  const float bc1 = 1.0f - Kokkos::powf(beta1, static_cast<float>(step));
+  const float bc2 = 1.0f - Kokkos::powf(beta2, static_cast<float>(step));
   Kokkos::parallel_for(
       label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {R, C}),
       KOKKOS_LAMBDA(size_t i, size_t j) {
@@ -75,7 +75,7 @@ void adam_step(
         v(i, j)  = static_cast<Scalar>(vv);
         float mhat = mm / bc1, vhat = vv / bc2;
         param(i, j) = static_cast<Scalar>(static_cast<float>(param(i, j)) -
-                                          lr * mhat / (sqrtf(vhat) + eps));
+                                          lr * mhat / (Kokkos::sqrtf(vhat) + eps));
       });
 }
 
@@ -93,8 +93,8 @@ void adam_step(
   if (step < 1) throw std::invalid_argument("adam_step: step must be >= 1");
   const size_t N = param.extent(0);
   if (N == 0) return;
-  const float bc1 = 1.0f - powf(beta1, static_cast<float>(step));
-  const float bc2 = 1.0f - powf(beta2, static_cast<float>(step));
+  const float bc1 = 1.0f - Kokkos::powf(beta1, static_cast<float>(step));
+  const float bc2 = 1.0f - Kokkos::powf(beta2, static_cast<float>(step));
   Kokkos::parallel_for(
       label, Kokkos::RangePolicy<ExecSpace>(0, N), KOKKOS_LAMBDA(size_t i) {
         float g  = static_cast<float>(grad(i));
@@ -104,7 +104,7 @@ void adam_step(
         v(i)     = static_cast<Scalar>(vv);
         float mhat = mm / bc1, vhat = vv / bc2;
         param(i) = static_cast<Scalar>(static_cast<float>(param(i)) -
-                                       lr * mhat / (sqrtf(vhat) + eps));
+                                       lr * mhat / (Kokkos::sqrtf(vhat) + eps));
       });
 }
 

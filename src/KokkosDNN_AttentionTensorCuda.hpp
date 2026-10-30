@@ -229,7 +229,7 @@ __global__ __launch_bounds__(128) void bidir_sdpa_kernel(
         if (v > tmax) tmax = v;
       }
       const float mnew = (tmax > m) ? tmax : m;
-      Saux[0][tid] = expf(m - mnew);  // aa (m == -1e30 first: 0)
+      Saux[0][tid] = Kokkos::expf(m - mnew);  // aa (m == -1e30 first: 0)
       Saux[1][tid] = mnew;
     }
     __syncthreads();
@@ -243,7 +243,7 @@ __global__ __launch_bounds__(128) void bidir_sdpa_kernel(
     }
     for (int e = tid; e < kTq * kTk; e += blockDim.x) {
       const int r = e / kTk, c = e % kTk;
-      W[r][c] = static_cast<__nv_bfloat16>(expf(SW[r][c] - Saux[1][r]));
+      W[r][c] = static_cast<__nv_bfloat16>(Kokkos::expf(SW[r][c] - Saux[1][r]));
     }
     __syncthreads();
 

@@ -121,11 +121,11 @@ void timestep_sinusoidal(
   Kokkos::parallel_for(
       label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {N, H}),
       KOKKOS_LAMBDA(size_t i, size_t j) {
-        float freq = expf(-logf(10000.0f) * static_cast<float>(j) /
+        float freq = Kokkos::expf(-Kokkos::logf(10000.0f) * static_cast<float>(j) /
                           static_cast<float>(H));
         float arg = t(i) * freq;
-        out(i, j) = cosf(arg);
-        out(i, j + H) = sinf(arg);
+        out(i, j) = Kokkos::cosf(arg);
+        out(i, j + H) = Kokkos::sinf(arg);
       });
 }
 

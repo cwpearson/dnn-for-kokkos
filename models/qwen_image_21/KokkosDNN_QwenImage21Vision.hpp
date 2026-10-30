@@ -246,7 +246,7 @@ void qwen21vit_rope_inplace(const XView& x, const PView& pos_hw,
         for (size_t k = 0; k < D / 2; ++k) {
           const float pos = (k < F) ? ph : pw;
           const float ang = pos * inv_freq(k < F ? k : k - F);
-          const float c = cosf(ang), s = sinf(ang);
+          const float c = Kokkos::cosf(ang), s = Kokkos::sinf(ang);
           const float a = static_cast<float>(x(t, h, k));
           const float b = static_cast<float>(x(t, h, k + D / 2));
           x(t, h, k) = static_cast<Scalar>(a * c - b * s);

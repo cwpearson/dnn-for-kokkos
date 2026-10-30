@@ -734,7 +734,7 @@ inline void qwen21vae_silu_inplace(const V2& t, const std::string& label) {
       KOKKOS_LAMBDA(size_t e) {
         const float x = static_cast<float>(t(e / C, e % C));
         t(e / C, e % C) = static_cast<typename V2::value_type>(
-            x / (1.0f + expf(-x)));
+            x / (1.0f + Kokkos::expf(-x)));
       });
 }
 
@@ -789,8 +789,8 @@ inline void qwen21vae_rmsnorm_inplace(const V2& t, const V1& gamma,
           const float v = static_cast<float>(t(r, c));
           ss += v * v;
         }
-        const float n = sqrtf(ss);
-        const float inv = sqrtf((float)C) / (n > 1e-12f ? n : 1e-12f);
+        const float n = Kokkos::sqrtf(ss);
+        const float inv = Kokkos::sqrtf((float)C) / (n > 1e-12f ? n : 1e-12f);
         for (size_t c = 0; c < C; ++c) {
           const float v = static_cast<float>(t(r, c));
           t(r, c) = static_cast<typename V2::value_type>(
@@ -1456,7 +1456,7 @@ class QwenImage21VaeModel {
         vu(vv.data(), T, 1, C);
     V3u ou(av.data(), T, 1, C);
     ::KokkosDNN::attention_mha_bidirectional<ExecSpace, Scalar>(
-        handle, qu, ku, vu, ou, 1.0f / sqrtf((float)C), tag + "_attn");
+        handle, qu, ku, vu, ou, 1.0f / Kokkos::sqrtf((float)C), tag + "_attn");
     KokkosDNN::gemm_bias<ExecSpace, Scalar>(
         handle, av,
         Impl::qwen21vae_bind_mat<ExecSpace, Scalar>(blobs, shapes,

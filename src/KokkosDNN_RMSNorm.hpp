@@ -46,7 +46,7 @@ struct RmsNormTeam {
           acc += v * v;
         },
         ss);
-    const float inv = 1.0f / sqrtf(ss / static_cast<float>(D) + eps_);
+    const float inv = 1.0f / Kokkos::sqrtf(ss / static_cast<float>(D) + eps_);
     Kokkos::parallel_for(
         Kokkos::TeamThreadRange(team, D), KOKKOS_LAMBDA(size_t d) {
           y_(t, d) = static_cast<Scalar>(static_cast<float>(x_(t, d)) * inv *
@@ -107,7 +107,7 @@ struct QkRmsNormTeam {
           acc += v * v;
         },
         ss);
-    const float inv = 1.0f / sqrtf(ss / static_cast<float>(D_) + eps_);
+    const float inv = 1.0f / Kokkos::sqrtf(ss / static_cast<float>(D_) + eps_);
     Kokkos::parallel_for(
         Kokkos::TeamThreadRange(team, D_), KOKKOS_LAMBDA(size_t d) {
           out_(t, h, d) = static_cast<Scalar>(
@@ -147,7 +147,7 @@ struct QkRmsNorm3dTeam {
           acc += v * v;
         },
         ss);
-    const float inv = 1.0f / sqrtf(ss / static_cast<float>(D_) + eps_);
+    const float inv = 1.0f / Kokkos::sqrtf(ss / static_cast<float>(D_) + eps_);
     Kokkos::parallel_for(
         Kokkos::TeamThreadRange(team, D_), KOKKOS_LAMBDA(size_t d) {
           out_(t, h, d) = static_cast<Scalar>(
@@ -294,7 +294,7 @@ struct RmsNormOnePlusTeam {
           v = s;
         },
         ss);
-    const float inv = 1.0f / sqrtf(ss / static_cast<float>(D) + eps);
+    const float inv = 1.0f / Kokkos::sqrtf(ss / static_cast<float>(D) + eps);
     Kokkos::parallel_for(
         Kokkos::TeamThreadRange(team, D), KOKKOS_LAMBDA(size_t d) {
           y_(t, d) = static_cast<Scalar>(static_cast<float>(x_(t, d)) * inv *

@@ -26,13 +26,13 @@ namespace Impl {
 // Scalar GELU kernels (FP32 in, FP32 out; callers cast to/from Scalar).
 // Device-callable (erff/tanhf resolve on host and CUDA device).
 KOKKOS_INLINE_FUNCTION float gelu_exact(float x) {
-  return 0.5f * x * (1.0f + erff(x * 0.7071067811865475f));
+  return 0.5f * x * (1.0f + Kokkos::erff(x * 0.7071067811865475f));
 }
 
 KOKKOS_INLINE_FUNCTION float gelu_tanh_approx(float x) {
   const float c = 0.7978845608028654f;  // sqrt(2/pi)
   const float u = c * (x + 0.044715f * x * x * x);
-  return 0.5f * x * (1.0f + tanhf(u));
+  return 0.5f * x * (1.0f + Kokkos::tanhf(u));
 }
 
 KOKKOS_INLINE_FUNCTION float gelu_apply(float x, GeluVariant variant) {
@@ -166,7 +166,7 @@ void logit_softcap_forward(
       label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {R, C}),
       KOKKOS_LAMBDA(size_t i, size_t j) {
         float v = static_cast<float>(x(i, j));
-        y(i, j) = static_cast<Scalar>(cap * tanhf(v / cap));
+        y(i, j) = static_cast<Scalar>(cap * Kokkos::tanhf(v / cap));
       });
 }
 
@@ -185,7 +185,7 @@ void logit_softcap_forward(
   Kokkos::parallel_for(
       label, Kokkos::RangePolicy<ExecSpace>(0, N), KOKKOS_LAMBDA(size_t i) {
         float v = static_cast<float>(x(i));
-        y(i) = static_cast<Scalar>(cap * tanhf(v / cap));
+        y(i) = static_cast<Scalar>(cap * Kokkos::tanhf(v / cap));
       });
 }
 
@@ -214,7 +214,7 @@ void sigmoid_forward(
       label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {R, C}),
       KOKKOS_LAMBDA(size_t i, size_t j) {
         float v = static_cast<float>(x(i, j));
-        y(i, j) = static_cast<Scalar>(1.0f / (1.0f + expf(-v)));
+        y(i, j) = static_cast<Scalar>(1.0f / (1.0f + Kokkos::expf(-v)));
       });
 }
 
@@ -250,7 +250,7 @@ void tanh_forward(
   Kokkos::parallel_for(
       label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {R, C}),
       KOKKOS_LAMBDA(size_t i, size_t j) {
-        y(i, j) = static_cast<Scalar>(tanhf(static_cast<float>(x(i, j))));
+        y(i, j) = static_cast<Scalar>(Kokkos::tanhf(static_cast<float>(x(i, j))));
       });
 }
 
@@ -368,7 +368,7 @@ void snake_forward(
       KOKKOS_LAMBDA(size_t t, size_t c) {
         const float v = static_cast<float>(x(t, c));
         const float a = static_cast<float>(alpha(c));
-        const float s = sinf(a * v);
+        const float s = Kokkos::sinf(a * v);
         y(t, c) = static_cast<Scalar>(v + (1.0f / a) * s * s);
       });
 }
