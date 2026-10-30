@@ -19,6 +19,15 @@
 # thread (see run_bin below).
 set -eu
 
+# GPU sanity first: log driver/GPU state before anything else so the
+# container logs always show what the CUDA runtime will see. A failure here
+# means no usable GPU was injected (e.g. rootless podman needs
+# --device nvidia.com/gpu=all, not --gpus all). Warn and continue so
+# --help/--version still work on GPU-less hosts.
+if ! nvidia-smi; then
+  echo "warning: nvidia-smi failed; no usable NVIDIA GPU in this container" >&2
+fi
+
 BIN=/usr/local/bin/kokkosdnn_server
 
 # run_bin "$@" : exec the server, optionally under gdb.
