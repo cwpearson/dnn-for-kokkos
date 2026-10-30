@@ -1358,6 +1358,59 @@ struct QuantGemvGroupedFunctor {
   }
 };
 
+// Unit GEMV functor: same contract as QuantGemvFunctor, but the
+// TeamThreadRange runs over packed-row decode units (K/32 for Q4_K/Q5_K/
+// Q6_K/Q8_0, see quant_unit_count) with one quant_unit_dot per unit instead
+// of K quant_elem calls. One block division plus one scale unpack per 32
+// elements instead of per element/group, 128-bit weight loads (Q4_K/Q5_K)
+// and 128-bit activation loads (xvec), FP32 accumulation. Requires
+// block-aligned K (see quant_can_unit); the caller falls back to the
+// grouped/per-element paths otherwise. Same values up to FP32
+// reassociation.
+template <class ExecSpace, class Scalar>
+struct QuantGemvUnitFunctor {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  Kokkos::View<Scalar*, ExecSpace> x, y;
+  const uint8_t* wdata;
+  GgmlType dtype;
+  size_t nunits;
+  size_t row_bytes;
+  bool xvec;
+
+  KOKKOS_INLINE_FUNCTION void operator()(const Member& team) const {
+    const size_t j   = (size_t)team.league_rank();
+    const uint8_t* r = wdata + j * row_bytes;
+    const auto xx    = x;
+    const GgmlType dt = dtype;
+    const size_t nu   = nunits;
+    const bool xv     = xvec;
+    const Scalar* xd  = xx.data();
+    const size_t xs   = xx.stride(0);
+    float team_sum    = 0;
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(team, nu),
+        KOKKOS_LAMBDA(size_t c, float& s) {
+          s += quant_unit_dot(dt, r, xd, xs, c, xv);
+        },
+        team_sum);
+    if (team.team_rank() == 0) y(j) = static_cast<Scalar>(team_sum);
+  }
+};
+
+// Unit-path eligibility: every decode unit must lie inside whole ggml
+// blocks (see quant_unit_count). Q4_K/Q5_K/Q6_K units span a 256-element
+// block, so K must be a multiple of 256; a Q8_0 unit is one 32-element
+// block. Other dtypes stay on the per-element path.
+inline bool quant_can_unit(GgmlType dtype, size_t K) {
+  switch (dtype) {
+    case GgmlType::Q4_K:
+    case GgmlType::Q5_K:
+    case GgmlType::Q6_K: return K % 256 == 0;
+    case GgmlType::Q8_0: return K % 32 == 0;
+    default: return false;
+  }
+}
+
 template <class ExecSpace, class Scalar>
 struct QuantGemmGroupedFunctor {
   using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
@@ -1854,8 +1907,24 @@ void quant_gemv(
     throw std::invalid_argument("quant_gemv: dimension mismatch");
   Impl::quant_check(w.dtype, w.rows, w.cols, w.data.extent(0), "quant_gemv");
   if (w.rows == 0 || w.cols == 0) return;
-  // Grouped sub-block path (one scale set per 32/16 elems) when K aligns;
-  // otherwise the per-element path below.
+  // Vectorized unit path (128-bit weight/activation loads, one scale unpack
+  // per 32 elements) when K is block-aligned; grouped sub-block path when K
+  // merely divides the group size; per-element path otherwise.
+  if (Impl::quant_can_unit(w.dtype, w.cols)) {
+    const size_t nu = Impl::quant_unit_count(w.dtype, w.cols);
+    Impl::QuantGemvUnitFunctor<ExecSpace, Scalar> f{
+        x, y, w.data.data(), w.dtype, nu, w.row_bytes(),
+        Impl::quant_aligned16(x.data())};
+    // One warp per row where the backend allows it (a row's reduction then
+    // stays inside one warp); host backends cap the team at 1 and the
+    // TeamThreadRange below simply runs serially.
+    const int want = Impl::quant_unit_threads(nu);
+    const int tmax = ::KokkosDNN::Impl::cached_team_size_max<ExecSpace>(f);
+    const int ts   = want < tmax ? want : (tmax > 0 ? tmax : 1);
+    Kokkos::TeamPolicy<ExecSpace> policy((int)w.rows, ts);
+    Kokkos::parallel_for(label, policy, f);
+    return;
+  }
   size_t gs = 0;
   if (Impl::quant_can_group(w.dtype, w.cols, gs)) {
     Impl::QuantGemvGroupedFunctor<ExecSpace, Scalar> f{
