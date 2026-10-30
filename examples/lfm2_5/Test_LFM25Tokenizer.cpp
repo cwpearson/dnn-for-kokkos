@@ -527,6 +527,20 @@ TEST(LFM25Tokenizer, ToolParseAliases) {
       parse_tool_calls("<thinking>hmm</thinking>answer", {}, true);
   EXPECT_EQ(th_lead.reasoning, "hmm");
   EXPECT_EQ(th_lead.text, "answer");
+  // Redundant closers while still leading are markup, not content: an
+  // empty alt block plus the canonical close (or a doubled close) never
+  // leaks a stray `</think>` into `content`.
+  ToolParseResult th_dbl =
+      parse_tool_calls("<thinking></thinking></think>answer");
+  EXPECT_EQ(th_dbl.reasoning, "");
+  EXPECT_EQ(th_dbl.text, "answer");
+  ToolParseResult th_dbl2 =
+      parse_tool_calls("<think>r1</think></think>answer", {}, true);
+  EXPECT_EQ(th_dbl2.reasoning, "r1");
+  EXPECT_EQ(th_dbl2.text, "answer");
+  // ...but a closer after real content stays literal.
+  ToolParseResult th_lit = parse_tool_calls("answer </think> more");
+  EXPECT_EQ(th_lit.text, "answer </think> more");
 
   // LFM3 / qwen3-coder grammar: <tool_call> + <function=...> +
   // <parameter=...> becomes a native call instead of leaking markup.

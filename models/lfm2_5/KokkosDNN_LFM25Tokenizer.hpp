@@ -285,9 +285,10 @@ std::vector<int> encode_chatml_with_tools(
 // after a tool call still counts); model text that merely mentions the
 // tag stays content. A block closes at the first </think>; a tool call
 // start or the turn terminator also ends the block implicitly. An
-// unclosed trailing explicit <think> treats the rest as reasoning; a lone
-// </think> without an opener passes through into the text unless
-// `start_in_reasoning` covers the leading segment. Unclosed
+// unclosed trailing explicit <think> treats the rest as reasoning; redundant
+// closers while still leading (e.g. `<thinking></thinking></think>` or a
+// doubled `</think></think>`) are consumed as markup, while a lone closer
+// after non-whitespace display content stays literal text. Unclosed
 // trailing tool markers (a turn cut by
 // max_tokens/length inside or just before a call block) are recovered
 // best-effort: complete calls (closed parens) in the truncated list become
