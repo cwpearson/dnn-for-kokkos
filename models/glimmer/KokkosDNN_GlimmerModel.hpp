@@ -402,8 +402,6 @@ class Model {
     }
     auto qscale = qk_qscale_;
 
-    const int HkvD = NKV * HD;
-
     for (size_t off = 0; off < T; off += Cmax) {
       const size_t C = std::min(Cmax, T - off);
       const size_t cpos = pos0 + off;
@@ -477,15 +475,11 @@ class Model {
         Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp, b.wq, deq_q_, q2, "wq");
         Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp, b.wk, deq_kv_, k2, "wk");
         Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp, b.wv, deq_kv_, v2, "wv");
-        qk_rmsnorm<ExecSpace, Scalar>(q2, qscale, EPS, q3);
-        qk_rmsnorm<ExecSpace, Scalar>(k2, ones, EPS, k3);
-        Kokkos::parallel_for(
-            "reshape_v",
-            Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0},
-                                                              {C, (size_t)HkvD}),
-            KOKKOS_LAMBDA(size_t t, size_t i) {
-              v3(t, i / HD, i % HD) = v2(t, i);
-            });
+        // Fused Q/K per-head norms + V reshape (one launch instead of
+        // qk q + qk k + reshape_v; bit-identical, see
+        // KokkosDNN_RMSNorm.hpp).
+        qk_rmsnorm_qkv_fused<ExecSpace, Scalar>(q2, qscale, q3, k2, ones, k3,
+                                               v2, v3, EPS);
         if (!nope) {
           auto inv = rope_inv_[(size_t)l];
           rope_neoX_inplace<ExecSpace, Scalar>(q3, k3, inv, HD, pos);
@@ -557,26 +551,22 @@ class Model {
         Impl::flatten_gate_sigmoid_mul<ExecSpace, Scalar>(attn_out, gate_attn,
                                                           attn_flat);
         Impl::linear_chunk<ExecSpace, Scalar>(handle, attn_flat, b.wo, deq_o_, proj, "wo");
-        rmsnorm_one_plus<ExecSpace, Scalar>(proj, b.post_attn_norm, POST_EPS,
-                                            tmp2);
-        Kokkos::parallel_for(
-            "resid1",
-            Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0},
-                                                              {C, (size_t)DIM}),
-            KOKKOS_LAMBDA(size_t t, size_t d) { h(t, d) += tmp2(t, d); });
+        // Fused post-attention norm + residual add (one launch instead of
+        // norm + resid1; ~1 ulp reassociation, see KokkosDNN_RMSNorm.hpp):
+        // h += norm(proj) * (1 + w).
+        rmsnorm_one_plus_resid<ExecSpace, Scalar>(proj, b.post_attn_norm,
+                                                 POST_EPS, h);
         // 2. SwiGLU MLP under the pre-FFN norm + post-FFN norm.
         rmsnorm_one_plus<ExecSpace, Scalar>(h, b.pre_ffn_norm, EPS, tmp2);
         Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp2, b.wgate, deq_ffn_, gate, "wgate");
         Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp2, b.wup, deq_ffn_, up, "wup");
         swiglu<ExecSpace, Scalar>(gate, up, act);
         Impl::linear_chunk<ExecSpace, Scalar>(handle, act, b.wdown, deq_down_, down, "wdown");
-        rmsnorm_one_plus<ExecSpace, Scalar>(down, b.post_ffn_norm, POST_EPS,
-                                            tmp2);
-        Kokkos::parallel_for(
-            "resid2",
-            Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0},
-                                                              {C, (size_t)DIM}),
-            KOKKOS_LAMBDA(size_t t, size_t d) { h(t, d) += tmp2(t, d); });
+        // Fused post-FFN norm + residual add (one launch instead of
+        // norm + resid2; ~1 ulp reassociation, see KokkosDNN_RMSNorm.hpp):
+        // h += norm(down) * (1 + w).
+        rmsnorm_one_plus_resid<ExecSpace, Scalar>(down, b.post_ffn_norm,
+                                                 POST_EPS, h);
       }
 
       // Only the last chunk produces logits (earlier chunks only fill KV).
