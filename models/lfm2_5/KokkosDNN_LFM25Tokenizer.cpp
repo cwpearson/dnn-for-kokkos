@@ -1472,9 +1472,11 @@ size_t trailing_partial_marker(const std::string& b) {
 // ends the block implicitly (the terminator itself is left in the display
 // for the tool/stop stages), so a turn cut or generated without a close
 // tag still separates reasoning from content. An unclosed trailing
-// explicit <think> treats the rest as reasoning; a lone </think> without
-// an opener passes through into the display unless start_in_reasoning
-// covers the leading segment.
+// explicit <think> treats the rest as reasoning. Redundant closers while
+// still leading (e.g. `<thinking></thinking></think>`, an empty alt block
+// plus the canonical close, or a doubled `</think></think>`) are consumed
+// as markup so they never leak into the display; a lone closer is only
+// content once non-whitespace display text precedes it.
 struct SplitThink {
   std::string display;
   std::string reasoning;
@@ -1552,6 +1554,25 @@ SplitThink split_think_blocks(const std::string& raw,
     pos = (term_kind == 0) ? term + term_len : term;
   }
   while (true) {
+    // Redundant leading closers (double-close tolerance): while nothing
+    // non-blank precedes, a closer whose gap is blank-ignoring-tool-blocks
+    // is markup, not content. The gap itself is preserved in the display
+    // (tool blocks excise downstream; whitespace matches the existing
+    // leading-space behavior) while the closer is dropped. Repeats so
+    // `<thinking></thinking></think>` collapses fully.
+    while (prior_out_ws) {
+      const char* close_m = nullptr;
+      const size_t c = find_earliest(
+          raw, pos, {kThinkEndToken, kThinkEndAltToken}, &close_m);
+      if (c == std::string::npos) break;
+      const char* open_m2 = nullptr;
+      const size_t o = find_earliest(
+          raw, pos, {kThinkStartToken, kThinkStartAltToken}, &open_m2);
+      if (o != std::string::npos && o < c) break;
+      if (!blank_ignoring_tool_blocks(raw, pos, c)) break;
+      out.display += raw.substr(pos, c - pos);
+      pos = c + std::string(close_m).size();
+    }
     const char* open_m = nullptr;
     const size_t s = find_earliest(
         raw, pos, {kThinkStartToken, kThinkStartAltToken}, &open_m);
@@ -2192,6 +2213,26 @@ void ToolCallStreamParser::l2_consume(const std::string& piece) {
       continue;
     }
     const char* open_m = nullptr;
+    // Redundant leading closers (whole-text mirror, firm bytes only): while
+    // the display is still blank, a complete closer whose gap is
+    // blank-ignoring-tool-blocks is markup. The gap flows to layer 3
+    // (tool blocks still excise there) while the closer is dropped. Bounded
+    // by the firm frontier so a split marker is held, never misrouted.
+    while (l2_ws_) {
+      const char* close_m = nullptr;
+      const size_t c = find_earliest(
+          buf, pos, {kThinkEndToken, kThinkEndAltToken}, &close_m);
+      if (c == std::string::npos || c >= f) break;
+      const size_t close_len = std::string(close_m).size();
+      if (c + close_len > f) break;
+      const char* open_m2 = nullptr;
+      const size_t o = find_earliest(
+          buf, pos, {kThinkStartToken, kThinkStartAltToken}, &open_m2);
+      if (o != std::string::npos && o < c) break;
+      if (!blank_ignoring_tool_blocks(buf, pos, c)) break;
+      disp += buf.substr(pos, c - pos);
+      pos = c + close_len;
+    }
     const size_t s =
         find_earliest(buf, pos, {kThinkStartToken, kThinkStartAltToken},
                       &open_m);

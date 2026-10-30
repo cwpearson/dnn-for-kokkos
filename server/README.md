@@ -258,7 +258,10 @@ closes the trace) is reported entirely as reasoning, so `content` is
 empty for that turn rather than the trace leaking into it.
 `<thinking>` / `</thinking>` are accepted wherever the canonical
 `<think>` / `</think>` pair is, and either closer ends either opener (a
-model that mixes the two still splits correctly).
+model that mixes the two still splits correctly). Redundant closers while
+still leading (`<thinking></thinking></think>`, doubled `</think>`) are
+consumed as markup so they never leak into `content`; a closer after real
+content stays literal.
 The trace never
 appears in `content`: streaming sends it as
 `reasoning_content` deltas (the DeepSeek/OpenRouter convention, which Zed
