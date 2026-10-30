@@ -47,13 +47,30 @@ run_bin() {
     # SIGPIPE (httplib socket writes) flowing to the server instead of
     # stopping inside gdb. On normal exit the trailing bt prints
     # "No stack." and is harmless; on a crash it dumps all threads.
+    #
+    # Post-mortem capture beyond `bt full`: a SIGSEGV with `#0 0x0` means an
+    # indirect call through a null pointer, and `bt` alone cannot say which
+    # one (nvcc's generated lambda boilerplate carries no source lines).
+    # `up` moves to the caller of the faulting frame, whose $pc is the return
+    # address, so the disassembly around it shows the `call *%reg` that
+    # faulted; `info registers` then shows whether that register (or the
+    # memory operand) was zero. `info sharedlibrary` catches a missing or
+    # version-skewed CUDA library (e.g. libnvJitLink, dlopen'd, so an ldd
+    # check at build time cannot see it). Each -ex is independent: gdb
+    # reports an error for one that does not apply and continues.
     exec gdb --batch --return-child-result \
       -ex "set pagination off" \
+      -ex "set print frame-arguments all" \
       -ex "handle SIGINT nostop noprint pass" \
       -ex "handle SIGTERM nostop noprint pass" \
       -ex "handle SIGPIPE nostop noprint pass" \
       -ex run \
       -ex "thread apply all bt full" \
+      -ex "info sharedlibrary" \
+      -ex "info registers" \
+      -ex up \
+      -ex 'info symbol $pc' \
+      -ex 'x/12i $pc-40' \
       --args "$BIN" "$@"
   fi
   exec "$BIN" "$@"
