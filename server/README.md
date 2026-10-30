@@ -289,9 +289,10 @@ Limits to know:
 - `response_format` fence-stripping applies to non-streaming replies;
   streamed JSON deltas arrive unmodified.
 - Zed (OpenAI-compatible provider, chat-completions path) is supported;
-  see [Zed (LFM2.5)](#zed-lfm25) for the provider settings this server
-  expects (a couple of Zed defaults are wrong for a reasoning model and
-  will visibly degrade multi-turn agent threads).
+  see [Zed (LFM2.5)](#zed-lfm25) and [Zed (Glimmer)](#zed-glimmer) for the
+  provider settings this server expects (a couple of Zed defaults are
+  wrong for a reasoning model and will visibly degrade multi-turn agent
+  threads).
 
 ## Zed (LFM2.5)
 
@@ -361,6 +362,69 @@ Why these values (the defaults are not all right for this model):
 After changing `interleaved_reasoning`, **start a new thread**: existing
 threads still carry the old, polluted history and may keep reproducing
 the old format.
+
+## Zed (Glimmer)
+
+Zed's `openai_compatible` provider works with the chat-completions path.
+Add the server as a provider in `~/.config/zed/settings.json` (or via
+Agent Settings → Add Provider, then fill in the capabilities below):
+
+```json
+{
+  "language_models": {
+    "openai_compatible": {
+      "kokkosdnn": {
+        "api_url": "http://127.0.0.1:8000/v1",
+        "available_models": [
+          {
+            "name": "glimmer-30b",
+            "display_name": "Glimmer 30B (local)",
+            "max_tokens": 8192,
+            "max_output_tokens": 4096,
+            "capabilities": {
+              "tools": false,
+              "images": false,
+              "parallel_tool_calls": false,
+              "prompt_cache_key": false,
+              "chat_completions": true,
+              "interleaved_reasoning": false,
+              "max_tokens_parameter": false
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+Why these values (several differ from the LFM2.5 settings above):
+
+- `tools: false` is **required**. Glimmer has no native tool grammar:
+  the server rejects `tools` and `tool_calls`/`tool` history turns with a
+  400. With Zed's default `true`, the agent attaches tools and every
+  tool-using thread fails.
+- `parallel_tool_calls: false` matches `tools: false` (the Zed default);
+  there is nothing to parallelize.
+- `interleaved_reasoning: false` (the Zed default) is correct here.
+  Glimmer emits no thinking trace, so there is no `reasoning_content` to
+  replay; the server drops any `thinking`/`reasoning`/`reasoning_content`
+  history field. Do not copy the LFM2.5 `true` value over.
+- `max_tokens` is Zed's **context window**, not an output cap; set it to
+  the server's `--max-seq-len` (default `8192`, arch max `131072`). Zed
+  compacts at 90% of this value, so a larger number lets the thread grow
+  past the server's limit and every later request fails with an
+  over-context 400.
+- `max_output_tokens` is the output cap, sent as `max_completion_tokens`.
+  Set it explicitly and generously: when unset, Zed sends no usable cap
+  (the field is absent or `null`), and the server then falls back to 256
+  completion tokens (the server clamps the value to
+  `max_seq_len - prompt_len` anyway).
+- `chat_completions` must stay `true`; the server has no `/v1/responses`.
+- `name` must match the server's `--model` (default `glimmer-30b`), and
+  `api_url` must end in `/v1` (Zed appends `/chat/completions`).
+- Do not set `reasoning_effort`: the server ignores it, and enabling
+  Zed's thinking controls for a non-reasoning model only adds confusion.
 
 ## Errors
 
