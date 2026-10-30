@@ -32,41 +32,31 @@ namespace KokkosDNN {
 namespace Glimmer {
 namespace Impl {
 
-// Elementwise attention-output gating (example-local; the core sigmoid op
-// writes a separate buffer, while here the gate multiplies in place):
-//   a[t,i] *= sigmoid(g[t,i]).
+// Fused flatten + attention-output gating:
+//   out[t,i] = attn[t,i/HD,i%HD] * sigmoid(g[t,i]).
+// Merges the rank-3 -> rank-2 reshape pass with the sigmoid gate multiply:
+// one launch and one write of [T, Hq*D] instead of two passes. Bit-identical
+// to running them back-to-back (the reshape intermediate was already
+// Scalar, so no rounding is skipped).
 template <class ExecSpace, class Scalar>
-void gate_sigmoid_mul(
-    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& a,
+void flatten_gate_sigmoid_mul(
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& attn,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& g,
-    const std::string& label = "Glimmer::gate_sigmoid_mul") {
-  const size_t T = a.extent(0), D = a.extent(1);
-  if (g.extent(0) != T || g.extent(1) != D)
-    throw std::invalid_argument("gate_sigmoid_mul: dimension mismatch");
-  if (T == 0 || D == 0) return;
-  Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, D}),
-      KOKKOS_LAMBDA(size_t t, size_t d) {
-        float gv = static_cast<float>(g(t, d));
-        float s  = 1.0f / (1.0f + expf(-gv));
-        a(t, d)  = static_cast<Scalar>(static_cast<float>(a(t, d)) * s);
-      });
-}
-
-// In-place scalar multiply over a rank-3 view (the q pre-scale; the core
-// scale_by_scalar covers rank-1/2 only).
-template <class ExecSpace, class Scalar>
-void scale_inplace_3d(
-    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& x, float s,
-    const std::string& label = "Glimmer::scale_inplace_3d") {
-  const size_t T = x.extent(0), H = x.extent(1), D = x.extent(2);
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& out) {
+  const size_t T = attn.extent(0), H = attn.extent(1), D = attn.extent(2);
+  if (g.extent(0) != T || g.extent(1) != H * D || out.extent(0) != T ||
+      out.extent(1) != H * D)
+    throw std::invalid_argument(
+        "flatten_gate_sigmoid_mul: dimension mismatch");
   if (T == 0 || H == 0 || D == 0) return;
   Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<3>>({0, 0, 0},
-                                                               {T, H, D}),
-      KOKKOS_LAMBDA(size_t t, size_t h, size_t d) {
-        x(t, h, d) =
-            static_cast<Scalar>(static_cast<float>(x(t, h, d)) * s);
+      "Glimmer::flatten_gate_sigmoid_mul",
+      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, H * D}),
+      KOKKOS_LAMBDA(size_t t, size_t i) {
+        float gv = static_cast<float>(g(t, i));
+        float s  = 1.0f / (1.0f + expf(-gv));
+        out(t, i) = static_cast<Scalar>(
+            static_cast<float>(attn(t, i / D, i % D)) * s);
       });
 }
 
@@ -83,14 +73,16 @@ void scale_inplace_3d(
 //   * embedding: h = scaleless-RMSNorm(E[tok]) (MuseGlimmerTextNormedEmbedding;
 //     no output multiplier at the embed — the multiplier applies to logits);
 //   * per layer: input CenteredRMSNorm (eps rms_norm_eps) ->
-//     q = scaleless-QKNorm(Wq t) * qk_scale_factor (3.87),
+//     q = scaleless-QKNorm(Wq t) * qk_scale_factor (3.87; the scale is
+//     fused into the q norm via the qk_qscale_ weight, one pass),
 //     k = scaleless-QKNorm(Wk t), v = Wv t (v unnormed) ->
 //     RoPE(theta = layer_rope_theta[l]) on q/k, SKIPPED on NoPE layers
 //     (layer_rope_theta == 0, i.e. the full-attention layers: the HF model
 //     passes position_embeddings=None there, so they rotate nothing) ->
 //     sliding (window 2048) or full causal GQA with scale 1/sqrt(head_dim)
 //     (the HF sdpa `scaling`; the 3.87 lives on q, not in the scale) ->
-//     attn_out *= sigmoid(Wgate_attn t) -> o_proj ->
+//     attn_out flat-reshaped and *= sigmoid(Wgate_attn t) in one fused
+//     pass -> o_proj ->
 //     post-attention CenteredRMSNorm (eps post_norm_eps) + residual ->
 //     SwiGLU MLP (silu) under pre-FFN CenteredRMSNorm (eps rms) ->
 //     post-FFN CenteredRMSNorm (eps post) + residual;
@@ -128,7 +120,12 @@ class Model {
   std::vector<Kokkos::View<float*, ExecSpace>> rope_inv_;
   // Ones vector standing in for the absent QK-norm weight (with_scale=False
   // upstream): qk_rmsnorm(flat, ones, eps, out) == scaleless per-head norm.
-  View1 qk_ones_;
+  // qk_qscale_ is the q-norm counterpart with the q pre-scale
+  // (qk_scale_factor) fused in: filling it with the scale makes the q
+  // qk_rmsnorm compute norm and scale in a single pass (it multiplies by
+  // w[d]). Refreshed in forward() if the config changed under us.
+  View1 qk_ones_, qk_qscale_;
+  float qk_qscale_used_ = -1.0f;
   // Dense KV caches, one [max_seq, n_kv, head_dim] K/V pair per layer.
   // Quantized mode (Config::kv_int8) rents the int8 pools + FP32 scale
   // tables below instead; the two modes never coexist (kv_alloc_fresh
@@ -188,13 +185,21 @@ class Model {
         rope_inv_[(size_t)l] = rope_inv_freq<ExecSpace>(
             cfg.head_dim, (float)theta, "", 1.0, 1.0, 4.0, 0);
     }
-    // Ones stand-in for the absent (scaleless) QK-norm weight.
+    // Ones stand-in for the absent (scaleless) QK-norm weight, plus the
+    // q-norm weight carrying the fused q pre-scale (see member docs).
     qk_ones_ = View1("qk_ones", (size_t)cfg.head_dim);
+    qk_qscale_ = View1("qk_qscale", (size_t)cfg.head_dim);
     {
       auto h = Kokkos::create_mirror_view(qk_ones_);
-      for (size_t i = 0; i < h.extent(0); ++i)
+      auto hs = Kokkos::create_mirror_view(qk_qscale_);
+      const float qs = (float)cfg.qk_scale_factor;
+      for (size_t i = 0; i < h.extent(0); ++i) {
         h(i) = static_cast<Scalar>(1.0f);
+        hs(i) = static_cast<Scalar>(qs);
+      }
       Kokkos::deep_copy(qk_ones_, h);
+      Kokkos::deep_copy(qk_qscale_, hs);
+      qk_qscale_used_ = qs;
     }
     kv_alloc_fresh();
     last_buf_ = View1("last", (size_t)cfg.dim);
@@ -356,8 +361,8 @@ class Model {
     if (pos0 + T > (size_t)cfg.max_seq_len)
       throw std::runtime_error("Model::forward: sequence exceeds max_seq_len");
     // Hoisted (device lambdas must not capture `this`/`cfg`).
-    const int DIM = cfg.dim, HD = cfg.head_dim, NH = cfg.n_heads,
-              NKV = cfg.n_kv_heads, VS = cfg.vocab_size, NL = cfg.n_layers;
+    const int DIM = cfg.dim, HD = cfg.head_dim, NKV = cfg.n_kv_heads,
+              VS = cfg.vocab_size, NL = cfg.n_layers;
     const float EPS = cfg.rms_norm_eps, POST_EPS = cfg.post_norm_eps;
     const float QK_SCALE = cfg.qk_scale_factor;
     const float ATTN_SCALE = 1.0f / std::sqrt((float)HD);
@@ -385,8 +390,18 @@ class Model {
     auto last = last_buf_;
     auto logits = logits_buf_;
     auto ones = qk_ones_;
+    // Refresh the fused q pre-scale weight if dims/config changed under us
+    // (mirrors ensure_scratch's repair-on-dim-change above).
+    if (qk_qscale_.extent(0) != (size_t)HD || qk_qscale_used_ != QK_SCALE) {
+      qk_qscale_ = View1("qk_qscale", (size_t)HD);
+      auto hqs = Kokkos::create_mirror_view(qk_qscale_);
+      for (size_t i = 0; i < hqs.extent(0); ++i)
+        hqs(i) = static_cast<Scalar>(QK_SCALE);
+      Kokkos::deep_copy(qk_qscale_, hqs);
+      qk_qscale_used_ = QK_SCALE;
+    }
+    auto qscale = qk_qscale_;
 
-    const int HqD = NH * HD;
     const int HkvD = NKV * HD;
 
     for (size_t off = 0; off < T; off += Cmax) {
@@ -451,8 +466,9 @@ class Model {
         auto& b = weights.blocks[(size_t)l];
         const bool full = cfg.is_full(l);
         const bool nope = cfg.layer_rope_theta[(size_t)l] <= 0.0;
-        // 1. Attention block: input norm, QK projs + scaleless per-head
-        // norms, q pre-scale, (optional) RoPE, KV write + GQA.
+        // 1. Attention block: input norm, QK projs + per-head norms (the q
+        // pre-scale is fused into the q norm via the qk_qscale_ weight),
+        // (optional) RoPE, KV write + GQA.
         rmsnorm_one_plus<ExecSpace, Scalar>(h, b.input_norm, EPS, tmp);
         // Linear dispatch (see KokkosDNN_GlimmerQuantDispatch.hpp): decode
         // chunks (C == 1) run quant_gemv on packed weights, prefill chunks
@@ -461,7 +477,7 @@ class Model {
         Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp, b.wq, deq_q_, q2, "wq");
         Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp, b.wk, deq_kv_, k2, "wk");
         Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp, b.wv, deq_kv_, v2, "wv");
-        qk_rmsnorm<ExecSpace, Scalar>(q2, ones, EPS, q3);
+        qk_rmsnorm<ExecSpace, Scalar>(q2, qscale, EPS, q3);
         qk_rmsnorm<ExecSpace, Scalar>(k2, ones, EPS, k3);
         Kokkos::parallel_for(
             "reshape_v",
@@ -470,7 +486,6 @@ class Model {
             KOKKOS_LAMBDA(size_t t, size_t i) {
               v3(t, i / HD, i % HD) = v2(t, i);
             });
-        Impl::scale_inplace_3d<ExecSpace, Scalar>(q3, QK_SCALE);
         if (!nope) {
           auto inv = rope_inv_[(size_t)l];
           rope_neoX_inplace<ExecSpace, Scalar>(q3, k3, inv, HD, pos);
@@ -534,17 +549,13 @@ class Model {
                                                        attn_out, ATTN_SCALE);
           }
         }
-        Kokkos::parallel_for(
-            "flatten",
-            Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0},
-                                                              {C, (size_t)HqD}),
-            KOKKOS_LAMBDA(size_t t, size_t i) {
-              attn_flat(t, i) = attn_out(t, i / HD, i % HD);
-            });
         // Output gating (sigmoid on the normed-input gate proj) + o_proj.
+        // The attn reshape and the gate multiply are fused into one pass
+        // (runs after the gate proj, whose output it consumes).
         Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp, b.wgate_attn, deq_q_, gate_attn,
                            "wgate_attn");
-        Impl::gate_sigmoid_mul<ExecSpace, Scalar>(attn_flat, gate_attn);
+        Impl::flatten_gate_sigmoid_mul<ExecSpace, Scalar>(attn_out, gate_attn,
+                                                          attn_flat);
         Impl::linear_chunk<ExecSpace, Scalar>(handle, attn_flat, b.wo, deq_o_, proj, "wo");
         rmsnorm_one_plus<ExecSpace, Scalar>(proj, b.post_attn_norm, POST_EPS,
                                             tmp2);
