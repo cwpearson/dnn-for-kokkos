@@ -78,8 +78,8 @@ that predates the `--arch lfm2.5|glimmer` selector, drop the `--arch` flag;
 Kokkos (CUDA backend, `KOKKOS_VERSION` 5.2.1, `CUDA_ARCH` AMPERE80,
 `CMAKE_BUILD_TYPE` Release — all overridable via `--build-arg`) plus
 `kokkosdnn_server` with cuBLAS/cuDNN
-dispatch on top of an `nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04` image
-(same tags as the `tpl=ON` leg of `.github/workflows/cuda.yaml`); the
+dispatch on top of an `nvidia/cuda:13.0.0-cudnn-devel-ubuntu24.04` image;
+the
 runtime stage copies only the server binary (plus a tiny argument-
 validating entrypoint) onto the matching `cudnn-runtime` image. Glimmer's
 sharded-safetensors glob is expanded inside the binary (POSIX `glob(3)`),

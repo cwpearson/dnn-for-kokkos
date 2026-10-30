@@ -70,7 +70,7 @@
 # the driver JIT-compiles it forward onto newer GPUs (Hopper/Blackwell);
 # pass --build-arg CUDA_ARCH=HOPPER90 (etc.) to target a GPU natively.
 
-ARG CUDA_VERSION=12.8.1
+ARG CUDA_VERSION=13.0.0
 ARG UBUNTU_VERSION=24.04
 ARG CUDA_ARCH=AMPERE80
 ARG CMAKE_BUILD_TYPE=Release
