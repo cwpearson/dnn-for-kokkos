@@ -5,9 +5,9 @@ LFM2.5 and Glimmer).
 Enabled with `-DKokkosDNN_ENABLE_SERVER=ON` (default `OFF`, so the default
 build is unaffected). Requires at least one model component
 (`KokkosDNN_ENABLE_MODEL_LFM25=ON` (default) and/or
-`KokkosDNN_ENABLE_MODEL_GLIMMER=ON` once the `models/glimmer` promotion
-lands — until then the Glimmer backend builds as a stub whose `load()`
-reports the missing target).
+`KokkosDNN_ENABLE_MODEL_GLIMMER=ON`). Without the Glimmer component the
+Glimmer backend builds as a stub whose `load()` reports the missing
+target.
 
 Fetching `cpp-httplib` + `nlohmann/json` via FetchContent touches the
 network at configure time. For offline builds, pre-seed the sources and
