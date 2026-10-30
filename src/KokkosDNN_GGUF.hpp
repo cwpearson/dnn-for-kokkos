@@ -1397,6 +1397,62 @@ struct QuantGemvUnitFunctor {
   }
 };
 
+// Multi-row unit GEMV: one team covers `rows_per_team` output rows (one
+// warp per row, 32 threads each, same per-thread unit pipeline as the
+// single-row functor above). Four rows per 128-thread team cuts the block
+// count 4x versus one-team-per-row (fewer scheduling round-trips, better
+// L2 reuse of the shared activation row) with identical numerics (same
+// quant_unit_dot terms, FP32 reassociation across threads of a row only).
+template <class ExecSpace, class Scalar>
+struct QuantGemvUnitMultiFunctor {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  Kokkos::View<Scalar*, ExecSpace> x, y;
+  const uint8_t* wdata;
+  GgmlType dtype;
+  size_t nunits;
+  size_t row_bytes;
+  size_t nrows;
+  bool xvec;
+  int rows_per_team;
+
+  KOKKOS_INLINE_FUNCTION void operator()(const Member& team) const {
+    const int ts = team.team_size();
+    const int rpt = rows_per_team;
+    const int tpr = (rpt > 0) ? (ts / rpt) : ts;
+    const int rank = team.team_rank();
+    const int sub = (tpr > 0) ? (rank / tpr) : 0;
+    const int lane = (tpr > 0) ? (rank - sub * tpr) : 0;
+    float* red = static_cast<float*>(
+        team.team_shmem().get_shmem(sizeof(float) * (size_t)ts));
+    const size_t base =
+        (size_t)team.league_rank() * (size_t)rpt + (size_t)sub;
+    const auto xx = x;
+    const Scalar* xd = xx.data();
+    const size_t xs = xx.stride(0);
+    const GgmlType dt = dtype;
+    const size_t nu = nunits;
+    const bool xv = xvec;
+    const size_t rb = row_bytes;
+    const uint8_t* wd = wdata;
+    float part = 0;
+    if (base < nrows) {
+      const uint8_t* r = wd + base * rb;
+      for (size_t c = (size_t)lane; c < nu; c += (size_t)tpr)
+        part += quant_unit_dot(dt, r, xd, xs, c, xv);
+    }
+    red[(size_t)rank] = part;
+    team.team_barrier();
+    if (rank < rpt) {
+      float sum = 0;
+      for (int t = rank * tpr; t < (rank + 1) * tpr; ++t)
+        sum += red[(size_t)t];
+      const size_t row =
+          (size_t)team.league_rank() * (size_t)rpt + (size_t)rank;
+      if (row < nrows) y(row) = static_cast<Scalar>(sum);
+    }
+  }
+};
+
 // Unit-path eligibility: every decode unit must lie inside whole ggml
 // blocks (see quant_unit_count). Q4_K/Q5_K/Q6_K units span a 256-element
 // block, so K must be a multiple of 256; a Q8_0 unit is one 32-element
@@ -1912,6 +1968,27 @@ void quant_gemv(
   // merely divides the group size; per-element path otherwise.
   if (Impl::quant_can_unit(w.dtype, w.cols)) {
     const size_t nu = Impl::quant_unit_count(w.dtype, w.cols);
+    // Multi-row (4 rows per 128-thread team, one warp per row) where the
+    // backend can field it; serial/host fallback stays single-row.
+    const bool use_multi = (w.rows >= 4);
+    if (use_multi) {
+      Impl::QuantGemvUnitMultiFunctor<ExecSpace, Scalar> mf{
+          x, y, w.data.data(), w.dtype, nu, w.row_bytes(), w.rows,
+          Impl::quant_aligned16(x.data()), 4};
+      const std::size_t shmem = sizeof(float) * 128;
+      const int tmax =
+          ::KokkosDNN::Impl::cached_team_size_max<ExecSpace>(mf, shmem);
+      const int want = 128;
+      const int ts = want < tmax ? want : (tmax > 1 ? tmax : 1);
+      mf.rows_per_team = (ts >= 128) ? 4 : (ts >= 64 ? 2 : 1);
+      const std::size_t shmem_ts = sizeof(float) * (std::size_t)ts;
+      const int teams = (int)((w.rows + (size_t)mf.rows_per_team - 1) /
+                              (size_t)mf.rows_per_team);
+      Kokkos::TeamPolicy<ExecSpace> policy(teams, ts);
+      policy.set_scratch_size(0, Kokkos::PerTeam(shmem_ts));
+      Kokkos::parallel_for(label, policy, mf);
+      return;
+    }
     Impl::QuantGemvUnitFunctor<ExecSpace, Scalar> f{
         x, y, w.data.data(), w.dtype, nu, w.row_bytes(),
         Impl::quant_aligned16(x.data())};
