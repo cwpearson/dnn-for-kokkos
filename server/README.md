@@ -75,8 +75,9 @@ that predates the `--arch lfm2.5|glimmer` selector, drop the `--arch` flag;
 `--model` still selects the served id.)
 
 `server/Dockerfile` is a multi-stage CUDA build: the builder stage compiles
-Kokkos (CUDA backend, `KOKKOS_VERSION` 5.2.1, `CUDA_ARCH` AMPERE80 — both
-overridable via `--build-arg`) plus `kokkosdnn_server` with cuBLAS/cuDNN
+Kokkos (CUDA backend, `KOKKOS_VERSION` 5.2.1, `CUDA_ARCH` AMPERE80,
+`CMAKE_BUILD_TYPE` Release — all overridable via `--build-arg`) plus
+`kokkosdnn_server` with cuBLAS/cuDNN
 dispatch on top of an `nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04` image
 (same tags as the `tpl=ON` leg of `.github/workflows/cuda.yaml`); the
 runtime stage copies only the server binary (plus a tiny argument-
@@ -157,12 +158,17 @@ Crash backtraces: the runtime image ships `gdb`, and the entrypoint
 honors `KOKKOSDNN_GDB` — run with `-e KOKKOSDNN_GDB=1` to execute the
 server under `gdb --batch` so a crash dumps `thread apply all bt full`
 for every thread to the container logs (`0`/unset runs the binary
-directly):
+directly). The flag alone cannot add symbols to a `Release` binary, so
+for line-numbered traces build with
+`--build-arg CMAKE_BUILD_TYPE=RelWithDebInfo` first (default `Release`;
+applies to both the Kokkos and kokkosdnn configures):
 
 ```sh
+docker build -f server/Dockerfile \
+    --build-arg CMAKE_BUILD_TYPE=RelWithDebInfo -t kokkosdnn-server:cuda-dbg .
 docker run --gpus all -p 8000:8000 -e KOKKOSDNN_GDB=1 \
     -v /path/to/lfm:/models/lfm:ro \
-    kokkosdnn-server:cuda \
+    kokkosdnn-server:cuda-dbg \
     --weights /models/lfm/lfm2_5.gguf --tokenizer /models/lfm/tokenizer.json
 ```
 

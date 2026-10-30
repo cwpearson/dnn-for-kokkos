@@ -55,6 +55,15 @@
 #     kokkosdnn-server:cuda \
 #     --weights /models/lfm/lfm2_5.gguf --tokenizer /models/lfm/tokenizer.json
 #
+# Debug symbols: CMAKE_BUILD_TYPE is a CMake build type
+# (--build-arg CMAKE_BUILD_TYPE=RelWithDebInfo, default Release) applied to
+# both the Kokkos and kokkosdnn configures. The run-time KOKKOSDNN_GDB flag
+# cannot add symbols to an already-built Release binary, so pair them for
+# line-numbered backtraces:
+#   docker build -f server/Dockerfile \
+#     --build-arg CMAKE_BUILD_TYPE=RelWithDebInfo -t kokkosdnn-server:cuda-dbg .
+# (RelWithDebInfo keeps -O2 while adding -g; the image grows slightly.)
+#
 # Cross-GPU note: CUDA_ARCH is a Kokkos CUDA arch name
 # (--build-arg CUDA_ARCH=HOPPER90, default AMPERE80) passed straight to
 # -DKokkos_ARCH_<arch>=ON. The default Ampere build also carries PTX, so
@@ -64,6 +73,7 @@
 ARG CUDA_VERSION=12.8.1
 ARG UBUNTU_VERSION=24.04
 ARG CUDA_ARCH=AMPERE80
+ARG CMAKE_BUILD_TYPE=Release
 
 # ---------------------------------------------------------------------------
 # Builder: full CUDA toolkit + cuDNN headers, Kokkos + server compiled here.
@@ -73,6 +83,7 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu${UBUNTU_VERSION} AS builder
 # Re-declare stage-local build args (ARGs reset at each FROM).
 ARG KOKKOS_VERSION=5.2.1
 ARG CUDA_ARCH
+ARG CMAKE_BUILD_TYPE
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -86,7 +97,7 @@ WORKDIR /src
 RUN git clone --depth 1 --branch ${KOKKOS_VERSION} \
       --recursive https://github.com/kokkos/kokkos.git kokkos-src \
  && cmake -S kokkos-src -B kokkos-build \
-      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
       -DCMAKE_INSTALL_PREFIX=/opt/kokkos \
       -DCMAKE_CXX_COMPILER=/src/kokkos-src/bin/nvcc_wrapper \
       -DKokkos_ENABLE_CUDA=ON \
@@ -108,7 +119,7 @@ RUN git clone --depth 1 --branch ${KOKKOS_VERSION} \
 # no-op until that option lands and must NOT be removed as "unused".
 COPY . /src/kokkosdnn
 RUN cmake -S /src/kokkosdnn -B /src/kokkosdnn-build \
-      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
       -DCMAKE_CXX_COMPILER=/src/kokkos-src/bin/nvcc_wrapper \
       -DCMAKE_INSTALL_PREFIX=/opt/kokkosdnn \
       -DKokkos_ROOT=/opt/kokkos \
