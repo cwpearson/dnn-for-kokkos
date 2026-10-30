@@ -302,6 +302,148 @@ struct RmsNormOnePlusTeam {
         });
   }
 };
+
+// Fused (1+w)-RMSNorm + residual add: h[t,:] += norm(x[t,:]) * (1 + w).
+// Same per-row math as RmsNormOnePlusTeam (serial sum-of-squares via
+// Kokkos::single, identical summation order) with the scale pass adding
+// directly into the residual stream instead of writing an intermediate.
+// Reassociation vs the two-pass form (rmsnorm_one_plus into tmp, then
+// h += tmp): the fused add may FMA-contract with the scale multiply
+// (single rounding instead of two), so float results can differ by ~1 ulp.
+// Narrow-Scalar (bhalf) builds are unaffected in practice: the explicit
+// round-to-Scalar of the normalized value pins both roundings and results
+// remain bit-identical (verified on CUDA). Eliminates one kernel launch and one
+// full [T, D] tmp round-trip per call. x and h must not alias (the model
+// passes proj/down vs h).
+template <class ExecSpace, class Scalar>
+struct RmsNormOnePlusResidTeam {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  using View2 = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
+  using View1 = Kokkos::View<Scalar*, ExecSpace>;
+  View2 x;
+  View1 w;
+  View2 h;
+  float eps;
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& team) const {
+    // Local handles: the lambdas below capture by value, so bind members
+    // to locals to avoid an implicit `this` capture (deprecated in C++20).
+    const View2 x_ = x, h_ = h;
+    const View1 w_ = w;
+    const size_t t = static_cast<size_t>(team.league_rank());
+    const size_t D = x.extent(1);
+    float ss = 0;
+    Kokkos::single(
+        Kokkos::PerTeam(team),
+        [&](float& v) {
+          float s = 0;
+          for (size_t d = 0; d < D; ++d) {
+            const float xvd = static_cast<float>(x(t, d));
+            s += xvd * xvd;
+          }
+          v = s;
+        },
+        ss);
+    const float inv = 1.0f / Kokkos::sqrtf(ss / static_cast<float>(D) + eps);
+    Kokkos::parallel_for(
+        Kokkos::TeamThreadRange(team, D), KOKKOS_LAMBDA(size_t d) {
+          const Scalar n = static_cast<Scalar>(
+              static_cast<float>(x_(t, d)) * inv *
+              (1.0f + static_cast<float>(w_(d))));
+          h_(t, d) += n;
+        });
+  }
+};
+
+// Fused Q/K per-head RMSNorm + V reshape: one team per (token, head-slot)
+// with slots [0, T*NH) normalizing q, [T*NH, T*(NH+NKV)) normalizing k,
+// and the remainder copying v from flat [T, Hkv*D] to [T, Hkv, D].
+// The q/k branches repeat QkRmsNormTeam's team-parallel reduce verbatim
+// (same summation, same team-size selection at the call site), so results
+// are bit-identical to separate qk_rmsnorm calls; the v copy is exact.
+// Replaces three launches (qk q, qk k, reshape_v) with one.
+template <class ExecSpace, class Scalar>
+struct QkVRmsNormFusedTeam {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  using View2 = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
+  using View1 = Kokkos::View<Scalar*, ExecSpace>;
+  using View3 = Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>;
+  View2 qflat;
+  View1 wq;
+  View3 qout;
+  View2 kflat;
+  View1 wk;
+  View3 kout;
+  View2 vflat;
+  View3 vout;
+  size_t NH;
+  size_t NKV;
+  float eps;
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& team) const {
+    const View2 qflat_ = qflat, kflat_ = kflat, vflat_ = vflat;
+    const View1 wq_ = wq, wk_ = wk;
+    const View3 qout_ = qout, kout_ = kout, vout_ = vout;
+    const float eps_ = eps;
+    const size_t NH_ = NH, NKV_ = NKV;
+    const size_t HD_ = wq_.extent(0);
+    const size_t T_ = qflat_.extent(0);
+    const size_t id = static_cast<size_t>(team.league_rank());
+    const size_t qn = T_ * NH_;
+    const size_t kn = T_ * NKV_;
+    if (id < qn) {
+      const size_t t = id / NH_;
+      const size_t h = id % NH_;
+      const size_t base = h * HD_;
+      float ss = 0;
+      Kokkos::parallel_reduce(
+          Kokkos::TeamThreadRange(team, HD_),
+          KOKKOS_LAMBDA(size_t d, float& acc) {
+            const float v = static_cast<float>(qflat_(t, base + d));
+            acc += v * v;
+          },
+          ss);
+      const float inv =
+          1.0f / Kokkos::sqrtf(ss / static_cast<float>(HD_) + eps_);
+      Kokkos::parallel_for(
+          Kokkos::TeamThreadRange(team, HD_), KOKKOS_LAMBDA(size_t d) {
+            qout_(t, h, d) = static_cast<Scalar>(
+                static_cast<float>(qflat_(t, base + d)) * inv *
+                static_cast<float>(wq_(d)));
+          });
+    } else if (id < qn + kn) {
+      const size_t j = id - qn;
+      const size_t t = j / NKV_;
+      const size_t h = j % NKV_;
+      const size_t base = h * HD_;
+      float ss = 0;
+      Kokkos::parallel_reduce(
+          Kokkos::TeamThreadRange(team, HD_),
+          KOKKOS_LAMBDA(size_t d, float& acc) {
+            const float v = static_cast<float>(kflat_(t, base + d));
+            acc += v * v;
+          },
+          ss);
+      const float inv =
+          1.0f / Kokkos::sqrtf(ss / static_cast<float>(HD_) + eps_);
+      Kokkos::parallel_for(
+          Kokkos::TeamThreadRange(team, HD_), KOKKOS_LAMBDA(size_t d) {
+            kout_(t, h, d) = static_cast<Scalar>(
+                static_cast<float>(kflat_(t, base + d)) * inv *
+                static_cast<float>(wk_(d)));
+          });
+    } else {
+      const size_t j = id - qn - kn;
+      const size_t t = j / NKV_;
+      const size_t h = j % NKV_;
+      const size_t base = h * HD_;
+      Kokkos::parallel_for(
+          Kokkos::TeamThreadRange(team, HD_), KOKKOS_LAMBDA(size_t d) {
+            vout_(t, h, d) = vflat_(t, base + d);
+          });
+    }
+  }
+};
 }  // namespace Impl
 
 // Gemma2 RMSNorm variant (zero-initialized weights multiply as (1 + w)):
@@ -326,6 +468,35 @@ void rmsnorm_one_plus(
   // 256 threads (Serial -> 1; strided TeamThreadRange stays correct).
   Impl::RmsNormOnePlusTeam<ExecSpace, Scalar> f{
       x, w, y, eps,
+  };
+  const int mx = Impl::cached_team_size_max<ExecSpace>(f);
+  int ts = static_cast<int>(D < 256 ? D : 256);
+  if (mx < ts) ts = mx;
+  if (ts < 1) ts = 1;
+  Kokkos::TeamPolicy<ExecSpace> policy(static_cast<int>(T), ts);
+  Kokkos::parallel_for(label, policy, f);
+}
+
+// Fused Gemma2 (1+w)-RMSNorm + residual add:
+//   h[i,:] += x[i,:] / sqrt(mean(x[i,:]^2) + eps) * (1 + w[:])
+// Reassociation vs rmsnorm_one_plus + separate add (see
+// Impl::RmsNormOnePlusResidTeam: ~1 ulp in float from FMA contraction of
+// the fused add; bhalf stays bit-identical): use a tight tolerance, not
+// bitwise equality, when comparing against the two-pass form. Team-parallel,
+// one team per row; Serial-safe via the team_size_max probe clamp. x and h
+// must not alias.
+template <class ExecSpace, class Scalar>
+void rmsnorm_one_plus_resid(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
+    const Kokkos::View<Scalar*, ExecSpace>& w, float eps,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& h,
+    const std::string& label = "KokkosDNN::rmsnorm_one_plus_resid") {
+  const size_t T = x.extent(0), D = x.extent(1);
+  if (h.extent(0) != T || h.extent(1) != D || w.extent(0) != D)
+    throw std::invalid_argument("rmsnorm_one_plus_resid: dimension mismatch");
+  if (T == 0 || D == 0) return;
+  Impl::RmsNormOnePlusResidTeam<ExecSpace, Scalar> f{
+      x, w, h, eps,
   };
   const int mx = Impl::cached_team_size_max<ExecSpace>(f);
   int ts = static_cast<int>(D < 256 ? D : 256);
@@ -396,6 +567,38 @@ void qk_rmsnorm3d(
   Impl::rmsnorm_team_launch<ExecSpace>(
       Impl::QkRmsNorm3dTeam<ExecSpace, Scalar>{q, w, out, H, D, eps}, T * H,
       D, label);
+}
+
+// Fused Q/K per-head RMSNorm + V flat-to-3D reshape (see
+// Impl::QkVRmsNormFusedTeam): bit-identical to qk_rmsnorm(qflat, wq, eps,
+// qout) + qk_rmsnorm(kflat, wk, eps, kout) + a vflat -> vout reshape copy,
+// in a single launch. q and k share one eps (the model passes the same
+// rms_norm_eps to both). Scalar-agnostic; backend-portable team-parallel.
+template <class ExecSpace, class Scalar>
+void qk_rmsnorm_qkv_fused(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& qflat,
+    const Kokkos::View<Scalar*, ExecSpace>& wq,
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& qout,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& kflat,
+    const Kokkos::View<Scalar*, ExecSpace>& wk,
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& kout,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& vflat,
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& vout,
+    float eps,
+    const std::string& label = "KokkosDNN::qk_rmsnorm_qkv_fused") {
+  const size_t T = qout.extent(0), NH = qout.extent(1), HD = qout.extent(2);
+  const size_t NKV = kout.extent(1);
+  if (qflat.extent(0) != T || qflat.extent(1) != NH * HD ||
+      wq.extent(0) != HD || kflat.extent(0) != T ||
+      kflat.extent(1) != NKV * HD || wk.extent(0) != HD ||
+      kout.extent(0) != T || kout.extent(2) != HD || vflat.extent(0) != T ||
+      vflat.extent(1) != NKV * HD || vout.extent(0) != T ||
+      vout.extent(1) != NKV || vout.extent(2) != HD)
+    throw std::invalid_argument("qk_rmsnorm_qkv_fused: dimension mismatch");
+  Impl::rmsnorm_team_launch<ExecSpace>(
+      Impl::QkVRmsNormFusedTeam<ExecSpace, Scalar>{
+          qflat, wq, qout, kflat, wk, kout, vflat, vout, NH, NKV, eps},
+      T * (NH + 2 * NKV), HD, label);
 }
 
 }  // namespace KokkosDNN
