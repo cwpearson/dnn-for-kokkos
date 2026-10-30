@@ -180,6 +180,41 @@ Ampere codegen and the JIT is repaid on every container start (no
 `~/.nv/ComputeCache` in the image). Build HOPPER90 for a native sm_90 SASS
 image on an H100.
 
+Device-memory checking: the entrypoint also honors `KOKKOSDNN_SANITIZER` —
+run with `-e KOKKOSDNN_SANITIZER=1` to execute the server under
+`compute-sanitizer` (memcheck by default; `KOKKOSDNN_SANITIZER_TOOL` selects
+`racecheck`/`initcheck`/`synccheck`, and `KOKKOSDNN_SANITIZER_ARGS` passes
+extra raw options such as `--force-blocking-launches --padding 32`). This
+catches out-of-bounds/misaligned device accesses, device-heap corruption and
+CUDA API errors, and reports the kernel, source line and thread/block of the
+fault — so pair it with the `RelWithDebInfo` build above for source
+attribution. Two caveats:
+
+- `KOKKOSDNN_GDB` and `KOKKOSDNN_SANITIZER` are **mutually exclusive**; the
+  entrypoint refuses to run with both. compute-sanitizer injects into the
+  target and drives it over its own frontend/target channel, and its
+  `--mode attach` requires an application "to which no other tool is
+  attached", so composing it with gdb yields results from neither.
+- memcheck instruments and serializes every access: expect a 10-100x
+  slowdown. Use a short prompt (a full 30B prefill is hours, not minutes),
+  and consider `KOKKOSDNN_SANITIZER_ARGS="--launch-skip N --launch-count M"`
+  to bound which launches are checked.
+
+`compute-sanitizer` is not in the `cudnn-runtime` base image, so install it
+with `--build-arg INSTALL_COMPUTE_SANITIZER=ON` (adds the CUDA-toolkit
+sanitizer package, a few hundred MB) — the entrypoint prints this same hint
+if the variable is set without the tool present.
+
+```sh
+docker build -f server/Dockerfile --build-arg CMAKE_BUILD_TYPE=RelWithDebInfo \
+    --build-arg INSTALL_COMPUTE_SANITIZER=ON -t kokkosdnn-server:cuda-san .
+docker run --gpus all -p 8000:8000 -e KOKKOSDNN_SANITIZER=1 \
+    -v /path/to/glimmer:/models/glimmer:ro \
+    kokkosdnn-server:cuda-san \
+    --arch glimmer --weights /models/glimmer/model.gguf \
+    --tokenizer /models/glimmer/tokenizer.json
+```
+
 ## Routes
 
 - `GET /v1/models` — `{object:"list", data:[{id, object:"model",
