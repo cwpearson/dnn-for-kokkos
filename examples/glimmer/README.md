@@ -29,10 +29,19 @@ cmake -S . -B build -DCMAKE_CXX_COMPILER=/path/to/kokkos-src/bin/nvcc_wrapper -D
 cmake --build build --parallel 8 --target glimmer_generate test_glimmer_generate test_glimmer_tokenizer
 
 # 3. Download the checkpoint with the `hf` CLI.
+# The full-precision weights live in the official Meta repo (gated:
+# accept the model terms at https://huggingface.co/meta-models/Muse-Glimmer-30B
+# then authenticate). Sharded at 30B scale: 2 shards, ~60 GiB BF16.
 pip install -U "huggingface_hub[cli]"
+hf auth login
 
-hf download darkc0de/Muse-Glimmer-30B-heretic model.safetensors* tokenizer.json \
-  tokenizer_config.json config.json generation_config.json \
+hf download meta-models/Muse-Glimmer-30B \
+  --include "model-*.safetensors" \
+  --include "model.safetensors.index.json" \
+  --include "tokenizer.json" \
+  --include "tokenizer_config.json" \
+  --include "config.json" \
+  --include "generation_config.json" \
   --local-dir weights/muse-glimmer-30b-text
 
 # Q4_K_M GGUF (~16.8 GB, ~17GB resident) for the 24GB recipe below.
@@ -45,12 +54,13 @@ hf download meta-models/Muse-Glimmer-30B-GGUF \
 # Real checkpoint run (~60 GiB weights).
 ./build/examples/glimmer/glimmer_generate \
   --model glimmer-30b --config models/glimmer/config-glimmer-30b-text.json \
-  --weights weights/muse-glimmer-30b-text/model.safetensors \
+  --weights "weights/muse-glimmer-30b-text/model-*.safetensors" \
   --tokenizer weights/muse-glimmer-30b-text/tokenizer.json \
   --prompt "Hello" --max-new 64
 ```
 
-`config-glimmer-30b-text.json` is the HF `text_config` object verbatim; the driver also accepts the full HF `config.json` (present keys win).
+`config-glimmer-30b-text.json` is the `text_config` object of the official
+`meta-models/Muse-Glimmer-30B` `config.json` verbatim; the driver also accepts the full HF `config.json` (present keys win).
 
 ## Example commands
 
@@ -70,7 +80,7 @@ Inspect what a (possibly still downloading) checkpoint file contains, without lo
 
 ```bash
 ./build/examples/glimmer/glimmer_generate \
-  --weights weights/muse-glimmer-30b-text/model.safetensors --list-tensors
+  --weights "weights/muse-glimmer-30b-text/model-*.safetensors" --list-tensors
 ```
 
 FP32 comparison run:
@@ -78,7 +88,7 @@ FP32 comparison run:
 ```bash
 ./build/examples/glimmer/glimmer_generate \
   --model glimmer-30b --config models/glimmer/config-glimmer-30b-text.json \
-  --weights weights/muse-glimmer-30b-text/model.safetensors \
+  --weights "weights/muse-glimmer-30b-text/model-*.safetensors" \
   --tokenizer weights/muse-glimmer-30b-text/tokenizer.json \
   --prompt "Hello" --max-new 64 --fp32
 ```
@@ -114,12 +124,12 @@ GGUF conversion-trap handling (verified against llama.cpp `conversion/muse_glimm
 - Synthesized QK norms: GGUF `attn_q_norm` (full `qk_scale_factor` 3.87) / `attn_k_norm` (ones) absorb the q pre-scale into a *scaled* RMSNorm, while the Model runs a *scaleless* QK norm plus the separate 3.87 multiply — mathematically identical (`rms(x)*3.87`, `rms(x)*1`, same eps), so the loader ignores both tensors (files with or without them load identically).
 - Metadata: `muse-glimmer.{logit_scale, final_logit_softcapping, attention.sliding_window, attention.sliding_window_pattern}` are read and validated against `Config` (throw on missing/mismatch), never silently overriding it.
 
-Useful flags: `--temperature 0` (greedy; the generation_config default is greedy), `--top-k/--top-p/--min-p/--repetition-penalty/--seed`, `--stop <id> ...`, `--stop-string`, `--add-bos/--no-add-bos`, `--prefill-chunk N` (`0` = single-shot), `--max-seq-len N` (validated against `[1, 131072]`), `--kv-int8 | --kv-fp | --kv-quant int8|none` (KV precision; config-file keys `kv_int8`/`kv_quantized`/`kv_quant` agree, last explicit CLI source wins), `--chat/--system/--role/--messages` (Muse-style template, assumption — see header), `--list-tensors`. `--weights` accepts glob patterns for sharded checkpoints, or a single `.gguf` file for a llama.cpp GGUF checkpoint (see above).
+Useful flags: `--temperature 0` (greedy; the driver defaults to greedy while the official `generation_config.json` defaults to sampling: `do_sample=true`, temperature 1.0, `top_p` 0.95, `top_k` 64), `--top-k/--top-p/--min-p/--repetition-penalty/--seed`, `--stop <id> ...`, `--stop-string`, `--add-bos/--no-add-bos`, `--prefill-chunk N` (`0` = single-shot), `--max-seq-len N` (validated against `[1, 131072]`), `--kv-int8 | --kv-fp | --kv-quant int8|none` (KV precision; config-file keys `kv_int8`/`kv_quantized`/`kv_quant` agree, last explicit CLI source wins), `--chat/--system/--role/--messages` (Muse-style template, assumption — see header), `--list-tensors`. `--weights` accepts glob patterns for sharded checkpoints, or a single `.gguf` file for a llama.cpp GGUF checkpoint (see above).
 
 ## Notes
 
 - Separate family from [llama](../llama/), [smollm2](../smollm2/), and [gemma4](../gemma4/): the model library (config, weights, model, tokenizer, session) lives in `models/glimmer/` as `KokkosDNN::glimmer` in namespace `KokkosDNN::Glimmer` (only the core `src/` ops are shared).
-- Weights: single `model.safetensors`-style layout (sharded at 30B scale, ~60 GiB BF16); only the `model.language_model.*` tensors are loaded. With `tie_word_embeddings=false` the loader requires a separate `lm_head` tensor and must NOT alias the embedding table. See `DESIGN.md` for the authoritative math.
+- Weights: `model-*-of-*.safetensors` sharded layout (2 shards at 30B scale, ~60 GiB BF16); only the `model.language_model.*` tensors are loaded. With `tie_word_embeddings=false` the loader requires a separate `lm_head` tensor and must NOT alias the embedding table. See `DESIGN.md` for the authoritative math.
 - Dtype: native bfloat16 (`Kokkos::Experimental::bhalf_t`, the checkpoint dtype) for weights/activations/KV; reductions, scales, and `inv_freq` stay FP32 — same convention as the Llama/SmolLM2/Gemma4 examples.
 - Attention: QK RMSNorms plus the `qk_scale_factor` (3.87) score multiplier (NOT `1/sqrt(d)`); sliding layers use the sliding GQA kernel (window 2048, RoPE theta 500000); full layers use full GQA with NoPE (no rotary — `layer_rope_theta` 0).
 - Head: `output_multiplier`-scaled hidden states, final RMSNorm, separate `lm_head` (`gemv` over it), `20·tanh(logits/20)` softcapping. Only library ops are reused; no new `src/` ops are expected for the text path except where the gap table says so. See `DESIGN.md` for the authoritative math.
