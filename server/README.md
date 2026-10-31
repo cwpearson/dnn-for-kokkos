@@ -155,8 +155,11 @@ Glimmer on a 24GB GPU (packed GGUF + int8 KV + chunk cap): `--kv-int8`
 halves the KV cache (3432 MiB at `--max-seq-len 131072` vs ~6.5 GiB
 dense; 214.5 MiB vs 416 MiB at the 8192 default) and `--prefill-chunk N`
 caps prefill scratch (~440 MiB at the 2048 default, ~110 MiB at 512).
-~17GB weights + 3432 MiB int8 KV + ~614 MiB dequant staging + ~440 MiB
-scratch ≈ 21.4 GiB, fitting 24GB:
+Int8 prefill dequantizes the live prefix into a `[max_seq_len, n_kv, d]`
+K/V scratch pair (128 MiB at 131072) and reuses the dense/cuDNN attention
+kernels, so `--kv-int8` no longer costs prefill throughput.
+~17GB weights + 3432 MiB int8 KV + 128 MiB dequantized KV + ~614 MiB
+dequant staging + ~440 MiB scratch ≈ 21.5 GiB, fitting 24GB:
 
 ```sh
 docker run --gpus all -p 8000:8000 \
