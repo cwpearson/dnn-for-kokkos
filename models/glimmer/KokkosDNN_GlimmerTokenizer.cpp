@@ -2340,7 +2340,7 @@ ToolCallStreamParser::ToolCallStreamParser(
       "<|begin_of_text|>", "<|start|>assistant", "<|message|>", "<|eot|>",
       "<|eom|>", "<atem:function_calls>", "</atem:function_calls>",
       "<atem:invoke", "</atem:invoke>", "<atem:parameter",
-      "</atem" ":parameter>", "<tool_output", "</tool_output>", "</"};
+      "</atem:parameter>", "<tool_output", "</tool_output>", "</"};
   for (const char* h : kHold) marker_hold_.push_back(h);
 }
 
