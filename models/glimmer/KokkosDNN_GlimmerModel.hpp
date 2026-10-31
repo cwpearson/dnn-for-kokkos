@@ -98,6 +98,12 @@ void flatten_gate_sigmoid_mul(
 // [max_seq, n_kv, head_dim] K/V pair (no sharing, no paging). With
 // Config::kv_int8 every layer instead owns symmetric-int8 pools plus
 // [max_seq, n_kv] FP32 scale tables (no sharing, no paging in this step).
+// The int8 mode additionally keeps one shared dense dequantized prefix
+// scratch (kv_deq_k_/kv_deq_v_, Scalar [max_seq, n_kv, head_dim] each) that
+// prefill chunks fill from the int8 pools so they can run the dense attention
+// kernels; decode reads the int8 pools directly. At the 131072 architecture
+// max that scratch is 134 MB = 128 MiB for bf16 Scalar (2 x 67 MB); at
+// max_seq_len 8192 it is 8.4 MB = 8 MiB. Dense KV mode leaves it empty.
 template <class ExecSpace, class Scalar = DefaultScalar>
 class Model {
  public:
@@ -134,6 +140,13 @@ class Model {
       v_cache;
   std::vector<ViewI8> kq_cache, vq_cache;
   std::vector<ViewScale> ks_cache, vs_cache;
+  // Shared dense dequantized prefill scratch (int8 mode only): one
+  // [max_seq_len, n_kv_heads, head_dim] Scalar K/V pair for all layers.
+  // A prefill chunk dequantizes its [0, cpos+C) prefix here once and runs the
+  // dense attention entry points (cuDNN SDPA on full layers, fast native
+  // streaming on sliding layers); single-token decode keeps the int8
+  // split-K path. Allocated in kv_alloc_fresh() only for Config::kv_int8.
+  View3 kv_deq_k_, kv_deq_v_;
   size_t seq_len = 0;
 
   // Persistent scratch: all T-sized temporaries are carved (via subview,
@@ -238,6 +251,8 @@ class Model {
     vq_cache.clear();
     ks_cache.clear();
     vs_cache.clear();
+    kv_deq_k_ = View3();
+    kv_deq_v_ = View3();
     if (cfg.use_quant_kv()) {
       for (int l = 0; l < cfg.n_layers; ++l) {
         kq_cache.emplace_back("kq_cache", MS, NKV, HD);
@@ -245,6 +260,12 @@ class Model {
         ks_cache.emplace_back("ks_cache", MS, NKV);
         vs_cache.emplace_back("vs_cache", MS, NKV);
       }
+      // One dense dequantized prefix buffer shared by all layers (see the
+      // member docs). Pairs with the int8 pools above; never allocated in
+      // dense KV mode. 134 MB = 128 MiB at the 131072 architecture max for
+      // bf16 Scalar (8.4 MB = 8 MiB at max_seq_len 8192).
+      kv_deq_k_ = View3("kv_deq_k", MS, NKV, HD);
+      kv_deq_v_ = View3("kv_deq_v", MS, NKV, HD);
       return;
     }
     for (int l = 0; l < cfg.n_layers; ++l) {
@@ -405,6 +426,10 @@ class Model {
     auto last = last_buf_;
     auto logits = logits_buf_;
     auto ones = qk_ones_;
+    // Dequantized prefill scratch (empty in dense KV mode; only read by the
+    // kvq branch below when C > 1).
+    auto kdeq = kv_deq_k_;
+    auto vdeq = kv_deq_v_;
     // Refresh the fused q pre-scale weight if dims/config changed under us
     // (mirrors ensure_scratch's repair-on-dim-change above).
     if (qk_qscale_.extent(0) != (size_t)HD || qk_qscale_used_ != QK_SCALE) {
@@ -506,11 +531,16 @@ class Model {
         // construction-time mode (views hoisted to locals above: indexing
         // the member vectors inside a device lambda would capture `this`).
         //   dense FP: legacy contiguous write + prefix-subview attention.
-        //   int8: quantizing write + dequant-on-the-fly native attention
-        //     (full and sliding forms). The quantized entry points ignore
-        //     the handle -- they always run the native streaming kernel
-        //     (cuDNN SDPA has no int8 form) -- so cuDNN is bypassed in
-        //     code, not just docs; TPL GEMMs elsewhere are unaffected.
+        //   int8: quantizing write always (decode and future turns must see
+        //     the quantized pools), then prefill chunks (C > 1) dequantize
+        //     the [0, cpos+C) prefix into the shared dense scratch and run
+        //     the dense attention entry points; single-token decode (C == 1)
+        //     keeps the int8 split-K kernel, which reads the pools directly
+        //     and is much faster than dequant + dense decode.
+        //     The quantized entry points ignore the handle -- they always run
+        //     the native streaming kernel (cuDNN SDPA has no int8 form) --
+        //     so in the old path cuDNN was bypassed in code, not just docs;
+        //     TPL GEMMs elsewhere are unaffected.
         // Dense is bit-identical to the pre-quant path; int8 drifts
         // slightly (symmetric per-token per-head rounding).
         if (!kvq) {
@@ -548,17 +578,44 @@ class Model {
           auto vsc = vs_cache[(size_t)l];
           kv_write_quantized_contiguous<ExecSpace, Scalar>(k3, v3, cpos, kqc,
                                                            ksc, vqc, vsc);
-          // Full pools (not prefix subviews): the quantized loaders cap the
-          // key range at q_off + t + 1 themselves, so the full pool plus the
-          // chunk start is exact for both prefill chunks and decode steps.
-          if (!full) {
-            attention_gqa_quantized_sliding<ExecSpace, Scalar>(
-                handle, q3, kqc, ksc, vqc, vsc, cpos, attn_out, ATTN_SCALE,
-                SWIN);
+          if (C > 1) {
+            // Prefill chunk: materialize the dequantized prefix once and run
+            // the dense attention kernels. The scratch values are exactly
+            // the on-the-fly dequantization (float(q) * scale), stored in
+            // Scalar like the dense KV cache; the int8 pools above stay the
+            // source of truth for decode and for later turns.
+            dequant_kv_prefix<ExecSpace>(kqc, ksc, cpos + C, kdeq);
+            dequant_kv_prefix<ExecSpace>(vqc, vsc, cpos + C, vdeq);
+            // Prefix subviews (like the dense path): the dense kernels read
+            // keys [0, cpos + t] via q_off and cap at k.extent(0), so passing
+            // exactly the live prefix keeps the cuDNN plan dims meaningful.
+            auto kp = Kokkos::subview(kdeq,
+                                      std::make_pair(size_t(0), cpos + C),
+                                      Kokkos::ALL, Kokkos::ALL);
+            auto vp = Kokkos::subview(vdeq,
+                                      std::make_pair(size_t(0), cpos + C),
+                                      Kokkos::ALL, Kokkos::ALL);
+            if (!full) {
+              attention_gqa_single_sliding<ExecSpace, Scalar>(
+                  handle, q3, kp, vp, cpos, attn_out, ATTN_SCALE, SWIN);
+            } else {
+              attention_gqa_single<ExecSpace, Scalar>(
+                  handle, q3, kp, vp, cpos, attn_out, ATTN_SCALE);
+            }
           } else {
-            attention_gqa_quantized<ExecSpace, Scalar>(handle, q3, kqc, ksc,
-                                                       vqc, vsc, cpos,
-                                                       attn_out, ATTN_SCALE);
+            // Single-token decode: int8 split-K over the quantized pools.
+            // Full pools (not prefix subviews): the quantized loaders cap the
+            // key range at q_off + t + 1 themselves, so the full pool plus
+            // the chunk start is exact.
+            if (!full) {
+              attention_gqa_quantized_sliding<ExecSpace, Scalar>(
+                  handle, q3, kqc, ksc, vqc, vsc, cpos, attn_out, ATTN_SCALE,
+                  SWIN);
+            } else {
+              attention_gqa_quantized<ExecSpace, Scalar>(handle, q3, kqc, ksc,
+                                                         vqc, vsc, cpos,
+                                                         attn_out, ATTN_SCALE);
+            }
           }
         }
         // Output gating (sigmoid on the normed-input gate proj) + o_proj.

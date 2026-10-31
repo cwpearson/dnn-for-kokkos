@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 
 #include "KokkosDNN_Handle.hpp"
@@ -87,7 +88,9 @@ void copy_prefix_3(const DstView& dst, const SrcView& src) {
 // Single-token decode (T == 1) of the contiguous int8 caches runs a
 // split-K kernel mirroring the dense launch_gqa_decode path (same
 // partial/combine structure, dequantized on the fly); wider prefill
-// widths and the paged-quant path keep the streaming core below.
+// widths and the paged-quant path keep the streaming core below (the
+// Glimmer Model instead dequantizes its prefix into a dense scratch and
+// reuses the dense kernels -- see dequant_kv_prefix).
 
 inline constexpr int KvInt8Max = 127;
 
@@ -130,6 +133,35 @@ void kv_write_quantized_contiguous(const K3View& k3, const V3View& v3,
           kq(cpos + t, h, d) = static_cast<int8_t>(kqi);
           vq(cpos + t, h, d) = static_cast<int8_t>(vqi);
         }
+      });
+}
+
+// Materialize a dense dequantized prefix of a contiguous int8 KV pool:
+// rows [0, n) of dst(k, h, d) = float(q(k, h, d)) * scales(k, h), with the
+// FP32 scale loaded once per (k, h) row and one contiguous d-row per thread
+// (the same value the on-the-fly QuantLoader computes, so no extra
+// quantization rounding). dst is typically a Scalar [max_seq, Hkv, D] scratch
+// owned by the caller; only the first n rows are written. This exists so a
+// caller that has just quantized a prefill chunk can run the dense attention
+// entry points over the int8 cache instead of the serial per-thread
+// streaming quantized core. The int8 pool and scale table are unchanged.
+template <class ExecSpace, class QView, class ScaleView, class DstView>
+void dequant_kv_prefix(const QView& q, const ScaleView& scales, size_t n,
+                       const DstView& dst,
+                       const std::string& label = "KokkosDNN::kv_dequant") {
+  using DstScalar = typename DstView::non_const_value_type;
+  const size_t Hkv = q.extent(1), D = q.extent(2);
+  if (n == 0 || Hkv == 0 || D == 0) return;
+  if (n > q.extent(0) || n > dst.extent(0) || dst.extent(1) < Hkv ||
+      dst.extent(2) < D || scales.extent(0) < n || scales.extent(1) < Hkv)
+    throw std::invalid_argument("dequant_kv_prefix: dimension mismatch");
+  Kokkos::parallel_for(
+      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {n, Hkv}),
+      KOKKOS_LAMBDA(size_t k, size_t h) {
+        const float s = scales(k, h);
+        for (size_t d = 0; d < D; ++d)
+          dst(k, h, d) =
+              static_cast<DstScalar>(static_cast<float>(q(k, h, d)) * s);
       });
 }
 
