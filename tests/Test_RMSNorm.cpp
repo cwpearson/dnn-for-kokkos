@@ -183,9 +183,9 @@ TEST(RMSNormOnePlus, BHalf) {
 
 // Fused (1+w)-RMSNorm + residual add: matches the host serial reference
 // within existing rmsnorm tolerances, and the device two-pass
-// rmsnorm_one_plus + h += tmp form within ~1 ulp (float; the fused add may
-// FMA-contract, a single rounding instead of two) or exactly (bhalf, where
-// the explicit narrow cast pins both roundings).
+// rmsnorm_one_plus + h += tmp form within a few ulp (float; the team-parallel
+// sum-of-squares reassociates and the fused add may FMA-contract) or within
+// narrow-Scalar rounding (bhalf, where both forms round to Scalar).
 template <class Scalar>
 void check_rmsnorm_one_plus_resid(float tol_host, float tol_twopass) {
   using Exec = Kokkos::DefaultExecutionSpace;

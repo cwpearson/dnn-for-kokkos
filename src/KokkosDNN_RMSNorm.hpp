@@ -55,6 +55,40 @@ struct RmsNormTeam {
   }
 };
 
+// Team-parallel scaleless row worker: same reduce-then-scale structure as
+// RmsNormTeam without the weight multiply. In-place safe (the reduction
+// completes before any write). Used by rmsnorm_noscale, whose old RangePolicy
+// -over-rows form left a decode (T=1) row to one thread running the whole D
+// loop serially.
+template <class ExecSpace, class Scalar>
+struct RmsNormNoScaleTeam {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  using View2 = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
+  View2 x;
+  View2 y;
+  float eps;
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& team) const {
+    const View2 x_ = x, y_ = y;
+    const float eps_ = eps;
+    const size_t t = static_cast<size_t>(team.league_rank());
+    const size_t D = x_.extent(1);
+    float ss = 0;
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(team, D),
+        KOKKOS_LAMBDA(size_t d, float& acc) {
+          const float v = static_cast<float>(x_(t, d));
+          acc += v * v;
+        },
+        ss);
+    const float inv = 1.0f / Kokkos::sqrtf(ss / static_cast<float>(D) + eps_);
+    Kokkos::parallel_for(
+        Kokkos::TeamThreadRange(team, D), KOKKOS_LAMBDA(size_t d) {
+          y_(t, d) = static_cast<Scalar>(static_cast<float>(x_(t, d)) * inv);
+        });
+  }
+};
+
 // Launcher shared by rmsnorm and the per-head qk variants below: one team
 // per row, team size min(D, 256) clamped to team_size_max.
 template <class ExecSpace, class Functor>
@@ -231,6 +265,8 @@ void rmsnorm_row(const Kokkos::View<Scalar*, ExecSpace>& x,
 // Scaleless RMSNorm (e.g. Gemma4 `v_norm`, `with_scale=False`):
 //   y[i,:] = x[i,:] / sqrt(mean(x[i,:]^2) + eps)
 // No weight multiply. Scalar-agnostic; norm accumulated in FP32.
+// Team-parallel over rows and dim (Impl::RmsNormNoScaleTeam; the FP32
+// sum-of-squares is reassociated by the reduction tree, a few ulp).
 // In-place safe (x and y may alias).
 template <class ExecSpace, class Scalar>
 void rmsnorm_noscale(
@@ -240,30 +276,21 @@ void rmsnorm_noscale(
   const size_t T = x.extent(0), D = x.extent(1);
   if (y.extent(0) != T || y.extent(1) != D)
     throw std::invalid_argument("rmsnorm_noscale: dimension mismatch");
-  if (T == 0 || D == 0) return;
-  Kokkos::parallel_for(
-      label, Kokkos::RangePolicy<ExecSpace>(0, T), KOKKOS_LAMBDA(size_t t) {
-        float ss = 0;
-        for (size_t d = 0; d < D; ++d) {
-          float v = static_cast<float>(x(t, d));
-          ss += v * v;
-        }
-        float inv = 1.0f / sqrt(ss / (float)D + eps);
-        for (size_t d = 0; d < D; ++d)
-          y(t, d) =
-              static_cast<Scalar>(static_cast<float>(x(t, d)) * inv);
-      });
+  Impl::rmsnorm_team_launch<ExecSpace>(
+      Impl::RmsNormNoScaleTeam<ExecSpace, Scalar>{x, y, eps}, T, D, label);
 }
 
 namespace Impl {
-// Team-parallel row-norm worker: one team per row; the sum-of-squares is
-// accumulated sequentially in the same order as the serial form (identical
-// summation) and broadcast via Kokkos::single, while the scale pass fans out
-// over the team (elementwise, order-free). A RangePolicy over rows alone
-// leaves only T threads (256 at encoder geometry); teams expose T*D-way
-// parallelism. (The rsqrt uses sqrtf where the serial form used sqrt: at
-// most 1 ulp, far inside the 1e-5 test tolerance.) Team size clamps to
-// team_size_max (Serial -> 1) via the caller's probe.
+// Team-parallel row-norm worker: one team per row. The sum-of-squares is a
+// team-parallel reduce (all threads participate) followed by a scale pass
+// that fans out over the team; the reduction tree reassociates the FP32
+// summation relative to a serial loop (a few ulp, far inside the 1e-5 test
+// tolerance). A RangePolicy over rows alone leaves only T threads (256 at
+// encoder geometry), and an earlier revision ran the sum serially on one
+// thread per team, which dominated decode (T=1 left a single thread running
+// the whole D loop while the other 255 idled). Team size clamps to
+// team_size_max (Serial -> 1) via the caller's probe; the strided
+// TeamThreadRange stays correct at any team size.
 template <class ExecSpace, class Scalar>
 struct RmsNormOnePlusTeam {
   using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
@@ -280,21 +307,18 @@ struct RmsNormOnePlusTeam {
     // in C++20; an error under -Werror on the nvcc path).
     const View2 x_ = x, y_ = y;
     const View1 w_ = w;
+    const float eps_ = eps;
     const size_t t = static_cast<size_t>(team.league_rank());
-    const size_t D = x.extent(1);
+    const size_t D = x_.extent(1);
     float ss = 0;
-    Kokkos::single(
-        Kokkos::PerTeam(team),
-        [&](float& v) {
-          float s = 0;
-          for (size_t d = 0; d < D; ++d) {
-            const float xvd = static_cast<float>(x(t, d));
-            s += xvd * xvd;
-          }
-          v = s;
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(team, D),
+        KOKKOS_LAMBDA(size_t d, float& acc) {
+          const float v = static_cast<float>(x_(t, d));
+          acc += v * v;
         },
         ss);
-    const float inv = 1.0f / Kokkos::sqrtf(ss / static_cast<float>(D) + eps);
+    const float inv = 1.0f / Kokkos::sqrtf(ss / static_cast<float>(D) + eps_);
     Kokkos::parallel_for(
         Kokkos::TeamThreadRange(team, D), KOKKOS_LAMBDA(size_t d) {
           y_(t, d) = static_cast<Scalar>(static_cast<float>(x_(t, d)) * inv *
@@ -304,17 +328,17 @@ struct RmsNormOnePlusTeam {
 };
 
 // Fused (1+w)-RMSNorm + residual add: h[t,:] += norm(x[t,:]) * (1 + w).
-// Same per-row math as RmsNormOnePlusTeam (serial sum-of-squares via
-// Kokkos::single, identical summation order) with the scale pass adding
+// Same per-row math as RmsNormOnePlusTeam (team-parallel FP32 sum-of-squares,
+// i.e. reduction-tree reassociation of a few ulp) with the scale pass adding
 // directly into the residual stream instead of writing an intermediate.
 // Reassociation vs the two-pass form (rmsnorm_one_plus into tmp, then
-// h += tmp): the fused add may FMA-contract with the scale multiply
-// (single rounding instead of two), so float results can differ by ~1 ulp.
-// Narrow-Scalar (bhalf) builds are unaffected in practice: the explicit
-// round-to-Scalar of the normalized value pins both roundings and results
-// remain bit-identical (verified on CUDA). Eliminates one kernel launch and one
-// full [T, D] tmp round-trip per call. x and h must not alias (the model
-// passes proj/down vs h).
+// h += tmp): in addition to the sum-of-squares tree, the fused add may
+// FMA-contract with the scale multiply (single rounding instead of two), so
+// float results can differ by a few ulp. Narrow-Scalar (bhalf) builds are
+// within the same narrow-Scalar rounding; they are no longer guaranteed
+// bit-identical because the reduction reassociates the norm. Eliminates one
+// kernel launch and one full [T, D] tmp round-trip per call. x and h must
+// not alias (the model passes proj/down vs h).
 template <class ExecSpace, class Scalar>
 struct RmsNormOnePlusResidTeam {
   using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
@@ -330,21 +354,18 @@ struct RmsNormOnePlusResidTeam {
     // to locals to avoid an implicit `this` capture (deprecated in C++20).
     const View2 x_ = x, h_ = h;
     const View1 w_ = w;
+    const float eps_ = eps;
     const size_t t = static_cast<size_t>(team.league_rank());
-    const size_t D = x.extent(1);
+    const size_t D = x_.extent(1);
     float ss = 0;
-    Kokkos::single(
-        Kokkos::PerTeam(team),
-        [&](float& v) {
-          float s = 0;
-          for (size_t d = 0; d < D; ++d) {
-            const float xvd = static_cast<float>(x(t, d));
-            s += xvd * xvd;
-          }
-          v = s;
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(team, D),
+        KOKKOS_LAMBDA(size_t d, float& acc) {
+          const float v = static_cast<float>(x_(t, d));
+          acc += v * v;
         },
         ss);
-    const float inv = 1.0f / Kokkos::sqrtf(ss / static_cast<float>(D) + eps);
+    const float inv = 1.0f / Kokkos::sqrtf(ss / static_cast<float>(D) + eps_);
     Kokkos::parallel_for(
         Kokkos::TeamThreadRange(team, D), KOKKOS_LAMBDA(size_t d) {
           const Scalar n = static_cast<Scalar>(
@@ -463,9 +484,10 @@ void rmsnorm_one_plus(
   if (y.extent(0) != T || y.extent(1) != D || w.extent(0) != D)
     throw std::invalid_argument("rmsnorm_one_plus: dimension mismatch");
   if (T == 0 || D == 0) return;
-  // Team per row (same summation order; the serial form exposed only T
-  // threads). Probe clamps the team size for backends that cannot field
-  // 256 threads (Serial -> 1; strided TeamThreadRange stays correct).
+  // Team per row: the sum-of-squares is a team-parallel reduce, so decode
+  // (T=1) spreads the whole row over the team instead of one serial thread.
+  // The probe clamps the team size for backends that cannot field 256
+  // threads (Serial -> 1; strided TeamThreadRange stays correct).
   Impl::RmsNormOnePlusTeam<ExecSpace, Scalar> f{
       x, w, y, eps,
   };
@@ -480,11 +502,12 @@ void rmsnorm_one_plus(
 // Fused Gemma2 (1+w)-RMSNorm + residual add:
 //   h[i,:] += x[i,:] / sqrt(mean(x[i,:]^2) + eps) * (1 + w[:])
 // Reassociation vs rmsnorm_one_plus + separate add (see
-// Impl::RmsNormOnePlusResidTeam: ~1 ulp in float from FMA contraction of
-// the fused add; bhalf stays bit-identical): use a tight tolerance, not
-// bitwise equality, when comparing against the two-pass form. Team-parallel,
-// one team per row; Serial-safe via the team_size_max probe clamp. x and h
-// must not alias.
+// Impl::RmsNormOnePlusResidTeam: a few ulp in float from the team-parallel
+// sum-of-squares tree and FMA contraction of the fused add; bhalf stays
+// within narrow-Scalar rounding but is no longer bit-identical): use a tight
+// tolerance, not bitwise equality, when comparing against the two-pass form.
+// Team-parallel, one team per row; Serial-safe via the team_size_max probe
+// clamp. x and h must not alias.
 template <class ExecSpace, class Scalar>
 void rmsnorm_one_plus_resid(
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
