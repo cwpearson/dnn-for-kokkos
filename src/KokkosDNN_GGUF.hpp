@@ -46,6 +46,7 @@
 #include <string>
 #include <vector>
 
+#include "KokkosDNN_GGUFGemvCuda.hpp"
 #include "KokkosDNN_Handle.hpp"
 #include "KokkosDNN_Macros.hpp"
 #include "KokkosDNN_Occupancy.hpp"
@@ -261,6 +262,17 @@ struct BlockQ5K {
   uint8_t qs[128];     // low 4 bits (nibble per quant, low nibble first)
 };
 static_assert(sizeof(BlockQ5K) == 176, "BlockQ5K must be 176 bytes");
+
+// The CUDA int8-dot GEMV (KokkosDNN_GGUFGemvCuda.hpp) walks these packed
+// layouts by byte offset; pin its copies so the two cannot drift.
+static_assert(sizeof(::KokkosDNN::Impl::GgufMvq::BlockQ4K) == sizeof(BlockQ4K),
+              "int8 GEMV Q4_K block layout drift");
+static_assert(sizeof(::KokkosDNN::Impl::GgufMvq::BlockQ5K) == sizeof(BlockQ5K),
+              "int8 GEMV Q5_K block layout drift");
+static_assert(sizeof(::KokkosDNN::Impl::GgufMvq::BlockQ6K) == sizeof(BlockQ6K),
+              "int8 GEMV Q6_K block layout drift");
+static_assert(sizeof(::KokkosDNN::Impl::GgufMvq::BlockQ80) == sizeof(BlockQ80),
+              "int8 GEMV Q8_0 block layout drift");
 
 // Scale/min unpacking for Q4_K (and Q5_K): 8 sub-blocks of 32 elements share
 // 12 bytes. j<4: 6-bit values straight out of bytes j/j+4; j>=4: 4-bit nibble
@@ -2327,6 +2339,96 @@ void quant_gemv(
     const std::string& label = "KokkosDNN::Gguf::quant_gemv") {
   DNNHandle<ExecSpace> handle;
   quant_gemv(handle, x, w, y, label);
+}
+
+// ---------------------------------------------------------------------------
+// int8-dot decode GEMV (CUDA): stage the activation row into int8 blocks once
+// and run 4 `__dp4a` per 32 weight elements (see
+// KokkosDNN_GGUFGemvCuda.hpp for the design and the numerics note).
+//
+// The staging buffer is caller-owned and reused across calls: decode runs
+// ~400 of these per token and must not allocate. Size it with
+// quant_gemv_int8_scratch_bytes(K) -- one buffer sized for the largest K in
+// the model serves every projection, since the layout only depends on K
+// through a block count.
+//
+// This is an ADDITIVE entry point, not a change to quant_gemv(x, w, y):
+// callers that do not stage activations keep the portable kernel bit for bit,
+// which is what the exact-reference parity tests
+// (tests/Test_GGUF.cpp, examples/glimmer/Test_GlimmerWeightsGGUF.cpp) pin.
+// Even with a buffer, anything the fast path does not claim (non-CUDA
+// backends, unsupported dtypes, K not block-aligned, un-staged scalars,
+// failed launch) falls through to the same portable path.
+// ---------------------------------------------------------------------------
+
+// Bytes of activation staging quant_gemv() needs for a K-element activation
+// row; 0 when K is not 32-element block aligned (no staging is possible, so
+// the portable path always runs).
+inline size_t quant_gemv_int8_scratch_bytes(size_t K) {
+  if (K % 32 != 0) return 0;
+  return ::KokkosDNN::Impl::GgufMvq::act_q8_bytes(K);
+}
+
+namespace Impl {
+
+// ggml dtype -> int8-GEMV dtype tag. False keeps the portable path.
+inline bool quant_int8_dtype(GgmlType dt,
+                             ::KokkosDNN::Impl::GgufMvq::Wd& out) {
+  using Wd = ::KokkosDNN::Impl::GgufMvq::Wd;
+  switch (dt) {
+    case GgmlType::Q4_K: out = Wd::Q4K; return true;
+    case GgmlType::Q5_K: out = Wd::Q5K; return true;
+    case GgmlType::Q6_K: out = Wd::Q6K; return true;
+    case GgmlType::Q8_0: out = Wd::Q80; return true;
+    default: return false;
+  }
+}
+
+}  // namespace Impl
+
+// True when quant_gemv(handle, x, w, y, act_scratch) takes the int8-dot path
+// on this backend for this dtype/K (given a correctly sized staging buffer).
+// Other backends, unsupported dtypes, un-staged scalars and K values that are
+// not block aligned all report false and keep the portable kernel.
+template <class ExecSpace, class Scalar>
+inline bool quant_gemv_int8_supported(GgmlType dtype, size_t K) {
+  if (!::KokkosDNN::Impl::GgufMvq::available<ExecSpace, Scalar>) return false;
+  if (quant_gemv_int8_scratch_bytes(K) == 0) return false;
+  ::KokkosDNN::Impl::GgufMvq::Wd mdt{};
+  return Impl::quant_int8_dtype(dtype, mdt) &&
+         ::KokkosDNN::Impl::GgufMvq::dtype_ok(mdt, K);
+}
+
+template <class ExecSpace, class Scalar>
+void quant_gemv(
+    const DNNHandle<ExecSpace>& handle,
+    const Kokkos::View<Scalar*, ExecSpace>& x, const QuantWeight<ExecSpace>& w,
+    const Kokkos::View<Scalar*, ExecSpace>& y,
+    const Kokkos::View<uint8_t*, ExecSpace>& act_scratch,
+    const std::string& label = "KokkosDNN::Gguf::quant_gemv") {
+  if (x.extent(0) != w.cols || y.extent(0) != w.rows)
+    throw std::invalid_argument("quant_gemv: dimension mismatch");
+  Impl::quant_check(w.dtype, w.rows, w.cols, w.data.extent(0), "quant_gemv");
+  if (w.rows == 0 || w.cols == 0) return;
+  const size_t need = quant_gemv_int8_scratch_bytes(w.cols);
+  ::KokkosDNN::Impl::GgufMvq::Wd mdt{};
+  if (need > 0 && act_scratch.extent(0) >= need &&
+      Impl::quant_int8_dtype(w.dtype, mdt) &&
+      ::KokkosDNN::Impl::GgufMvq::launch_quant_gemv_int8<ExecSpace, Scalar>(
+          x, w.data.data(), mdt, w.rows, w.cols, w.row_bytes(), y,
+          act_scratch.data(), act_scratch.extent(0)))
+    return;
+  quant_gemv(handle, x, w, y, label);
+}
+
+template <class ExecSpace, class Scalar>
+void quant_gemv(
+    const ExecSpace&, const Kokkos::View<Scalar*, ExecSpace>& x,
+    const QuantWeight<ExecSpace>& w, const Kokkos::View<Scalar*, ExecSpace>& y,
+    const Kokkos::View<uint8_t*, ExecSpace>& act_scratch,
+    const std::string& label = "KokkosDNN::Gguf::quant_gemv") {
+  DNNHandle<ExecSpace> handle;
+  quant_gemv(handle, x, w, y, act_scratch, label);
 }
 
 // Y[M,N] = X[M,K] * W[N,K]^T with packed-quant W, FP32 accumulation.

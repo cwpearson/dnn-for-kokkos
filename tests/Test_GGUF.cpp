@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -615,60 +616,67 @@ struct CaseCfg {
 void build_case(GgmlType dtype, size_t N, size_t K, std::vector<float>& ref,
                 std::vector<uint8_t>& raw) {
   ref.resize(N * K);
+  // K-quant rows are built block by block (256 values each), so K may span
+  // any number of whole blocks.
   if (dtype == GgmlType::Q4_K) {
     for (size_t i = 0; i < N; ++i)
       for (size_t k = 0; k < K; ++k)
         ref[i * K + k] = (float)((i * K + k) % 16);
-    raw.resize(N * 144);
-    for (size_t i = 0; i < N; ++i) {
-      BlockQ4K b = make_unit_q4k();
-      for (int iter = 0; iter < 4; ++iter)
-        for (int l = 0; l < 32; ++l) {
-          const uint8_t lo = (uint8_t)ref[i * K + iter * 64 + l];
-          const uint8_t hi = (uint8_t)ref[i * K + iter * 64 + 32 + l];
-          b.qs[iter * 32 + l] = (uint8_t)(lo | (hi << 4));
-        }
-      std::memcpy(raw.data() + i * 144, &b, 144);
-    }
+    const size_t nb = K / 256;
+    raw.resize(N * nb * 144);
+    for (size_t i = 0; i < N; ++i)
+      for (size_t blk = 0; blk < nb; ++blk) {
+        BlockQ4K b = make_unit_q4k();
+        for (int iter = 0; iter < 4; ++iter)
+          for (int l = 0; l < 32; ++l) {
+            const uint8_t lo =
+                (uint8_t)ref[i * K + blk * 256 + iter * 64 + l];
+            const uint8_t hi =
+                (uint8_t)ref[i * K + blk * 256 + iter * 64 + 32 + l];
+            b.qs[iter * 32 + l] = (uint8_t)(lo | (hi << 4));
+          }
+        std::memcpy(raw.data() + (i * nb + blk) * 144, &b, 144);
+      }
     return;
   }
   if (dtype == GgmlType::Q5_K) {
     for (size_t i = 0; i < N; ++i)
       for (size_t k = 0; k < K; ++k)
         ref[i * K + k] = (float)((i * K + k) % 32);
-    raw.resize(N * 176);
-    for (size_t i = 0; i < N; ++i) {
-      BlockQ5K b = make_unit_q5k();
-      pack_unit_q5k(ref.data() + i * K, &b);
-      std::memcpy(raw.data() + i * 176, &b, 176);
-    }
+    const size_t nb = K / 256;
+    raw.resize(N * nb * 176);
+    for (size_t i = 0; i < N; ++i)
+      for (size_t blk = 0; blk < nb; ++blk) {
+        BlockQ5K b = make_unit_q5k();
+        pack_unit_q5k(ref.data() + i * K + blk * 256, &b);
+        std::memcpy(raw.data() + (i * nb + blk) * 176, &b, 176);
+      }
     return;
   }
   if (dtype == GgmlType::Q6_K) {
     for (size_t i = 0; i < N; ++i)
       for (size_t k = 0; k < K; ++k)
         ref[i * K + k] = -32.0f + (float)((i * K + k) % 16);
-    raw.resize(N * 210);
-    for (size_t i = 0; i < N; ++i) {
-      BlockQ6K b{};
-      b.d = 0x3C00;
-      for (int s = 0; s < 16; ++s) b.scales[s] = 1;
-      // qh = 0: decoded q = nibble - 32, so store v + 32 in the nibbles.
-      for (int c = 0; c < 2; ++c)
-        for (int l = 0; l < 32; ++l) {
-          const uint8_t v0 =
-              (uint8_t)(ref[i * K + c * 128 + l] + 32.0f);  // y[l]
-          const uint8_t v1 =
-              (uint8_t)(ref[i * K + c * 128 + 64 + l] + 32.0f);  // y[l+64]
-          const uint8_t v2 =
-              (uint8_t)(ref[i * K + c * 128 + 32 + l] + 32.0f);  // y[l+32]
-          const uint8_t v3 =
-              (uint8_t)(ref[i * K + c * 128 + 96 + l] + 32.0f);  // y[l+96]
-          b.ql[c * 64 + l]      = (uint8_t)(v0 | (v1 << 4));
-          b.ql[c * 64 + 32 + l] = (uint8_t)(v2 | (v3 << 4));
-        }
-      std::memcpy(raw.data() + i * 210, &b, 210);
-    }
+    const size_t nb = K / 256;
+    raw.resize(N * nb * 210);
+    for (size_t i = 0; i < N; ++i)
+      for (size_t blk = 0; blk < nb; ++blk) {
+        BlockQ6K b{};
+        b.d = 0x3C00;
+        for (int s = 0; s < 16; ++s) b.scales[s] = 1;
+        // qh = 0: decoded q = nibble - 32, store v + 32 in the nibbles.
+        for (int c = 0; c < 2; ++c)
+          for (int l = 0; l < 32; ++l) {
+            const float* r = ref.data() + i * K + blk * 256 + c * 128;
+            const uint8_t v0 = (uint8_t)(r[l] + 32.0f);       // y[l]
+            const uint8_t v1 = (uint8_t)(r[l + 64] + 32.0f);  // y[l+64]
+            const uint8_t v2 = (uint8_t)(r[l + 32] + 32.0f);  // y[l+32]
+            const uint8_t v3 = (uint8_t)(r[l + 96] + 32.0f);  // y[l+96]
+            b.ql[c * 64 + l]      = (uint8_t)(v0 | (v1 << 4));
+            b.ql[c * 64 + 32 + l] = (uint8_t)(v2 | (v3 << 4));
+          }
+        std::memcpy(raw.data() + (i * nb + blk) * 210, &b, 210);
+      }
     return;
   }
   // Small exact-binary values for the F-variants and Q8_0.
@@ -828,10 +836,202 @@ void check_dequant_to_dense(GgmlType dtype, size_t K, float tol) {
           << "," << k << ")";
 }
 
+// ---------------------------------------------------------------------------
+// (f) int8-staged (dp4a) GEMV. The activation int8 quantization is the only
+// new rounding, so the reference dequantizes the SAME int8 blocks on the host
+// (bit-identical quantizer: d = amax/127, q = rint(x/d)) and the comparison
+// is then tight -- it only tolerates FP32 reassociation. A second check pins
+// the fallback: whenever the fast path declines (unsupported dtype, K not
+// block aligned, undersized staging) the result must equal the portable path
+// exactly, never "close".
+// ---------------------------------------------------------------------------
+template <class Scalar>
+void check_quant_gemv_int8(GgmlType dtype, size_t K, float tol) {
+  const size_t N = 5;
+  std::vector<float> ref;
+  std::vector<uint8_t> raw;
+  build_case(dtype, N, K, ref, raw);
+  std::vector<float> wdq;
+  host_dequant(dtype, raw.data(), N * K, wdq);
+
+  const float step = 0.125f;
+  Kokkos::View<Scalar*, Exec> x("x", K), y("y", N), yref("yref", N);
+  auto hx = Kokkos::create_mirror_view(x);
+  for (size_t k = 0; k < K; ++k)
+    hx(k) = static_cast<Scalar>(step * (float)((int)(k % 7) - 3));
+  Kokkos::deep_copy(x, hx);
+  QuantWeight<Exec> w = make_qw<Exec>(dtype, N, K, raw);
+  KokkosDNN::DNNHandle<Exec> h;
+
+  // Host copy of the stage-1 quantizer.
+  std::vector<float> dqx(K);
+  for (size_t k0 = 0; k0 + 32 <= K; k0 += 32) {
+    float amax = 0.0f;
+    for (size_t i = 0; i < 32; ++i)
+      amax = std::max(amax, std::fabs((float)hx(k0 + i)));
+    const float d   = amax / 127.0f;
+    const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+    for (size_t i = 0; i < 32; ++i) {
+      int q = (int)std::nearbyint((float)hx(k0 + i) * inv);
+      q     = std::max(-127, std::min(127, q));
+      dqx[k0 + i] = d * (float)q;
+    }
+  }
+
+  Kokkos::View<uint8_t*, Exec> scratch("scratch",
+                                       quant_gemv_int8_scratch_bytes(K));
+  const bool active = quant_gemv_int8_supported<Exec, Scalar>(dtype, K);
+  quant_gemv(h, x, w, y, scratch);
+  Kokkos::fence();
+  auto got = Kokkos::create_mirror_view(y);
+  Kokkos::deep_copy(got, y);
+
+  quant_gemv(h, x, w, yref);
+  Kokkos::fence();
+  auto base = Kokkos::create_mirror_view(yref);
+  Kokkos::deep_copy(base, yref);
+
+  for (size_t j = 0; j < N; ++j) {
+    if (active) {
+      // Reference on the dequantized weights and the dequantized int8
+      // activation blocks (double accumulation).
+      double acc = 0;
+      for (size_t k = 0; k < K; ++k)
+        acc += (double)wdq[j * K + k] * (double)dqx[k];
+      EXPECT_NEAR((float)got(j), (float)acc, tol)
+          << "int8 GEMV mismatch dtype=" << ggml_type_name(dtype)
+          << " row=" << j;
+    } else {
+      EXPECT_FLOAT_EQ((float)got(j), (float)base(j))
+          << "declined int8 GEMV must reproduce the portable path: dtype="
+          << ggml_type_name(dtype) << " row=" << j;
+    }
+  }
+}
+
+// Random-payload variant: the crafted packings above pin the element mapping
+// but use unit scales, so the 6-bit (scale, min) unpacking and the Q6_K
+// per-16 scales are only exercised here. The payload bytes are random
+// (superblock scales sanitized so no block is inf/nan) and the reference
+// dequantizes those exact bytes and replays the stage-1 int8 quantizer on the
+// host, so the tolerance stays tight: a wrong (scale, min) or half-sum
+// selection in any unit shows up immediately.
+template <class Scalar>
+void check_quant_gemv_int8_random(GgmlType dtype, size_t K) {
+  const size_t N = 7;
+  const size_t rb = ggml_row_bytes(dtype, K);
+  std::mt19937 rng(0xC0FFEEu);
+  std::vector<uint8_t> raw(N * rb);
+  for (auto& byte : raw) byte = (uint8_t)(rng() & 0xFFu);
+  // Superblock scale fields: a small finite fp16 (2^-7) instead of noise.
+  std::vector<size_t> block_bytes;
+  switch (dtype) {
+    case GgmlType::Q4_K: block_bytes.push_back(144); break;
+    case GgmlType::Q5_K: block_bytes.push_back(176); break;
+    case GgmlType::Q6_K: block_bytes.push_back(210); break;
+    case GgmlType::Q8_0: block_bytes.push_back(34); break;
+    default: throw std::runtime_error("random int8 case: bad dtype");
+  }
+  const uint16_t small = 0x2400u;  // fp16 2^-7
+  for (size_t r = 0; r < N; ++r)
+    for (size_t off = 0; off + block_bytes[0] <= rb; off += block_bytes[0]) {
+      uint8_t* blk = raw.data() + r * rb + off;
+      if (dtype == GgmlType::Q6_K) {
+        std::memcpy(blk + 208, &small, 2);
+        // 6-bit quant scales are int8 here (any value is valid).
+        for (int s = 0; s < 16; ++s) blk[192 + (size_t)s] = (int8_t)(s * 9 - 70);
+      } else if (dtype == GgmlType::Q8_0) {
+        std::memcpy(blk, &small, 2);
+      } else {
+        std::memcpy(blk, &small, 2);
+        std::memcpy(blk + 2, &small, 2);
+      }
+    }
+
+  Kokkos::View<Scalar*, Exec> x("x", K), y("y", N);
+  auto hx = Kokkos::create_mirror_view(x);
+  for (size_t k = 0; k < K; ++k) {
+    const float u = (float)((int)(rng() % 2001) - 1000) / 1000.0f;
+    hx(k) = static_cast<Scalar>(u);
+  }
+  Kokkos::deep_copy(x, hx);
+  QuantWeight<Exec> w = make_qw<Exec>(dtype, N, K, raw);
+  std::vector<float> wdq;
+  host_dequant(dtype, raw.data(), N * K, wdq);
+
+  // Host copy of the stage-1 quantizer: with the activation rounding
+  // reproduced exactly, the reference is the only source of truth and the
+  // tolerance stays tight (FP32 reassociation), so a wrong (scale, min) or
+  // half-sum selection in ANY unit shows up as a large deviation.
+  std::vector<float> dqx(K);
+  for (size_t k0 = 0; k0 + 32 <= K; k0 += 32) {
+    float amax = 0.0f;
+    for (size_t i = 0; i < 32; ++i)
+      amax = std::max(amax, std::fabs((float)hx(k0 + i)));
+    const float d   = amax / 127.0f;
+    const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+    for (size_t i = 0; i < 32; ++i) {
+      int q = (int)std::nearbyint((float)hx(k0 + i) * inv);
+      q     = std::max(-127, std::min(127, q));
+      dqx[k0 + i] = d * (float)q;
+    }
+  }
+
+  Kokkos::View<uint8_t*, Exec> scratch("scratch",
+                                       quant_gemv_int8_scratch_bytes(K));
+  KokkosDNN::DNNHandle<Exec> h;
+  quant_gemv(h, x, w, y, scratch);
+  Kokkos::fence();
+  auto got = Kokkos::create_mirror_view(y);
+  Kokkos::deep_copy(got, y);
+  // On a backend that declines the fast path the activations are used as-is,
+  // so the reference uses the same values.
+  const bool active = quant_gemv_int8_supported<Exec, Scalar>(dtype, K);
+  for (size_t k = 0; k < K; ++k)
+    if (!active) dqx[k] = (float)hx(k);
+  for (size_t j = 0; j < N; ++j) {
+    double mag = 0, acc = 0;
+    for (size_t k = 0; k < K; ++k) {
+      const double v = (double)wdq[j * K + k] * (double)dqx[k];
+      mag += std::fabs(v);
+      acc += v;
+    }
+    EXPECT_NEAR((double)(float)got(j), acc, 1e-4 * mag + 1e-3)
+        << "random int8 GEMV dtype=" << ggml_type_name(dtype) << " row=" << j;
+  }
+}
+
+template <class Scalar>
+void check_quant_gemv_int8_declines(GgmlType dtype, size_t K) {
+  const size_t N = 3;
+  std::vector<float> ref;
+  std::vector<uint8_t> raw;
+  build_case(dtype, N, K, ref, raw);
+  Kokkos::View<Scalar*, Exec> x("x", K), y("y", N), y2("y2", N);
+  auto hx = Kokkos::create_mirror_view(x);
+  for (size_t k = 0; k < K; ++k)
+    hx(k) = static_cast<Scalar>(0.25f * (float)((int)(k % 5) - 2));
+  Kokkos::deep_copy(x, hx);
+  QuantWeight<Exec> w = make_qw<Exec>(dtype, N, K, raw);
+  KokkosDNN::DNNHandle<Exec> h;
+  // Undersized staging: the fast path must decline, not read past the end.
+  Kokkos::View<uint8_t*, Exec> tiny("tiny",
+                                    quant_gemv_int8_scratch_bytes(K) / 2);
+  quant_gemv(h, x, w, y, tiny);
+  quant_gemv(h, x, w, y2);
+  Kokkos::fence();
+  auto a = Kokkos::create_mirror_view(y);
+  auto b = Kokkos::create_mirror_view(y2);
+  Kokkos::deep_copy(a, y);
+  Kokkos::deep_copy(b, y2);
+  for (size_t j = 0; j < N; ++j)
+    EXPECT_FLOAT_EQ((float)a(j), (float)b(j))
+        << "undersized staging must decline: dtype=" << ggml_type_name(dtype);
+}
+
 }  // namespace
 
-TEST(GgufQuantGemm, GemvFloat) {
-  check_quant_gemv<float>(GgmlType::F32, 64, 1e-4f);
+TEST(GgufQuantGemm, GemvFloat) {  check_quant_gemv<float>(GgmlType::F32, 64, 1e-4f);
   check_quant_gemv<float>(GgmlType::F16, 64, 1e-4f);
   check_quant_gemv<float>(GgmlType::BF16, 64, 1e-4f);
   check_quant_gemv<float>(GgmlType::Q8_0, 64, 1e-4f);
@@ -889,6 +1089,56 @@ TEST(GgufDequantToDense, Float) {
   check_dequant_to_dense<float>(GgmlType::Q4_K, 256, 1e-4f);
   check_dequant_to_dense<float>(GgmlType::Q5_K, 256, 1e-4f);
   check_dequant_to_dense<float>(GgmlType::Q6_K, 256, 1e-4f);
+}
+
+// int8-dot (dp4a) decode GEMV: K = 512 covers two K-blocks (and, for Q4_K/Q6_K,
+// all 8 unit positions of each block) so every half/pair/nibble branch runs.
+TEST(GgufQuantGemm, GemvInt8Float) {
+  using KokkosDNN::Gguf::quant_gemv_int8_scratch_bytes;
+  using KokkosDNN::Gguf::quant_gemv_int8_supported;
+  EXPECT_GT(quant_gemv_int8_scratch_bytes(512), 512u);
+  EXPECT_EQ(quant_gemv_int8_scratch_bytes(500), 0u);
+  // Supported set: block-aligned K-quants and Q8_0 only.
+  const bool f32_supported =
+      quant_gemv_int8_supported<Exec, float>(GgmlType::F32, 512);
+  const bool unaligned_supported =
+      quant_gemv_int8_supported<Exec, float>(GgmlType::Q4_K, 128);
+  EXPECT_FALSE(f32_supported);
+  EXPECT_FALSE(unaligned_supported);
+  check_quant_gemv_int8<float>(GgmlType::Q4_K, 512, 1e-3f);
+  check_quant_gemv_int8<float>(GgmlType::Q4_K, 1024, 1e-3f);
+  check_quant_gemv_int8<float>(GgmlType::Q4_K, 4096, 1e-3f);
+  check_quant_gemv_int8<float>(GgmlType::Q5_K, 512, 1e-3f);
+  check_quant_gemv_int8<float>(GgmlType::Q6_K, 512, 1e-3f);
+  check_quant_gemv_int8<float>(GgmlType::Q6_K, 1024, 1e-3f);
+  check_quant_gemv_int8<float>(GgmlType::Q6_K, 4096, 1e-3f);
+  check_quant_gemv_int8<float>(GgmlType::Q8_0, 512, 1e-3f);
+  // Dtypes the fast path does not implement keep the portable kernel.
+  check_quant_gemv_int8<float>(GgmlType::F32, 512, 1e-3f);
+}
+
+TEST(GgufQuantGemm, GemvInt8BHalf) {
+  using bhalf_t = Kokkos::Experimental::bhalf_t;
+  check_quant_gemv_int8<bhalf_t>(GgmlType::Q4_K, 512, 1e-2f);
+  check_quant_gemv_int8<bhalf_t>(GgmlType::Q6_K, 512, 1e-2f);
+  check_quant_gemv_int8<bhalf_t>(GgmlType::Q8_0, 512, 1e-2f);
+}
+
+// Undersized staging and non-block-aligned K must fall back to the portable
+// path bit for bit (no silent wrong results).
+TEST(GgufQuantGemm, GemvInt8RandomPayload) {
+  check_quant_gemv_int8_random<float>(GgmlType::Q4_K, 2048);
+  check_quant_gemv_int8_random<float>(GgmlType::Q5_K, 2048);
+  check_quant_gemv_int8_random<float>(GgmlType::Q6_K, 2048);
+  check_quant_gemv_int8_random<float>(GgmlType::Q8_0, 2048);
+  check_quant_gemv_int8_random<float>(GgmlType::Q6_K, 6656);
+  check_quant_gemv_int8_random<float>(GgmlType::Q4_K, 6656);
+}
+
+TEST(GgufQuantGemm, GemvInt8Declines) {
+  check_quant_gemv_int8_declines<float>(GgmlType::Q4_K, 512);
+  check_quant_gemv_int8_declines<float>(GgmlType::Q6_K, 512);
+  check_quant_gemv_int8_declines<float>(GgmlType::Q8_0, 64);
 }
 
 TEST(GgufDequantToDense, BHalf) {
