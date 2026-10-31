@@ -140,6 +140,13 @@ class PrefixCache : public PrefixCacheCore {
   struct Entry {
     std::vector<int> tokens;
     bool quant = false;  // snapshot mode: true = int8 pools + scales
+    // False for entries snapshotted after forwarding PAST the key (the
+    // merged content+suffix prefill in Session::prefill_cached): the KV
+    // rows are complete, so the entry is a valid resume point, but no
+    // last-token logits were ever produced at this boundary. Such entries
+    // can only serve suffixes (content < full), never an exact hit that
+    // needs logits with no forward.
+    bool has_logits = true;
     std::vector<View3> k;  // per-layer dense K cache prefix
     std::vector<View3> v;  // per-layer dense V cache prefix
     std::vector<ViewI8> kq;  // per-layer int8 K pool prefix
@@ -206,7 +213,8 @@ class PrefixCache : public PrefixCacheCore {
 
   // Copy the entry's stashed last-token logits out (exact-hit path, where
   // no suffix forward runs to produce fresh logits). The destination may
-  // live in any memory space; Kokkos::deep_copy bridges it.
+  // live in any memory space; Kokkos::deep_copy bridges it. Only valid
+  // when entry_has_logits(idx) is true.
   template <class DstView>
   void restore_logits(size_t idx, DstView& dst) const {
     Kokkos::deep_copy(dst, entries_.at(idx).logits);
@@ -215,6 +223,12 @@ class PrefixCache : public PrefixCacheCore {
   // Logits width stashed under entry `idx` (for sizing `dst` above).
   size_t entry_logits_size(size_t idx) const {
     return entries_.at(idx).logits.extent(0);
+  }
+
+  // Whether entry `idx` can serve an exact hit without a forward (it was
+  // snapshotted by a forward that ended exactly at the key boundary).
+  bool entry_has_logits(size_t idx) const {
+    return entries_.at(idx).has_logits;
   }
 
   // Mark entry `idx` most-recently-used (key and snapshot together).
@@ -226,21 +240,53 @@ class PrefixCache : public PrefixCacheCore {
     PrefixCacheCore::promote(idx);
   }
 
-  // Snapshot the model's current state under `tokens` (requires
-  // model.seq_len == tokens.size()). Exact duplicates just promote; new
-  // keys push front and evict least-recently-used beyond capacity.
+  // Snapshot the model's current KV state under `tokens`: rows [0, n) must
+  // be fully written, i.e. model.seq_len >= tokens.size(). A snapshot taken
+  // after forwarding past the key (the merged content+suffix prefill in
+  // Session::prefill_cached) is valid for suffix resumes but stores no
+  // logits; use the two-argument overload for that case. Exact duplicates
+  // just promote; new keys push front and evict least-recently-used beyond
+  // capacity.
   // `logits` is the last-token logits view returned by the forward that
   // reached this state (copied; the source aliases model scratch and may
   // live in any memory space).
   template <class LogitsView>
   void save(const std::vector<int>& tokens, const ModelT& model,
             const LogitsView& logits) {
-    if (capacity() == 0 || tokens.empty()) return;
-    if (model.seq_len != tokens.size()) return;  // misuse guard: no partial
+    const int idx = save_state(tokens, model);
+    if (idx < 0) return;
+    Entry& e = entries_[static_cast<size_t>(idx)];
+    e.has_logits = false;
+    if (e.logits.extent(0) != logits.extent(0))
+      e.logits = View1("KokkosDNN::Glimmer::PrefixCache::logits",
+                       logits.extent(0));
+    Kokkos::deep_copy(e.logits, logits);
+    e.has_logits = true;
+  }
+
+  // Snapshot without last-token logits (see above). The entry resumes
+  // suffixes exactly like a logged snapshot; only an exact hit that would
+  // otherwise skip the forward needs logits, and that path is unreachable
+  // here because this overload is used only when the caller forwards a
+  // suffix past the key.
+  void save(const std::vector<int>& tokens, const ModelT& model) {
+    (void)save_state(tokens, model);
+  }
+
+ private:
+  // Shared snapshot/promote half of save(): returns the entry index (new
+  // entry at 0, or an existing promoted one), or -1 when nothing was
+  // stored. Callers fill in logits.
+  int save_state(const std::vector<int>& tokens, const ModelT& model) {
+    if (capacity() == 0 || tokens.empty()) return -1;
+    // Every row in [0, n) must already be written. seq_len may be larger
+    // when the caller forwarded a suffix past the snapshot boundary; those
+    // later rows are simply not part of this entry.
+    if (model.seq_len < tokens.size()) return -1;
     for (size_t i = 0; i < entries_.size(); ++i) {
       if (entries_[i].tokens == tokens) {
         promote(i);
-        return;
+        return 0;
       }
     }
     Entry e;
@@ -293,18 +339,15 @@ class PrefixCache : public PrefixCacheCore {
         Kokkos::deep_copy(e.v[l], src_v);
       }
     }
-    e.logits = View1("KokkosDNN::Glimmer::PrefixCache::logits",
-                      logits.extent(0));
-    Kokkos::deep_copy(e.logits, logits);
     entries_.insert(entries_.begin(), std::move(e));
     push_front_key(tokens);
     while (entries_.size() > capacity()) {
       entries_.pop_back();
       pop_back_key();
     }
+    return 0;
   }
 
- private:
   // Snapshots parallel to the base-class keys (same order, same size).
   std::vector<Entry> entries_;
 };
