@@ -511,6 +511,7 @@ TEST(LFM25Tokenizer, ToolParseAliases) {
   using KokkosDNN::LFM25::kToolCallEndToken;
   using KokkosDNN::LFM25::kToolCallStartToken;
   using KokkosDNN::LFM25::parse_tool_calls;
+  using KokkosDNN::LFM25::ToolCallStreamParser;
   using KokkosDNN::LFM25::ToolParseResult;
 
   // <thinking>/</thinking> is accepted as a <think> alias: the trace is
@@ -541,6 +542,28 @@ TEST(LFM25Tokenizer, ToolParseAliases) {
   // ...but a closer after real content stays literal.
   ToolParseResult th_lit = parse_tool_calls("answer </think> more");
   EXPECT_EQ(th_lit.text, "answer </think> more");
+  // A closer inside tool-call arguments is not markup: the whole block is
+  // skipped as a unit, so a genuinely-leading closer after the block is
+  // still stripped (and the streaming view, which receives tool blocks
+  // atomically, agrees instead of desyncing).
+  ToolParseResult th_tool =
+      parse_tool_calls("<tool_call></think></tool_call></think>answer");
+  EXPECT_EQ(th_tool.text, "answer");
+  {
+    ToolCallStreamParser fed;
+    std::string acc, racc;
+    const std::string raw =
+        "<tool_call></think></tool_call></think>answer";
+    for (char ch : raw) {
+      acc += fed.push(std::string(1, ch));
+      racc += fed.poll_reasoning();
+    }
+    ToolParseResult tail = fed.finish();
+    acc += tail.text;
+    racc += tail.reasoning;
+    EXPECT_EQ(acc, th_tool.text);
+    EXPECT_EQ(racc, th_tool.reasoning);
+  }
 
   // LFM3 / qwen3-coder grammar: <tool_call> + <function=...> +
   // <parameter=...> becomes a native call instead of leaking markup.
