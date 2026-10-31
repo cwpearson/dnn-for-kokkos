@@ -66,6 +66,32 @@ dispatch: ON/OFF`, `cuDNN SDPA dispatch: ON/OFF`). Check that block first
 when throughput is below expectations: a MIG slice, a partially visible
 device, or a build with the TPL dispatch compiled out all show up there.
 
+## Performance
+
+Measured end-to-end over HTTP with the 17GB Q4_K_M Glimmer GGUF on an RTX
+3090 24GB (host power cap 180 W), `--max-seq-len 8192`, greedy, cold prefix
+cache, against llama.cpp `0ec4027` on the same GPU/file:
+
+| workload | kokkosdnn_server | llama-server |
+|---|---|---|
+| decode, 128 generated tokens | **18.3–18.9 tok/s** | 15.8 tok/s |
+| prefill 389 tokens | 0.79 s | ~0.64 s |
+| prefill 1078 tokens | **1.67 s** | ~1.67 s |
+| prefill 2454 tokens | **3.82 s** | 3.73 s |
+| launch → `listening on` | 3.5–6 s (mmap) | 6.7 s |
+
+The per-turn stderr line (`prompt_tokens=… prefill_ms=… decode_ms=…
+decode_tok_s=… prefix_hit=…`) is the ground truth for a deployment: `lock_ms`,
+`encode_ms` and `sse_ms` isolate host/transport cost from model time, and
+`prefix_hit`/`prefix_reused` show what the one-entry cache saved. A cache-miss
+prefill forwards the content prefix and the generation-prompt suffix in one
+pass, so a cold 389-token turn does not pay a second full dequant at M=4.
+
+`--prefill-chunk 2048` (the default) is ~15–20% faster than 512 on long
+prompts because every chunk re-dequantizes all weights; use 512 only when the
+KV cache plus scratch must fit a tighter device-memory budget (see the 24GB
+recipe below).
+
 ## Docker
 
 One image serves EITHER LFM2.5 OR Glimmer — the builder compiles both

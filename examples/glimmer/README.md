@@ -2,7 +2,7 @@
 
 Muse Glimmer 30B text-path inference built on the core library: 30B text config defaults, a safetensors checkpoint loader, a BPE `tokenizer.json` loader, a hybrid sliding/full KV-cache autoregressive model, and a `glimmer_generate` driver.
 
-Scope: **text only** (`text_config`); vision tower and multimodal glue are out of scope. **Inference only** with **bfloat16 storage/compute by default** (`--fp32` opts in). Safetensors weights load at full precision; a `.gguf` checkpoint keeps its packing on device (F32/F16/BF16 exact, Q8_0/Q4_K/Q5_K/Q6_K stay packed — the Q4_K_M recipe is ~17GB resident — with on-the-fly `quant_gemv` decode and dequant-once + dense GEMM prefill). KV caches are dense FP by default (`--kv-int8` selects the symmetric-int8 cache). The driver encodes raw prompts directly.
+Scope: **text only** (`text_config`); vision tower and multimodal glue are out of scope. **Inference only** with **bfloat16 storage/compute by default** (`--fp32` opts in). Safetensors weights load at full precision; a `.gguf` checkpoint keeps its packing on device (F32/F16/BF16 exact, Q8_0/Q4_K/Q5_K/Q6_K stay packed — the Q4_K_M recipe is ~17GB resident — with on-the-fly `quant_gemv` decode and dequant-once + dense GEMM prefill). On CUDA the decode GEMV stages each activation row to int8 and uses `dp4a` (same trade as llama.cpp's MMVQ; the portable bf16 path is used elsewhere); prefill dequantizes each weight once per chunk and runs cuBLAS. KV caches are dense FP by default (`--kv-int8` selects the symmetric-int8 cache). The driver encodes raw prompts directly.
 
 > Status: **driver implemented**. `glimmer_generate` runs tiny random models (`--tiny`), full-size shapes with random weights (`--model glimmer-30b`), and real checkpoints (`--weights`, `--tokenizer`); the model library (`KokkosDNN_Glimmer{Config,Weights,Model,Tokenizer,Session,PrefixCache}.hpp`, `KokkosDNN::glimmer` in `models/glimmer/`) is functional and covered by `test_glimmer_generate` + `test_glimmer_session` + `test_glimmer_tokenizer`. Tensor names carry ASSUMPTION markers (see `DESIGN.md` and the headers); confirm them against `modeling_muse_glimmer.py`. The chat template follows the upstream `chat_template.jinja` (ATEM tool protocol with `to=self` reasoning and `to=<tool>` tool channels); the `kokkosdnn_server --arch glimmer` front-end serves it with full OpenAI tools support.
 
@@ -100,10 +100,16 @@ GGUF checkpoint run (llama.cpp naming, packed quant stays on device):
   --model glimmer-30b --config models/glimmer/config-glimmer-30b-text.json \
   --weights weights/muse-glimmer-30b-text/Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf \
   --tokenizer weights/muse-glimmer-30b-text/tokenizer.json \
-  --prompt "Hello" --max-new 64
+  --prompt "Hello" --max-new 64 --max-seq-len 8192
 ```
 
-A single `--weights` entry ending in `.gguf` (case-insensitive) selects the GGUF path (`KokkosDNN::Glimmer::load_gguf`); F32/F16/BF16 decode exactly, Q8_0/Q4_K/Q5_K/Q6_K (i.e. the Q4_K_M recipe, which stores those per-tensor dtypes) stay packed on device with on-the-fly dequant (decode) / dequant-once + dense GEMM (prefill chunks), anything else throws. Mixing `.gguf` with safetensors shards is an error. `--list-tensors` works on `.gguf` files too.
+The explicit `--max-seq-len` matters with a full `config.json` overlay: it
+supplies `max_position_embeddings = 131072`, whose dense FP16 KV cache
+(~6.5 GiB) plus the ~17GB packed weights does not fit a 24GB GPU. Use
+`--max-seq-len 8192` with dense KV, or `--kv-int8` for long contexts (see
+the 24GB recipe below).
+
+A single `--weights` entry ending in `.gguf` (case-insensitive) selects the GGUF path (`KokkosDNN::Glimmer::load_gguf`); F32/F16/BF16 decode exactly, Q8_0/Q4_K/Q5_K/Q6_K (i.e. the Q4_K_M recipe, which stores those per-tensor dtypes) stay packed on device with on-the-fly dequant (decode; int8-dot on CUDA) / dequant-once + dense GEMM (prefill chunks), anything else throws. Mixing `.gguf` with safetensors shards is an error. `--list-tensors` works on `.gguf` files too.
 
 24GB recipe (packed GGUF + int8 KV + chunk cap): `--kv-int8` halves the KV cache (214.5 MiB at the 8192 default, 3432 MiB at the 131072 arch max vs 416 MiB / ~6.5 GiB dense) and `--prefill-chunk N` caps prefill scratch (~440 MiB at the 2048 default, ~110 MiB at 512). ~17GB Q4_K_M weights + 3432 MiB int8 KV + ~614 MiB dequant staging + scratch ≈ 21.4 GiB, fitting 24GB:
 
@@ -114,6 +120,12 @@ A single `--weights` entry ending in `.gguf` (case-insensitive) selects the GGUF
   --tokenizer weights/muse-glimmer-30b-text/tokenizer.json \
   --prompt "Hello" --max-new 64 --kv-int8 --max-seq-len 131072 --prefill-chunk 512
 ```
+
+Keep the default 2048 chunk for throughput when it fits: every prefill chunk
+re-dequantizes the weights once, so a long prompt pays one dequant pass per
+512-token chunk at `--prefill-chunk 512` (measured on the 17GB Q4_K_M
+checkpoint: 2454 tokens 3.8 s at 2048 vs 4.5 s at 512). The 131072-context
+recipe above uses 512 only to keep peak device memory under 24GB.
 
 The same flags exist on `kokkosdnn_server --arch glimmer` (see `server/README.md`); the one-entry prefix cache works in both dense and int8 modes for agentic loops.
 
@@ -148,4 +160,35 @@ Unit tests: `Test_GlimmerConfig.cpp` (presets, fixture, full-config wrapper, tin
 
 ## Performance
 
-No dedicated benchmark; GEMM/attention shapes route through the shared library dispatch, so measure with the repo microbenchmarks (`benchmarks/kokkosdnn_bench`, opt-in via `-DKokkosDNN_ENABLE_BENCHMARKS=ON`). Prefill cost is bounded by `--prefill-chunk N` (O(N·dim) activations); decode is `gemv`-bound on the 202048-wide head.
+Measured on an RTX 3090 24GB (power-capped at 180 W by the host; CUDA 13.2,
+16-core host) with the 17GB Q4_K_M GGUF, `--max-seq-len 8192`, greedy, and a
+cold one-entry prefix cache. Reference: llama.cpp `0ec4027` (CUDA, sm_86) on
+the same file, model and GPU.
+
+| workload | glimmer | llama.cpp |
+|---|---|---|
+| decode, 128 tokens | **18.3–18.9 tok/s** (53–55 ms/token) | 15.8 tok/s |
+| prefill 389 tokens (1 chunk) | 0.79 s (2.04 ms/token) | ~0.64 s (1.65 ms/token) |
+| prefill 1078 tokens | **1.67 s** (1.55 ms/token) | ~1.67 s (1.55 ms/token) |
+| prefill 2454 tokens | **3.82 s** (1.56 ms/token) | 3.73 s (1.55 ms/token) |
+| server launch → listening (17GB GGUF) | 3.5–6 s | 6.7 s |
+
+Decode is GEMV-bound (the 17GB of packed weights are streamed once per
+token). On CUDA `quant_gemv` quantizes the activation row to int8 per
+32-element block and runs `dp4a` (`src/KokkosDNN_GGUFGemvCuda.hpp`); the
+portable bf16 path remains the fallback for other backends, other dtypes, or
+callers that do not pass the staging buffer. Prefill stays on
+dequantize-once + cuBLAS (GEMM is compute-bound there; a fused packed GEMM
+would only remove the ~11% staging share). The remaining short-prompt prefill
+gap is that staging pass plus per-chunk fixed cost — hence long prompts reach
+parity while a single 389-token chunk is ~1.2x behind.
+
+`--prefill-chunk N` trades device memory for dequant passes: every chunk
+re-dequantizes each weight matrix, so `512` costs ~15–20% more prefill time
+than the `2048` default on long prompts. Keep 2048 when it fits; drop to 512
+only when KV + scratch must stay under 24GB.
+
+Measure with the repo bundles: `benchmarks/kokkosdnn_bench` and
+`benchmarks/kokkosdnn_bench_gguf_gemv` (packed GEMV GB/s per real shape),
+opt-in via `-DKokkosDNN_ENABLE_BENCHMARKS=ON`.
+
