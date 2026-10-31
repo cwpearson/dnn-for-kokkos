@@ -45,6 +45,17 @@ jobs:
       KOKKOS_INSTALL: ${{ github.workspace }}/kokkos-install
       ROCM_PATH: /opt/rocm
     steps:
+      - name: Reclaim disk
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android \
+                      /usr/local/.ghcup \
+                      /usr/share/dotnet \
+                      /usr/share/swift \
+                      /usr/lib/jvm
+          sudo apt-get clean
+          df -h /
+
       - uses: actions/checkout@v5
 
       - name: Install build tools
