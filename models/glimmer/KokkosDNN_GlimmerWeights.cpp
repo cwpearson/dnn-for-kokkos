@@ -2,12 +2,18 @@
 // SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 #include "KokkosDNN_GlimmerWeights.hpp"
 
+#include "KokkosDNN_GlimmerGgufMap.hpp"
+
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <type_traits>
@@ -635,6 +641,91 @@ void load_safetensors(const Config& cfg,
 
 namespace {
 
+// Checkpoint reader for the GGUF branch: the mapped, zero-copy reader where
+// POSIX mmap is available, the shared full-file reader otherwise.
+#if KOKKOSDNN_GLIMMER_HAS_MMAP
+using CheckpointFile = Impl::MappedGgufFile;
+#else
+using CheckpointFile = Gguf::GgufFile;
+#endif
+
+// Opt-in checkpoint-load diagnostics: KOKKOSDNN_LOAD_TIMING=1 makes the
+// loaders below print per-phase wall times (header parse, per-tensor host
+// staging, device allocation, H2D copy) to stderr. Off by default; the
+// steady_clock reads are skipped entirely when the variable is unset.
+bool load_timing_enabled() {
+  static const bool on = std::getenv("KOKKOSDNN_LOAD_TIMING") != nullptr;
+  return on;
+}
+
+using LoadClock = std::chrono::steady_clock;
+
+inline double since_s(LoadClock::time_point t0) {
+  return std::chrono::duration<double>(LoadClock::now() - t0).count();
+}
+
+// Scoped wall-time report for one phase of a loader.
+class LoadPhase {
+ public:
+  explicit LoadPhase(const char* what) : what_(what) {
+    if (load_timing_enabled()) start_ = LoadClock::now();
+  }
+  LoadPhase(const LoadPhase&)            = delete;
+  LoadPhase& operator=(const LoadPhase&) = delete;
+  ~LoadPhase() {
+    if (load_timing_enabled())
+      std::fprintf(stderr, "[load] %-24s %8.3f s\n", what_, since_s(start_));
+  }
+
+ private:
+  const char* what_;
+  LoadClock::time_point start_{};
+};
+
+// Sums one phase's wall time into a counter (per-tensor helpers below).
+class LoadAccum {
+ public:
+  explicit LoadAccum(double& slot) : slot_(slot) {
+    if (load_timing_enabled()) start_ = LoadClock::now();
+  }
+  LoadAccum(const LoadAccum&)            = delete;
+  LoadAccum& operator=(const LoadAccum&) = delete;
+  ~LoadAccum() {
+    if (load_timing_enabled()) slot_ += since_s(start_);
+  }
+
+ private:
+  double& slot_;
+  LoadClock::time_point start_{};
+};
+
+// Aggregate per-tensor counters (summed over every tensor of a checkpoint).
+struct LoadStats {
+  double host_stage_s   = 0;  // host-side staging/permutation of bytes
+  double device_alloc_s = 0;
+  double h2d_s          = 0;  // host -> device copy
+  size_t tensors        = 0;
+  size_t bytes          = 0;
+};
+LoadStats g_load_stats;
+
+void report_load_stats(const char* tag) {
+  if (!load_timing_enabled()) return;
+  std::fprintf(stderr,
+               "[load] %-24s %8.3f s (%zu tensors, %.2f GiB)\n", tag,
+               g_load_stats.h2d_s + g_load_stats.host_stage_s +
+                   g_load_stats.device_alloc_s,
+               g_load_stats.tensors,
+               (double)g_load_stats.bytes / (1024.0 * 1024.0 * 1024.0));
+  std::fprintf(stderr, "[load]   host staging         %8.3f s\n",
+               g_load_stats.host_stage_s);
+  std::fprintf(stderr, "[load]   device alloc         %8.3f s\n",
+               g_load_stats.device_alloc_s);
+  std::fprintf(stderr, "[load]   H2D copy             %8.3f s\n",
+               g_load_stats.h2d_s);
+  g_load_stats = LoadStats{};
+}
+
 // GGUF leaf names follow llama.cpp's `tn()` convention: per-layer tensors
 // live under "blk.{l}." with a ".weight" suffix.
 std::string gguf_blk(int l, const std::string& leaf) {
@@ -657,15 +748,19 @@ std::string gguf_shape_str(const Gguf::GgufTensorInfo& info) {
 }
 
 // Resolve stem+".weight", falling back to the bare stem. Returns nullptr
-// when neither is present (caller reports the missing tensor).
-const Gguf::GgufTensorInfo* gguf_resolve(const Gguf::GgufFile& file,
+// when neither is present (caller reports the missing tensor). Templated on
+// the checkpoint reader (mapped or Gguf::GgufFile) — both expose the same
+// contains()/find() surface.
+template <class File>
+const Gguf::GgufTensorInfo* gguf_resolve(const File& file,
                                          const std::string& stem) {
   if (file.contains(stem + ".weight")) return &file.find(stem + ".weight");
   if (file.contains(stem)) return &file.find(stem);
   return nullptr;
 }
 
-const Gguf::GgufTensorInfo& gguf_require(const Gguf::GgufFile& file,
+template <class File>
+const Gguf::GgufTensorInfo& gguf_require(const File& file,
                                          const std::string& stem) {
   if (const auto* info = gguf_resolve(file, stem)) return *info;
   throw std::runtime_error("tensor not found in checkpoint: '" + stem +
@@ -680,53 +775,133 @@ namespace Impl {
 // (rotate_half) layout matched by rope_neoX_inplace. This is transformers'
 // _permute_for_rope:
 //   out[h*hd + i*(hd/2)+j, :] = in[h*hd + j*2+i, :], i in {0,1}.
-// Whole packed rows of `row_bytes` each are swapped through a scratch
-// buffer (no dequantization). head_dim must be even (Config enforces it).
-inline void permute_packed_rows_for_rope(uint8_t* data, size_t rows,
-                                         size_t row_bytes, size_t n_heads,
-                                         size_t head_dim) {
-  if (rows != n_heads * head_dim || rows == 0 || row_bytes == 0 ||
-      head_dim == 0 || head_dim % 2 != 0)
+// Whole packed rows of `row_bytes` each are copied through a scratch buffer
+// (no dequantization). head_dim must be even (Config enforces it).
+//
+// Rows [first_row, first_row + nrows) of the destination are produced from
+// the same rows of `src`, so a caller can stream the tensor in head-aligned
+// chunks instead of staging all of it on the host.
+inline void permute_packed_rows_for_rope_range(
+    const uint8_t* src, uint8_t* dst, size_t first_row, size_t nrows,
+    size_t total_rows, size_t row_bytes, size_t n_heads, size_t head_dim) {
+  if (n_heads * head_dim != total_rows || row_bytes == 0 || head_dim == 0 ||
+      head_dim % 2 != 0 || first_row % head_dim != 0 ||
+      nrows % head_dim != 0 || nrows == 0)
     throw std::runtime_error("permute_packed_rows_for_rope: bad dims");
   const size_t half = head_dim / 2;
-  std::vector<uint8_t> out(rows * row_bytes);
-  for (size_t h = 0; h < n_heads; ++h) {
-    for (size_t i = 0; i < 2; ++i) {
-      for (size_t j = 0; j < half; ++j) {
-        const size_t dst = h * head_dim + i * half + j;
-        const size_t src = h * head_dim + j * 2 + i;
-        std::memcpy(out.data() + dst * row_bytes, data + src * row_bytes,
-                    row_bytes);
-      }
-    }
+  for (size_t r = 0; r < nrows; ++r) {
+    const size_t g = first_row + r;  // destination row within the tensor
+    const size_t h = g / head_dim;
+    const size_t i = (g % head_dim) / half;  // 0 = first half, 1 = second
+    const size_t j = g % half;
+    const size_t s = h * head_dim + j * 2 + i;
+    std::memcpy(dst + r * row_bytes, src + s * row_bytes, row_bytes);
   }
-  std::memcpy(data, out.data(), out.size());
 }
 
 }  // namespace Impl
 
-// Dequantize one GGUF tensor to host FP32 with an informative error when
+// Device copy of `n` raw bytes from a host-readable pointer (the checkpoint
+// mapping, or the fallback reader's buffer). The host side is a temporary
+// unmanaged view, so no second copy of the bytes is materialized.
+template <class DstView>
+void gguf_copy_bytes_to_device(const DstView& dst, const uint8_t* src,
+                               size_t nbytes) {
+  if (nbytes == 0) return;
+  Kokkos::View<const uint8_t*, Kokkos::HostSpace,
+               Kokkos::MemoryTraits<Kokkos::Unmanaged>>
+      stage(src, nbytes);
+  Kokkos::deep_copy(dst, stage);
+}
+
+// Dequantize one packed payload to host FP32 with an informative error when
 // the dtype is outside the compute set (F32/F16/BF16/Q8_0/Q4_K/Q5_K/Q6_K).
-std::vector<float> gguf_dequant_rows(const Gguf::GgufFile& file,
-                                     const Gguf::GgufTensorInfo& info) {
-  std::vector<float> tmp;
-  try {
-    Gguf::dequant_tensor_to_float(file, info, tmp);
-  } catch (const std::exception& e) {
-    throw std::runtime_error("cannot decode '" + info.name + "': " + e.what());
+// Same block decoders as Gguf::dequant_tensor_to_float, sourced from a raw
+// payload pointer so it works for any checkpoint reader. Only used for the
+// 1-D norms, which are a few KiB each.
+void gguf_dequant_payload_to_float(const uint8_t* src,
+                                   const Gguf::GgufTensorInfo& info,
+                                   std::vector<float>& out) {
+  out.resize((size_t)info.numel);
+  if (info.numel == 0) return;
+  float* dst = out.data();
+  switch (info.dtype) {
+    case Gguf::GgmlType::F32:
+      std::memcpy(dst, src, out.size() * 4);
+      return;
+    case Gguf::GgmlType::F16: {
+      const uint16_t* h = reinterpret_cast<const uint16_t*>(src);
+      for (size_t i = 0; i < out.size(); ++i)
+        dst[i] = Gguf::fp16_to_float_host(h[i]);
+      return;
+    }
+    case Gguf::GgmlType::BF16: {
+      const uint16_t* h = reinterpret_cast<const uint16_t*>(src);
+      for (size_t i = 0; i < out.size(); ++i)
+        dst[i] = Gguf::bf16_to_float_host(h[i]);
+      return;
+    }
+    case Gguf::GgmlType::Q8_0: {
+      float tmp[32];
+      for (uint64_t b = 0, n = info.numel / 32; b < n; ++b) {
+        Gguf::BlockQ80 blk;
+        std::memcpy(&blk, src + b * sizeof(blk), sizeof(blk));
+        Gguf::dequant_q80_block(&blk, tmp);
+        std::memcpy(dst + b * 32, tmp, sizeof(tmp));
+      }
+      return;
+    }
+    case Gguf::GgmlType::Q4_K: {
+      float tmp[256];
+      for (uint64_t b = 0, n = info.numel / 256; b < n; ++b) {
+        Gguf::BlockQ4K blk;
+        std::memcpy(&blk, src + b * sizeof(blk), sizeof(blk));
+        Gguf::dequant_q4k_block(&blk, tmp);
+        std::memcpy(dst + b * 256, tmp, sizeof(tmp));
+      }
+      return;
+    }
+    case Gguf::GgmlType::Q5_K: {
+      float tmp[256];
+      for (uint64_t b = 0, n = info.numel / 256; b < n; ++b) {
+        Gguf::BlockQ5K blk;
+        std::memcpy(&blk, src + b * sizeof(blk), sizeof(blk));
+        Gguf::dequant_q5k_block(&blk, tmp);
+        std::memcpy(dst + b * 256, tmp, sizeof(tmp));
+      }
+      return;
+    }
+    case Gguf::GgmlType::Q6_K: {
+      float tmp[256];
+      for (uint64_t b = 0, n = info.numel / 256; b < n; ++b) {
+        Gguf::BlockQ6K blk;
+        std::memcpy(&blk, src + b * sizeof(blk), sizeof(blk));
+        Gguf::dequant_q6k_block(&blk, tmp);
+        std::memcpy(dst + b * 256, tmp, sizeof(tmp));
+      }
+      return;
+    }
+    default:
+      throw std::runtime_error("unsupported dtype " +
+                               Gguf::ggml_type_name(info.dtype));
   }
-  return tmp;
 }
 
 // Load one 2-D tensor into a packed device weight (no host dequantization:
 // the payload moves verbatim and stays quantized for quant_gemv/quant_gemm).
 // Throws when the dtype is outside the compute set, with the tensor name in
 // the message (mirrors the old dequant path's error context).
-template <class ExecSpace>
-void gguf_load_mat(const Gguf::GgufFile& file, const std::string& stem,
-                   size_t rows, size_t cols,
-                   Gguf::QuantWeight<ExecSpace>& dst, bool permute_rope = false,
-                   size_t rope_heads = 0, size_t rope_head_dim = 0) {
+//
+// The bytes go straight from the checkpoint mapping into the device view:
+// an unmanaged host view over the payload is the deep_copy source, so the
+// loader never stages a copy of the tensor in host RAM. The q/k rope
+// re-permutation is the one case that needs a host scratch buffer; it is
+// streamed in head-aligned chunks bounded by kPermuteChunkBytes.
+template <class ExecSpace, class File>
+void gguf_load_mat(const File& file, const std::string& stem, size_t rows,
+                   size_t cols, Gguf::QuantWeight<ExecSpace>& dst,
+                   bool permute_rope = false, size_t rope_heads = 0,
+                   size_t rope_head_dim = 0) {
   const auto& info = gguf_require(file, stem);
   if (info.n_dims != 2 || info.rows() != rows || info.cols() != cols)
     throw std::runtime_error("shape mismatch for '" + info.name +
@@ -739,24 +914,52 @@ void gguf_load_mat(const Gguf::GgufFile& file, const std::string& stem,
   } catch (const std::exception& e) {
     throw std::runtime_error("cannot decode '" + info.name + "': " + e.what());
   }
-  std::vector<uint8_t> host(info.nbytes);
-  if (!host.empty())
-    std::memcpy(host.data(), file.payload(info), host.size());
-  if (permute_rope)
-    Impl::permute_packed_rows_for_rope(host.data(), rows,
-                                       Gguf::ggml_row_bytes(info.dtype, cols),
-                                       rope_heads, rope_head_dim);
+  const uint8_t* src     = file.payload(info);
+  const size_t row_bytes = Gguf::ggml_row_bytes(info.dtype, cols);
   Gguf::QuantWeight<ExecSpace> w;
   w.dtype = info.dtype;
   w.rows  = rows;
   w.cols  = cols;
-  w.data  = Kokkos::View<uint8_t*, ExecSpace>("Glimmer::weight", host.size());
-  if (!host.empty()) {
-    Kokkos::View<uint8_t*, Kokkos::HostSpace> stage("Glimmer::weight_host",
-                                                    host.size());
-    std::memcpy(stage.data(), host.data(), host.size());
-    Kokkos::deep_copy(w.data, stage);
+  {
+    LoadAccum acc(g_load_stats.device_alloc_s);
+    w.data = Kokkos::View<uint8_t*, ExecSpace>("Glimmer::weight", info.nbytes);
   }
+  if (info.nbytes != 0) {
+    if (!permute_rope) {
+      LoadAccum acc(g_load_stats.h2d_s);
+      gguf_copy_bytes_to_device(w.data, src, (size_t)info.nbytes);
+    } else {
+      if (rope_head_dim == 0)
+        throw std::runtime_error("gguf_load_mat: rope_head_dim required for '"
+                                 + info.name + "'");
+      // Chunk by whole heads so every chunk is independently permutable.
+      constexpr size_t kPermuteChunkBytes = size_t{64} << 20;
+      const size_t bytes_per_head = row_bytes * rope_head_dim;
+      const size_t heads_per_chunk =
+          std::max<size_t>(1, kPermuteChunkBytes /
+                                  std::max<size_t>(bytes_per_head, 1));
+      const size_t rows_per_chunk = heads_per_chunk * rope_head_dim;
+      std::vector<uint8_t> stage;
+      stage.reserve(
+          std::min(rows, rows_per_chunk) * std::max<size_t>(row_bytes, 1));
+      for (size_t r0 = 0; r0 < rows; r0 += rows_per_chunk) {
+        const size_t r1 = std::min(rows, r0 + rows_per_chunk);
+        stage.resize((r1 - r0) * row_bytes);
+        {
+          LoadAccum acc(g_load_stats.host_stage_s);
+          Impl::permute_packed_rows_for_rope_range(
+              src, stage.data(), r0, r1 - r0, rows, row_bytes, rope_heads,
+              rope_head_dim);
+        }
+        auto sub = Kokkos::subview(w.data, std::make_pair(r0 * row_bytes,
+                                                         r1 * row_bytes));
+        LoadAccum acc(g_load_stats.h2d_s);
+        gguf_copy_bytes_to_device(sub, stage.data(), stage.size());
+      }
+    }
+  }
+  g_load_stats.tensors += 1;
+  g_load_stats.bytes += (size_t)info.nbytes;
   dst = w;
 }
 
@@ -764,8 +967,8 @@ void gguf_load_mat(const Gguf::GgufFile& file, const std::string& stem,
 // Conversion adds +shift to HF-centered weights (GGUF rms_norm is x/rms*w
 // while HF CenteredRMSNorm is x/rms*(1+w)); shift is 1 for the four layer
 // norms and 0 for the final norm (norm_shift in conversion/muse_glimmer.py).
-template <class ExecSpace, class Scalar>
-void gguf_load_norm(const Gguf::GgufFile& file, const std::string& stem,
+template <class ExecSpace, class Scalar, class File>
+void gguf_load_norm(const File& file, const std::string& stem,
                     const Kokkos::View<Scalar*, ExecSpace>& dst, float shift) {
   const auto& info = gguf_require(file, stem);
   if (info.numel != dst.extent(0))
@@ -773,7 +976,12 @@ void gguf_load_norm(const Gguf::GgufFile& file, const std::string& stem,
                              "': checkpoint has " + gguf_shape_str(info) +
                              ", expected [" + std::to_string(dst.extent(0)) +
                              "]");
-  std::vector<float> tmp = gguf_dequant_rows(file, info);
+  std::vector<float> tmp;
+  try {
+    gguf_dequant_payload_to_float(file.payload(info), info, tmp);
+  } catch (const std::exception& e) {
+    throw std::runtime_error("cannot decode '" + info.name + "': " + e.what());
+  }
   if (shift != 0.0f)
     for (auto& v : tmp) v -= shift;
   auto h = Kokkos::create_mirror_view(dst);
@@ -812,7 +1020,8 @@ typename Map::mapped_type gguf_find_kv(const Map& all,
 // Validate conversion-written hyperparameters against cfg. The GGUF file is
 // authoritative about its own bytes, but the Model runs off cfg: any
 // disagreement is a hard error, never a silent override.
-void gguf_validate_metadata(const Gguf::GgufFile& file, const Config& cfg) {
+template <class File>
+void gguf_validate_metadata(const File& file, const Config& cfg) {
   constexpr const char* arch = "muse-glimmer";
   constexpr double rel_tol   = 1e-6;
   auto close = [&](const std::string& what, double have, double want) {
@@ -873,9 +1082,29 @@ void gguf_validate_metadata(const Gguf::GgufFile& file, const Config& cfg) {
 template <class ExecSpace, class Scalar>
 void load_gguf(const Config& cfg, const std::string& path,
                Weights<ExecSpace, Scalar>& w) {
+  LoadClock::time_point t_total;
+  if (load_timing_enabled()) t_total = LoadClock::now();
   w.allocate(cfg);
-  Gguf::GgufFile file(path);  // throws on missing/corrupt file
-  gguf_validate_metadata(file, cfg);
+  // Map the checkpoint read-only where the platform supports it (POSIX), so
+  // tensor payloads are copied to the device straight out of the mapping
+  // instead of through a full-file host buffer. Elsewhere the shared reader
+  // (bounded ifstream reads) takes over.
+  std::unique_ptr<CheckpointFile> file_owner;
+  {
+    LoadPhase p("GGUF map/read + parse");
+    file_owner = std::make_unique<CheckpointFile>(path);
+  }
+  const CheckpointFile& file = *file_owner;  // throws on corrupt file
+#if KOKKOSDNN_GLIMMER_HAS_MMAP
+  // Read the rest of the file into the page cache in the background while
+  // the tensors below are copied to the device: disk reads and H2D copies
+  // then overlap instead of serializing.
+  file_owner->start_prefetch();
+#endif
+  {
+    LoadPhase p("GGUF metadata check");
+    gguf_validate_metadata(file, cfg);
+  }
   const size_t D = (size_t)cfg.dim, V = (size_t)cfg.vocab_size;
   gguf_load_mat<ExecSpace>(file, "token_embd", V, D, w.embed);
   // Final norm: the conversion shift is 0 (only *layernorm names shift).
@@ -929,10 +1158,21 @@ void load_gguf(const Config& cfg, const std::string& path,
     // loading the synthesized tensors would be exactly equivalent. Files
     // with or without them load identically.
   }
+#if KOKKOSDNN_GLIMMER_HAS_MMAP
+  // Every payload copy above reads straight out of the mapping, so make sure
+  // all transfers have completed before the mapping is released (and before
+  // the prefetcher threads are joined).
+  Kokkos::fence();
+  file_owner->stop_prefetch();
+#endif
+  report_load_stats("tensor load total");
+  if (load_timing_enabled())
+    std::fprintf(stderr, "[load] %-24s %8.3f s\n", "load_gguf end-to-end",
+                 since_s(t_total));
 }
 
 std::vector<std::string> list_gguf_tensors(const std::string& path) {
-  Gguf::GgufFile file(path);
+  CheckpointFile file(path);  // header only: no tensor data is touched
   std::vector<std::string> out;
   for (const auto& t : file.tensors()) out.push_back(t.name);
   std::sort(out.begin(), out.end());

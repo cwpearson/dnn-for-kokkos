@@ -45,7 +45,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace KokkosDNN {
@@ -169,6 +171,7 @@ class GlimmerBackend final : public ChatBackend {
       weights_.allocate(cfg_);
       const std::vector<std::string> files =
           expand_weight_patterns(opts.weights);
+      const auto t_load = std::chrono::steady_clock::now();
       if (files.size() == 1 && is_gguf_path(files[0])) {
         Glimmer::load_gguf(cfg_, files[0], weights_);
       } else {
@@ -181,7 +184,18 @@ class GlimmerBackend final : public ChatBackend {
                 "unsupported)");
         Glimmer::load_safetensors(cfg_, files, weights_);
       }
+      const auto t_tok = std::chrono::steady_clock::now();
       tok_ = Glimmer::Tokenizer(opts.tokenizer);
+      const auto t_end = std::chrono::steady_clock::now();
+      if (std::getenv("KOKKOSDNN_LOAD_TIMING") != nullptr) {
+        const auto secs = [](auto a, auto b) {
+          return std::chrono::duration<double>(b - a).count();
+        };
+        std::fprintf(stderr, "[load] %-24s %8.3f s\n", "weights (backend)",
+                     secs(t_load, t_tok));
+        std::fprintf(stderr, "[load] %-24s %8.3f s\n", "tokenizer.json",
+                     secs(t_tok, t_end));
+      }
       prefix_cache_host_ = opts.prefix_cache_host;
       sess_.reset();
     } catch (const std::exception& e) {

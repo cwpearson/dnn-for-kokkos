@@ -124,6 +124,14 @@ std::vector<std::string> list_checkpoint_tensors(
 // missing tensors, shape mismatch, or GGUF metadata (logit scale, softcap,
 // sliding window + pattern) that disagrees with cfg.
 //
+// Host footprint: on POSIX the file is mapped read-only and each tensor's
+// packed payload is deep-copied to the device straight out of the mapping
+// (see KokkosDNN_GlimmerGgufMap.hpp), with a background prefetcher keeping
+// disk reads overlapped with the H2D copies. The host therefore never holds
+// a second copy of the checkpoint: peak host usage is the reclaimable file
+// mapping, not 2x the file size. Other platforms fall back to the shared
+// full-file reader (Gguf::GgufFile). Tensor bytes are identical in both.
+//
 // Expected GGUF names (llama.cpp `tn()` convention with the ".weight"
 // suffix; bare stems are also accepted):
 //   token_embd.weight, output_norm.weight, output.weight,
@@ -140,7 +148,7 @@ std::vector<std::string> list_checkpoint_tensors(
 //   * Q/K RoPE layout: conversion unpermutes q/k into ggml interleaved
 //     (NORM) layout; the loader re-permutes packed rows back into the HF
 //     rotate_half layout consumed by rope_neoX_inplace (whole packed-row
-//     swaps, no dequantization).
+//     swaps through a bounded host scratch, no dequantization).
 //   * Synthesized QK norms: GGUF attn_q_norm (full qk_scale_factor) /
 //     attn_k_norm (ones) absorb the q pre-scale into a *scaled* RMSNorm,
 //     while the Model runs a *scaleless* QK norm plus the separate 3.87
