@@ -230,23 +230,43 @@ class Session : public ISession {
       model_.reset();
     }
     if (hit_len < content.size()) {
-      // Forward the uncached content tail, then snapshot the content state
-      // for future turns before forwarding the generation-prompt suffix.
-      View1 lg = forward_range(full, hit_len, content.size());
-      std::vector<int> key(full.begin(),
-                           full.begin() + static_cast<long>(content.size()));
-      prefix_cache_.save(key, model_, lg);
-      if (content.size() < full.size())
-        forward_full_from(content.size(), full);
-      else
+      const std::vector<int> key(full.begin(),
+                                 full.begin() + static_cast<long>(content.size()));
+      if (content.size() == full.size()) {
+        // No generation-prompt suffix: the forward ends exactly at the
+        // cacheable boundary, so snapshot the logits too.
+        View1 lg = forward_range(full, hit_len, content.size());
+        prefix_cache_.save(key, model_, lg);
         stash_logits(lg);
+      } else {
+        // Merge the uncached content tail and the generation-prompt suffix
+        // into ONE forward. Forwarding them separately costs a full
+        // dequant pass plus a GEMM at M = suffix length; for a raw chat
+        // prompt (~385 content + 4 generation-prompt tokens) that suffix
+        // forward was ~30% of prefill. The KV rows for [0, content) are
+        // written by this forward and stay valid, so the cacheable state is
+        // snapshotted afterwards (without boundary logits: none were
+        // produced there).
+        View1 lg = forward_range(full, hit_len, full.size());
+        prefix_cache_.save(key, model_);
+        stash_logits(lg);
+      }
     } else if (content.size() < full.size()) {
       // Exact content hit: the content state is already resident.
       forward_full_from(content.size(), full);
-    } else {
+    } else if (hit >= 0 && prefix_cache_.entry_has_logits(
+                              static_cast<size_t>(hit))) {
       // Repeated identical prompt (full == content == cached): no suffix
       // to forward; reuse the stashed last-token logits directly.
       stash_entry_logits(static_cast<size_t>(hit));
+    } else {
+      // Exact content hit on an entry snapshotted past its key (no logits).
+      // Recompute the whole prompt; this only happens when a caller repeats
+      // a prompt whose content boundary was merged with a suffix last time.
+      model_.reset();
+      View1 lg = forward_range(full, 0, full.size());
+      prefix_cache_.save(full, model_, lg);
+      stash_logits(lg);
     }
     has_pending_ = true;
     prev_ = -1;
