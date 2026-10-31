@@ -1485,10 +1485,14 @@ struct SplitThink {
 // True when b[pos, end) holds no non-whitespace outside complete tool-call
 // blocks. Complete blocks are excised downstream, so they must not count as
 // display content (otherwise thinking after a tool call would look mid-turn
-// and leak into `content`). An unclosed block start counts as content, as
-// does a block whose end marker lies past `end`: from this window's point of
-// view it may still be plain text. Shared by the whole-text split and the
-// streaming layer so both classify a gap identically.
+// and leak into `content`). An unclosed block start counts as content: from
+// this window's point of view it may still be plain text. Note the asymmetry
+// with a block that starts inside the window but closes past `end`: the
+// caller (redundant-closer skip below) handles that case explicitly by
+// skipping the whole block, so this helper keeps the conservative
+// within-window rule and stays identical for the whole-text and streaming
+// views. Shared by the whole-text split and the streaming layer so both
+// classify a gap identically.
 bool blank_ignoring_tool_blocks(const std::string& b, size_t pos,
                                 size_t end) {
   while (pos < end) {
@@ -1510,6 +1514,45 @@ bool blank_ignoring_tool_blocks(const std::string& b, size_t pos,
   for (size_t i = pos; i < end; ++i)
     if (!std::isspace(static_cast<unsigned char>(b[i]))) return false;
   return true;
+}
+
+// When the think-closer at `c` lies inside a complete tool-call block (tool
+// arguments that merely contain closer bytes), it is not a think closer at
+// all: the whole block must be skipped as a unit and preserved for the later
+// excision/call stage. Sets [bs, be) to the block span (past its end marker)
+// and returns true. Returns false when `c` is outside any block starting in
+// [pos, c), or when the enclosing block never closes (unclosed starts count
+// as content). Blocks do not nest, so the last start before `c` governs.
+// The end search runs past `c` (into the full string `b`): a closer inside
+// tool args must not be mistaken for markup even when the block closes well
+// after it. Callers still gate the skip on blank_ignoring_tool_blocks(b,
+// pos, bs) so real content before the block keeps the closer literal.
+bool tool_block_containing_closer(const std::string& b, size_t pos, size_t c,
+                                  size_t& bs, size_t& be) {
+  size_t last_st = std::string::npos;
+  const char* last_sm = nullptr;
+  size_t q = pos;
+  while (q < c) {
+    const char* sm = nullptr;
+    const size_t st = find_earliest(
+        b, q, {kToolCallStartToken, kToolCallStartAltToken}, &sm);
+    if (st == std::string::npos || st >= c) break;
+    last_st = st;
+    last_sm = sm;
+    q = st + 1;
+  }
+  if (last_st == std::string::npos) return false;
+  const char* em = nullptr;
+  const size_t en = find_earliest(
+      b, last_st + std::string(last_sm).size(),
+      {kToolCallEndToken, kToolCallEndAltToken}, &em);
+  if (en == std::string::npos) return false;
+  if (c < en) {
+    bs = last_st;
+    be = en + std::string(em).size();
+    return true;
+  }
+  return false;
 }
 
 SplitThink split_think_blocks(const std::string& raw,
@@ -1569,6 +1612,21 @@ SplitThink split_think_blocks(const std::string& raw,
       const size_t o = find_earliest(
           raw, pos, {kThinkStartToken, kThinkStartAltToken}, &open_m2);
       if (o != std::string::npos && o < c) break;
+      // Closer inside a complete tool-call block is tool-argument bytes, not
+      // markup: skip the whole block (preserving it for the later
+      // excision/call stage) and keep scanning. Without this, a closer in
+      // tool args blocks the loop while the streaming layer — which receives
+      // tool blocks atomically — moves past the block and strips a later
+      // genuinely-leading closer, desyncing the two views.
+      {
+        size_t bs = 0, be = 0;
+        if (tool_block_containing_closer(raw, pos, c, bs, be)) {
+          if (!blank_ignoring_tool_blocks(raw, pos, bs)) break;
+          out.display += raw.substr(pos, be - pos);
+          pos = be;
+          continue;
+        }
+      }
       if (!blank_ignoring_tool_blocks(raw, pos, c)) break;
       out.display += raw.substr(pos, c - pos);
       pos = c + std::string(close_m).size();
@@ -2218,6 +2276,10 @@ void ToolCallStreamParser::l2_consume(const std::string& piece) {
     // blank-ignoring-tool-blocks is markup. The gap flows to layer 3
     // (tool blocks still excise there) while the closer is dropped. Bounded
     // by the firm frontier so a split marker is held, never misrouted.
+    // A closer inside a complete tool-call block is tool-argument bytes:
+    // skip the whole block (it excises downstream) and keep scanning, so
+    // this layer agrees with the whole-text split on which closers are
+    // genuinely leading.
     while (l2_ws_) {
       const char* close_m = nullptr;
       const size_t c = find_earliest(
@@ -2229,6 +2291,16 @@ void ToolCallStreamParser::l2_consume(const std::string& piece) {
       const size_t o = find_earliest(
           buf, pos, {kThinkStartToken, kThinkStartAltToken}, &open_m2);
       if (o != std::string::npos && o < c) break;
+      {
+        size_t bs = 0, be = 0;
+        if (tool_block_containing_closer(buf, pos, c, bs, be)) {
+          if (be > f) break;  // block not yet firm: hold, never misroute
+          if (!blank_ignoring_tool_blocks(buf, pos, bs)) break;
+          disp += buf.substr(pos, be - pos);
+          pos = be;
+          continue;
+        }
+      }
       if (!blank_ignoring_tool_blocks(buf, pos, c)) break;
       disp += buf.substr(pos, c - pos);
       pos = c + close_len;
