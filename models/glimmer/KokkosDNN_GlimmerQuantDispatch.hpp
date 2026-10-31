@@ -66,10 +66,13 @@ void linear_decode(
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& W,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& staging,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& Y,
-    const std::string& label = "Glimmer::linear_decode") {
+    const std::string& label = "Glimmer::linear_decode",
+    const Kokkos::View<uint8_t*, ExecSpace>& act_scratch =
+        Kokkos::View<uint8_t*, ExecSpace>()) {
   if (X.extent(0) != 1 || Y.extent(0) != 1)
     throw std::invalid_argument("linear_decode: expected single-row X and Y");
   (void)staging;
+  (void)act_scratch;  // dense weights need no int8 staging
   // M == 1 reuses the native team-per-row GEMV kernel (or cuBLAS M=1) via
   // the shared gemm dispatch; numerics identical to the former call sites.
   gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), X, W,
@@ -88,6 +91,13 @@ void linear_decode(
 // pitch == K, so carved subviews of oversized buffers would silently fall
 // back to the native kernel. The Model rents one exact-size buffer per
 // distinct projection shape for this reason.
+//
+// `act_scratch` is the persistent int8 activation staging buffer of the CUDA
+// decode path (Gguf::quant_gemv_int8_scratch_bytes(K) bytes, see
+// KokkosDNN_GGUFGemvCuda.hpp). It is optional and trailing so the dense and
+// exact-reference call sites stay unchanged: empty means "no staging" and
+// decode runs the portable unit-dot kernel (a different, ~1%-level arithmetic
+// only when the staging buffer is actually supplied).
 
 template <class ExecSpace, class Scalar>
 void linear_prefill(
@@ -111,7 +121,9 @@ void linear_decode(
     const Gguf::QuantWeight<ExecSpace>& W,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& staging,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& Y,
-    const std::string& label = "Glimmer::linear_decode") {
+    const std::string& label = "Glimmer::linear_decode",
+    const Kokkos::View<uint8_t*, ExecSpace>& act_scratch =
+        Kokkos::View<uint8_t*, ExecSpace>()) {
   if (X.extent(0) != 1 || Y.extent(0) != 1)
     throw std::invalid_argument("linear_decode: expected single-row X and Y");
   if (X.extent(1) != W.cols || Y.extent(1) != W.rows)
@@ -126,7 +138,7 @@ void linear_decode(
   Kokkos::View<Scalar*, ExecSpace,
                Kokkos::MemoryTraits<Kokkos::Unmanaged>>
       y1(Y.data(), W.rows);
-  Gguf::quant_gemv<ExecSpace, Scalar>(handle, x1, W, y1, label);
+  Gguf::quant_gemv<ExecSpace, Scalar>(handle, x1, W, y1, act_scratch, label);
 }
 
 // Chunk entry point: decode for single-row chunks, prefill otherwise.
@@ -139,9 +151,11 @@ void linear_chunk(
     const Weight& W,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& staging,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& Y,
-    const std::string& label = "Glimmer::linear_chunk") {
+    const std::string& label = "Glimmer::linear_chunk",
+    const Kokkos::View<uint8_t*, ExecSpace>& act_scratch =
+        Kokkos::View<uint8_t*, ExecSpace>()) {
   if (X.extent(0) == 1) {
-    linear_decode(handle, X, W, staging, Y, label);
+    linear_decode(handle, X, W, staging, Y, label, act_scratch);
   } else {
     linear_prefill(handle, X, W, staging, Y, label);
   }
@@ -155,7 +169,10 @@ void lm_head_forward(
     const Kokkos::View<Scalar*, ExecSpace>& last,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& W,
     const Kokkos::View<Scalar*, ExecSpace>& logits,
-    const std::string& label = "lm_head") {
+    const std::string& label = "lm_head",
+    const Kokkos::View<uint8_t*, ExecSpace>& act_scratch =
+        Kokkos::View<uint8_t*, ExecSpace>()) {
+  (void)act_scratch;  // dense weights need no int8 staging
   gemv<ExecSpace, Scalar>(handle, last, W, logits, label);
 }
 
@@ -165,8 +182,11 @@ void lm_head_forward(
     const Kokkos::View<Scalar*, ExecSpace>& last,
     const Gguf::QuantWeight<ExecSpace>& W,
     const Kokkos::View<Scalar*, ExecSpace>& logits,
-    const std::string& label = "lm_head") {
-  Gguf::quant_gemv<ExecSpace, Scalar>(handle, last, W, logits, label);
+    const std::string& label = "lm_head",
+    const Kokkos::View<uint8_t*, ExecSpace>& act_scratch =
+        Kokkos::View<uint8_t*, ExecSpace>()) {
+  Gguf::quant_gemv<ExecSpace, Scalar>(handle, last, W, logits, act_scratch,
+                                      label);
 }
 
 // ---- Embedding gather (dense table vs packed-row dequant) -----------------

@@ -155,6 +155,12 @@ class Model {
   // Weights holds dense views (ensure_deq_staging keys off the block weight
   // type), so dense builds pay no extra memory.
   MatR deq_q_, deq_kv_, deq_o_, deq_ffn_, deq_down_;
+  // int8 activation staging for the CUDA decode GEMV (see
+  // Gguf::quant_gemv_int8_scratch_bytes and
+  // KokkosDNN_GGUFGemvCuda.hpp): one buffer sized for the widest GEMV K in
+  // the model, reused by every projection, so steady decode allocates
+  // nothing. Empty for dense Weights (that path never stages activations).
+  Kokkos::View<uint8_t*, ExecSpace> q8_act_buf_;
   View3 q3_buf_, k3_buf_, v3_buf_, attn_out_buf_;
   ViewInt pos_buf_;
   View1 last_buf_, logits_buf_;
@@ -330,6 +336,15 @@ class Model {
         deq_ffn_ = MatR("deq_ffn", FFN, DIM);
       if (deq_down_.extent(0) != DIM || deq_down_.extent(1) != FFN)
         deq_down_ = MatR("deq_down", DIM, FFN);
+      // int8 decode-GEMV activation staging: monotone in K, so one buffer
+      // sized for the widest projection serves all of them.
+      const size_t need =
+          std::max(std::max(Gguf::quant_gemv_int8_scratch_bytes(DIM),
+                            Gguf::quant_gemv_int8_scratch_bytes(HqD)),
+                   std::max(Gguf::quant_gemv_int8_scratch_bytes(HkvD),
+                            Gguf::quant_gemv_int8_scratch_bytes(FFN)));
+      if (q8_act_buf_.extent(0) < need)
+        q8_act_buf_ = Kokkos::View<uint8_t*, ExecSpace>("q8_act", need);
     }
   }
 
@@ -472,9 +487,12 @@ class Model {
         // chunks (C == 1) run quant_gemv on packed weights, prefill chunks
         // dequantize-once into exact staging + dense gemm. Dense Weights
         // take the plain gemm path in both cases (staging ignored).
-        Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp, b.wq, deq_q_, q2, "wq");
-        Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp, b.wk, deq_kv_, k2, "wk");
-        Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp, b.wv, deq_kv_, v2, "wv");
+        Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp, b.wq, deq_q_, q2,
+                                              "wq", q8_act_buf_);
+        Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp, b.wk, deq_kv_, k2,
+                                              "wk", q8_act_buf_);
+        Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp, b.wv, deq_kv_, v2,
+                                              "wv", q8_act_buf_);
         // Fused Q/K per-head norms + V reshape (one launch instead of
         // qk q + qk k + reshape_v; bit-identical, see
         // KokkosDNN_RMSNorm.hpp).
@@ -546,11 +564,13 @@ class Model {
         // Output gating (sigmoid on the normed-input gate proj) + o_proj.
         // The attn reshape and the gate multiply are fused into one pass
         // (runs after the gate proj, whose output it consumes).
-        Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp, b.wgate_attn, deq_q_, gate_attn,
-                           "wgate_attn");
+        Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp, b.wgate_attn, deq_q_,
+                                              gate_attn, "wgate_attn",
+                                              q8_act_buf_);
         Impl::flatten_gate_sigmoid_mul<ExecSpace, Scalar>(attn_out, gate_attn,
                                                           attn_flat);
-        Impl::linear_chunk<ExecSpace, Scalar>(handle, attn_flat, b.wo, deq_o_, proj, "wo");
+        Impl::linear_chunk<ExecSpace, Scalar>(handle, attn_flat, b.wo, deq_o_,
+                                              proj, "wo", q8_act_buf_);
         // Fused post-attention norm + residual add (one launch instead of
         // norm + resid1; ~1 ulp reassociation, see KokkosDNN_RMSNorm.hpp):
         // h += norm(proj) * (1 + w).
@@ -558,10 +578,13 @@ class Model {
                                                  POST_EPS, h);
         // 2. SwiGLU MLP under the pre-FFN norm + post-FFN norm.
         rmsnorm_one_plus<ExecSpace, Scalar>(h, b.pre_ffn_norm, EPS, tmp2);
-        Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp2, b.wgate, deq_ffn_, gate, "wgate");
-        Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp2, b.wup, deq_ffn_, up, "wup");
+        Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp2, b.wgate, deq_ffn_,
+                                              gate, "wgate", q8_act_buf_);
+        Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp2, b.wup, deq_ffn_,
+                                              up, "wup", q8_act_buf_);
         swiglu<ExecSpace, Scalar>(gate, up, act);
-        Impl::linear_chunk<ExecSpace, Scalar>(handle, act, b.wdown, deq_down_, down, "wdown");
+        Impl::linear_chunk<ExecSpace, Scalar>(handle, act, b.wdown, deq_down_,
+                                              down, "wdown", q8_act_buf_);
         // Fused post-FFN norm + residual add (one launch instead of
         // norm + resid2; ~1 ulp reassociation, see KokkosDNN_RMSNorm.hpp):
         // h += norm(down) * (1 + w).
@@ -578,7 +601,9 @@ class Model {
       // Untied lm_head through the shared head dispatch (dense gemv /
       // packed quant_gemv), then the output-multiplier + tanh softcap head:
       // logits = cap * tanh((lm_head(h) * mult) / cap).
-      Impl::lm_head_forward<ExecSpace, Scalar>(handle, last, weights.lm_head, logits, "lm_head");
+      Impl::lm_head_forward<ExecSpace, Scalar>(handle, last, weights.lm_head,
+                                               logits, "lm_head",
+                                               q8_act_buf_);
       scale_by_scalar<ExecSpace, Scalar>(logits, OUT_MULT, logits);
       logit_softcap_forward<ExecSpace, Scalar>(logits, SOFTCAP, logits);
     }
