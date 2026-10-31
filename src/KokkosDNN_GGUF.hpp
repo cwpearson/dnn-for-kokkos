@@ -1012,6 +1012,18 @@ inline bool quant_can_group(GgmlType dtype, size_t K, size_t& gs) {
 // Same arithmetic per element (dm * q + mm) * x, FP32 accumulation; the only
 // change is which thread accumulates which elements, i.e. FP32 reassociation.
 //
+// Activation side: one unit consumes 16-32 packed weight bytes but a 64-byte
+// (bf16) or 128-byte (f32) activation window, so the activations are the larger
+// half of the load traffic once the weight loads are 128-bit. Decode GEMV also
+// re-reads the same activation row for every output row, which is what
+// QuantGemvUnitBlockedFunctor exploits: each thread group keeps one set of
+// accumulators per output row, loads the unit's window once for all of them and
+// converts it to FP32 once. Measured on the RTX 3090 (Glimmer-30B Q4_K_M, bf16
+// activations, 180 W cap, per-shape best case): ffn_gate/up 498 -> 552 GB/s,
+// ffn_down 621 -> 703 GB/s, lm_head (Q5_K, 924 MB) 416 -> 490 GB/s, 256-row k/v
+// 55/85 -> 73/110 GB/s, 4096-row attention projections 365 -> 396 GB/s, i.e.
+// 42.1 ms -> 36.7 ms of GEMV per decode token as measured in the server.
+//
 // Q6_K/Q8_0 blocks are 210/34 bytes, so the packed payload is only 2-byte
 // aligned per block (210 and 34 are 2 mod 4, and a row of them inherits that):
 // 16-byte vector loads on those weights would fault on odd block indices and
@@ -1062,14 +1074,108 @@ struct alignas(16) QuantX8 {
   Scalar v[8];
 };
 
+// Activation window of one decode unit: the 32 elements quant_unit_dot reads
+// for any packed dtype, as four 8-element aligned chunks. The chunk order is
+// dtype-specific (see quant_unit_load_x) because the unit's two 16-element
+// sub-blocks are not adjacent in every layout:
+//   Q4_K:  [k0, k0+16) and [k0+32, k0+48)
+//   Q5_K,
+//   Q8_0:  32 contiguous elements
+//   Q6_K:  [k0, k0+16) and [k0+64, k0+80)
+// Holding it once lets several output rows share one activation load instead
+// of re-reading the row per output row.
+// Stored as float even when the activation row is bf16: the conversion is
+// otherwise repeated by every output row that shares the window.
+struct alignas(16) QuantUnitX {
+  float v[4][8];
+};
+
+// Load the activation window of unit `c` (dtype known at compile time).
+template <GgmlType Dt, class Scalar>
+KOKKOS_INLINE_FUNCTION QuantUnitX quant_unit_load_x(const Scalar* xd,
+                                                    size_t c) {
+  size_t k0 = 0, k1 = 0, k2 = 0, k3 = 0;
+  if constexpr (Dt == GgmlType::Q4_K) {
+    const size_t k = (c / 8) * 256 + ((c % 8) / 2) * 64 + (c % 2) * 16;
+    k0 = k;
+    k1 = k + 8;
+    k2 = k + 32;
+    k3 = k + 40;
+  } else if constexpr (Dt == GgmlType::Q6_K) {
+    const size_t k = (c / 8) * 256 + ((c % 8) / 4) * 128 + ((c % 4) / 2) * 32 +
+                     (c % 2) * 16;
+    k0 = k;
+    k1 = k + 8;
+    k2 = k + 64;
+    k3 = k + 72;
+  } else {  // Q5_K, Q8_0: 32 contiguous elements
+    const size_t k =
+        (Dt == GgmlType::Q8_0)
+            ? c * 32
+            : (c / 8) * 256 + ((c % 8) / 2) * 64 + (((c % 8) % 2) ? 32 : 0);
+    k0 = k;
+    k1 = k + 8;
+    k2 = k + 16;
+    k3 = k + 24;
+  }
+  const QuantX8<Scalar> a = *reinterpret_cast<const QuantX8<Scalar>*>(xd + k0);
+  const QuantX8<Scalar> b = *reinterpret_cast<const QuantX8<Scalar>*>(xd + k1);
+  const QuantX8<Scalar> c2 = *reinterpret_cast<const QuantX8<Scalar>*>(xd + k2);
+  const QuantX8<Scalar> d = *reinterpret_cast<const QuantX8<Scalar>*>(xd + k3);
+  QuantUnitX w;
+KOKKOSDNN_PRAGMA_UNROLL()
+  for (int i = 0; i < 8; ++i) {
+    w.v[0][i] = static_cast<float>(a.v[i]);
+    w.v[1][i] = static_cast<float>(b.v[i]);
+    w.v[2][i] = static_cast<float>(c2.v[i]);
+    w.v[3][i] = static_cast<float>(d.v[i]);
+  }
+  return w;
+}
+
 // One Q4_K unit: 16 packed bytes -> 16 low-nibble (sub-block 2*iter) and 16
 // high-nibble (sub-block 2*iter+1) elements, each with its own (d*scale,
 // -dmin*min) pair. Unit c of a row: block c/8, iter (c%8)/2, half c%2; the
 // unit's first element is block*256 + iter*64 + half*16.
+KOKKOS_INLINE_FUNCTION float quant_q4k_dot_x(const uint8_t* row, size_t c,
+                                            const QuantUnitX& x) {
+  const size_t blk  = c / 8;
+  const BlockQ4K* b = reinterpret_cast<const BlockQ4K*>(
+      row + blk * sizeof(BlockQ4K));
+  const size_t iter = (c % 8) / 2;
+  const size_t half = c % 2;
+  QuantU8x16 q = *reinterpret_cast<const QuantU8x16*>(
+      b->qs + iter * 32 + half * 16);
+  uint8_t sc, mn;
+  get_scale_min_k4(static_cast<int>(2 * iter), b->scales, &sc, &mn);
+  const float dmA = fp16_to_float(b->d) * (float)sc;
+  const float mmA = -fp16_to_float(b->dmin) * (float)mn;
+  get_scale_min_k4(static_cast<int>(2 * iter + 1), b->scales, &sc, &mn);
+  const float dmB = fp16_to_float(b->d) * (float)sc;
+  const float mmB = -fp16_to_float(b->dmin) * (float)mn;
+  float sa = 0, sb = 0;
+KOKKOSDNN_PRAGMA_UNROLL()
+  for (int i = 0; i < 8; ++i) {
+    sa = fmaf(dmA * (float)(q.b[i] & 0xF) + mmA,
+              x.v[0][i], sa);
+    sa = fmaf(dmA * (float)(q.b[i + 8] & 0xF) + mmA,
+              x.v[1][i], sa);
+    sb = fmaf(dmB * (float)(q.b[i] >> 4) + mmB,
+              x.v[2][i], sb);
+    sb = fmaf(dmB * (float)(q.b[i + 8] >> 4) + mmB,
+              x.v[3][i], sb);
+  }
+  return sa + sb;
+}
+
 template <class Scalar>
 KOKKOS_INLINE_FUNCTION float quant_q4k_chunk_dot(const uint8_t* row,
                                                  const Scalar* xd, size_t xs,
                                                  size_t c, bool xvec) {
+  if (xvec)
+    return quant_q4k_dot_x(row, c,
+                           quant_unit_load_x<GgmlType::Q4_K, Scalar>(xd, c));
+  // Unaligned activation row: same math, scalar loads.
   const size_t blk  = c / 8;
   const BlockQ4K* b = reinterpret_cast<const BlockQ4K*>(
       row + blk * sizeof(BlockQ4K));
@@ -1086,35 +1192,12 @@ KOKKOS_INLINE_FUNCTION float quant_q4k_chunk_dot(const uint8_t* row,
   const float dmB = fp16_to_float(b->d) * (float)sc;
   const float mmB = -fp16_to_float(b->dmin) * (float)mn;
   float sa = 0, sb = 0;
-  if (xvec) {
-    // Four 128-bit activation loads instead of 32 scalar ones (1.4x on the
-    // microbenchmark above).
-    const QuantX8<Scalar>* xa =
-        reinterpret_cast<const QuantX8<Scalar>*>(xd + k0);
-    const QuantX8<Scalar>* xb =
-        reinterpret_cast<const QuantX8<Scalar>*>(xd + k0 + 32);
-    const QuantX8<Scalar> lo0 = xa[0], lo1 = xa[1];
-    const QuantX8<Scalar> hi0 = xb[0], hi1 = xb[1];
 KOKKOSDNN_PRAGMA_UNROLL()
-    for (int i = 0; i < 8; ++i) {
-      const float x_lo0 = static_cast<float>(lo0.v[i]);
-      const float x_lo1 = static_cast<float>(lo1.v[i]);
-      const float x_hi0 = static_cast<float>(hi0.v[i]);
-      const float x_hi1 = static_cast<float>(hi1.v[i]);
-      sa = fmaf(dmA * (float)(q.b[i] & 0xF) + mmA, x_lo0, sa);
-      sa = fmaf(dmA * (float)(q.b[i + 8] & 0xF) + mmA, x_lo1, sa);
-      sb = fmaf(dmB * (float)(q.b[i] >> 4) + mmB, x_hi0, sb);
-      sb = fmaf(dmB * (float)(q.b[i + 8] >> 4) + mmB, x_hi1, sb);
-    }
-  } else {
-    // Unaligned activation row: same math, scalar loads.
-KOKKOSDNN_PRAGMA_UNROLL()
-    for (int i = 0; i < 16; ++i) {
-      sa = fmaf(dmA * (float)(q.b[i] & 0xF) + mmA,
-                static_cast<float>(xd[(k0 + i) * xs]), sa);
-      sb = fmaf(dmB * (float)(q.b[i] >> 4) + mmB,
-                static_cast<float>(xd[(k0 + 32 + i) * xs]), sb);
-    }
+  for (int i = 0; i < 16; ++i) {
+    sa = fmaf(dmA * (float)(q.b[i] & 0xF) + mmA,
+              static_cast<float>(xd[(k0 + i) * xs]), sa);
+    sb = fmaf(dmB * (float)(q.b[i] >> 4) + mmB,
+              static_cast<float>(xd[(k0 + 32 + i) * xs]), sb);
   }
   return sa + sb;
 }
@@ -1126,10 +1209,52 @@ KOKKOSDNN_PRAGMA_UNROLL()
 // selects sub-blocks {0,2} or {1,3}, i.e. element offsets +0 and +64 from the
 // unit base; `half` selects the 16-element half. Both windows are 16 elements,
 // so all 32 elements of the unit are covered exactly once.
+KOKKOS_INLINE_FUNCTION float quant_q6k_dot_x(const uint8_t* row, size_t c,
+                                            const QuantUnitX& x) {
+  const size_t blk  = c / 8;
+  const BlockQ6K* b = reinterpret_cast<const BlockQ6K*>(
+      row + blk * sizeof(BlockQ6K));
+  const size_t chunk = (c % 8) / 4;
+  const size_t pair  = (c % 4) / 2;
+  const size_t half  = c % 2;
+  const QuantU16x8 ql =
+      quant_load_u16x8(b->ql + chunk * 64 + pair * 32 + half * 16);
+  const QuantU16x8 qh = quant_load_u16x8(b->qh + chunk * 32 + half * 16);
+  const float dd      = fp16_to_float(b->d);
+  const float ds0     = dd * (float)b->scales[chunk * 8 + 2 * pair + half];
+  const float ds1 = dd * (float)b->scales[chunk * 8 + 2 * pair + half + 4];
+  const int shf   = pair ? 2 : 0;
+  float sa = 0, sb = 0;
+KOKKOSDNN_PRAGMA_UNROLL()
+  for (int i = 0; i < 8; ++i) {
+    const int qa0 = (int)((quant_u16x8_byte(ql, i) & 0xF) |
+                          (((quant_u16x8_byte(qh, i) >> shf) & 3) << 4));
+    const int qa1 = (int)((quant_u16x8_byte(ql, i + 8) & 0xF) |
+                          (((quant_u16x8_byte(qh, i + 8) >> shf) & 3) << 4));
+    const int qb0 = (int)((quant_u16x8_byte(ql, i) >> 4) |
+                          (((quant_u16x8_byte(qh, i) >> (shf + 4)) & 3) << 4));
+    const int qb1 = (int)((quant_u16x8_byte(ql, i + 8) >> 4) |
+                          (((quant_u16x8_byte(qh, i + 8) >> (shf + 4)) & 3)
+                           << 4));
+    sa = fmaf(ds0 * (float)(qa0 - 32),
+              x.v[0][i], sa);
+    sa = fmaf(ds0 * (float)(qa1 - 32),
+              x.v[1][i], sa);
+    sb = fmaf(ds1 * (float)(qb0 - 32),
+              x.v[2][i], sb);
+    sb = fmaf(ds1 * (float)(qb1 - 32),
+              x.v[3][i], sb);
+  }
+  return sa + sb;
+}
+
 template <class Scalar>
 KOKKOS_INLINE_FUNCTION float quant_q6k_chunk_dot(const uint8_t* row,
                                                  const Scalar* xd, size_t xs,
                                                  size_t c, bool xvec) {
+  if (xvec)
+    return quant_q6k_dot_x(row, c,
+                           quant_unit_load_x<GgmlType::Q6_K, Scalar>(xd, c));
   const size_t blk  = c / 8;
   const BlockQ6K* b = reinterpret_cast<const BlockQ6K*>(
       row + blk * sizeof(BlockQ6K));
@@ -1145,51 +1270,58 @@ KOKKOS_INLINE_FUNCTION float quant_q6k_chunk_dot(const uint8_t* row,
   const float ds1 = dd * (float)b->scales[chunk * 8 + 2 * pair + half + 4];
   const int shf   = pair ? 2 : 0;
   float sa = 0, sb = 0;
-  if (xvec) {
-    const QuantX8<Scalar>* xa =
-        reinterpret_cast<const QuantX8<Scalar>*>(xd + k0);
-    const QuantX8<Scalar>* xb =
-        reinterpret_cast<const QuantX8<Scalar>*>(xd + k0 + 64);
-    const QuantX8<Scalar> a0 = xa[0], a1 = xa[1];
-    const QuantX8<Scalar> b0 = xb[0], b1 = xb[1];
-    float xa8[16], xb8[16];
 KOKKOSDNN_PRAGMA_UNROLL()
-    for (int i = 0; i < 8; ++i) {
-      xa8[i]     = static_cast<float>(a0.v[i]);
-      xa8[i + 8] = static_cast<float>(a1.v[i]);
-      xb8[i]     = static_cast<float>(b0.v[i]);
-      xb8[i + 8] = static_cast<float>(b1.v[i]);
-    }
-KOKKOSDNN_PRAGMA_UNROLL()
-    for (int i = 0; i < 16; ++i) {
-      const int qa = (int)((quant_u16x8_byte(ql, i) & 0xF) |
-                           (((quant_u16x8_byte(qh, i) >> shf) & 3) << 4));
-      const int qb = (int)((quant_u16x8_byte(ql, i) >> 4) |
-                           (((quant_u16x8_byte(qh, i) >> (shf + 4)) & 3) << 4));
-      sa = fmaf(ds0 * (float)(qa - 32), xa8[i], sa);
-      sb = fmaf(ds1 * (float)(qb - 32), xb8[i], sb);
-    }
-  } else {
-KOKKOSDNN_PRAGMA_UNROLL()
-    for (int i = 0; i < 16; ++i) {
-      const int qa = (int)((quant_u16x8_byte(ql, i) & 0xF) |
-                           (((quant_u16x8_byte(qh, i) >> shf) & 3) << 4));
-      const int qb = (int)((quant_u16x8_byte(ql, i) >> 4) |
-                           (((quant_u16x8_byte(qh, i) >> (shf + 4)) & 3) << 4));
-      sa = fmaf(ds0 * (float)(qa - 32),
-                static_cast<float>(xd[(k0 + i) * xs]), sa);
-      sb = fmaf(ds1 * (float)(qb - 32),
-                static_cast<float>(xd[(k0 + 64 + i) * xs]), sb);
-    }
+  for (int i = 0; i < 16; ++i) {
+    const int qa = (int)((quant_u16x8_byte(ql, i) & 0xF) |
+                         (((quant_u16x8_byte(qh, i) >> shf) & 3) << 4));
+    const int qb = (int)((quant_u16x8_byte(ql, i) >> 4) |
+                         (((quant_u16x8_byte(qh, i) >> (shf + 4)) & 3) << 4));
+    sa = fmaf(ds0 * (float)(qa - 32),
+              static_cast<float>(xd[(k0 + i) * xs]), sa);
+    sb = fmaf(ds1 * (float)(qb - 32),
+              static_cast<float>(xd[(k0 + 64 + i) * xs]), sb);
   }
   return sa + sb;
 }
 
 // One Q8_0 unit: a whole 34-byte block (32 elements, one scale).
+KOKKOS_INLINE_FUNCTION float quant_q80_dot_x(const uint8_t* row, size_t c,
+                                            const QuantUnitX& x) {
+  const BlockQ80* b = reinterpret_cast<const BlockQ80*>(
+      row + c * sizeof(BlockQ80));
+  const float d = fp16_to_float(b->d);
+  // BlockQ80 is 34 bytes: 2-byte loads (qs follows a 2-byte header).
+  const QuantU16x8 lo =
+      quant_load_u16x8(reinterpret_cast<const uint8_t*>(b->qs));
+  const QuantU16x8 hi =
+      quant_load_u16x8(reinterpret_cast<const uint8_t*>(b->qs + 16));
+  // Four independent FMA chains (see quant_q5k_dot_x).
+  float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+KOKKOSDNN_PRAGMA_UNROLL()
+  for (int i = 0; i < 8; ++i) {
+    const float q0 = static_cast<float>(
+        static_cast<int8_t>(quant_u16x8_byte(lo, i)));
+    const float q1 = static_cast<float>(
+        static_cast<int8_t>(quant_u16x8_byte(lo, i + 8)));
+    const float q2 = static_cast<float>(
+        static_cast<int8_t>(quant_u16x8_byte(hi, i)));
+    const float q3 = static_cast<float>(
+        static_cast<int8_t>(quant_u16x8_byte(hi, i + 8)));
+    s0 = fmaf(d * q0, x.v[0][i], s0);
+    s1 = fmaf(d * q1, x.v[1][i], s1);
+    s2 = fmaf(d * q2, x.v[2][i], s2);
+    s3 = fmaf(d * q3, x.v[3][i], s3);
+  }
+  return (s0 + s1) + (s2 + s3);
+}
+
 template <class Scalar>
 KOKKOS_INLINE_FUNCTION float quant_q80_chunk_dot(const uint8_t* row,
                                                  const Scalar* xd, size_t xs,
                                                  size_t c, bool xvec) {
+  if (xvec)
+    return quant_q80_dot_x(row, c,
+                           quant_unit_load_x<GgmlType::Q8_0, Scalar>(xd, c));
   const BlockQ80* b = reinterpret_cast<const BlockQ80*>(
       row + c * sizeof(BlockQ80));
   const size_t k0 = c * 32;
@@ -1200,36 +1332,12 @@ KOKKOS_INLINE_FUNCTION float quant_q80_chunk_dot(const uint8_t* row,
   const QuantU16x8 hi =
       quant_load_u16x8(reinterpret_cast<const uint8_t*>(b->qs + 16));
   float s = 0;
-  if (xvec) {
-    const QuantX8<Scalar>* xa =
-        reinterpret_cast<const QuantX8<Scalar>*>(xd + k0);
-    const QuantX8<Scalar> a0 = xa[0], a1 = xa[1];
-    const QuantX8<Scalar> a2 = xa[2], a3 = xa[3];
-    float xf[32];
 KOKKOSDNN_PRAGMA_UNROLL()
-    for (int i = 0; i < 8; ++i) {
-      xf[i]      = static_cast<float>(a0.v[i]);
-      xf[i + 8]  = static_cast<float>(a1.v[i]);
-      xf[i + 16] = static_cast<float>(a2.v[i]);
-      xf[i + 24] = static_cast<float>(a3.v[i]);
-    }
-KOKKOSDNN_PRAGMA_UNROLL()
-    for (int i = 0; i < 16; ++i) {
-      const float qa = static_cast<float>(
-          static_cast<int8_t>(quant_u16x8_byte(lo, i)));
-      const float qb = static_cast<float>(
-          static_cast<int8_t>(quant_u16x8_byte(hi, i)));
-      s = fmaf(d * qa, xf[i], s);
-      s = fmaf(d * qb, xf[i + 16], s);
-    }
-  } else {
-KOKKOSDNN_PRAGMA_UNROLL()
-    for (int i = 0; i < 32; ++i) {
-      const uint8_t byte = i < 16 ? quant_u16x8_byte(lo, i)
-                                  : quant_u16x8_byte(hi, i - 16);
-      s = fmaf(d * static_cast<float>(static_cast<int8_t>(byte)),
-               static_cast<float>(xd[(k0 + i) * xs]), s);
-    }
+  for (int i = 0; i < 32; ++i) {
+    const uint8_t byte = i < 16 ? quant_u16x8_byte(lo, i)
+                                : quant_u16x8_byte(hi, i - 16);
+    s = fmaf(d * static_cast<float>(static_cast<int8_t>(byte)),
+             static_cast<float>(xd[(k0 + i) * xs]), s);
   }
   return s;
 }
@@ -1240,10 +1348,58 @@ KOKKOSDNN_PRAGMA_UNROLL()
 // block*256 + iter*64 + half*32. The 32 qs bytes come from qs + iter*32 (two
 // 128-bit loads) and the 32 qh bytes from qh (two more); only the nibble side
 // `half` and the one qh bit (1/2 << 2*iter) are used.
+KOKKOS_INLINE_FUNCTION float quant_q5k_dot_x(const uint8_t* row, size_t c,
+                                            const QuantUnitX& x) {
+  const size_t blk  = c / 8;
+  const BlockQ5K* b = reinterpret_cast<const BlockQ5K*>(
+      row + blk * sizeof(BlockQ5K));
+  const size_t sub  = c % 8;
+  const size_t iter = sub / 2;
+  const bool low    = (sub % 2) == 0;
+  const QuantU8x16 ql0 =
+      *reinterpret_cast<const QuantU8x16*>(b->qs + iter * 32);
+  const QuantU8x16 ql1 =
+      *reinterpret_cast<const QuantU8x16*>(b->qs + iter * 32 + 16);
+  const QuantU8x16 qh0 = *reinterpret_cast<const QuantU8x16*>(b->qh);
+  const QuantU8x16 qh1 = *reinterpret_cast<const QuantU8x16*>(b->qh + 16);
+  uint8_t sc, mn;
+  get_scale_min_k4(static_cast<int>(sub), b->scales, &sc, &mn);
+  const float dm = fp16_to_float(b->d) * (float)sc;
+  const float mm = -fp16_to_float(b->dmin) * (float)mn;
+  const uint8_t u = (uint8_t)((low ? 1u : 2u) << (2 * iter));
+  // Nibble side and the qh bit are selected once per unit (a uniform shift and
+  // one mask) instead of per element, which is what kept this kernel at a
+  // third of the Q4_K rate: it is the lm_head dtype in Q4_K_M checkpoints.
+  const int sh = low ? 0 : 4;
+  // One scale/min pair covers all 32 elements, so the four 8-element chunks are
+  // four independent FMA chains (a single accumulator serialises on the 4-cycle
+  // FMA latency and runs this dtype at half rate).
+  float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+KOKKOSDNN_PRAGMA_UNROLL()
+  for (int i = 0; i < 8; ++i) {
+    const float q0 = (float)(((ql0.b[i] >> sh) & 0xF) |
+                             ((qh0.b[i] & u) ? 16 : 0));
+    const float q1 = (float)(((ql0.b[i + 8] >> sh) & 0xF) |
+                             ((qh0.b[i + 8] & u) ? 16 : 0));
+    const float q2 = (float)(((ql1.b[i] >> sh) & 0xF) |
+                             ((qh1.b[i] & u) ? 16 : 0));
+    const float q3 = (float)(((ql1.b[i + 8] >> sh) & 0xF) |
+                             ((qh1.b[i + 8] & u) ? 16 : 0));
+    s0 = fmaf(dm * q0 + mm, x.v[0][i], s0);
+    s1 = fmaf(dm * q1 + mm, x.v[1][i], s1);
+    s2 = fmaf(dm * q2 + mm, x.v[2][i], s2);
+    s3 = fmaf(dm * q3 + mm, x.v[3][i], s3);
+  }
+  return (s0 + s1) + (s2 + s3);
+}
+
 template <class Scalar>
 KOKKOS_INLINE_FUNCTION float quant_q5k_chunk_dot(const uint8_t* row,
                                                   const Scalar* xd, size_t xs,
                                                   size_t c, bool xvec) {
+  if (xvec)
+    return quant_q5k_dot_x(row, c,
+                           quant_unit_load_x<GgmlType::Q5_K, Scalar>(xd, c));
   const size_t blk  = c / 8;
   const BlockQ5K* b = reinterpret_cast<const BlockQ5K*>(
       row + blk * sizeof(BlockQ5K));
@@ -1262,38 +1418,18 @@ KOKKOS_INLINE_FUNCTION float quant_q5k_chunk_dot(const uint8_t* row,
   const float dm = fp16_to_float(b->d) * (float)sc;
   const float mm = -fp16_to_float(b->dmin) * (float)mn;
   const uint8_t u = (uint8_t)((low ? 1u : 2u) << (2 * iter));
+  const int sh    = low ? 0 : 4;
   float s         = 0;
-  if (xvec) {
-    const QuantX8<Scalar>* xa =
-        reinterpret_cast<const QuantX8<Scalar>*>(xd + k0);
-    const QuantX8<Scalar> a0 = xa[0], a1 = xa[1], a2 = xa[2], a3 = xa[3];
-    float xf[32];
 KOKKOSDNN_PRAGMA_UNROLL()
-    for (int i = 0; i < 8; ++i) {
-      xf[i]      = static_cast<float>(a0.v[i]);
-      xf[i + 8]  = static_cast<float>(a1.v[i]);
-      xf[i + 16] = static_cast<float>(a2.v[i]);
-      xf[i + 24] = static_cast<float>(a3.v[i]);
-    }
-    for (int i = 0; i < 32; ++i) {
-      const uint8_t qb = i < 16 ? (low ? (uint8_t)(ql0.b[i] & 0xF)
-                                       : (uint8_t)(ql0.b[i] >> 4))
-                                : (low ? (uint8_t)(ql1.b[i - 16] & 0xF)
-                                       : (uint8_t)(ql1.b[i - 16] >> 4));
-      const uint8_t hb = i < 16 ? qh0.b[i] : qh1.b[i - 16];
-      const float qf   = (float)qb + (float)((hb & u) ? 16 : 0);
-      s = fmaf(dm * qf + mm, xf[i], s);
-    }
-  } else {
-    for (int i = 0; i < 32; ++i) {
-      const uint8_t qb = i < 16 ? (low ? (uint8_t)(ql0.b[i] & 0xF)
-                                       : (uint8_t)(ql0.b[i] >> 4))
-                                : (low ? (uint8_t)(ql1.b[i - 16] & 0xF)
-                                       : (uint8_t)(ql1.b[i - 16] >> 4));
-      const uint8_t hb = i < 16 ? qh0.b[i] : qh1.b[i - 16];
-      const float qf   = (float)qb + (float)((hb & u) ? 16 : 0);
-      s = fmaf(dm * qf + mm, static_cast<float>(xd[(k0 + (size_t)i) * xs]), s);
-    }
+  for (int i = 0; i < 16; ++i) {
+    const float qa = (float)(((ql0.b[i] >> sh) & 0xF) |
+                             ((qh0.b[i] & u) ? 16 : 0));
+    const float qb = (float)(((ql1.b[i] >> sh) & 0xF) |
+                             ((qh1.b[i] & u) ? 16 : 0));
+    s = fmaf(dm * qa + mm,
+             static_cast<float>(xd[(k0 + (size_t)i) * xs]), s);
+    s = fmaf(dm * qb + mm,
+             static_cast<float>(xd[(k0 + 16 + (size_t)i) * xs]), s);
   }
   return s;
 }
@@ -1312,6 +1448,21 @@ KOKKOS_INLINE_FUNCTION float quant_unit_dot(GgmlType dtype,
     default:
       return quant_elem(dtype, row, c) * static_cast<float>(xd[c * xs]);
   }
+}
+
+// Same dot against an already-loaded activation window, dtype fixed at compile
+// time (no per-unit switch, everything inlines and unrolls).
+template <GgmlType Dt>
+KOKKOS_INLINE_FUNCTION float quant_unit_dot_x(const uint8_t* row, size_t c,
+                                              const QuantUnitX& x) {
+  if constexpr (Dt == GgmlType::Q4_K)
+    return quant_q4k_dot_x(row, c, x);
+  else if constexpr (Dt == GgmlType::Q5_K)
+    return quant_q5k_dot_x(row, c, x);
+  else if constexpr (Dt == GgmlType::Q6_K)
+    return quant_q6k_dot_x(row, c, x);
+  else
+    return quant_q80_dot_x(row, c, x);
 }
 
 // Threads per output row in a decode team: 32 keeps a row's reduction inside
@@ -1367,6 +1518,10 @@ struct QuantGemvGroupedFunctor {
 // block-aligned K (see quant_can_unit); the caller falls back to the
 // grouped/per-element paths otherwise. Same values up to FP32
 // reassociation.
+//
+// This pair is now only the fallback for activation rows that are not
+// 16-byte aligned (QuantGemvUnitBlockedFunctor handles the aligned case with
+// dtype-specialized code and shared activation windows).
 template <class ExecSpace, class Scalar>
 struct QuantGemvUnitFunctor {
   using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
@@ -1452,6 +1607,149 @@ struct QuantGemvUnitMultiFunctor {
     }
   }
 };
+
+// Row-blocked unit GEMV: each thread group handles ROWS output rows and keeps
+// ROWS accumulators for the same unit column, so the activation window (4x the
+// packed weight bytes per unit for Q4_K, 2x for Q6_K) is loaded and addressed
+// once per ROWS weight loads instead of once per row. `Dt` is a compile-time
+// dtype: no per-unit switch, and the unpack unrolls against fixed offsets.
+// Requires a 16-byte aligned activation row (see QuantUnitX); the caller keeps
+// the runtime-dtype path for unaligned rows. Same FP32 terms as quant_unit_dot
+// per row, FP32 reassociation across a row's lanes only.
+template <class ExecSpace, class Scalar, GgmlType Dt, int ROWS>
+struct QuantGemvUnitBlockedFunctor {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  Kokkos::View<Scalar*, ExecSpace> x, y;
+  const uint8_t* wdata;
+  size_t nunits;
+  size_t row_bytes;
+  size_t nrows;
+  int threads_per_row;
+  int groups;  // row groups per team (team_size == threads_per_row * groups)
+
+  KOKKOS_INLINE_FUNCTION void operator()(const Member& team) const {
+    const int tpr   = threads_per_row;
+    const int gs    = groups;
+    const int rank  = team.team_rank();
+    const int g     = (tpr > 0) ? (rank / tpr) : 0;
+    const int lane  = (tpr > 0) ? (rank - g * tpr) : 0;
+    float* red      = static_cast<float*>(
+        team.team_shmem().get_shmem(sizeof(float) * (size_t)team.team_size() *
+                                    (size_t)ROWS));
+    const auto xx    = x;
+    const Scalar* xd = xx.data();
+    const uint8_t* wd = wdata;
+    const size_t nu  = nunits;
+    const size_t rb  = row_bytes;
+    const size_t nr  = nrows;
+    // Tail teams clamp their row indices instead of branching per unit: rows
+    // past the end recompute the last real row and their result is dropped.
+    const size_t first =
+        ((size_t)team.league_rank() * (size_t)gs + (size_t)g) * (size_t)ROWS;
+    const uint8_t* row[ROWS];
+KOKKOSDNN_PRAGMA_UNROLL()
+    for (int k = 0; k < ROWS; ++k)
+      row[k] = wd + ((first + (size_t)k < nr) ? (first + (size_t)k)
+                                              : (nr - 1)) *
+                       rb;
+    float acc[ROWS];
+KOKKOSDNN_PRAGMA_UNROLL()
+    for (int k = 0; k < ROWS; ++k) acc[k] = 0;
+    for (size_t c = (size_t)lane; c < nu; c += (size_t)tpr) {
+      const QuantUnitX xw = quant_unit_load_x<Dt, Scalar>(xd, c);
+KOKKOSDNN_PRAGMA_UNROLL()
+      for (int k = 0; k < ROWS; ++k)
+        acc[k] += quant_unit_dot_x<Dt>(row[k], c, xw);
+    }
+    float* slot = red + (size_t)rank * (size_t)ROWS;
+KOKKOSDNN_PRAGMA_UNROLL()
+    for (int k = 0; k < ROWS; ++k) slot[k] = acc[k];
+    team.team_barrier();
+    const int rows_team = gs * ROWS;
+    if (rank < rows_team) {
+      const int gg   = rank / ROWS;
+      const int kk   = rank - gg * ROWS;
+      float sum      = 0;
+      const float* p = red + (size_t)gg * (size_t)tpr * (size_t)ROWS + kk;
+      for (int t = 0; t < tpr; ++t) sum += p[(size_t)t * (size_t)ROWS];
+      const size_t rowidx =
+          ((size_t)team.league_rank() * (size_t)gs + (size_t)gg) *
+              (size_t)ROWS +
+          (size_t)kk;
+      if (rowidx < nr) y(rowidx) = static_cast<Scalar>(sum);
+    }
+  }
+};
+
+// Launch the row-blocked unit kernel for one compile-time dtype, shrinking the
+// team if the backend cannot field the requested one.
+template <class ExecSpace, class Scalar, GgmlType Dt, int ROWS>
+inline void quant_gemv_unit_blocked(const Kokkos::View<Scalar*, ExecSpace>& x,
+                                    const QuantWeight<ExecSpace>& w,
+                                    const Kokkos::View<Scalar*, ExecSpace>& y,
+                                    int threads_per_row, int groups,
+                                    const std::string& label) {
+  const size_t nu = quant_unit_count(w.dtype, w.cols);
+  QuantGemvUnitBlockedFunctor<ExecSpace, Scalar, Dt, ROWS> f{
+      x,
+      y,
+      w.data.data(),
+      nu,
+      w.row_bytes(),
+      w.rows,
+      threads_per_row,
+      groups};
+  std::size_t shmem = sizeof(float) * (std::size_t)threads_per_row *
+                      (std::size_t)groups * (std::size_t)ROWS;
+  const int tmax = ::KokkosDNN::Impl::cached_team_size_max<ExecSpace>(f, shmem);
+  int ts         = threads_per_row * groups;
+  if (ts > tmax) {
+    groups = (tmax > threads_per_row) ? (tmax / threads_per_row) : 1;
+    ts     = threads_per_row * groups;
+    shmem  = sizeof(float) * (std::size_t)ts * (std::size_t)ROWS;
+  }
+  f.groups = groups;
+  const std::size_t rows_per_team = (std::size_t)groups * (std::size_t)ROWS;
+  const int teams = (int)((w.rows + rows_per_team - 1) / rows_per_team);
+  Kokkos::TeamPolicy<ExecSpace> policy(teams, ts);
+  policy.set_scratch_size(0, Kokkos::PerTeam(shmem));
+  Kokkos::parallel_for(label, policy, f);
+}
+
+// Pick a blocked layout and dispatch on the (compile-time) dtype. Wide matrices
+// get 4 rows per 128-thread team (two row groups of two rows, 64 threads per
+// row): measured best for every wide shape, because fewer teams re-read the
+// activation row and 64 threads per row shortens each thread's unit chain.
+// Short matrices are team-count bound, so they get one row per 128-thread team
+// instead (a 256-row projection cannot fill the GPU with 4-row teams).
+template <class ExecSpace, class Scalar>
+inline void quant_gemv_unit_dispatch(const Kokkos::View<Scalar*, ExecSpace>& x,
+                                     const QuantWeight<ExecSpace>& w,
+                                     const Kokkos::View<Scalar*, ExecSpace>& y,
+                                     const std::string& label) {
+  const size_t nu  = quant_unit_count(w.dtype, w.cols);
+  const bool wide  = w.rows >= 1024;
+  int tpr          = wide ? 64 : 128;
+  const int groups = wide ? 2 : 1;
+  while (tpr > 1 && (size_t)tpr > nu) tpr /= 2;
+#define KOKKOSDNN_IMPL_GGUF_UNIT_CASE(DT)                                    \
+  case DT:                                                                   \
+    if (wide)                                                                \
+      quant_gemv_unit_blocked<ExecSpace, Scalar, DT, 2>(x, w, y, tpr, groups, \
+                                                        label);              \
+    else                                                                     \
+      quant_gemv_unit_blocked<ExecSpace, Scalar, DT, 1>(x, w, y, tpr, groups, \
+                                                        label);              \
+    return
+  switch (w.dtype) {
+    KOKKOSDNN_IMPL_GGUF_UNIT_CASE(GgmlType::Q4_K);
+    KOKKOSDNN_IMPL_GGUF_UNIT_CASE(GgmlType::Q5_K);
+    KOKKOSDNN_IMPL_GGUF_UNIT_CASE(GgmlType::Q6_K);
+    KOKKOSDNN_IMPL_GGUF_UNIT_CASE(GgmlType::Q8_0);
+    default: return;
+  }
+#undef KOKKOSDNN_IMPL_GGUF_UNIT_CASE
+}
 
 // Unit-path eligibility: every decode unit must lie inside whole ggml
 // blocks (see quant_unit_count). Q4_K/Q5_K/Q6_K units span a 256-element
@@ -1968,8 +2266,14 @@ void quant_gemv(
   // merely divides the group size; per-element path otherwise.
   if (Impl::quant_can_unit(w.dtype, w.cols)) {
     const size_t nu = Impl::quant_unit_count(w.dtype, w.cols);
-    // Multi-row (4 rows per 128-thread team, one warp per row) where the
-    // backend can field it; serial/host fallback stays single-row.
+    // Row-blocked, dtype-specialized kernel for aligned activation rows: each
+    // thread group shares one activation window between two output rows.
+    if (Impl::quant_aligned16(x.data())) {
+      Impl::quant_gemv_unit_dispatch<ExecSpace, Scalar>(x, w, y, label);
+      return;
+    }
+    // Unaligned activation row: the runtime-dtype unit path (scalar
+    // activation loads), multi-row where the backend can field it.
     const bool use_multi = (w.rows >= 4);
     if (use_multi) {
       Impl::QuantGemvUnitMultiFunctor<ExecSpace, Scalar> mf{

@@ -42,6 +42,19 @@ kokkosdnn_suppress_third_party_warnings(benchmark_main)
 kokkosdnn_suppress_third_party_warnings(benchmark::benchmark)
 kokkosdnn_suppress_third_party_warnings(benchmark::benchmark_main)
 
+# Standalone bandwidth benchmark for the packed-quant GEMV (decode) path: reads
+# the real matrices of a GGUF checkpoint and reports GB/s per shape, which is
+# what the decode loop is bound by. Separate binary because it needs a model
+# file and has its own main() (no google-benchmark fixture):
+#   ./kokkosdnn_bench_gguf_gemv <model.gguf> [iters] [rows] [tpr] [groups]
+# rows/tpr/groups (default 0 = the shipped layout) drive the row-blocked kernel
+# directly, for tuning the layout against a real checkpoint.
+#   ./kokkosdnn_bench_gguf_gemv <model.gguf> 40 2 64 2 blk.0.ffn_gate.weight
+add_executable(kokkosdnn_bench_gguf_gemv Bench_GGUFGemv.cpp)
+target_link_libraries(kokkosdnn_bench_gguf_gemv PRIVATE KokkosDNN::kokkosdnn)
+set_target_properties(kokkosdnn_bench_gguf_gemv PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+kokkosdnn_enable_compiler_warnings(kokkosdnn_bench_gguf_gemv)
+
 add_executable(kokkosdnn_bench
   BenchmarkMain.cpp
   Bench_Gemm.cpp

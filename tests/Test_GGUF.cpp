@@ -703,9 +703,12 @@ void build_case(GgmlType dtype, size_t N, size_t K, std::vector<float>& ref,
   }
 }
 
+// `rel` > 0 switches the kernel-check tolerance to rel * (1 + |reference|),
+// which is the honest bound when the row sums are large (bhalf outputs, wide
+// rows): an absolute tolerance would either be vacuous or impossible.
 template <class Scalar>
-void check_quant_gemv(GgmlType dtype, size_t K, float tol) {
-  const size_t N = 3;
+void check_quant_gemv_rows(GgmlType dtype, size_t N, size_t K, float tol,
+                           float rel = 0.f) {
   std::vector<float> ref;
   std::vector<uint8_t> raw;
   build_case(dtype, N, K, ref, raw);
@@ -735,7 +738,8 @@ void check_quant_gemv(GgmlType dtype, size_t K, float tol) {
     double acc = 0;
     for (size_t k = 0; k < K; ++k)
       acc += (double)wdq[j * K + k] * (double)(float)hx(k);
-    EXPECT_NEAR((float)got(j), (float)acc, tol)
+    const float atol = rel > 0.f ? rel * (1.f + (float)std::fabs(acc)) : tol;
+    EXPECT_NEAR((float)got(j), (float)acc, atol)
         << "kernel mismatch dtype=" << ggml_type_name(dtype) << " row=" << j;
     // Sanity vs the original floats: exact for F32/crafted, bounded for
     // the rest.
@@ -754,6 +758,11 @@ void check_quant_gemv(GgmlType dtype, size_t K, float tol) {
   // ExecSpace (no-handle) overload runs too.
   quant_gemv(Exec{}, x, w, y);
   Kokkos::fence();
+}
+
+template <class Scalar>
+void check_quant_gemv(GgmlType dtype, size_t K, float tol) {
+  check_quant_gemv_rows<Scalar>(dtype, 3, K, tol);
 }
 
 template <class Scalar>
@@ -837,6 +846,29 @@ TEST(GgufQuantGemm, GemvBHalf) {
   check_quant_gemv<bhalf_t>(GgmlType::F16, 64, 5e-2f);
   check_quant_gemv<bhalf_t>(GgmlType::BF16, 64, 5e-2f);
   check_quant_gemv<bhalf_t>(GgmlType::Q8_0, 64, 5e-2f);
+}
+
+// The K-quant dtypes with bf16 activations are what the decode path actually
+// runs (Glimmer/llama use bf16 activations, K-quant weights); the case above
+// only covers the dtypes the fp16-era tests used.
+TEST(GgufQuantGemm, GemvBHalfKQuant) {
+  using bhalf_t = Kokkos::Experimental::bhalf_t;
+  check_quant_gemv<bhalf_t>(GgmlType::Q4_K, 256, 0.f);
+  check_quant_gemv<bhalf_t>(GgmlType::Q5_K, 256, 0.f);
+  check_quant_gemv<bhalf_t>(GgmlType::Q6_K, 256, 0.f);
+}
+
+// Row count picks the kernel layout (one row per wide team below 1024 rows,
+// four rows sharing activation windows above), and the row tail is handled by
+// clamping: pin both sides of the split plus a non-multiple-of-four tail.
+TEST(GgufQuantGemm, GemvWideRows) {
+  for (size_t N : {1023u, 1024u, 1102u}) {
+    check_quant_gemv_rows<float>(GgmlType::Q4_K, N, 256, 0.f, 1e-5f);
+    check_quant_gemv_rows<float>(GgmlType::Q5_K, N, 256, 0.f, 1e-5f);
+    check_quant_gemv_rows<float>(GgmlType::Q6_K, N, 256, 0.f, 1e-5f);
+  }
+  using bhalf_t = Kokkos::Experimental::bhalf_t;
+  check_quant_gemv_rows<bhalf_t>(GgmlType::Q4_K, 1102, 256, 0.f, 1e-2f);
 }
 
 TEST(GgufQuantGemm, GemmFloat) {
