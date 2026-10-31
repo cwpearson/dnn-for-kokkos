@@ -111,7 +111,7 @@ the 24GB recipe below).
 
 A single `--weights` entry ending in `.gguf` (case-insensitive) selects the GGUF path (`KokkosDNN::Glimmer::load_gguf`); F32/F16/BF16 decode exactly, Q8_0/Q4_K/Q5_K/Q6_K (i.e. the Q4_K_M recipe, which stores those per-tensor dtypes) stay packed on device with on-the-fly dequant (decode; int8-dot on CUDA) / dequant-once + dense GEMM (prefill chunks), anything else throws. Mixing `.gguf` with safetensors shards is an error. `--list-tensors` works on `.gguf` files too.
 
-24GB recipe (packed GGUF + int8 KV + chunk cap): `--kv-int8` halves the KV cache (214.5 MiB at the 8192 default, 3432 MiB at the 131072 arch max vs 416 MiB / ~6.5 GiB dense) and `--prefill-chunk N` caps prefill scratch (~440 MiB at the 2048 default, ~110 MiB at 512). ~17GB Q4_K_M weights + 3432 MiB int8 KV + ~614 MiB dequant staging + scratch ≈ 21.4 GiB, fitting 24GB:
+24GB recipe (packed GGUF + int8 KV + chunk cap): `--kv-int8` halves the KV cache (214.5 MiB at the 8192 default, 3432 MiB at the 131072 arch max vs 416 MiB / ~6.5 GiB dense) and `--prefill-chunk N` caps prefill scratch (~440 MiB at the 2048 default, ~110 MiB at 512). Int8 prefill dequantizes the live prefix into a shared dense scratch and reuses the dense attention kernels (cuDNN SDPA on full layers), so prefill speed matches dense KV; the scratch is one `[max_seq_len, n_kv_heads, head_dim]` K/V pair in bf16 — 128 MiB (134 MB) at 131072, 8 MiB (8.4 MB) at 8192 (double for `--fp32`). Single-token decode still reads the int8 pools directly. ~17GB Q4_K_M weights + 3432 MiB int8 KV + 128 MiB dequantized KV + ~614 MiB dequant staging + scratch ≈ 21.5 GiB, fitting 24GB:
 
 ```bash
 ./build/examples/glimmer/glimmer_generate \
