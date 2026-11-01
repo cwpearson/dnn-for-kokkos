@@ -77,8 +77,9 @@
 // once. Pass --no-staged for the legacy single-phase run. No disk round-trip
 // and no second process: the embeds are separate
 // (MiB) allocations from the (GiB) encoder weights. In the interactive loop
-// the encoder and transformer additionally live in HOST memory (loaded once
-// before the first prompt) and are copied host->device per iteration, so
+// the encoder and transformer shards are mapped once before the first
+// prompt (mmap; the OS page cache is the host staging) and are streamed
+// host->device per iteration, so
 // staging (default) keeps the same one-component-resident property every
 // iteration
 // without re-reading the ~32 GB checkpoint from disk. Each phase logs its
@@ -97,14 +98,6 @@
 #include "qwen_image_21_common.hpp"
 #include "KokkosDNN_ExampleReadline.hpp"
 
-// Converted host-staged weights (KokkosDNN library): the loop warms once
-// (disk -> host) and stages host->device per iteration.
-#if defined(QWEN21_DRIVER_HAVE_DIT) || \
-    (defined(QWEN21_DRIVER_HAVE_ENCODER) && \
-     defined(QWEN21_DRIVER_HAVE_TOKENIZER))
-#include "KokkosDNN_QwenImage21HostWeights.hpp"
-#endif
-
 void usage();
 template <class CfgT>
 int run_interactive_loop(const CfgT& cfg, const struct LoopFixedOpts& o);
@@ -113,11 +106,13 @@ int run_interactive_loop(const CfgT& cfg, const struct LoopFixedOpts& o);
 // When --prompt is absent (and no parity/file handoff flags are given) the
 // driver runs as a REPL on a TTY: it asks for a prompt, asks for an output
 // filename, generates, and repeats indefinitely until EOF or quit/exit.
-// The encoder and transformer weights are loaded ONCE into host memory
-// (HostSpace mirrors) before the first prompt; every iteration copies the
-// needed component host->device, runs the phase, and releases the device
-// copy -- so staging (default) keeps the same one-component-resident property
-// per iteration without re-reading the ~32 GB checkpoint from disk.
+// The encoder and transformer shards are mapped ONCE before the first
+// prompt (open/mmap/parse; the OS page cache is the host staging); every
+// iteration streams the needed component from the mappings host->device,
+// runs the phase, and releases the device copy -- so staging (default)
+// keeps the same one-component-resident property per iteration without
+// re-reading the ~32 GB checkpoint from disk and without a second
+// host-side copy of the weights.
 // File/parity modes (--prompt-embeds-in/--text-weights, --init-latents-in,
 // --dump-steps, --decode-latents-in) and non-TTY stdin force the legacy
 // one-off run. In the loop the latent seed is base --seed + iteration, so
@@ -363,35 +358,25 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
 
 #if defined(QWEN21_DRIVER_HAVE_DIT) || \
     (defined(QWEN21_DRIVER_HAVE_ENCODER) && \
-     defined(QWEN21_DRIVER_HAVE_TOKENIZER))
-  // Converted weights live in host memory from here on (warmed once,
-  // disk -> host, no device allocation); each iteration stages host->device
-  // and releases the device copy. bhalf_t matches both the DiT (DScalar)
-  // and the encoder device models.
-  KokkosDNN::QwenImage21::HostWeights<Kokkos::Experimental::bhalf_t>
-      host_weights;
+     defined(QWEN21_DRIVER_HAVE_TOKENIZER)) || \
+    defined(QWEN21_DRIVER_HAVE_VAE)
+  // Persistent mmap'd checkpoint shards (mapped once here, shared across
+  // loop iterations): the OS page cache is the host staging, so per-phase
+  // loads stream from the mappings and only the phase's device weights
+  // are ever resident.
+  KokkosDNN::QwenImage21::MappedShardSet mapped_shards;
 #endif
 #ifdef QWEN21_DRIVER_HAVE_DIT
-  // DiT weights warmed once above; each iteration copies host->device,
-  // samples, and releases the device copy.
+  // DiT shard paths resolved once here; each iteration loads host->device
+  // from the mappings below, samples, and releases the device copy.
+  std::vector<std::string> dit_shards;
   if (!o.tiny) {
     const std::string dit_dir = ckpt_sub(o.ckpt, "transformer");
-    const std::vector<std::string> shards =
-        resolve_shard_list(dit_dir, "--ckpt");
-    if (shards.size() > 1)
-      std::printf("[loading %zu shards]\n", shards.size());
+    dit_shards = resolve_shard_list(dit_dir, "--ckpt");
+    if (dit_shards.size() > 1)
+      std::printf("[loading %zu shards]\n", dit_shards.size());
     else
       std::printf("[loading %s]\n", dit_dir.c_str());
-    try {
-      host_weights.warm_dit(cfg, shards);
-    } catch (const std::exception& e) {
-      throw std::runtime_error(std::string(e.what()) +
-                               " (need Qwen-Image-2.1 weights or --tiny)");
-    }
-    std::printf("[loop] DiT weights resident in host memory: %.1f GB "
-                "(copied host->device each iteration%s)\n",
-                (double)host_weights.dit.resident_bytes() / 1e9,
-                o.staged ? ", staged" : "");
   }
 #endif
 
@@ -404,6 +389,7 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
   std::vector<int> loop_head_ids;
   size_t loop_drop = 0;
   KokkosDNN::QwenImage21Encoder::Config loop_ecfg;
+  std::vector<std::string> encoder_shards;
   if (!o.tiny && !o.ckpt.empty()) {
     namespace QELoop = KokkosDNN::QwenImage21Encoder;
     require_ckpt_dir(o.ckpt);
@@ -442,23 +428,15 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
       throw std::runtime_error(
           "Qwen encoder hidden (" + std::to_string(loop_ecfg.hidden_dim) +
           ") != caption dim (" + std::to_string(be_caption_dim(cfg)) + ")");
-    const std::vector<std::string> eshards =
+    const std::vector<std::string> eshards_check =
         resolve_shard_list(ckpt_sub(o.ckpt, "text_encoder"), "--ckpt");
-    if (eshards.size() != 1)
+    if (eshards_check.size() != 1)
       throw std::runtime_error(
           "--ckpt text_encoder must be the single-shard text_encoder/ "
           "model.safetensors (got " +
-          std::to_string(eshards.size()) + " shards)");
+          std::to_string(eshards_check.size()) + " shards)");
+    encoder_shards = eshards_check;
     std::printf("[loading %s]\n", ckpt_sub(o.ckpt, "text_encoder").c_str());
-    try {
-      host_weights.warm_encoder(loop_ecfg, eshards[0]);
-    } catch (const std::exception& e) {
-      throw std::runtime_error(std::string(e.what()) +
-                               " (need Qwen-Image-2.1 weights or --tiny)");
-    }
-    std::printf("[loop] Qwen encoder weights resident in host memory: %.1f "
-                "GB (copied host->device each iteration)\n",
-                (double)host_weights.encoder.resident_bytes() / 1e9);
   }
   if (o.tiny && !o.ckpt.empty())
     std::printf("[encode] --tiny skips the Qwen forward (random-weights "
@@ -504,16 +482,44 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
                 "for editing each time)\n");
   }
   std::fflush(stdout);
+#if defined(QWEN21_DRIVER_HAVE_DIT) || \
+    (defined(QWEN21_DRIVER_HAVE_ENCODER) && \
+     defined(QWEN21_DRIVER_HAVE_TOKENIZER)) || \
+    defined(QWEN21_DRIVER_HAVE_VAE)
+  // Map every checkpoint shard once (skipped for --tiny): DiT + text
+  // encoder (+ VAE when decoding). Each iteration's phase loads stream
+  // from these mappings; the device copies are still released per phase.
+  if (!o.tiny && !o.ckpt.empty()) {
+    std::vector<std::string> all_shards;
+#ifdef QWEN21_DRIVER_HAVE_DIT
+    all_shards.insert(all_shards.end(), dit_shards.begin(), dit_shards.end());
+#endif
+#if defined(QWEN21_DRIVER_HAVE_ENCODER) && \
+    defined(QWEN21_DRIVER_HAVE_TOKENIZER)
+    all_shards.insert(all_shards.end(), encoder_shards.begin(),
+                      encoder_shards.end());
+#endif
 #ifdef QWEN21_DRIVER_HAVE_VAE
-  // VAE shards staged once in host RAM: every iteration's decode streams
-  // from these bytes instead of disk (the DiT/encoder above use converted
-  // host staging instead; the VAE path is load-per-decode by design).
-  KokkosDNN::QwenImage21::ShardCache vae_cache;
-  if (!o.tiny && !o.ckpt.empty() && vae_decode) {
-    vae_cache.warm(resolve_shard_list(ckpt_sub(o.ckpt, "vae"), "--ckpt"));
-    std::printf("[shard-cache] vae staged: %zu shard(s), %.3f GB resident\n",
-                vae_cache.count(),
-                (double)vae_cache.bytes() / 1e9);
+    if (vae_decode) {
+      const std::vector<std::string> vae_shards =
+          resolve_shard_list(ckpt_sub(o.ckpt, "vae"), "--ckpt");
+      all_shards.insert(all_shards.end(), vae_shards.begin(), vae_shards.end());
+    }
+#endif
+    if (!all_shards.empty()) {
+      try {
+        mapped_shards.warm(all_shards);
+      } catch (const std::exception& e) {
+        throw std::runtime_error(std::string(e.what()) +
+                                 " (need Qwen-Image-2.1 weights or --tiny)");
+      }
+      mapped_shards.start_prefetch_all();
+      std::printf("[mmap] %zu shard(s), %.1f GB mapped "
+                  "(streamed host->device each iteration%s)\n",
+                  mapped_shards.shard_count(),
+                  (double)mapped_shards.mapped_bytes() / 1e9,
+                  o.staged ? ", staged" : "");
+    }
   }
 #endif
   size_t iter = 0;
@@ -565,12 +571,12 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
                 (unsigned long long)cur_seed, cur_out.c_str());
     std::fflush(stdout);
 
-    // ---- Phase 1: encode (device encoder is a per-iteration copy) ----
+    // ---- Phase 1: encode (device encoder loaded per iteration) ----
     EncoderStage enc;
     bool encoded = false;
 #if defined(QWEN21_DRIVER_HAVE_ENCODER) && \
     defined(QWEN21_DRIVER_HAVE_TOKENIZER)
-    if (host_weights.has_encoder) {
+    if (!encoder_shards.empty()) {
       try {
         namespace QEIter = KokkosDNN::QwenImage21Encoder;
         const size_t max_len = be_max_seq(cfg);
@@ -582,7 +588,7 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
         KokkosDNN::QwenImage21Encoder::QwenImage21EncoderModel<
             Exec, Kokkos::Experimental::bhalf_t>
             enc_model(loop_ecfg);
-        host_weights.stage_encoder_to(enc_model.weights());
+        enc_model.weights().load_safetensors(encoder_shards[0], &mapped_shards);
         Kokkos::View<int**, Kokkos::LayoutRight, Exec> toks("qwen21enc_toks",
                                                             1, ids.size());
         {
@@ -644,24 +650,20 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
                   (double)enc.device_bytes() / (1024.0 * 1024.0));
     }
 
-    // ---- Phase 2: DiT (device copy restored from the host cache) ----
+    // ---- Phase 2: DiT (device copy loaded from the mappings) ----
 #ifdef QWEN21_DRIVER_HAVE_DIT
     KokkosDNN::QwenImage21Dit::QwenImage21DitModel<Exec, DScalar> dit_model(
         cfg);
     {
       auto& w = dit_model.weights();
-      if (host_weights.has_dit) {
-        host_weights.stage_dit_to(w);
-        std::printf("[loading host->device %.1f GB]\n",
+      if (!o.tiny) {
+        w.load_safetensors(dit_shards, &mapped_shards);
+        std::printf("[loading mmap->device %.1f GB]\n",
                     (double)w.resident_bytes() / 1e9);
-      } else if (o.tiny) {
+      } else {
         w.random_init(o.seed);
         std::printf("[tiny random weights] layers=%d hidden=%d latent=%dx%d\n",
                     cfg.num_layers, cfg.hidden_dim, W, H);
-      } else {
-        throw std::runtime_error(
-            "need Qwen-Image-2.1 weights or --tiny (unreachable: host load "
-            "would have failed before the loop)");
       }
       QW::print_phase_memory("sample", w.resident_bytes(),
                              dit_model.scratch_bytes());
@@ -746,7 +748,8 @@ int run_interactive_loop(const CfgT& cfg, const LoopFixedOpts& o) {
 #ifdef QWEN21_DRIVER_HAVE_VAE
       try {
         decoded = try_vae_decode_rgba(lat, C, (size_t)H, (size_t)W, o.ckpt,
-                                      pix, oH, oW, oCh, nullptr, &vae_cache);
+                                      pix, oH, oW, oCh, nullptr,
+                                      &mapped_shards);
         std::printf("[decode] VAE RGBA %zux%zux%d ready for output\n", oH, oW,
                     oCh);
       } catch (const std::exception& e) {
@@ -932,6 +935,54 @@ int main(int argc, char** argv) {
     // Full runs need the canonical checkpoint; --tiny skips it.
     if (!tiny) require_ckpt_dir(ckpt);
 
+#if defined(QWEN21_DRIVER_HAVE_DIT) || \
+    (defined(QWEN21_DRIVER_HAVE_ENCODER) && \
+     defined(QWEN21_DRIVER_HAVE_TOKENIZER)) || \
+    defined(QWEN21_DRIVER_HAVE_VAE)
+    // One-off run: map the checkpoint shards once up front so the
+    // encode/sample/decode phases below stream from the mappings; each
+    // phase still releases its device weights before the next loads.
+    KokkosDNN::QwenImage21::MappedShardSet mapped_once;
+    if (!tiny) {
+      std::vector<std::string> all_shards;
+#ifdef QWEN21_DRIVER_HAVE_DIT
+      {
+        const std::vector<std::string> dit_shards =
+            resolve_shard_list(ckpt_sub(ckpt, "transformer"), "--ckpt");
+        all_shards.insert(all_shards.end(), dit_shards.begin(),
+                          dit_shards.end());
+      }
+#endif
+#if defined(QWEN21_DRIVER_HAVE_ENCODER) && \
+    defined(QWEN21_DRIVER_HAVE_TOKENIZER)
+      {
+        const std::vector<std::string> enc_shards =
+            resolve_shard_list(ckpt_sub(ckpt, "text_encoder"), "--ckpt");
+        all_shards.insert(all_shards.end(), enc_shards.begin(),
+                          enc_shards.end());
+      }
+#endif
+#ifdef QWEN21_DRIVER_HAVE_VAE
+      if (vae_decode) {
+        const std::vector<std::string> vae_shards =
+            resolve_shard_list(ckpt_sub(ckpt, "vae"), "--ckpt");
+        all_shards.insert(all_shards.end(), vae_shards.begin(),
+                          vae_shards.end());
+      }
+#endif
+      if (!all_shards.empty()) {
+        mapped_once.warm(all_shards);
+        std::printf("[mmap] %zu shard(s), %.1f GB mapped\n",
+                    mapped_once.shard_count(),
+                    (double)mapped_once.mapped_bytes() / 1e9);
+      }
+    }
+    KokkosDNN::QwenImage21::MappedShardSet* maps_once =
+        (!tiny && mapped_once.shard_count() > 0) ? &mapped_once : nullptr;
+#else
+    KokkosDNN::QwenImage21::MappedShardSet* maps_once = nullptr;
+#endif
+
     // ---- VAE-only parity path (--decode-latents-in) ----
     // Bypasses encode + DiT load + sampler: golden latents go straight
     // through the runtime affine + VAE decode. Needs the real VAE.
@@ -956,8 +1007,8 @@ int main(int argc, char** argv) {
     }
 
     // Default interactive loop: no --prompt (and no file/parity handoff) on
-    // a TTY means prompt -> filename -> generate, indefinitely. Weights are
-    // preloaded once into host memory and copied host->device per iteration
+    // a TTY means prompt -> filename -> generate, indefinitely. Shards are
+    // mapped once and streamed host->device per iteration
     // (see run_interactive_loop). Anything script-like -- an explicit
     // --prompt, a caption/latent file, --dump-steps, or non-TTY stdin --
     // takes the legacy one-off path below, so golden/CI runs are unchanged.
@@ -985,7 +1036,7 @@ int main(int argc, char** argv) {
 
     // ---- Phase 1: encode (no DiT weights are loaded yet) ----
     EncoderStage enc =
-        EncoderStage::run(cfg, prompt, caption_src, ckpt, tiny);
+        EncoderStage::run(cfg, prompt, caption_src, ckpt, tiny, 0, maps_once);
     log_encode_memory(enc);
 
     // In-memory handoff: the embeds (~L*Cc floats per branch, MiB-scale) are
@@ -1026,7 +1077,7 @@ int main(int argc, char** argv) {
               resolve_shard_list(dit_dir, "--ckpt");
           if (shards.size() > 1)
             std::printf("[loading %zu shards]\n", shards.size());
-          w.load_safetensors(shards);
+          w.load_safetensors(shards, maps_once);
         } catch (const std::exception& e) {
           throw std::runtime_error(std::string(e.what()) +
                                    " (need Qwen-Image-2.1 weights or --tiny)");
@@ -1256,7 +1307,7 @@ int main(int argc, char** argv) {
 #ifdef QWEN21_DRIVER_HAVE_VAE
       try {
         decoded = try_vae_decode_rgba(lat, C, (size_t)H, (size_t)W, ckpt, pix,
-                                      oH, oW, oCh);
+                                      oH, oW, oCh, nullptr, maps_once);
         std::printf("[decode] VAE RGBA %zux%zux%d ready for output\n", oH, oW,
                     oCh);
       } catch (const std::exception& e) {

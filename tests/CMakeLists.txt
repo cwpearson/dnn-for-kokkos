@@ -65,13 +65,9 @@ if(KokkosDNN_ENABLE_MODEL_QWEN_IMAGE_21)
   kokkosdnn_add_test(test_qwen_image_21_vae Test_QwenImage21Vae.cpp)
   target_include_directories(test_qwen_image_21_vae PRIVATE
     ${CMAKE_SOURCE_DIR}/models/qwen_image_21)
-  kokkosdnn_add_test(test_qwen_image_21_shard_cache
-    Test_QwenImage21ShardCache.cpp)
-  target_include_directories(test_qwen_image_21_shard_cache PRIVATE
-    ${CMAKE_SOURCE_DIR}/models/qwen_image_21)
-  kokkosdnn_add_test(test_qwen_image_21_host_weights
-    Test_QwenImage21HostWeights.cpp)
-  target_include_directories(test_qwen_image_21_host_weights PRIVATE
+  kokkosdnn_add_test(test_qwen_image_21_safetensors_map
+    Test_QwenImage21SafetensorsMap.cpp)
+  target_include_directories(test_qwen_image_21_safetensors_map PRIVATE
     ${CMAKE_SOURCE_DIR}/models/qwen_image_21)
 endif()
 

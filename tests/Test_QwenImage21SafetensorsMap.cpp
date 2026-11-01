@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 // SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
-// Qwen-Image-2.1 host shard cache tests: fabricated minimal safetensors
-// shards load bit-identically from disk and from a warmed ShardCache, for
+// Qwen-Image-2.1 host shard maps tests: fabricated minimal safetensors
+// shards load bit-identically from disk and from a warmed MappedShardSet, for
 // every weights type (DiT / encoder+vision sharing one text_encoder-style
-// shard / VAE blobs), in F32 and BF16 file dtypes, plus cache semantics
+// shard / VAE blobs), in F32 and BF16 file dtypes, plus maps semantics
 // (warm counts, freshness, clear, validation errors preserved).
 #include <gtest/gtest.h>
 
@@ -99,7 +99,7 @@ void write_shard(const std::string& path,
 
 std::string test_dir(const std::string& name) {
   const auto dir = std::filesystem::temp_directory_path() /
-                   ("qwen21_shardcache_" + std::to_string(::getpid())) / name;
+                   ("qwen21_qwen21_maps_" + std::to_string(::getpid())) / name;
   std::error_code ec;
   std::filesystem::remove_all(dir, ec);
   std::filesystem::create_directories(dir, ec);
@@ -262,7 +262,7 @@ ViewMap fab_map(const std::vector<FabTensor>& tensors) {
   return m;
 }
 
-TEST(QwenImage21ShardCache, DitFileVsCacheF32) {
+TEST(QwenImage21MappedShardSet, DitFileVsMappedF32) {
   const QW::Config cfg = QW::Config::tiny_test();
   const auto tensors = fab_specs(QD::qwen21_dit_expected_tensors(cfg), false);
   const std::string path = test_dir("dit_f32") + "/dit.safetensors";
@@ -270,23 +270,23 @@ TEST(QwenImage21ShardCache, DitFileVsCacheF32) {
 
   QD::QwenImage21DitModel<Exec, float> m_file(cfg);
   ASSERT_NO_THROW(m_file.weights().load_safetensors(path));
-  QW::ShardCache cache;
-  EXPECT_EQ(cache.count(), 0u);
-  EXPECT_EQ(cache.warm({path}), 1u);
-  EXPECT_EQ(cache.count(), 1u);
-  EXPECT_EQ(cache.warm({path}), 0u);  // fresh: no reload
-  ASSERT_NE(cache.find(path), nullptr);
-  QD::QwenImage21DitModel<Exec, float> m_cache(cfg);
-  ASSERT_NO_THROW(m_cache.weights().load_safetensors(path, &cache));
+  QW::MappedShardSet maps;
+  EXPECT_EQ(maps.shard_count(), 0u);
+  EXPECT_EQ(maps.warm({path}), 1u);
+  EXPECT_EQ(maps.shard_count(), 1u);
+  EXPECT_EQ(maps.warm({path}), 0u);  // fresh: no reload
+  ASSERT_NE(maps.find(path), nullptr);
+  QD::QwenImage21DitModel<Exec, float> m_mapped(cfg);
+  ASSERT_NO_THROW(m_mapped.weights().load_safetensors(path, &maps));
 
   // Bit-identical across paths, and equal to the fabricated payloads.
-  expect_maps_equal(dit_views(m_file.weights()), dit_views(m_cache.weights()));
-  expect_maps_equal(fab_map(tensors), dit_views(m_cache.weights()));
+  expect_maps_equal(dit_views(m_file.weights()), dit_views(m_mapped.weights()));
+  expect_maps_equal(fab_map(tensors), dit_views(m_mapped.weights()));
   EXPECT_EQ(m_file.weights().resident_bytes(),
-            m_cache.weights().resident_bytes());
+            m_mapped.weights().resident_bytes());
 }
 
-TEST(QwenImage21ShardCache, DitFileVsCacheBF16) {
+TEST(QwenImage21MappedShardSet, DitFileVsMappedBF16) {
   const QW::Config cfg = QW::Config::tiny_test();
   const auto tensors = fab_specs(QD::qwen21_dit_expected_tensors(cfg), true);
   const std::string path = test_dir("dit_bf16") + "/dit.safetensors";
@@ -294,16 +294,16 @@ TEST(QwenImage21ShardCache, DitFileVsCacheBF16) {
 
   QD::QwenImage21DitModel<Exec, float> m_file(cfg);
   ASSERT_NO_THROW(m_file.weights().load_safetensors(path));
-  QW::ShardCache cache;
-  ASSERT_EQ(cache.warm({path}), 1u);
-  QD::QwenImage21DitModel<Exec, float> m_cache(cfg);
-  ASSERT_NO_THROW(m_cache.weights().load_safetensors(path, &cache));
+  QW::MappedShardSet maps;
+  ASSERT_EQ(maps.warm({path}), 1u);
+  QD::QwenImage21DitModel<Exec, float> m_mapped(cfg);
+  ASSERT_NO_THROW(m_mapped.weights().load_safetensors(path, &maps));
 
-  expect_maps_equal(dit_views(m_file.weights()), dit_views(m_cache.weights()));
-  expect_maps_equal(fab_map(tensors), dit_views(m_cache.weights()));
+  expect_maps_equal(dit_views(m_file.weights()), dit_views(m_mapped.weights()));
+  expect_maps_equal(fab_map(tensors), dit_views(m_mapped.weights()));
 }
 
-TEST(QwenImage21ShardCache, EncoderVisionShareOneShard) {
+TEST(QwenImage21MappedShardSet, EncoderVisionShareOneShard) {
   const QE::Config ecfg = QE::Config::tiny_test();
   const QV::Config vcfg = QV::Config::tiny_test();
   // One text_encoder-style shard: text tensors + visual tower + the tied
@@ -315,12 +315,12 @@ TEST(QwenImage21ShardCache, EncoderVisionShareOneShard) {
   const std::string path = test_dir("encvis") + "/model.safetensors";
   write_shard(path, tensors);
 
-  QW::ShardCache cache;
-  ASSERT_EQ(cache.warm({path}), 1u);
+  QW::MappedShardSet maps;
+  ASSERT_EQ(maps.warm({path}), 1u);
   QE::QwenImage21EncoderModel<Exec, float> enc(ecfg);
-  ASSERT_NO_THROW(enc.weights().load_safetensors(path, &cache));
+  ASSERT_NO_THROW(enc.weights().load_safetensors(path, &maps));
   QV::QwenImage21VisionModel<Exec, float> vmodel(vcfg);
-  ASSERT_NO_THROW(vmodel.weights().load_safetensors(path, &cache));
+  ASSERT_NO_THROW(vmodel.weights().load_safetensors(path, &maps));
 
   QE::QwenImage21EncoderModel<Exec, float> enc_file(ecfg);
   ASSERT_NO_THROW(enc_file.weights().load_safetensors(path));
@@ -331,7 +331,7 @@ TEST(QwenImage21ShardCache, EncoderVisionShareOneShard) {
                     vis_views(vmodel.weights()));
 }
 
-TEST(QwenImage21ShardCache, VaeBlobsFileVsCache) {
+TEST(QwenImage21MappedShardSet, VaeBlobsFileVsMapped) {
   const std::vector<FabTensor> tensors = {
       {"enc.conv.weight", {8}, payload(8, 1, false)},
       {"enc.norm.weight", {4}, payload(4, 2, false)},
@@ -341,24 +341,24 @@ TEST(QwenImage21ShardCache, VaeBlobsFileVsCache) {
   const std::string path = test_dir("vae") + "/vae.safetensors";
   write_shard(path, tensors);
 
-  QVV::QwenImage21VaeWeights<Exec, float> w_file, w_cache;
+  QVV::QwenImage21VaeWeights<Exec, float> w_file, w_mapped;
   {
     QVV::Config c;
     c.validate();
     w_file.allocate(c);
-    w_cache.allocate(c);
+    w_mapped.allocate(c);
   }
   ASSERT_NO_THROW(w_file.load_safetensors(path));
-  QW::ShardCache cache;
-  ASSERT_EQ(cache.warm({path}), 1u);
-  ASSERT_NO_THROW(w_cache.load_safetensors(path, &cache));
+  QW::MappedShardSet maps;
+  ASSERT_EQ(maps.warm({path}), 1u);
+  ASSERT_NO_THROW(w_mapped.load_safetensors(path, &maps));
 
-  expect_maps_equal(vae_views(w_file), vae_views(w_cache));
-  expect_maps_equal(fab_map(tensors), vae_views(w_cache));
-  EXPECT_EQ(w_file.resident_bytes(), w_cache.resident_bytes());
+  expect_maps_equal(vae_views(w_file), vae_views(w_mapped));
+  expect_maps_equal(fab_map(tensors), vae_views(w_mapped));
+  EXPECT_EQ(w_file.resident_bytes(), w_mapped.resident_bytes());
 }
 
-TEST(QwenImage21ShardCache, WarmFreshnessClear) {
+TEST(QwenImage21MappedShardSet, WarmFreshnessClear) {
   const std::string dir = test_dir("semantics");
   const std::string p1 = dir + "/a.safetensors";
   const std::string p2 = dir + "/b.safetensors";
@@ -367,76 +367,76 @@ TEST(QwenImage21ShardCache, WarmFreshnessClear) {
   const auto sz1 = std::filesystem::file_size(p1);
   const auto sz2 = std::filesystem::file_size(p2);
 
-  QW::ShardCache cache;
-  EXPECT_EQ(cache.find(p1), nullptr);
-  EXPECT_EQ(cache.warm({p1, p2}), 2u);
-  EXPECT_EQ(cache.count(), 2u);
-  EXPECT_EQ(cache.bytes(), (unsigned long long)(sz1 + sz2));
-  EXPECT_NE(cache.find(p1), nullptr);
+  QW::MappedShardSet maps;
+  EXPECT_EQ(maps.find(p1), nullptr);
+  EXPECT_EQ(maps.warm({p1, p2}), 2u);
+  EXPECT_EQ(maps.shard_count(), 2u);
+  EXPECT_EQ(maps.mapped_bytes(), (unsigned long long)(sz1 + sz2));
+  EXPECT_NE(maps.find(p1), nullptr);
 
   // Missing file warms loud (fail fast, like every other loader input).
-  EXPECT_THROW(cache.warm({dir + "/nope.safetensors"}), std::runtime_error);
+  EXPECT_THROW(maps.warm({dir + "/nope.safetensors"}), std::runtime_error);
 
   // Rewriting a shard invalidates it until the next warm().
   write_shard(p1, {{"t.a", {7}, payload(7, 3, false)}});
-  EXPECT_EQ(cache.find(p1), nullptr);
-  EXPECT_EQ(cache.warm({p1}), 1u);
-  EXPECT_NE(cache.find(p1), nullptr);
-  EXPECT_EQ(cache.bytes(),
+  EXPECT_EQ(maps.find(p1), nullptr);
+  EXPECT_EQ(maps.warm({p1}), 1u);
+  EXPECT_NE(maps.find(p1), nullptr);
+  EXPECT_EQ(maps.mapped_bytes(),
             (unsigned long long)(std::filesystem::file_size(p1) + sz2));
 
-  cache.clear();
-  EXPECT_EQ(cache.count(), 0u);
-  EXPECT_EQ(cache.bytes(), 0u);
-  EXPECT_EQ(cache.find(p1), nullptr);
+  maps.clear();
+  EXPECT_EQ(maps.shard_count(), 0u);
+  EXPECT_EQ(maps.mapped_bytes(), 0u);
+  EXPECT_EQ(maps.find(p1), nullptr);
 }
 
-TEST(QwenImage21ShardCache, UnwarmedCacheFallsBackToDisk) {
+TEST(QwenImage21MappedShardSet, UnwarmedMapsFallsBackToDisk) {
   const std::vector<FabTensor> tensors = {
       {"v.only", {6}, payload(6, 5, false)},
   };
   const std::string path = test_dir("fallback") + "/v.safetensors";
   write_shard(path, tensors);
 
-  // Empty cache: loads read from disk and succeed.
-  QW::ShardCache cache;
+  // Empty maps: loads read from disk and succeed.
+  QW::MappedShardSet maps;
   QVV::QwenImage21VaeWeights<Exec, float> w;
   {
     QVV::Config c;
     c.validate();
     w.allocate(c);
   }
-  ASSERT_NO_THROW(w.load_safetensors(path, &cache));
+  ASSERT_NO_THROW(w.load_safetensors(path, &maps));
   expect_maps_equal(fab_map(tensors), vae_views(w));
 }
 
-TEST(QwenImage21ShardCache, ValidationErrorsPreserved) {
+TEST(QwenImage21MappedShardSet, ValidationErrorsPreserved) {
   const QW::Config cfg = QW::Config::tiny_test();
   const std::string dir = test_dir("errors");
 
-  // Missing tensor still throws through the cache path.
+  // Missing tensor still throws through the maps path.
   {
     auto tensors = fab_specs(QD::qwen21_dit_expected_tensors(cfg), false);
     tensors.pop_back();
     const std::string path = dir + "/missing.safetensors";
     write_shard(path, tensors);
-    QW::ShardCache cache;
-    ASSERT_EQ(cache.warm({path}), 1u);
+    QW::MappedShardSet maps;
+    ASSERT_EQ(maps.warm({path}), 1u);
     QD::QwenImage21DitModel<Exec, float> m(cfg);
-    EXPECT_THROW(m.weights().load_safetensors(path, &cache),
+    EXPECT_THROW(m.weights().load_safetensors(path, &maps),
                  std::runtime_error);
   }
-  // Unknown tensor still throws through the cache path.
+  // Unknown tensor still throws through the maps path.
   {
     auto tensors = fab_specs(QD::qwen21_dit_expected_tensors(cfg), false);
     tensors.push_back(
         FabTensor{"bogus.weight", {2}, payload(2, 7, false)});
     const std::string path = dir + "/unknown.safetensors";
     write_shard(path, tensors);
-    QW::ShardCache cache;
-    ASSERT_EQ(cache.warm({path}), 1u);
+    QW::MappedShardSet maps;
+    ASSERT_EQ(maps.warm({path}), 1u);
     QD::QwenImage21DitModel<Exec, float> m(cfg);
-    EXPECT_THROW(m.weights().load_safetensors(path, &cache),
+    EXPECT_THROW(m.weights().load_safetensors(path, &maps),
                  std::runtime_error);
   }
 }

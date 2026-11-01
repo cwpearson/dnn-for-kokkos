@@ -100,6 +100,7 @@
 #include "KokkosDNN_GemmBias.hpp"
 
 #include "KokkosDNN_QwenImage21Config.hpp"
+#include "KokkosDNN_QwenImage21SafetensorsMap.hpp"
 
 namespace KokkosDNN {
 namespace QwenImage21Vae {
@@ -491,11 +492,11 @@ struct QwenImage21VaeWeights {
   // Load every tensor found in the shard(s) into device blobs (F32/BF16
   // file -> Scalar). Names outside both skeletons are accepted here;
   // dtype/shape/slice errors throw. Pass a warmed
-  // QwenImage21::ShardCache to stream staged shards from host RAM instead
-  // of disk (repeat loads); the default nullptr reads every shard from
-  // disk, so existing one-argument callers are unchanged.
+  // QwenImage21::MappedShardSet to stream mapped shards from the OS page
+  // cache instead of disk (repeat loads); the default nullptr reads every
+  // shard from disk, so existing one-argument callers are unchanged.
   void load_safetensors(const std::vector<std::string>& shard_paths,
-                        QwenImage21::ShardCache* cache = nullptr) {
+                        QwenImage21::MappedShardSet* maps = nullptr) {
     if (shard_paths.empty())
       throw std::invalid_argument(
           "QwenImage21VaeWeights::load_safetensors: no shards given");
@@ -506,12 +507,13 @@ struct QwenImage21VaeWeights {
                   "float or bhalf_t");
     for (const std::string& path : shard_paths) {
       std::ifstream f;
-      const QwenImage21::Impl::Qwen21ShardBlob* blob =
-          (cache != nullptr) ? cache->find(path) : nullptr;
-      const std::map<std::string, QwenImage21::Impl::Qwen21SafeEntry> entries =
-          (blob != nullptr)
-              ? QwenImage21::Impl::qwen21_parse_shard_blob(blob->bytes, path)
-              : QwenImage21::Impl::qwen21_open_shard(f, path);
+      std::map<std::string, QwenImage21::Impl::Qwen21SafeEntry> disk_entries;
+      const QwenImage21::Impl::Qwen21MappedShard* mapped =
+          (maps != nullptr) ? maps->find(path) : nullptr;
+      if (mapped == nullptr)
+        disk_entries = QwenImage21::Impl::qwen21_open_shard(f, path);
+      const std::map<std::string, QwenImage21::Impl::Qwen21SafeEntry>&
+          entries = (mapped != nullptr) ? mapped->entries() : disk_entries;
       for (const auto& kv : entries) {
         const std::string& full = kv.first;
         const QwenImage21::Impl::Qwen21SafeEntry& en = kv.second;
@@ -531,9 +533,9 @@ struct QwenImage21VaeWeights {
               "QwenImage21VaeWeights::load_safetensors: tensor '" + full +
               "' slice size mismatch");
         V1 dev_blob("qwen21vae_blob", (size_t)numel);
-        if (blob != nullptr) {
+        if (mapped != nullptr) {
           QwenImage21::Impl::qwen21_stream_into<ExecSpace, Scalar>(
-              *blob, en, (size_t)numel, elsize, dev_blob.data());
+              *mapped, en, (size_t)numel, elsize, dev_blob.data());
         } else {
           QwenImage21::Impl::qwen21_stream_into<ExecSpace, Scalar>(
               f, en, (size_t)numel, elsize, dev_blob.data());
@@ -549,8 +551,8 @@ struct QwenImage21VaeWeights {
   }
 
   void load_safetensors(const std::string& shard_path,
-                        QwenImage21::ShardCache* cache = nullptr) {
-    load_safetensors(std::vector<std::string>{shard_path}, cache);
+                        QwenImage21::MappedShardSet* maps = nullptr) {
+    load_safetensors(std::vector<std::string>{shard_path}, maps);
   }
 
   // Allocate exactly the decoder tensors decode() consumes (see

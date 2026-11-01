@@ -73,6 +73,7 @@
 #include "KokkosDNN_RMSNorm.hpp"
 
 #include "KokkosDNN_QwenImage21Config.hpp"
+#include "KokkosDNN_QwenImage21SafetensorsMap.hpp"
 
 namespace KokkosDNN {
 namespace QwenImage21Dit {
@@ -1208,11 +1209,11 @@ struct QwenImage21DitWeights {
   // single deep_copy per tensor (no 2x device residency). Throws on missing
   // tensors, unknown tensor names, non-F32/BF16 dtypes, or shape/numel/
   // byte-size mismatch. Needs allocate() first. Pass a warmed
-  // QwenImage21::ShardCache to stream staged shards from host RAM instead
-  // of disk (repeat loads); the default nullptr reads every shard from
-  // disk, so existing one-argument callers are unchanged.
+  // QwenImage21::MappedShardSet to stream mapped shards from the OS page
+  // cache instead of disk (repeat loads); the default nullptr reads every
+  // shard from disk, so existing one-argument callers are unchanged.
   void load_safetensors(const std::vector<std::string>& shard_paths,
-                        QwenImage21::ShardCache* cache = nullptr) {
+                        QwenImage21::MappedShardSet* maps = nullptr) {
     if (shard_paths.empty())
       throw std::invalid_argument(
           "QwenImage21DitWeights::load_safetensors: no shards given");
@@ -1231,12 +1232,13 @@ struct QwenImage21DitWeights {
 
     for (const std::string& path : shard_paths) {
       std::ifstream f;
-      const QwenImage21::Impl::Qwen21ShardBlob* blob =
-          (cache != nullptr) ? cache->find(path) : nullptr;
-      const std::map<std::string, QwenImage21::Impl::Qwen21SafeEntry> entries =
-          (blob != nullptr)
-              ? QwenImage21::Impl::qwen21_parse_shard_blob(blob->bytes, path)
-              : QwenImage21::Impl::qwen21_open_shard(f, path);
+      std::map<std::string, QwenImage21::Impl::Qwen21SafeEntry> disk_entries;
+      const QwenImage21::Impl::Qwen21MappedShard* mapped =
+          (maps != nullptr) ? maps->find(path) : nullptr;
+      if (mapped == nullptr)
+        disk_entries = QwenImage21::Impl::qwen21_open_shard(f, path);
+      const std::map<std::string, QwenImage21::Impl::Qwen21SafeEntry>&
+          entries = (mapped != nullptr) ? mapped->entries() : disk_entries;
       for (const auto& kv : entries) {
         const std::string& full = kv.first;
         const QwenImage21::Impl::Qwen21SafeEntry& en = kv.second;
@@ -1258,8 +1260,8 @@ struct QwenImage21DitWeights {
           throw std::runtime_error(
               "QwenImage21DitWeights::load_safetensors: duplicate tensor '" +
               spec->name + "'");
-        if (blob != nullptr) {
-          load_one_tensor(*blob, full, en, *spec);
+        if (mapped != nullptr) {
+          load_one_tensor(*mapped, full, en, *spec);
         } else {
           load_one_tensor(f, full, en, *spec);
         }
@@ -1275,14 +1277,14 @@ struct QwenImage21DitWeights {
   }
 
   void load_safetensors(const std::string& shard_path,
-                        QwenImage21::ShardCache* cache = nullptr) {
-    load_safetensors(std::vector<std::string>{shard_path}, cache);
+                        QwenImage21::MappedShardSet* maps = nullptr) {
+    load_safetensors(std::vector<std::string>{shard_path}, maps);
   }
 
  private:
   // Stream one file tensor into its device view (shape-checked). Source is
-  // either a disk stream or a staged shard image (overload resolution on
-  // the first argument picks the matching qwen21_stream_into).
+  // either a disk stream or a mapped shard (overload resolution on the
+  // first argument picks the matching qwen21_stream_into).
   template <class Source>
   void load_one_tensor(Source& src, const std::string& full,
                        const QwenImage21::Impl::Qwen21SafeEntry& en,
