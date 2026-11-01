@@ -93,29 +93,33 @@ jobs:
           # its parsing unit test (kokkosdnn_server_parsing, no weights
           # needed); FetchContent fetches cpp-httplib + nlohmann/json.
           # Missing system stb headers are fetched automatically.
+          # BENCHMARKS=OFF: the benchmark binaries are never executed on
+          # this runner (see below), and building them plus the
+          # Google Benchmark FetchContent dependency costs a large share
+          # of the 6 h macOS job budget; benchmark compile coverage stays
+          # on the Linux/GPU workflows.
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DKokkos_ROOT="${KOKKOS_INSTALL}" \
             -DKokkosDNN_ENABLE_TESTS=ON \
             -DKokkosDNN_ENABLE_EXAMPLES=ON \
-            -DKokkosDNN_ENABLE_BENCHMARKS=ON \
+            -DKokkosDNN_ENABLE_BENCHMARKS=OFF \
             -DKokkosDNN_ENABLE_IMAGE=ON \
             -DKokkosDNN_ENABLE_SERVER=ON \
             -DKokkosDNN_ENABLE_COMPILER_WARNINGS=ON \
             -DKokkosDNN_ENABLE_ACCELERATE=${{ matrix.accelerate }}
 
-      # Build every target (library, tests, examples, benchmarks).
+      # Build every target (library, tests, examples; benchmarks off, see above).
       - name: Build everything
         run: cmake --build build --parallel
 
       # Run the full ctest suite: unit tests plus example tests, all on tiny
       # configs that run in seconds. Tests needing real data
       # (KOKKOSDNN_WEIGHTS / TOKENIZER_JSON / GOLDEN_JSON / LLAMA_CONFIG_JSON)
-      # self-skip via GTEST_SKIP when those files are absent. The
-      # kokkosdnn_bench_list entry only lists benchmarks (no kernels run).
-      # Deliberately NOT executed here: kokkosdnn_bench microbenchmarks run
-      # Llama 8B shapes whose naive native kernels take much longer than a
-      # CI step should (see README "Benchmarks").
+      # self-skip via GTEST_SKIP when those files are absent.
+      # Deliberately NOT built or executed here: kokkosdnn_bench
+      # microbenchmarks run Llama 8B shapes whose naive native kernels take
+      # much longer than a CI step should (see README "Benchmarks").
       # Unlike the CUDA/ROCm workflows (build-only, no GPU on runners), the
       # macOS runner can execute host-backend binaries, so tests run here.
       - name: Run tests

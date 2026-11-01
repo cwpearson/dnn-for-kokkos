@@ -1694,7 +1694,11 @@ KOKKOSDNN_PRAGMA_UNROLL()
 };
 
 // Launch the row-blocked unit kernel for one compile-time dtype, shrinking the
-// team if the backend cannot field the requested one.
+// team if the backend cannot field the requested one. Host backends with a
+// team-size cap of 1 (Kokkos Threads with one thread) cannot run the blocked
+// layout at all when ROWS > 1 (each of the groups*ROWS rows needs a writer
+// thread) or with threads_per_row > 1; those fall back to the single-row unit
+// kernel, which runs with team_size 1 through a TeamThreadRange.
 template <class ExecSpace, class Scalar, GgmlType Dt, int ROWS>
 inline void quant_gemv_unit_blocked(const Kokkos::View<Scalar*, ExecSpace>& x,
                                     const QuantWeight<ExecSpace>& w,
@@ -1711,20 +1715,39 @@ inline void quant_gemv_unit_blocked(const Kokkos::View<Scalar*, ExecSpace>& x,
       w.rows,
       threads_per_row,
       groups};
-  std::size_t shmem = sizeof(float) * (std::size_t)threads_per_row *
-                      (std::size_t)groups * (std::size_t)ROWS;
+  const std::size_t shmem = sizeof(float) * (std::size_t)threads_per_row *
+                            (std::size_t)groups * (std::size_t)ROWS;
   const int tmax = ::KokkosDNN::Impl::cached_team_size_max<ExecSpace>(f, shmem);
-  int ts         = threads_per_row * groups;
-  if (ts > tmax) {
-    groups = (tmax > threads_per_row) ? (tmax / threads_per_row) : 1;
-    ts     = threads_per_row * groups;
-    shmem  = sizeof(float) * (std::size_t)ts * (std::size_t)ROWS;
+  int tpr        = threads_per_row;
+  int gs         = groups;
+  // Shrink threads-per-row first (halving preserves the nu clamp), then the
+  // group count, so the team fits the backend cap.
+  while (tpr > 1 && tpr * gs > tmax) tpr /= 2;
+  if (tpr * gs > tmax) gs = (tmax / tpr > 0) ? (tmax / tpr) : 1;
+  if (tmax < 1 || tpr < ROWS || tpr * gs > tmax) {
+    // No blocked team fits (single-thread cap with ROWS > 1, or scratch too
+    // large even for one thread): run the single-row unit kernel, which needs
+    // no scratch and completes with team_size 1. The blocked path is only
+    // taken for 16-byte-aligned activation rows (see quant_gemv), so the
+    // vectorized activation loads stay valid.
+    QuantGemvUnitFunctor<ExecSpace, Scalar> uf{
+        x, y, w.data.data(), w.dtype, nu, w.row_bytes(), true};
+    const int want = quant_unit_threads(nu);
+    const int umax = ::KokkosDNN::Impl::cached_team_size_max<ExecSpace>(uf);
+    const int uts  = want < umax ? want : (umax > 0 ? umax : 1);
+    Kokkos::TeamPolicy<ExecSpace> upolicy((int)w.rows, uts);
+    Kokkos::parallel_for(label, upolicy, uf);
+    return;
   }
-  f.groups = groups;
-  const std::size_t rows_per_team = (std::size_t)groups * (std::size_t)ROWS;
+  f.threads_per_row = tpr;
+  f.groups          = gs;
+  const int ts      = tpr * gs;
+  const std::size_t shmem_ts =
+      sizeof(float) * (std::size_t)ts * (std::size_t)ROWS;
+  const std::size_t rows_per_team = (std::size_t)gs * (std::size_t)ROWS;
   const int teams = (int)((w.rows + rows_per_team - 1) / rows_per_team);
   Kokkos::TeamPolicy<ExecSpace> policy(teams, ts);
-  policy.set_scratch_size(0, Kokkos::PerTeam(shmem));
+  policy.set_scratch_size(0, Kokkos::PerTeam(shmem_ts));
   Kokkos::parallel_for(label, policy, f);
 }
 
