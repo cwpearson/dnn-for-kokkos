@@ -7,8 +7,8 @@
 // all-finite outputs, and determinism (two forwards agree bit-for-bit).
 //
 // The synthetic pixels below intentionally do NOT use the optional
-// KokkosDNN image component, so this test runs with
-// KokkosDNN_ENABLE_IMAGE=OFF (the default).
+// KokkosDNN image component, so this test runs with or without
+// KokkosDNN_ENABLE_IMAGE (ON by default).
 //
 // Canonical synthetic pixel formula (shared with dinov3_encode.cpp,
 // Test_Dinov3Golden.cpp and examples/dinov3/generate_golden.py --synthetic;

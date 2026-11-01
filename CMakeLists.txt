@@ -23,7 +23,7 @@ option(KokkosDNN_ENABLE_CUDNN "Dispatch attention to cuDNN SDPA when ExecSpace i
 option(KokkosDNN_ENABLE_HIPBLAS "Dispatch GEMM to hipBLAS when ExecSpace is HIP" OFF)
 option(KokkosDNN_ENABLE_MIOPEN "Dispatch conv/attention-helpers to MIOpen when ExecSpace is HIP" OFF)
 option(KokkosDNN_ENABLE_ACCELERATE "Dispatch GEMM to Apple Accelerate (vecLib cblas_sgemm) on host execution spaces" OFF)
-option(KokkosDNN_ENABLE_IMAGE "Build optional image I/O component (stb-based JPEG/PNG/BMP decode, PNG/JPEG encode + preprocessing; WebP via libwebp unless KokkosDNN_ENABLE_IMAGE_WEBP=OFF)" OFF)
+option(KokkosDNN_ENABLE_IMAGE "Build optional image I/O component (stb-based JPEG/PNG/BMP decode, PNG/JPEG encode + preprocessing; WebP via libwebp unless KokkosDNN_ENABLE_IMAGE_WEBP=OFF)" ON)
 option(KokkosDNN_ENABLE_IMAGE_WEBP "Enable WebP decode/encode in the image component (libwebp, system or fetched)" ON)
 option(KokkosDNN_ENABLE_MODEL_LFM25 "Build LFM2.5 model component (KokkosDNN::lfm25)" ON)
 option(KokkosDNN_ENABLE_MODEL_GLIMMER "Build Muse Glimmer 30B text model component (KokkosDNN::glimmer)" ON)
@@ -280,7 +280,7 @@ kokkosdnn_enable_compiler_warnings(kokkosdnn)
 set_target_properties(kokkosdnn PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
 
 # ---------------------------------------------------------------------------
-# Optional image component (OFF by default; no dependency from core target)
+# Optional image component (ON by default; no dependency from core target)
 # ---------------------------------------------------------------------------
 # Baked into KokkosDNNConfig.cmake below: whether the image component has
 # WebP support and whether it came from a system WebP package (consumer

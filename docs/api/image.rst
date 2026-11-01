@@ -1,8 +1,8 @@
 Optional image component
 ==========================
 
-Headers: ``src/images/KokkosDNN_Image*.hpp``. Built only with
-``KokkosDNN_ENABLE_IMAGE=ON`` (stb-backed JPEG/PNG/BMP decode plus
+Headers: ``src/images/KokkosDNN_Image*.hpp``. Built with
+``KokkosDNN_ENABLE_IMAGE=ON`` (ON by default; stb-backed JPEG/PNG/BMP decode plus
 PNG/JPEG encode and resize/normalize preprocessing into device views;
 WebP decode plus WebP encode via libwebp unless
 ``KokkosDNN_ENABLE_IMAGE_WEBP=OFF``). See

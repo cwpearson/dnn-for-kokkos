@@ -65,7 +65,7 @@ Configure options
      - register gtest tests via ``gtest_discover_tests`` (set OFF for
        GPU-less build-only CI, where test binaries cannot run at build time)
    * - ``KokkosDNN_ENABLE_IMAGE``
-     - OFF
+     - ON
      - optional image component (``KokkosDNN::image``, stb-backed I/O + preprocessing)
    * - ``KokkosDNN_ENABLE_MODEL_LFM25``
      - ON
