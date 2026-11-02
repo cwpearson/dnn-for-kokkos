@@ -5,13 +5,16 @@
 
 #include "KokkosDNN_KokoroPth.hpp"
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <fstream>
-#include <iostream>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -22,14 +25,16 @@ namespace Kokoro {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Little-endian readers.
+// Little-endian readers over the mmap'd image.
 // ---------------------------------------------------------------------------
-uint16_t rd16(const std::vector<char>& b, size_t p) {
-  return (uint16_t)((uint8_t)b[p] | ((uint8_t)b[p + 1] << 8));
+uint16_t rd16(const char* b, size_t p) {
+  const auto* u = reinterpret_cast<const uint8_t*>(b);
+  return (uint16_t)(u[p] | ((uint16_t)u[p + 1] << 8));
 }
-uint32_t rd32(const std::vector<char>& b, size_t p) {
-  return (uint32_t)((uint8_t)b[p] | ((uint8_t)b[p + 1] << 8) |
-                    ((uint8_t)b[p + 2] << 16) | ((uint8_t)b[p + 3] << 24));
+uint32_t rd32(const char* b, size_t p) {
+  const auto* u = reinterpret_cast<const uint8_t*>(b);
+  return (uint32_t)(u[p] | ((uint32_t)u[p + 1] << 8) |
+                    ((uint32_t)u[p + 2] << 16) | ((uint32_t)u[p + 3] << 24));
 }
 
 // ---------------------------------------------------------------------------
@@ -43,20 +48,49 @@ struct ZipEntry {
   uint16_t method = 0;
 };
 
-std::vector<char> read_file(const std::string& path) {
-  std::ifstream f(path, std::ios::binary | std::ios::ate);
-  if (!f) throw std::runtime_error("open_pth: cannot open '" + path + "'");
-  const long long n = (long long)f.tellg();
-  if (n <= 0) throw std::runtime_error("open_pth: empty file '" + path + "'");
-  f.seekg(0, std::ios::beg);
-  std::vector<char> buf((size_t)n);
-  f.read(buf.data(), n);
-  if (!f) throw std::runtime_error("open_pth: short read '" + path + "'");
-  return buf;
+// ---------------------------------------------------------------------------
+// Read-only MAP_PRIVATE file image. mmap failure is a hard error (throw);
+// there is no ifstream fallback anywhere on the weight path.
+// ---------------------------------------------------------------------------
+struct MmapDeleter {
+  size_t size = 0;
+  void operator()(const char* p) const noexcept {
+    if (p != nullptr) ::munmap(const_cast<char*>(p), size);
+  }
+};
+
+std::shared_ptr<const char> mmap_file(const std::string& path,
+                                      size_t& size_out, const char* what) {
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0)
+    throw std::runtime_error(std::string(what) + ": cannot open '" + path +
+                             "'");
+  struct stat st;
+  if (::fstat(fd, &st) != 0) {
+    ::close(fd);
+    throw std::runtime_error(std::string(what) + ": cannot stat '" + path +
+                             "'");
+  }
+  if (st.st_size <= 0) {
+    ::close(fd);
+    throw std::runtime_error(std::string(what) + ": empty file '" + path +
+                             "'");
+  }
+  const size_t size = (size_t)st.st_size;
+  void* m = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+  ::close(fd);  // the mapping keeps the file alive
+  if (m == MAP_FAILED)
+    throw std::runtime_error(std::string(what) + ": mmap failed for '" + path +
+                             "'");
+#if defined(MADV_SEQUENTIAL)
+  ::madvise(m, size, MADV_SEQUENTIAL);
+#endif
+  size_out = size;
+  return std::shared_ptr<const char>(static_cast<const char*>(m),
+                                     MmapDeleter{size});
 }
 
-std::vector<ZipEntry> zip_index(const std::vector<char>& buf) {
-  const size_t n = buf.size();
+std::vector<ZipEntry> zip_index(const char* buf, size_t n) {
   if (n < 22) throw std::runtime_error("open_pth: too small for ZIP");
   // Find EOCD (PK\x05\x06) scanning the tail (comment <= 64KB).
   size_t eocd = n;
@@ -87,7 +121,7 @@ std::vector<ZipEntry> zip_index(const std::vector<char>& buf) {
     if (p + 46 + nl > n)
       throw std::runtime_error("open_pth: central directory overrun");
     ZipEntry e;
-    e.name.assign(buf.data() + p + 46, nl);
+    e.name.assign(buf + p + 46, nl);
     e.method = method;
     e.comp_size = cs;
     e.uncomp_size = us;
@@ -99,19 +133,19 @@ std::vector<ZipEntry> zip_index(const std::vector<char>& buf) {
 }
 
 // Data range of a stored entry: local header gives name/extra lengths.
-std::pair<uint64_t, uint64_t> zip_data_range(const std::vector<char>& buf,
+std::pair<uint64_t, uint64_t> zip_data_range(const char* buf, size_t n,
                                              const ZipEntry& e) {
   if (e.method != 0)
     throw std::runtime_error("open_pth: entry '" + e.name +
                              "' is compressed (only stored supported)");
   const size_t p = (size_t)e.local_offset;
-  if (p + 30 > buf.size() || !(buf[p] == 'P' && buf[p + 1] == 'K' &&
-                              buf[p + 2] == '\x03' && buf[p + 3] == '\x04'))
+  if (p + 30 > n || !(buf[p] == 'P' && buf[p + 1] == 'K' &&
+                      buf[p + 2] == '\x03' && buf[p + 3] == '\x04'))
     throw std::runtime_error("open_pth: bad local header for '" + e.name +
                              "'");
   const uint16_t nl = rd16(buf, p + 26), el = rd16(buf, p + 28);
   const uint64_t start = (uint64_t)p + 30 + nl + el;
-  if (start + e.comp_size > buf.size())
+  if (start + e.comp_size > n)
     throw std::runtime_error("open_pth: entry '" + e.name + "' overruns file");
   return {start, e.comp_size};
 }
@@ -190,8 +224,8 @@ int64_t node_int(const NodePtr& n, const char* what) {
   return n->ival;
 }
 
-void parse_pickle(const std::vector<char>& data, NodePtr& root) {
-  Cursor c{data.data(), data.data() + data.size()};
+void parse_pickle(const char* data, size_t size, NodePtr& root) {
+  Cursor c{data, data + size};
   std::vector<NodePtr> stack;
   std::vector<NodePtr> memo;
   auto pop = [&]() -> NodePtr {
@@ -504,8 +538,10 @@ void collect(const NodePtr& n, const std::string& prefix,
 }  // namespace
 
 PthArchive open_pth(const std::string& path) {
-  std::vector<char> buf = read_file(path);
-  std::vector<ZipEntry> entries = zip_index(buf);
+  size_t n = 0;
+  std::shared_ptr<const char> map = mmap_file(path, n, "open_pth");
+  const char* buf = map.get();
+  std::vector<ZipEntry> entries = zip_index(buf, n);
   // Discover the prefix: entry ending in "/data.pkl".
   std::string prefix;
   const ZipEntry* pkl = nullptr;
@@ -522,22 +558,22 @@ PthArchive open_pth(const std::string& path) {
   bool have_bo = false;
   for (auto& e : entries) {
     if (e.name == prefix + "/byteorder") {
-      auto r = zip_data_range(buf, e);
+      auto r = zip_data_range(buf, n, e);
       if (r.second < 6 ||
-          std::string(buf.data() + r.first, 6) != "little")
+          std::string(buf + r.first, 6) != "little")
         throw std::runtime_error("open_pth: archive is not little-endian");
       have_bo = true;
     }
   }
   if (!have_bo) throw std::runtime_error("open_pth: no byteorder entry");
-  auto pr = zip_data_range(buf, *pkl);
-  std::vector<char> pkl_bytes(buf.data() + pr.first,
-                              buf.data() + pr.first + pr.second);
+  auto pr = zip_data_range(buf, n, *pkl);
   NodePtr root;
-  parse_pickle(pkl_bytes, root);
+  parse_pickle(buf + pr.first, (size_t)pr.second, root);
   PthArchive a;
   a.path = path;
   a.prefix = prefix;
+  a.map = std::move(map);
+  a.map_size = n;
   if (root->kind == Node::Kind::Tensor) {
     // Single-tensor pack (voice .pt): inventory holds one nameless entry.
     std::vector<PthTensorMeta> tmp;
@@ -553,7 +589,7 @@ PthArchive open_pth(const std::string& path) {
   for (auto& e : entries) {
     if (e.name.size() > dprefix.size() &&
         e.name.compare(0, dprefix.size(), dprefix) == 0) {
-      auto r = zip_data_range(buf, e);
+      auto r = zip_data_range(buf, n, e);
       a.records[e.name.substr(dprefix.size())] = r;
     }
   }
@@ -572,18 +608,27 @@ std::vector<float> read_pth_storage(const PthArchive& archive,
   if (it == archive.records.end())
     throw std::runtime_error("read_pth_storage: no record '" + storage_key +
                              "'");
-  std::ifstream f(archive.path, std::ios::binary);
-  if (!f) throw std::runtime_error("read_pth_storage: cannot reopen '" +
-                                   archive.path + "'");
-  f.seekg((long long)it->second.first, std::ios::beg);
-  const size_t nbytes = (size_t)it->second.second;
+  // The archive owns its mapping; fall back to a fresh MAP_PRIVATE view of
+  // the same file only for archives that carry none (still mmap-only).
+  std::shared_ptr<const char> held;
+  const char* base = nullptr;
+  size_t n = 0;
+  if (archive.map) {
+    base = archive.map.get();
+    n = archive.map_size;
+  } else {
+    held = mmap_file(archive.path, n, "read_pth_storage");
+    base = held.get();
+  }
+  const uint64_t off = it->second.first, nbytes = it->second.second;
+  if (off + nbytes > n)
+    throw std::runtime_error("read_pth_storage: record '" + storage_key +
+                             "' out of mapped range");
   if (nbytes % 4 != 0)
     throw std::runtime_error("read_pth_storage: record '" + storage_key +
                              "' not a multiple of 4 bytes");
-  std::vector<float> out(nbytes / 4);
-  f.read(reinterpret_cast<char*>(out.data()), (long long)nbytes);
-  if (!f) throw std::runtime_error("read_pth_storage: short read '" +
-                                   storage_key + "'");
+  std::vector<float> out((size_t)(nbytes / 4));
+  if (!out.empty()) std::memcpy(out.data(), base + off, (size_t)nbytes);
   return out;
 }
 
