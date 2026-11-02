@@ -1205,18 +1205,24 @@ struct QwenImage21DitWeights {
   // the combined shard set must cover every expected tensor). Tensor names
   // are suffix-matched (training/export prefixes allowed). File dtypes F32
   // and BF16 are accepted (converted to Scalar on the host). Bytes stream
-  // per tensor through bounded HostSpace chunks into a host mirror with a
-  // single deep_copy per tensor (no 2x device residency). Throws on missing
+  // per tensor from a warmed QwenImage21::MappedShardSet (the OS page cache)
+  // through bounded HostSpace chunks into a host mirror with a single
+  // deep_copy per tensor (no 2x device residency). Throws on missing
   // tensors, unknown tensor names, non-F32/BF16 dtypes, or shape/numel/
-  // byte-size mismatch. Needs allocate() first. Pass a warmed
-  // QwenImage21::MappedShardSet to stream mapped shards from the OS page
-  // cache instead of disk (repeat loads); the default nullptr reads every
-  // shard from disk, so existing one-argument callers are unchanged.
+  // byte-size mismatch. Needs allocate() first. The maps argument is
+  // required: warm() the checkpoint shards once and pass the set here; a
+  // null maps or a shard missing from it throws (there is no disk fallback
+  // on the weight path).
   void load_safetensors(const std::vector<std::string>& shard_paths,
                         QwenImage21::MappedShardSet* maps = nullptr) {
     if (shard_paths.empty())
       throw std::invalid_argument(
           "QwenImage21DitWeights::load_safetensors: no shards given");
+    if (maps == nullptr)
+      throw std::runtime_error(
+          "QwenImage21DitWeights::load_safetensors: maps is null (warm a "
+          "QwenImage21::MappedShardSet and pass it; the weight path is "
+          "mmap-only)");
     if (img_in_W.extent(0) == 0)
       throw std::runtime_error(
           "QwenImage21DitWeights::load_safetensors: allocate first");
@@ -1231,14 +1237,14 @@ struct QwenImage21DitWeights {
     for (const auto& s : specs) found[s.name] = false;
 
     for (const std::string& path : shard_paths) {
-      std::ifstream f;
-      std::map<std::string, QwenImage21::Impl::Qwen21SafeEntry> disk_entries;
-      const QwenImage21::Impl::Qwen21MappedShard* mapped =
-          (maps != nullptr) ? maps->find(path) : nullptr;
+      const QwenImage21::Impl::Qwen21MappedShard* mapped = maps->find(path);
       if (mapped == nullptr)
-        disk_entries = QwenImage21::Impl::qwen21_open_shard(f, path);
+        throw std::runtime_error(
+            "QwenImage21DitWeights::load_safetensors: shard '" + path +
+            "' is not in the warmed maps (warm() it first; the weight path "
+            "is mmap-only)");
       const std::map<std::string, QwenImage21::Impl::Qwen21SafeEntry>&
-          entries = (mapped != nullptr) ? mapped->entries() : disk_entries;
+          entries = mapped->entries();
       for (const auto& kv : entries) {
         const std::string& full = kv.first;
         const QwenImage21::Impl::Qwen21SafeEntry& en = kv.second;
@@ -1260,11 +1266,7 @@ struct QwenImage21DitWeights {
           throw std::runtime_error(
               "QwenImage21DitWeights::load_safetensors: duplicate tensor '" +
               spec->name + "'");
-        if (mapped != nullptr) {
-          load_one_tensor(*mapped, full, en, *spec);
-        } else {
-          load_one_tensor(f, full, en, *spec);
-        }
+        load_one_tensor(*mapped, full, en, *spec);
         found[spec->name] = true;
       }
     }
@@ -1282,11 +1284,9 @@ struct QwenImage21DitWeights {
   }
 
  private:
-  // Stream one file tensor into its device view (shape-checked). Source is
-  // either a disk stream or a mapped shard (overload resolution on the
-  // first argument picks the matching qwen21_stream_into).
-  template <class Source>
-  void load_one_tensor(Source& src, const std::string& full,
+  // Stream one mapped tensor into its device view (shape-checked).
+  void load_one_tensor(const QwenImage21::Impl::Qwen21MappedShard& shard,
+                       const std::string& full,
                        const QwenImage21::Impl::Qwen21SafeEntry& en,
                        const DitTensorSpec& s) {
     const size_t elsize = QwenImage21::Impl::qwen21_entry_elsize(en, full);
@@ -1312,14 +1312,14 @@ struct QwenImage21DitWeights {
             "QwenImage21DitWeights::load_safetensors: view mismatch '" +
             s.name + "'");
       QwenImage21::Impl::qwen21_stream_into<ExecSpace, Scalar>(
-          src, en, want, elsize, (*dst2).data());
+          shard, en, want, elsize, (*dst2).data());
     } else {
       if (!dst1 || (*dst1).extent(0) != (size_t)s.d0)
         throw std::runtime_error(
             "QwenImage21DitWeights::load_safetensors: view mismatch '" +
             s.name + "'");
       QwenImage21::Impl::qwen21_stream_into<ExecSpace, Scalar>(
-          src, en, want, elsize, (*dst1).data());
+          shard, en, want, elsize, (*dst1).data());
     }
   }
 

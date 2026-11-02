@@ -1268,6 +1268,10 @@ struct EncoderStage {
   ) {
     namespace QE = KokkosDNN::QwenImage21Encoder;
     require_ckpt_dir(ckpt_dir);
+    if (maps == nullptr)
+      throw std::runtime_error(
+          "in-process Qwen encode needs a warmed "
+          "QwenImage21::MappedShardSet (the weight path is mmap-only)");
     const std::string tok_json =
         ckpt_sub(ckpt_dir, "processor") + "/tokenizer.json";
     const std::string encoder_path = ckpt_sub(ckpt_dir, "text_encoder");
@@ -1382,6 +1386,10 @@ struct EncoderStage {
     namespace QE = KokkosDNN::QwenImage21Encoder;
     namespace QV = KokkosDNN::QwenImage21Vision;
     require_ckpt_dir(ckpt_dir);
+    if (maps == nullptr)
+      throw std::runtime_error(
+          "in-process joint encode needs a warmed "
+          "QwenImage21::MappedShardSet (the weight path is mmap-only)");
     const std::string encoder_path = ckpt_sub(ckpt_dir, "text_encoder");
     const size_t S = ids.size(), Nv = vis_rows.size();
     if (S == 0 || Nv == 0)
@@ -1545,6 +1553,10 @@ struct EncoderStage {
     namespace QE = KokkosDNN::QwenImage21Encoder;
     namespace QV = KokkosDNN::QwenImage21Vision;
     require_ckpt_dir(ckpt_dir);
+    if (maps == nullptr)
+      throw std::runtime_error(
+          "in-process joint encode needs a warmed "
+          "QwenImage21::MappedShardSet (the weight path is mmap-only)");
     const std::string encoder_path = ckpt_sub(ckpt_dir, "text_encoder");
     const size_t S = ids.size(), Nv = vis_rows.size();
     const size_t n_imgs = pixels_list.size();
@@ -2277,6 +2289,10 @@ inline std::vector<float> try_vae_encode_image(
 ) {
   namespace QV = KokkosDNN::QwenImage21Vae;
   require_ckpt_dir(ckpt_dir);
+  if (maps == nullptr)
+    throw std::runtime_error(
+        "VAE encode needs a warmed QwenImage21::MappedShardSet (the weight "
+        "path is mmap-only)");
   const std::string vae_dir = ckpt_sub(ckpt_dir, "vae");
   QV::Config vcfg;
   {
@@ -2350,6 +2366,10 @@ inline bool try_vae_decode_rgba(const std::vector<float>& lat, size_t C,
 ) {
   namespace QV = KokkosDNN::QwenImage21Vae;
   require_ckpt_dir(ckpt_dir);
+  if (maps == nullptr)
+    throw std::runtime_error(
+        "VAE decode needs a warmed QwenImage21::MappedShardSet (the weight "
+        "path is mmap-only)");
   const std::string vae_dir = ckpt_sub(ckpt_dir, "vae");
   QV::Config vcfg;
   {
@@ -2490,7 +2510,9 @@ inline void write_output_image(const std::string& out,
 inline void run_vae_only(const std::string& lat_path, bool token_major,
                          size_t C, size_t H, size_t W,
                          const std::string& ckpt_dir, const std::string& out,
-                         const std::string& f32_out) {
+                         const std::string& f32_out,
+                         KokkosDNN::QwenImage21::MappedShardSet* maps =
+                             nullptr) {
 #ifdef QWEN21_DRIVER_HAVE_VAE
   std::vector<float> lat = load_decode_latents(lat_path, C, H, W, token_major);
   std::printf("[decode-latents %s] %zux%zux%zu floats (%s layout)\n",
@@ -2501,7 +2523,8 @@ inline void run_vae_only(const std::string& lat_path, bool token_major,
   std::vector<unsigned char> pix;
   const bool ok = try_vae_decode_rgba(lat, C, H, W, ckpt_dir, pix, oH, oW,
                                       oCh,
-                                      f32_out.empty() ? nullptr : &rgba_f32);
+                                      f32_out.empty() ? nullptr : &rgba_f32,
+                                      maps);
   if (!ok) throw std::runtime_error("VAE-only decode failed");
   if (!f32_out.empty()) {
     save_raw_f32(f32_out, rgba_f32);

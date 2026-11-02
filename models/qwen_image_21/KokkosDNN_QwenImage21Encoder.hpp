@@ -293,15 +293,20 @@ struct QwenImage21EncoderWeights {
   // ("model.visual.*"). Names are matched after stripping an optional
   // ".language_model" infix; lm_head/visual keys are skipped (the T2I text
   // path never reads them). Throws on missing/duplicate/dtype/shape
-  // mismatch, and on any other unknown tensor. Needs allocate() first.
-  // Pass a warmed QwenImage21::MappedShardSet to stream a mapped shard from
-  // the OS page cache instead of disk (repeat loads); the default nullptr
-  // reads from disk, so existing one-argument callers are unchanged.
+  // mismatch, and on any other unknown tensor. Needs allocate() first. The
+  // maps argument is required: warm() the shard once and pass the set here;
+  // a null maps or a shard missing from it throws (there is no disk fallback
+  // on the weight path).
   void load_safetensors(const std::string& shard_path,
                         QwenImage21::MappedShardSet* maps = nullptr) {
     if (embed.extent(0) == 0)
       throw std::runtime_error(
           "QwenImage21EncoderWeights::load_safetensors: allocate first");
+    if (maps == nullptr)
+      throw std::runtime_error(
+          "QwenImage21EncoderWeights::load_safetensors: maps is null (warm a "
+          "QwenImage21::MappedShardSet and pass it; the weight path is "
+          "mmap-only)");
     static_assert(std::is_same_v<Scalar, float> ||
                       std::is_same_v<Scalar,
                                      Kokkos::Experimental::bhalf_t>,
@@ -311,14 +316,14 @@ struct QwenImage21EncoderWeights {
         qwen21_encoder_expected_tensors(cfg);
     std::map<std::string, bool> found;
     for (const auto& s : specs) found[s.name] = false;
-    std::ifstream f;
-    std::map<std::string, QwenImage21::Impl::Qwen21SafeEntry> disk_entries;
-    const QwenImage21::Impl::Qwen21MappedShard* mapped =
-        (maps != nullptr) ? maps->find(shard_path) : nullptr;
+    const QwenImage21::Impl::Qwen21MappedShard* mapped = maps->find(shard_path);
     if (mapped == nullptr)
-      disk_entries = QwenImage21::Impl::qwen21_open_shard(f, shard_path);
+      throw std::runtime_error(
+          "QwenImage21EncoderWeights::load_safetensors: shard '" + shard_path +
+          "' is not in the warmed maps (warm() it first; the weight path "
+          "is mmap-only)");
     const std::map<std::string, QwenImage21::Impl::Qwen21SafeEntry>& entries =
-        (mapped != nullptr) ? mapped->entries() : disk_entries;
+        mapped->entries();
     for (const auto& kv : entries) {
       const std::string& full = kv.first;
       const QwenImage21::Impl::Qwen21SafeEntry& en = kv.second;
@@ -340,11 +345,7 @@ struct QwenImage21EncoderWeights {
         throw std::runtime_error(
             "QwenImage21EncoderWeights::load_safetensors: duplicate tensor '" +
             spec->name + "'");
-      if (mapped != nullptr) {
-        load_one_tensor(*mapped, full, en, *spec);
-      } else {
-        load_one_tensor(f, full, en, *spec);
-      }
+      load_one_tensor(*mapped, full, en, *spec);
       found[spec->name] = true;
     }
     for (const auto& s : specs) {
@@ -372,11 +373,9 @@ struct QwenImage21EncoderWeights {
     return full.compare(0, 13, "model.visual.") == 0;
   }
 
-  // Stream one file tensor into its device view (shape-checked). Source is
-  // either a disk stream or a mapped shard (overload resolution on the
-  // first argument picks the matching qwen21_stream_into).
-  template <class Source>
-  void load_one_tensor(Source& src, const std::string& full,
+  // Stream one mapped tensor into its device view (shape-checked).
+  void load_one_tensor(const QwenImage21::Impl::Qwen21MappedShard& shard,
+                       const std::string& full,
                        const QwenImage21::Impl::Qwen21SafeEntry& en,
                        const EncoderTensorSpec& s) {
     const size_t elsize = QwenImage21::Impl::qwen21_entry_elsize(en, full);
@@ -402,14 +401,14 @@ struct QwenImage21EncoderWeights {
             "QwenImage21EncoderWeights::load_safetensors: view mismatch '" +
             s.name + "'");
       QwenImage21::Impl::qwen21_stream_into<ExecSpace, Scalar>(
-          src, en, want, elsize, (*dst2).data());
+          shard, en, want, elsize, (*dst2).data());
     } else {
       if (!dst1 || (*dst1).extent(0) != (size_t)s.d0)
         throw std::runtime_error(
             "QwenImage21EncoderWeights::load_safetensors: view mismatch '" +
             s.name + "'");
       QwenImage21::Impl::qwen21_stream_into<ExecSpace, Scalar>(
-          src, en, want, elsize, (*dst1).data());
+          shard, en, want, elsize, (*dst1).data());
     }
   }
 

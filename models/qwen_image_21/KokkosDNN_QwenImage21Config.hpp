@@ -354,34 +354,8 @@ inline std::map<std::string, Qwen21SafeEntry> qwen21_parse_header(
   return out;
 }
 
-// Open one safetensors shard and return (stream, entries). The caller owns
-// the stream position afterwards (helpers below seek explicitly).
-inline std::map<std::string, Qwen21SafeEntry> qwen21_open_shard(
-    std::ifstream& f, const std::string& path) {
-  f.open(path, std::ios::binary | std::ios::ate);
-  if (!f)
-    throw std::runtime_error("QwenImage21: cannot open '" + path + "'");
-  std::streamoff e = f.tellg();
-  if (e < 8)
-    throw std::runtime_error("QwenImage21: too small '" + path + "'");
-  const size_t fsize = (size_t)e;
-  f.seekg(0, std::ios::beg);
-  char hlen_raw[8];
-  f.read(hlen_raw, 8);
-  if (!f)
-    throw std::runtime_error("QwenImage21: short read '" + path + "'");
-  const uint64_t hn = qwen21_ld64(hlen_raw);
-  if (8 + hn > fsize)
-    throw std::runtime_error("QwenImage21: bad header in '" + path + "'");
-  std::string js((size_t)hn, '\0');
-  f.read(js.data(), (std::streamsize)hn);
-  if (!f)
-    throw std::runtime_error("QwenImage21: short header '" + path + "'");
-  return qwen21_parse_header(js, 8 + hn);
-}
-
 inline size_t qwen21_entry_elsize(const Qwen21SafeEntry& en,
-                                  const std::string& full) {
+                                   const std::string& full) {
   if (en.dtype == "F32") return 4;
   if (en.dtype == "BF16") return 2;
   throw std::runtime_error("QwenImage21: tensor '" + full + "' has dtype " +
@@ -414,31 +388,6 @@ void qwen21_convert_chunk(const char* raw, size_t elsize, Scalar* dst,
     for (size_t i = 0; i < m; ++i)
       dst[i] = static_cast<Scalar>(qwen21_bf16_to_float(src[i]));
   }
-}
-
-// File bytes -> host mirror in bounded chunks, then one deep_copy.
-// No 2x device residency: only the destination view lives on device.
-template <class ExecSpace, class Scalar>
-void qwen21_stream_into(std::ifstream& f, const Qwen21SafeEntry& en,
-                        size_t n, size_t elsize, Scalar* dev_ptr) {
-  using HostV = Kokkos::View<Scalar*, Kokkos::HostSpace>;
-  HostV host("qwen21_load", n);
-  constexpr size_t kChunk = size_t{1} << 18;
-  std::vector<char> raw;
-  raw.reserve(std::min(n, kChunk) * elsize);
-  for (size_t o = 0; o < n;) {
-    const size_t m = std::min(n - o, kChunk);
-    raw.resize(m * elsize);
-    f.seekg((std::streamoff)(en.begin + o * elsize), std::ios::beg);
-    f.read(raw.data(), (std::streamsize)(m * elsize));
-    if (!f)
-      throw std::runtime_error("QwenImage21: truncated tensor data");
-    qwen21_convert_chunk<Scalar>(raw.data(), elsize, host.data() + o, m);
-    o += m;
-  }
-  Kokkos::View<Scalar*, ExecSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>> dev(
-      dev_ptr, n);
-  Kokkos::deep_copy(dev, host);
 }
 
 }  // namespace Impl
