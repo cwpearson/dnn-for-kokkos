@@ -27,6 +27,7 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -48,13 +49,18 @@ struct PthTensorMeta {
 };
 
 // Parsed archive: ordered tensor inventory + byte ranges of each storage
-// record. Tensor bytes stay on disk until read_pth_storage() is called.
+// record. The file stays mapped read-only (POSIX mmap, MAP_PRIVATE) for the
+// lifetime of the archive; read_pth_storage() copies straight from the
+// mapping (the OS page cache), with no ifstream anywhere on the path.
 struct PthArchive {
   std::string path;
   std::string prefix;  // zip entry prefix, e.g. "model" / "af_heart"
   std::vector<PthTensorMeta> tensors;  // document order
   // storage_key -> (file offset, byte size) of the data/<key> record.
   std::map<std::string, std::pair<uint64_t, uint64_t>> records;
+  // Read-only MAP_PRIVATE image of the file (shared across copies).
+  std::shared_ptr<const char> map;
+  size_t map_size = 0;
 };
 
 // Parse the ZIP index + data.pkl. Throws std::runtime_error on I/O errors
@@ -64,9 +70,9 @@ PthArchive open_pth(const std::string& path);
 // Total parameter count over the inventory (sum of numel).
 int64_t pth_total_params(const PthArchive& archive);
 
-// Stream one storage record from disk as float32 (little-endian host
-// assumed, matching the archive byteorder marker). Throws if the record is
-// missing, short, or not float32.
+// Stream one storage record from the archive's mmap as float32
+// (little-endian host assumed, matching the archive byteorder marker).
+// Throws if the record is missing, short, or not float32.
 std::vector<float> read_pth_storage(const PthArchive& archive,
                                     const std::string& storage_key);
 
