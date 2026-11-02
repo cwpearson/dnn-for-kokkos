@@ -73,12 +73,16 @@
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <fstream>
 #include <map>
 #include <random>
 #include <stdexcept>
@@ -643,6 +647,71 @@ inline std::map<std::string, DitSafeEntry> dit_parse_header(
   return out;
 }
 
+// ---- mmap-only shard view (POSIX MAP_PRIVATE, no fallback) ----
+// Read-only mapping of one safetensors shard; the OS page cache is the
+// host staging. mmap failure is a hard error. Non-copyable; munmap on
+// destruction. Header entries carry absolute file offsets.
+struct DitMappedFile {
+  std::string path;
+  const char* map = nullptr;
+  size_t size = 0;
+  std::map<std::string, DitSafeEntry> entries;
+
+  explicit DitMappedFile(const std::string& p) : path(p) {
+    const int fd = ::open(p.c_str(), O_RDONLY);
+    if (fd < 0)
+      throw std::runtime_error(
+          "MossImageDitWeights::load_safetensors: cannot open '" + p + "'");
+    struct stat st;
+    if (::fstat(fd, &st) != 0) {
+      ::close(fd);
+      throw std::runtime_error(
+          "MossImageDitWeights::load_safetensors: cannot stat '" + p + "'");
+    }
+    if (st.st_size < 8) {
+      ::close(fd);
+      throw std::runtime_error(
+          "MossImageDitWeights::load_safetensors: too small '" + p + "'");
+    }
+    size = (size_t)st.st_size;
+    void* m = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);
+    if (m == MAP_FAILED)
+      throw std::runtime_error(
+          "MossImageDitWeights::load_safetensors: mmap failed for '" + p +
+          "'");
+    map = static_cast<const char*>(m);
+#if defined(MADV_SEQUENTIAL)
+    ::madvise(const_cast<char*>(map), size, MADV_SEQUENTIAL);
+#endif
+    const uint64_t hn = dit_ld64(map);
+    if (8 + hn > size) {
+      ::munmap(const_cast<char*>(map), size);
+      map = nullptr;
+      throw std::runtime_error(
+          "MossImageDitWeights::load_safetensors: bad header in '" + p + "'");
+    }
+    entries = dit_parse_header(std::string(map + 8, map + 8 + (size_t)hn),
+                               8 + hn);
+    for (const auto& kv : entries) {
+      if (kv.second.begin > kv.second.end || kv.second.end > size) {
+        ::munmap(const_cast<char*>(map), size);
+        map = nullptr;
+        throw std::runtime_error(
+            "MossImageDitWeights::load_safetensors: tensor '" + kv.first +
+            "' out of range in '" + p + "'");
+      }
+    }
+  }
+
+  ~DitMappedFile() {
+    if (map != nullptr) ::munmap(const_cast<char*>(map), size);
+  }
+
+  DitMappedFile(const DitMappedFile&) = delete;
+  DitMappedFile& operator=(const DitMappedFile&) = delete;
+};
+
 // Grow-only view cache: exact-size managed views keyed by (tag, extents).
 // Entries are never shrunk or evicted, so steady-state forward() performs
 // no allocation; distinct shapes seen over the process lifetime bound memory.
@@ -956,36 +1025,8 @@ struct MossImageDitWeights {
     for (const auto& s : specs) found[s.name] = false;
 
     for (const std::string& path : shard_paths) {
-      std::ifstream f(path, std::ios::binary | std::ios::ate);
-      if (!f)
-        throw std::runtime_error(
-            "MossImageDitWeights::load_safetensors: cannot open '" + path +
-            "'");
-      std::streamoff e = f.tellg();
-      if (e < 8)
-        throw std::runtime_error(
-            "MossImageDitWeights::load_safetensors: too small '" + path + "'");
-      const size_t fsize = (size_t)e;
-      f.seekg(0, std::ios::beg);
-      char hlen_raw[8];
-      f.read(hlen_raw, 8);
-      if (!f)
-        throw std::runtime_error(
-            "MossImageDitWeights::load_safetensors: short read '" + path +
-            "'");
-      const uint64_t hn = Impl::dit_ld64(hlen_raw);
-      if (8 + hn > fsize)
-        throw std::runtime_error(
-            "MossImageDitWeights::load_safetensors: bad header in '" + path +
-            "'");
-      std::string js((size_t)hn, '\0');
-      f.read(js.data(), (std::streamsize)hn);
-      if (!f)
-        throw std::runtime_error(
-            "MossImageDitWeights::load_safetensors: short header '" + path +
-            "'");
-      const uint64_t data_base = 8 + hn;
-      auto entries = Impl::dit_parse_header(js, data_base);
+      Impl::DitMappedFile shard(path);
+      const auto& entries = shard.entries;
       for (const auto& kv : entries) {
         const std::string& full = kv.first;
         const Impl::DitSafeEntry& en = kv.second;
@@ -1011,7 +1052,7 @@ struct MossImageDitWeights {
           throw std::runtime_error(
               "MossImageDitWeights::load_safetensors: duplicate tensor '" +
               spec->name + "'");
-        load_one_tensor(f, full, en, *spec);
+        load_one_tensor(shard.map, full, en, *spec);
         found[spec->name] = true;
       }
     }
@@ -1029,7 +1070,8 @@ struct MossImageDitWeights {
 
  private:
   // Stream one file tensor into its device view (shape-checked).
-  void load_one_tensor(std::ifstream& f, const std::string& full,
+  // `base` is the shard mmap base; entry offsets are absolute.
+  void load_one_tensor(const char* base, const std::string& full,
                        const Impl::DitSafeEntry& en, const DitTensorSpec& s) {
     size_t elsize = 0;
     if (en.dtype == "F32") {
@@ -1068,44 +1110,37 @@ struct MossImageDitWeights {
         throw std::runtime_error(
             "MossImageDitWeights::load_safetensors: view mismatch '" + s.name +
             "'");
-      stream_into(f, en, want, elsize, (*dst2).data(), want);
+      stream_into(base + en.begin, want, elsize, (*dst2).data(), want);
     } else {
       if (!dst1 || (*dst1).extent(0) != (size_t)s.d0)
         throw std::runtime_error(
             "MossImageDitWeights::load_safetensors: view mismatch '" + s.name +
             "'");
-      stream_into(f, en, want, elsize, (*dst1).data(), want);
+      stream_into(base + en.begin, want, elsize, (*dst1).data(), want);
     }
   }
 
-  // File bytes -> host mirror in bounded chunks, then one deep_copy.
-  void stream_into(std::ifstream& f, const Impl::DitSafeEntry& en, size_t n,
-                   size_t elsize, Scalar* dev_ptr, size_t n_elems) {
+  // Mapping bytes -> host mirror in bounded chunks, then one deep_copy.
+  void stream_into(const char* payload, size_t n, size_t elsize,
+                   Scalar* dev_ptr, size_t n_elems) {
     using HostV = Kokkos::View<Scalar*, Kokkos::HostSpace>;
     HostV host("dit_load", n_elems);
     constexpr size_t kChunk = size_t{1} << 18;
-    std::vector<char> raw;
-    raw.reserve(std::min(n, kChunk) * elsize);
     const bool fast_f32 = std::is_same_v<Scalar, float> && elsize == 4;
     for (size_t o = 0; o < n;) {
       const size_t m = std::min(n - o, kChunk);
-      raw.resize(m * elsize);
-      f.seekg((std::streamoff)(en.begin + o * elsize), std::ios::beg);
-      f.read(raw.data(), (std::streamsize)(m * elsize));
-      if (!f)
-        throw std::runtime_error(
-            "MossImageDitWeights::load_safetensors: truncated tensor data");
+      const char* src = payload + o * elsize;
       if (fast_f32) {
-        std::memcpy(host.data() + o, raw.data(), m * 4);
+        std::memcpy(host.data() + o, src, m * 4);
       } else if (elsize == 4) {  // F32 file -> Scalar (float or bhalf_t)
-        const float* src = reinterpret_cast<const float*>(raw.data());
+        const float* fsrc = reinterpret_cast<const float*>(src);
         for (size_t i = 0; i < m; ++i)
-          host(o + i) = static_cast<Scalar>(src[i]);
+          host(o + i) = static_cast<Scalar>(fsrc[i]);
       } else {  // BF16 file -> Scalar via FP32
-        const uint16_t* src = reinterpret_cast<const uint16_t*>(raw.data());
+        const uint16_t* usrc = reinterpret_cast<const uint16_t*>(src);
         for (size_t i = 0; i < m; ++i)
           host(o + i) =
-              static_cast<Scalar>(Impl::dit_bf16_to_float(src[i]));
+              static_cast<Scalar>(Impl::dit_bf16_to_float(usrc[i]));
       }
       o += m;
     }
