@@ -37,6 +37,13 @@
 
 #include <Kokkos_Core.hpp>
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cstdint>
 #include <cstring>
@@ -44,6 +51,8 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "KokkosDNN_GGUFGemvCuda.hpp"
@@ -402,9 +411,78 @@ struct GgufTensorInfo {
 };
 
 // ---------------------------------------------------------------------------
-// Host-side GGUF file reader. Loads the file into memory, parses header,
-// string metadata, and tensor infos; exposes bounds-checked payload access.
+// Host-side GGUF file reader. Memory-maps the file read-only (POSIX mmap,
+// MAP_PRIVATE) and parses the header, string metadata, and tensor infos
+// over the mapping; exposes bounds-checked payload access. mmap failure is
+// a hard error (std::runtime_error, no fallback). Linux + macOS only.
+//
+// A sequential read-ahead prefetcher (start_prefetch/stop_prefetch) faults
+// the mapping into the page cache while the loader copies earlier tensors
+// to the device, so disk reads and H2D copies overlap instead of
+// serializing.
 // ---------------------------------------------------------------------------
+namespace Impl {
+
+// Sink for the prefetcher's page touches, so the compiler cannot drop the
+// reads. Atomic because several prefetch threads report into it.
+inline void gguf_prefetch_sink_byte(unsigned char v) {
+  static std::atomic<unsigned char> sink{0};
+  sink.fetch_xor(v, std::memory_order_relaxed);
+}
+
+// Sequential read-ahead threads that fault the mapping into the page cache
+// while the loader copies earlier tensors to the device.
+class GgufMappedPrefetcher {
+ public:
+  GgufMappedPrefetcher() = default;
+  ~GgufMappedPrefetcher() { stop(); }
+  GgufMappedPrefetcher(const GgufMappedPrefetcher&)            = delete;
+  GgufMappedPrefetcher& operator=(const GgufMappedPrefetcher&) = delete;
+
+  // Split [begin, end) across a few threads and touch one byte per page in
+  // order. Page faults (and the kernel's read-ahead) then pull the file in
+  // at roughly the parallel-IO rate of the backing device.
+  void start(const char* begin, const char* end) {
+    stop();
+    stop_.store(false, std::memory_order_relaxed);
+    const size_t nbytes = (size_t)(end - begin);
+    if (nbytes == 0) return;
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 4;
+    const size_t nthreads = std::min<size_t>(4, hw);
+    const size_t chunk    = nbytes / nthreads + 1;
+    workers_.reserve(nthreads);
+    for (size_t i = 0; i < nthreads; ++i) {
+      const char* lo = begin + i * chunk;
+      if (lo >= end) break;
+      const char* hi = std::min(end, lo + chunk);
+      workers_.emplace_back([this, lo, hi] { run(lo, hi); });
+    }
+  }
+
+  void stop() {
+    stop_.store(true, std::memory_order_relaxed);
+    for (auto& t : workers_)
+      if (t.joinable()) t.join();
+    workers_.clear();
+  }
+
+ private:
+  void run(const char* lo, const char* hi) {
+    constexpr size_t kPage = 4096;  // conservative: <= every page size
+    unsigned char acc      = 0;
+    for (const char* p = lo; p < hi && !stop_.load(std::memory_order_relaxed);
+         p += kPage)
+      acc = (unsigned char)(acc + *reinterpret_cast<const unsigned char*>(p));
+    gguf_prefetch_sink_byte(acc);
+  }
+
+  std::atomic<bool> stop_{true};
+  std::vector<std::thread> workers_;
+};
+
+}  // namespace Impl
+
 class GgufFile {
  public:
   static constexpr uint32_t kMagic   = 0x46554747u;  // "GGUF" little-endian
@@ -412,18 +490,53 @@ class GgufFile {
   static constexpr size_t kAlign     = 32;
 
   explicit GgufFile(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("GgufFile: cannot open '" + path + "'");
-    f.seekg(0, std::ios::end);
-    std::streamoff n = f.tellg();
-    if (n < 0) throw std::runtime_error("GgufFile: cannot stat '" + path + "'");
-    if (n < 24)
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) throw std::runtime_error("GgufFile: cannot open '" + path + "'");
+    struct stat st;
+    if (::fstat(fd, &st) != 0) {
+      ::close(fd);
+      throw std::runtime_error("GgufFile: cannot stat '" + path + "'");
+    }
+    if (st.st_size < 24) {
+      ::close(fd);
       throw std::runtime_error("GgufFile: file too small '" + path + "'");
-    f.seekg(0, std::ios::beg);
-    buf_.resize((size_t)n);
-    f.read(buf_.data(), n);
-    if (!f) throw std::runtime_error("GgufFile: short read '" + path + "'");
-    parse();
+    }
+    size_        = (size_t)st.st_size;
+    void* mapped = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);  // the mapping keeps the file alive
+    if (mapped == MAP_FAILED)
+      throw std::runtime_error("GgufFile: mmap failed for '" + path + "'");
+    map_ = static_cast<const char*>(mapped);
+#if defined(MADV_SEQUENTIAL)
+    ::madvise(const_cast<char*>(map_), size_, MADV_SEQUENTIAL);
+#endif
+    try {
+      parse();
+    } catch (...) {
+      ::munmap(const_cast<char*>(map_), size_);
+      map_  = nullptr;
+      size_ = 0;
+      throw;
+    }
+  }
+
+  ~GgufFile() {
+    prefetch_.stop();
+    if (map_ != nullptr) ::munmap(const_cast<char*>(map_), size_);
+  }
+
+  GgufFile(const GgufFile&)            = delete;
+  GgufFile& operator=(const GgufFile&) = delete;
+
+  GgufFile(GgufFile&& other) noexcept { move_from(std::move(other)); }
+
+  GgufFile& operator=(GgufFile&& other) noexcept {
+    if (this != &other) {
+      prefetch_.stop();
+      if (map_ != nullptr) ::munmap(const_cast<char*>(map_), size_);
+      move_from(std::move(other));
+    }
+    return *this;
   }
 
   bool contains(const std::string& name) const {
@@ -496,21 +609,42 @@ class GgufFile {
     return bool_arr_kv_;
   }
 
-  // Bounds-checked pointer to a tensor's packed payload.
+  // Bounds-checked pointer to a tensor's packed payload (valid for the
+  // lifetime of this object, i.e. while the mapping is held).
   const uint8_t* payload(const GgufTensorInfo& info) const {
     const size_t abs = data_start_ + (size_t)info.offset;
-    if (abs + info.nbytes > buf_.size())
+    if (abs + info.nbytes > size_)
       throw std::runtime_error("GgufFile: tensor '" + info.name +
                                "' payload out of range");
-    return reinterpret_cast<const uint8_t*>(buf_.data() + abs);
+    return reinterpret_cast<const uint8_t*>(map_ + abs);
   }
 
   uint32_t version() const { return version_; }
   const std::vector<GgufTensorInfo>& tensors() const { return tensors_; }
   size_t data_start() const { return data_start_; }
-  size_t file_size() const { return buf_.size(); }
+  size_t file_size() const { return size_; }
+
+  // Start/stop sequential read-ahead over the whole mapping. Idempotent;
+  // the prefetcher is always stopped (and joined) by the destructor.
+  void start_prefetch() { prefetch_.start(map_, map_ + size_); }
+  void stop_prefetch() { prefetch_.stop(); }
 
  private:
+  void move_from(GgufFile&& other) noexcept {
+    other.prefetch_.stop();  // a moved-from mapping must go quiet first
+    map_        = other.map_;
+    size_       = other.size_;
+    version_    = other.version_;
+    data_start_ = other.data_start_;
+    tensors_    = std::move(other.tensors_);
+    index_      = std::move(other.index_);
+    str_kv_     = std::move(other.str_kv_);
+    f32_kv_     = std::move(other.f32_kv_);
+    u32_kv_     = std::move(other.u32_kv_);
+    bool_arr_kv_ = std::move(other.bool_arr_kv_);
+    other.map_  = nullptr;
+    other.size_ = 0;
+  }
   // Little-endian cursor with bounds checks (GGUF is LE-only, as is ggml).
   struct Cursor {
     const char* p;
@@ -593,9 +727,9 @@ class GgufFile {
   }
 
   void parse() {
-    Cursor c{buf_.data(), buf_.data() + buf_.size()};
-    if (buf_[0] != 'G' || buf_[1] != 'G' || buf_[2] != 'U' ||
-        buf_[3] != 'F')
+    Cursor c{map_, map_ + size_};
+    if (map_[0] != 'G' || map_[1] != 'G' || map_[2] != 'U' ||
+        map_[3] != 'F')
       throw std::runtime_error("GgufFile: bad magic (not a GGUF file)");
     c.p += 4;
     version_ = c.u32();
@@ -643,20 +777,21 @@ class GgufFile {
       tensors_.push_back(std::move(ti));
     }
 
-    const size_t off = (size_t)(c.p - buf_.data());
+    const size_t off = (size_t)(c.p - map_);
     data_start_      = (off + kAlign - 1) & ~(kAlign - 1);
-    if (data_start_ > buf_.size())
+    if (data_start_ > size_)
       throw std::runtime_error("GgufFile: header runs past EOF");
     // Validate every payload range up front so later access cannot OOB.
     for (const auto& ti : tensors_) {
       const size_t abs = data_start_ + (size_t)ti.offset;
-      if (abs + ti.nbytes > buf_.size())
+      if (abs + ti.nbytes > size_)
         throw std::runtime_error("GgufFile: tensor '" + ti.name +
                                  "' payload out of range");
     }
   }
 
-  std::vector<char> buf_;
+  const char* map_   = nullptr;
+  size_t size_       = 0;
   uint32_t version_ = 0;
   size_t data_start_ = 0;
   std::vector<GgufTensorInfo> tensors_;
@@ -665,6 +800,7 @@ class GgufFile {
   std::map<std::string, float> f32_kv_;
   std::map<std::string, uint32_t> u32_kv_;
   std::map<std::string, std::vector<char>> bool_arr_kv_;
+  Impl::GgufMappedPrefetcher prefetch_;
 };
 
 // Dequantize a whole tensor to FP32 (streamed block by block; peak extra RAM
