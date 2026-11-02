@@ -6,27 +6,34 @@
 
 #include "KokkosDNN_SanaPth.hpp"
 
+#include <cstdint>
 #include <cstring>
-#include <fstream>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace KokkosDNN {
 namespace Sana {
 namespace Impl {
 namespace {
 
-// ---- Little-endian readers -------------------------------------------------
-uint16_t rd_u16(const std::vector<char>& b, size_t p) {
+// ---- Little-endian readers (over the mmap'd archive mapping) ----------------
+uint16_t rd_u16(const char* b, size_t p) {
   uint16_t v = 0;
-  std::memcpy(&v, b.data() + p, 2);
+  std::memcpy(&v, b + p, 2);
   return v;
 }
 
-uint32_t rd_u32(const std::vector<char>& b, size_t p) {
+uint32_t rd_u32(const char* b, size_t p) {
   uint32_t v = 0;
-  std::memcpy(&v, b.data() + p, 4);
+  std::memcpy(&v, b + p, 4);
   return v;
 }
 
@@ -43,25 +50,50 @@ constexpr uint32_t kEocdSig = 0x06054b50;
 constexpr uint32_t kCdSig = 0x02014b50;
 constexpr uint32_t kLocalSig = 0x04034b50;
 
-// Read the whole file (data.pkl is ~91 KiB; central directory is tiny).
-// Storage blobs are never bulk-loaded: readers seek to record offsets.
-std::vector<char> read_file(const std::string& path) {
-  std::ifstream f(path, std::ios::binary);
-  if (!f) throw std::runtime_error("open_pth: cannot open '" + path + "'");
-  f.seekg(0, std::ios::end);
-  const long long n = (long long)f.tellg();
-  if (n < 0) throw std::runtime_error("open_pth: cannot stat '" + path + "'");
-  f.seekg(0, std::ios::beg);
-  std::vector<char> buf((size_t)n);
-  if (n > 0 && !f.read(buf.data(), n))
-    throw std::runtime_error("open_pth: short read of '" + path + "'");
-  return buf;
-}
+// Read-only mmap view of the whole .pth archive (MAP_PRIVATE). The ZIP
+// central directory, data.pkl, and every storage blob are parsed/copied
+// straight from this mapping; mmap failure is a hard error (no fallback).
+struct MappedFile {
+  const char* data = nullptr;
+  size_t size = 0;
 
-std::vector<ZipEntry> read_central_directory(const std::vector<char>& buf,
+  explicit MappedFile(const std::string& path) {
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0)
+      throw std::runtime_error("open_pth: cannot open '" + path + "'");
+    struct stat st;
+    if (::fstat(fd, &st) != 0) {
+      ::close(fd);
+      throw std::runtime_error("open_pth: cannot stat '" + path + "'");
+    }
+    if (st.st_size <= 0) {
+      ::close(fd);
+      throw std::runtime_error("open_pth: empty file '" + path + "'");
+    }
+    size = (size_t)st.st_size;
+    void* m = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);  // the mapping keeps the file alive
+    if (m == MAP_FAILED)
+      throw std::runtime_error("open_pth: mmap failed for '" + path + "'");
+    data = static_cast<const char*>(m);
+  }
+
+  ~MappedFile() {
+    if (data) ::munmap(const_cast<char*>(data), size);
+  }
+
+  MappedFile(const MappedFile&) = delete;
+  MappedFile& operator=(const MappedFile&) = delete;
+  MappedFile(MappedFile&& o) noexcept : data(o.data), size(o.size) {
+    o.data = nullptr;
+    o.size = 0;
+  }
+  MappedFile& operator=(MappedFile&&) = delete;
+};
+
+std::vector<ZipEntry> read_central_directory(const char* buf, size_t n,
                                              const std::string& path) {
   // EOCD is within the last 22 + 64 KiB (max comment length).
-  const size_t n = buf.size();
   if (n < 22) throw std::runtime_error("open_pth: '" + path + "' too small");
   const size_t lo = (n > (22 + 65535)) ? n - (22 + 65535) : 0;
   size_t eocd = n;  // not found
@@ -92,7 +124,7 @@ std::vector<ZipEntry> read_central_directory(const std::vector<char>& buf,
                    cl = rd_u16(buf, p + 32);
     if (p + 46 + nl > n)
       throw std::runtime_error("open_pth: '" + path + "': bad name");
-    e.name.assign(buf.data() + p + 46, nl);
+    e.name.assign(buf + p + 46, nl);
     p += 46 + nl + el + cl;
     out.push_back(e);
   }
@@ -101,7 +133,7 @@ std::vector<ZipEntry> read_central_directory(const std::vector<char>& buf,
 
 // Byte range of a stored record's payload.
 std::pair<uint64_t, uint64_t> record_range(
-    const std::vector<char>& buf, const std::vector<ZipEntry>& entries,
+    const char* buf, size_t n, const std::vector<ZipEntry>& entries,
     const std::string& name, const std::string& path) {
   for (const auto& e : entries) {
     if (e.name != name) continue;
@@ -109,11 +141,11 @@ std::pair<uint64_t, uint64_t> record_range(
       throw std::runtime_error("open_pth: '" + path + "': '" + name +
                                "' uses deflate; only stored records supported");
     const size_t lh = (size_t)e.local_offset;
-    if (lh + 30 > buf.size() || rd_u32(buf, lh) != kLocalSig)
+    if (lh + 30 > n || rd_u32(buf, lh) != kLocalSig)
       throw std::runtime_error("open_pth: '" + path + "': bad local header");
     const uint16_t nl = rd_u16(buf, lh + 26), el = rd_u16(buf, lh + 28);
     const uint64_t data = (uint64_t)lh + 30 + nl + el;
-    if (data + e.size > buf.size())
+    if (data + e.size > n)
       throw std::runtime_error("open_pth: '" + path + "': truncated record");
     return {data, e.size};
   }
@@ -146,7 +178,7 @@ struct Value {
 
 class Unpickler {
  public:
-  explicit Unpickler(const std::vector<char>& bytes) : b_(bytes) {}
+  explicit Unpickler(const char* data, size_t size) : b_(data), n_(size) {}
 
   Value run() {
     for (;;) {
@@ -267,7 +299,7 @@ class Unpickler {
           const uint32_t n = rd_u32();
           Value v;
           v.type = Value::Type::Str;
-          v.str.assign(&b_[pos_], n);
+          v.str.assign(b_ + pos_, n);
           pos_ += n;
           stack_.push_back(v);
           break;
@@ -330,7 +362,8 @@ class Unpickler {
   std::shared_ptr<DictEntries> pending_metadata_;
 
  private:
-  const std::vector<char>& b_;
+  const char* b_;
+  size_t n_;
   size_t pos_ = 0;
   std::vector<Value> stack_;
   std::vector<Value> memo_;
@@ -347,22 +380,22 @@ class Unpickler {
   }
 
   uint8_t get() {
-    if (pos_ >= b_.size()) fail("truncated stream");
+    if (pos_ >= n_) fail("truncated stream");
     return (uint8_t)b_[pos_++];
   }
 
   uint16_t rd_u16() {
-    if (pos_ + 2 > b_.size()) fail("truncated u16");
+    if (pos_ + 2 > n_) fail("truncated u16");
     uint16_t v;
-    std::memcpy(&v, &b_[pos_], 2);
+    std::memcpy(&v, b_ + pos_, 2);
     pos_ += 2;
     return v;
   }
 
   uint32_t rd_u32() {
-    if (pos_ + 4 > b_.size()) fail("truncated u32");
+    if (pos_ + 4 > n_) fail("truncated u32");
     uint32_t v;
-    std::memcpy(&v, &b_[pos_], 4);
+    std::memcpy(&v, b_ + pos_, 4);
     pos_ += 4;
     return v;
   }
@@ -376,9 +409,9 @@ class Unpickler {
 
   std::string get_line() {
     size_t e = pos_;
-    while (e < b_.size() && b_[e] != '\n') ++e;
-    if (e >= b_.size()) fail("truncated GLOBAL line");
-    std::string s(&b_[pos_], e - pos_);
+    while (e < n_ && b_[e] != '\n') ++e;
+    if (e >= n_) fail("truncated GLOBAL line");
+    std::string s(b_ + pos_, e - pos_);
     pos_ = e + 1;
     return s;
   }
@@ -547,9 +580,13 @@ std::vector<std::pair<std::string, std::vector<int64_t>>> sana_pth_expected(
 }  // namespace Impl
 
 PthArchive open_pth(const std::string& path) {
-  const std::vector<char> file = Impl::read_file(path);
+  // Shared ownership: the aliasing mapping below keeps this alive, so the
+  // record offsets in the returned archive stay valid (no disk re-reads).
+  const auto mapped = std::make_shared<Impl::MappedFile>(path);
+  const char* base = mapped->data;
+  const size_t n = mapped->size;
   const std::vector<Impl::ZipEntry> entries =
-      Impl::read_central_directory(file, path);
+      Impl::read_central_directory(base, n, path);
   // Locate data.pkl and derive the record prefix.
   std::string pkl_name;
   for (const auto& e : entries) {
@@ -562,11 +599,9 @@ PthArchive open_pth(const std::string& path) {
   if (pkl_name.empty())
     throw std::runtime_error("open_pth: '" + path + "': no data.pkl record");
   const std::string prefix = pkl_name.substr(0, pkl_name.size() - 8);
-  const auto pkl_range = Impl::record_range(file, entries, pkl_name, path);
-  std::vector<char> pkl(file.begin() + (long long)pkl_range.first,
-                        file.begin() + (long long)(pkl_range.first +
-                                                  pkl_range.second));
-  Impl::Unpickler up(pkl);
+  const auto pkl_range =
+      Impl::record_range(base, n, entries, pkl_name, path);
+  Impl::Unpickler up(base + pkl_range.first, (size_t)pkl_range.second);
   Impl::Value top = up.run();
   if (top.type != Impl::Value::Type::Dict || !top.dict || top.dict->empty())
     throw std::runtime_error("open_pth: '" + path + "': top is not a dict");
@@ -581,6 +616,10 @@ PthArchive open_pth(const std::string& path) {
   PthArchive ar;
   ar.path = path;
   ar.prefix = prefix;
+  // Retain the archive mapping in the returned archive (aliasing shared_ptr:
+  // ownership is the MappedFile, the pointer is the mapping base).
+  ar.mapping = std::shared_ptr<const void>(mapped, base);
+  ar.mapping_size = n;
   for (const auto& kv : sd) {
     const Impl::Value& v = *kv.second;
     if (v.type != Impl::Value::Type::Tensor)
@@ -603,7 +642,7 @@ PthArchive open_pth(const std::string& path) {
       const std::string rec =
           prefix + "data/" + std::to_string(v.storage_id);
       ar.records[v.storage_id] =
-          Impl::record_range(file, entries, rec, path);
+          Impl::record_range(base, n, entries, rec, path);
     }
   }
   if (up.pending_metadata_) {
@@ -634,19 +673,21 @@ std::vector<float> read_pth_storage(const PthArchive& archive,
   if (it == archive.records.end())
     throw std::runtime_error("read_pth_storage: unknown storage " +
                              std::to_string(storage_id));
-  std::ifstream f(archive.path, std::ios::binary);
-  if (!f)
-    throw std::runtime_error("read_pth_storage: cannot open '" +
-                             archive.path + "'");
-  f.seekg((long long)it->second.first, std::ios::beg);
-  if (!f) throw std::runtime_error("read_pth_storage: seek failed");
-  std::vector<char> raw(it->second.second);
-  if (!raw.empty() && !f.read(raw.data(), (long long)raw.size()))
-    throw std::runtime_error("read_pth_storage: short read");
-  if (raw.size() % 4 != 0)
+  if (!archive.mapping || archive.mapping_size == 0)
+    throw std::runtime_error("read_pth_storage: archive has no mapping");
+  // Served from the archive mapping retained by open_pth: no re-mmap,
+  // no disk re-read, no fallback.
+  const uint64_t off = it->second.first, len = it->second.second;
+  if (len > archive.mapping_size || off > archive.mapping_size - len)
+    throw std::runtime_error("read_pth_storage: record out of range");
+  if (len % 4 != 0)
     throw std::runtime_error("read_pth_storage: non-float32 record size");
-  std::vector<float> out(raw.size() / 4);
-  std::memcpy(out.data(), raw.data(), raw.size());
+  std::vector<float> out((size_t)(len / 4));
+  if (!out.empty()) {
+    std::memcpy(out.data(),
+                static_cast<const char*>(archive.mapping.get()) + off,
+                (size_t)len);
+  }
   return out;
 }
 
