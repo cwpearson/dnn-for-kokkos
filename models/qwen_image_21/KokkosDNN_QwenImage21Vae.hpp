@@ -491,29 +491,33 @@ struct QwenImage21VaeWeights {
 
   // Load every tensor found in the shard(s) into device blobs (F32/BF16
   // file -> Scalar). Names outside both skeletons are accepted here;
-  // dtype/shape/slice errors throw. Pass a warmed
-  // QwenImage21::MappedShardSet to stream mapped shards from the OS page
-  // cache instead of disk (repeat loads); the default nullptr reads every
-  // shard from disk, so existing one-argument callers are unchanged.
+  // dtype/shape/slice errors throw. The maps argument is required: warm()
+  // the shard(s) once and pass the set here; a null maps or a shard missing
+  // from it throws (there is no disk fallback on the weight path).
   void load_safetensors(const std::vector<std::string>& shard_paths,
                         QwenImage21::MappedShardSet* maps = nullptr) {
     if (shard_paths.empty())
       throw std::invalid_argument(
           "QwenImage21VaeWeights::load_safetensors: no shards given");
+    if (maps == nullptr)
+      throw std::runtime_error(
+          "QwenImage21VaeWeights::load_safetensors: maps is null (warm a "
+          "QwenImage21::MappedShardSet and pass it; the weight path is "
+          "mmap-only)");
     static_assert(std::is_same_v<Scalar, float> ||
                       std::is_same_v<Scalar,
                                      Kokkos::Experimental::bhalf_t>,
                   "QwenImage21VaeWeights::load_safetensors: Scalar must be "
                   "float or bhalf_t");
     for (const std::string& path : shard_paths) {
-      std::ifstream f;
-      std::map<std::string, QwenImage21::Impl::Qwen21SafeEntry> disk_entries;
-      const QwenImage21::Impl::Qwen21MappedShard* mapped =
-          (maps != nullptr) ? maps->find(path) : nullptr;
+      const QwenImage21::Impl::Qwen21MappedShard* mapped = maps->find(path);
       if (mapped == nullptr)
-        disk_entries = QwenImage21::Impl::qwen21_open_shard(f, path);
+        throw std::runtime_error(
+            "QwenImage21VaeWeights::load_safetensors: shard '" + path +
+            "' is not in the warmed maps (warm() it first; the weight path "
+            "is mmap-only)");
       const std::map<std::string, QwenImage21::Impl::Qwen21SafeEntry>&
-          entries = (mapped != nullptr) ? mapped->entries() : disk_entries;
+          entries = mapped->entries();
       for (const auto& kv : entries) {
         const std::string& full = kv.first;
         const QwenImage21::Impl::Qwen21SafeEntry& en = kv.second;
@@ -533,13 +537,8 @@ struct QwenImage21VaeWeights {
               "QwenImage21VaeWeights::load_safetensors: tensor '" + full +
               "' slice size mismatch");
         V1 dev_blob("qwen21vae_blob", (size_t)numel);
-        if (mapped != nullptr) {
-          QwenImage21::Impl::qwen21_stream_into<ExecSpace, Scalar>(
-              *mapped, en, (size_t)numel, elsize, dev_blob.data());
-        } else {
-          QwenImage21::Impl::qwen21_stream_into<ExecSpace, Scalar>(
-              f, en, (size_t)numel, elsize, dev_blob.data());
-        }
+        QwenImage21::Impl::qwen21_stream_into<ExecSpace, Scalar>(
+            *mapped, en, (size_t)numel, elsize, dev_blob.data());
         blobs[full] = dev_blob;
         shapes[full] = en.shape;
         dtypes[full] = en.dtype;

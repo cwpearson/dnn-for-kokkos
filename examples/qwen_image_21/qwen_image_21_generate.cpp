@@ -963,7 +963,9 @@ int main(int argc, char** argv) {
       }
 #endif
 #ifdef QWEN21_DRIVER_HAVE_VAE
-      if (vae_decode) {
+      // The --decode-latents-in parity path decodes too, so its shards are
+      // warmed even when --no-vae-decode disables the normal tail decode.
+      if (vae_decode || !decode_latents_in.empty()) {
         const std::vector<std::string> vae_shards =
             resolve_shard_list(ckpt_sub(ckpt, "vae"), "--ckpt");
         all_shards.insert(all_shards.end(), vae_shards.begin(),
@@ -977,6 +979,8 @@ int main(int argc, char** argv) {
                     (double)mapped_once.mapped_bytes() / 1e9);
       }
     }
+    // Non-null in every non-tiny run that warms shards (all weight loads
+    // below require a warmed maps; tiny runs never reach a load).
     KokkosDNN::QwenImage21::MappedShardSet* maps_once =
         (!tiny && mapped_once.shard_count() > 0) ? &mapped_once : nullptr;
 #else
@@ -991,7 +995,7 @@ int main(int argc, char** argv) {
         throw std::runtime_error(
             "--decode-latents-in needs the real VAE; drop --tiny");
       run_vae_only(decode_latents_in, decode_latents_layout == "token", C,
-                   (size_t)H, (size_t)W, ckpt, out, decode_out_f32);
+                   (size_t)H, (size_t)W, ckpt, out, decode_out_f32, maps_once);
       Kokkos::finalize();
       return 0;
     }
