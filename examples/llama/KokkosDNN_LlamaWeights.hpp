@@ -78,7 +78,7 @@ void random_init(const Config& cfg, Weights<ExecSpace, Scalar>& w,
 //   files : one or more .safetensors shards (multi-file Llama checkpoints
 //           are all listed; tensors are looked up across shards).
 // On-disk dtypes BF16/FP16/F32 are all converted to Scalar. Shards are
-// mapped read-only (mmap; bounded chunked reads where mmap is unavailable)
+// mapped read-only (::mmap)
 // and each tensor streams from the mapping through a small (~1 MiB) host
 // staging buffer — no full-tensor/host-F32 expansion. Loading is lazy
 // per-tensor in call order (each tensor converts/copies once, shards stay

@@ -19,25 +19,15 @@
 
 #include <cstdint>
 #include <cstring>
-#include <fstream>
 #include <map>
 #include <stdexcept>
 #include <string>
 
-// mmap-backed reads (POSIX). Fallback: bounded ifstream reads with the same
-// chunked staging when mmap is unavailable (mirrors the Sana loaders).
-#if !defined(KOKKOSDNN_HAS_MMAP)
-#if defined(__unix__) || defined(__unix) || defined(__APPLE__) || \
-    defined(__linux__)
-#define KOKKOSDNN_HAS_MMAP 1
+// mmap-backed reads (POSIX mmap; mmap failure is a hard error).
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#else
-#define KOKKOSDNN_HAS_MMAP 0
-#endif
-#endif
 
 namespace KokkosDNN {
 namespace Moss {
@@ -59,15 +49,12 @@ inline uint64_t ld64(const char* p) {
   return lo | (hi << 32);
 }
 
-// ---- file reader: mmap window or bounded ifstream seeks ----
+// ---- file reader: mmap window ----
 struct FileReader {
   std::string path;
   size_t size = 0;
-#if KOKKOSDNN_HAS_MMAP
   const char* map = nullptr;
-#endif
   explicit FileReader(const std::string& p) : path(p) {
-#if KOKKOSDNN_HAS_MMAP
     int fd = ::open(p.c_str(), O_RDONLY);
     if (fd < 0) throw std::runtime_error("moss: cannot open " + p);
     struct stat st;
@@ -84,33 +71,16 @@ struct FileReader {
     ::close(fd);
     if (m == MAP_FAILED) throw std::runtime_error("moss: mmap failed: " + p);
     map = static_cast<const char*>(m);
-#else
-    std::ifstream f(p, std::ios::binary | std::ios::ate);
-    if (!f) throw std::runtime_error("moss: cannot open " + p);
-    std::streamoff e = f.tellg();
-    if (e <= 0) throw std::runtime_error("moss: empty file: " + p);
-    size = (size_t)e;
-#endif
   }
   ~FileReader() {
-#if KOKKOSDNN_HAS_MMAP
     if (map) ::munmap(const_cast<char*>(map), size);
-#endif
   }
   FileReader(const FileReader&) = delete;
   FileReader& operator=(const FileReader&) = delete;
 
   void read_bytes(uint64_t off, char* dst, size_t n) const {
     if (off + n > size) throw std::runtime_error("moss: read out of range");
-#if KOKKOSDNN_HAS_MMAP
     std::memcpy(dst, map + off, n);
-#else
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("moss: cannot open " + path);
-    f.seekg((std::streamoff)off);
-    f.read(dst, (std::streamsize)n);
-    if (!f) throw std::runtime_error("moss: truncated read");
-#endif
   }
   std::string read_str(uint64_t off, size_t n) const {
     std::string s(n, '\0');

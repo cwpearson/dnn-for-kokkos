@@ -4,28 +4,17 @@
 
 #include <cctype>
 #include <cstring>
-#include <fstream>
 #include <iostream>
 #include <random>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
 
-// mmap-backed zero-copy checkpoint reads (POSIX). Fallback: chunked
-// ifstream reads with the same bounded host staging when mmap is
-// unavailable (e.g. non-POSIX builds).
-#if !defined(KOKKOSDNN_HAS_MMAP)
-#if defined(__unix__) || defined(__unix) || defined(__APPLE__) || \
-    defined(__linux__)
-#define KOKKOSDNN_HAS_MMAP 1
+// mmap-backed zero-copy checkpoint reads (::mmap; Linux and macOS only).
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#else
-#define KOKKOSDNN_HAS_MMAP 0
-#endif
-#endif
 
 namespace KokkosDNN {
 namespace Dinov3 {
@@ -66,19 +55,6 @@ inline float bf16_to_fp32(uint16_t h) {
   std::memcpy(&out, &f, 4);
   return out;
 }
-
-#if !KOKKOSDNN_HAS_MMAP
-// Only the non-mmap (ifstream) checkpoint path uses this; guard the
-// definition so mmap builds do not see an unused function.
-uint64_t read_le64(std::ifstream& f) {
-  unsigned char b[8];
-  f.read(reinterpret_cast<char*>(b), 8);
-  if (!f) throw std::runtime_error("safetensors: truncated header length");
-  uint64_t v = 0;
-  for (int i = 7; i >= 0; --i) v = (v << 8) | b[i];
-  return v;
-}
-#endif
 
 static uint64_t load_le64(const char* p) {
   const auto* b = reinterpret_cast<const unsigned char*>(p);
@@ -235,9 +211,9 @@ size_t dtype_elem_bytes(const std::string& dtype, const std::string& name) {
                            "' for tensor '" + name + "'");
 }
 
-// One mapped (or fallback-readable) checkpoint file. The tensor data
+// One mapped checkpoint file. The tensor data
 // section is never copied wholesale: conversions read directly from the
-// mmap window (or bounded ifstream chunk reads on non-mmap builds) and
+// mmap window and
 // stream into small host staging buffers, so peak extra host RAM is one
 // chunk (~1 MiB), not a full-model F32 expansion.
 struct ShardFile {
@@ -245,12 +221,9 @@ struct ShardFile {
   std::map<std::string, TensorMeta> metas;
   size_t data_start = 0;
   size_t file_size  = 0;
-#if KOKKOSDNN_HAS_MMAP
   const char* map = nullptr;
-#endif
 
   explicit ShardFile(const std::string& p) : path(p) {
-#if KOKKOSDNN_HAS_MMAP
     int fd = ::open(p.c_str(), O_RDONLY);
     if (fd < 0) throw std::runtime_error("cannot open " + p);
     struct stat st;
@@ -275,28 +248,10 @@ struct ShardFile {
     }
     data_start = (size_t)(8 + n);
     metas      = parse_header(std::string(map + 8, (size_t)n));
-#else
-    std::ifstream f(p, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot open " + p);
-    uint64_t n = read_le64(f);
-    std::string js(n, '\0');
-    f.read(js.data(), (std::streamsize)n);
-    if (!f) throw std::runtime_error("truncated JSON in " + p);
-    f.seekg(0, std::ios::end);
-    std::streamoff end = f.tellg();
-    if (end < 0) throw std::runtime_error("cannot stat " + p);
-    file_size  = (size_t)end;
-    data_start = (size_t)(8 + n);
-    if (data_start > file_size)
-      throw std::runtime_error("truncated JSON in " + p);
-    metas = parse_header(js);
-#endif
   }
 
   ~ShardFile() {
-#if KOKKOSDNN_HAS_MMAP
     if (map) ::munmap(const_cast<char*>(map), file_size);
-#endif
   }
 
   ShardFile(const ShardFile&)            = delete;
@@ -305,36 +260,16 @@ struct ShardFile {
       : path(std::move(o.path)),
         metas(std::move(o.metas)),
         data_start(o.data_start),
-        file_size(o.file_size)
-#if KOKKOSDNN_HAS_MMAP
-        ,
+        file_size(o.file_size),
         map(o.map)
-#endif
   {
-#if KOKKOSDNN_HAS_MMAP
     o.map       = nullptr;
-#endif
     o.file_size = 0;
   }
   ShardFile& operator=(ShardFile&&) = delete;
 
-  // Read n raw bytes at data-section offset `off` into dst. Only used by
-  // the non-mmap fallback streaming paths below; the mmap path uses
-  // data_ptr() instead.
-#if !KOKKOSDNN_HAS_MMAP
-  void read_bytes(size_t off, char* dst, size_t n) const {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot open " + path);
-    f.seekg((std::streamoff)(data_start + off));
-    f.read(dst, (std::streamsize)n);
-    if (!f) throw std::runtime_error("safetensors: truncated tensor data");
-  }
-#endif
-
-#if KOKKOSDNN_HAS_MMAP
   // Direct pointer into the mapped window (bounds-checked by caller).
   const char* data_ptr(size_t off) const { return map + data_start + off; }
-#endif
 };
 
 // Streaming chunk size (elements per host staging buffer). Bounds extra
@@ -408,7 +343,6 @@ void stream_to_mat(const ShardFile& sh, const std::string& name,
   if (rows == 0 || cols == 0) return;
   size_t rows_per_chunk =
       std::max<size_t>(1, kStreamChunkElems / std::max<size_t>(cols, 1));
-#if KOKKOSDNN_HAS_MMAP
   for (size_t r0 = 0; r0 < rows; r0 += rows_per_chunk) {
     size_t r1 = std::min(rows, r0 + rows_per_chunk);
     size_t n  = (r1 - r0) * cols;
@@ -423,23 +357,6 @@ void stream_to_mat(const ShardFile& sh, const std::string& name,
         Kokkos::ALL());
     Kokkos::deep_copy(sub, stage);
   }
-#else
-  size_t es = dtype_elem_bytes(m.dtype, name);
-  std::vector<char> raw;
-  for (size_t r0 = 0; r0 < rows; r0 += rows_per_chunk) {
-    size_t r1 = std::min(rows, r0 + rows_per_chunk);
-    size_t n  = (r1 - r0) * cols;
-    raw.resize(n * es);
-    sh.read_bytes(m.begin + r0 * cols * es, raw.data(), n * es);
-    Kokkos::View<Scalar**, Kokkos::LayoutRight, Kokkos::HostSpace> stage(
-        "safetensors_chunk", r1 - r0, cols);
-    convert_block<Scalar>(raw.data(), m.dtype, stage.data(), n);
-    auto sub = Kokkos::subview(
-        dst, std::make_pair(r0, r1),
-        Kokkos::ALL());
-    Kokkos::deep_copy(sub, stage);
-  }
-#endif
 }
 
 // Stream one [n] tensor into a device vector view in chunks.
@@ -450,7 +367,6 @@ void stream_to_vec(const ShardFile& sh, const std::string& name,
   size_t n = dst.extent(0);
   check_tensor(sh, name, m, {n});
   if (n == 0) return;
-#if KOKKOSDNN_HAS_MMAP
   for (size_t o = 0; o < n; o += kStreamChunkElems) {
     size_t c = std::min(kStreamChunkElems, n - o);
     Kokkos::View<Scalar*, Kokkos::HostSpace> stage("safetensors_chunk", c);
@@ -461,20 +377,6 @@ void stream_to_vec(const ShardFile& sh, const std::string& name,
         dst, std::make_pair(o, o + c));
     Kokkos::deep_copy(sub, stage);
   }
-#else
-  size_t es = dtype_elem_bytes(m.dtype, name);
-  std::vector<char> raw;
-  for (size_t o = 0; o < n; o += kStreamChunkElems) {
-    size_t c = std::min(kStreamChunkElems, n - o);
-    raw.resize(c * es);
-    sh.read_bytes(m.begin + o * es, raw.data(), c * es);
-    Kokkos::View<Scalar*, Kokkos::HostSpace> stage("safetensors_chunk", c);
-    convert_block<Scalar>(raw.data(), m.dtype, stage.data(), c);
-    auto sub = Kokkos::subview(
-        dst, std::make_pair(o, o + c));
-    Kokkos::deep_copy(sub, stage);
-  }
-#endif
 }
 
 // Stream the patch-embed Conv2d weight [D, C, K, K] into a flattened
@@ -493,7 +395,6 @@ void stream_patch_to_mat(const ShardFile& sh, const std::string& name,
   if (D == 0 || CKK == 0) return;
   size_t rows_per_chunk =
       std::max<size_t>(1, kStreamChunkElems / std::max<size_t>(CKK, 1));
-#if KOKKOSDNN_HAS_MMAP
   for (size_t r0 = 0; r0 < D; r0 += rows_per_chunk) {
     size_t r1 = std::min(D, r0 + rows_per_chunk);
     size_t n  = (r1 - r0) * CKK;
@@ -508,23 +409,6 @@ void stream_patch_to_mat(const ShardFile& sh, const std::string& name,
         Kokkos::ALL());
     Kokkos::deep_copy(sub, stage);
   }
-#else
-  size_t es = dtype_elem_bytes(m.dtype, name);
-  std::vector<char> raw;
-  for (size_t r0 = 0; r0 < D; r0 += rows_per_chunk) {
-    size_t r1 = std::min(D, r0 + rows_per_chunk);
-    size_t n  = (r1 - r0) * CKK;
-    raw.resize(n * es);
-    sh.read_bytes(m.begin + r0 * CKK * es, raw.data(), n * es);
-    Kokkos::View<Scalar**, Kokkos::LayoutRight, Kokkos::HostSpace> stage(
-        "safetensors_chunk", r1 - r0, CKK);
-    convert_block<Scalar>(raw.data(), m.dtype, stage.data(), n);
-    auto sub = Kokkos::subview(
-        dst, std::make_pair(r0, r1),
-        Kokkos::ALL());
-    Kokkos::deep_copy(sub, stage);
-  }
-#endif
 }
 
 // Stream a [1, 1, D] token tensor (cls_token) into a [D] device vector.
@@ -536,7 +420,6 @@ void stream_111_to_vec(const ShardFile& sh, const std::string& name,
   size_t n = dst.extent(0);
   size_t es = check_tensor(sh, name, m, {1, 1, n});
   if (n == 0) return;
-#if KOKKOSDNN_HAS_MMAP
   for (size_t o = 0; o < n; o += kStreamChunkElems) {
     size_t c = std::min(kStreamChunkElems, n - o);
     Kokkos::View<Scalar*, Kokkos::HostSpace> stage("safetensors_chunk", c);
@@ -546,19 +429,6 @@ void stream_111_to_vec(const ShardFile& sh, const std::string& name,
         dst, std::make_pair(o, o + c));
     Kokkos::deep_copy(sub, stage);
   }
-#else
-  std::vector<char> raw;
-  for (size_t o = 0; o < n; o += kStreamChunkElems) {
-    size_t c = std::min(kStreamChunkElems, n - o);
-    raw.resize(c * es);
-    sh.read_bytes(m.begin + o * es, raw.data(), c * es);
-    Kokkos::View<Scalar*, Kokkos::HostSpace> stage("safetensors_chunk", c);
-    convert_block<Scalar>(raw.data(), m.dtype, stage.data(), c);
-    auto sub = Kokkos::subview(
-        dst, std::make_pair(o, o + c));
-    Kokkos::deep_copy(sub, stage);
-  }
-#endif
 }
 
 // Stream a [1, R, D] token tensor (register_tokens) into an [R, D]
@@ -575,7 +445,6 @@ void stream_1RD_to_mat(const ShardFile& sh, const std::string& name,
   if (R == 0 || D == 0) return;
   size_t rows_per_chunk =
       std::max<size_t>(1, kStreamChunkElems / std::max<size_t>(D, 1));
-#if KOKKOSDNN_HAS_MMAP
   for (size_t r0 = 0; r0 < R; r0 += rows_per_chunk) {
     size_t r1 = std::min(R, r0 + rows_per_chunk);
     size_t n  = (r1 - r0) * D;
@@ -588,22 +457,6 @@ void stream_1RD_to_mat(const ShardFile& sh, const std::string& name,
         Kokkos::ALL());
     Kokkos::deep_copy(sub, stage);
   }
-#else
-  std::vector<char> raw;
-  for (size_t r0 = 0; r0 < R; r0 += rows_per_chunk) {
-    size_t r1 = std::min(R, r0 + rows_per_chunk);
-    size_t n  = (r1 - r0) * D;
-    raw.resize(n * es);
-    sh.read_bytes(m.begin + r0 * D * es, raw.data(), n * es);
-    Kokkos::View<Scalar**, Kokkos::LayoutRight, Kokkos::HostSpace> stage(
-        "safetensors_chunk", r1 - r0, D);
-    convert_block<Scalar>(raw.data(), m.dtype, stage.data(), n);
-    auto sub = Kokkos::subview(
-        dst, std::make_pair(r0, r1),
-        Kokkos::ALL());
-    Kokkos::deep_copy(sub, stage);
-  }
-#endif
 }
 
 }  // namespace
@@ -702,8 +555,8 @@ void load_safetensors(const Config& cfg,
                       const std::vector<std::string>& files,
                       Weights<ExecSpace, Scalar>& w) {
   w.allocate(cfg);
-  // Map every file read-only (mmap; bounded ifstream reads where mmap is
-  // unavailable) and index tensors across files. Tensors stream per-tensor
+  // Map every file read-only (::mmap) and index tensors across files.
+  // Tensors stream per-tensor
   // from the mapping in chunks, so at most one ~1 MiB staging buffer plus
   // one target-sized device deep_copy chunk is live at a time — no
   // full-model (or full-tensor F32) host expansion. Later files win on

@@ -86,8 +86,8 @@ void random_init(const Config& cfg, Weights<ExecSpace, Scalar>& w,
 //           shards; later shards win on duplicate names).
 // On-disk dtypes BF16/FP16/F32 are packed preserving the dtype (identity
 // packing; only dtypes in Gguf::gguf_can_compute() are accepted). Shards are
-// mapped read-only (mmap; bounded chunked reads where mmap is unavailable)
-// and each tensor streams from the mapping through a small (~1 MiB) host
+// mapped read-only (::mmap) and each tensor streams from the mapping through
+// a small (~1 MiB) host
 // staging buffer — no full-tensor/host-F32 expansion. Loading is lazy
 // per-tensor in call order (each tensor converts/copies once, shards stay
 // mapped for the call). Throws on missing tensors or shape mismatch.
@@ -124,13 +124,12 @@ std::vector<std::string> list_checkpoint_tensors(
 // missing tensors, shape mismatch, or GGUF metadata (logit scale, softcap,
 // sliding window + pattern) that disagrees with cfg.
 //
-// Host footprint: on POSIX the file is mapped read-only and each tensor's
-// packed payload is deep-copied to the device straight out of the mapping
-// (see KokkosDNN_GlimmerGgufMap.hpp), with a background prefetcher keeping
-// disk reads overlapped with the H2D copies. The host therefore never holds
-// a second copy of the checkpoint: peak host usage is the reclaimable file
-// mapping, not 2x the file size. Other platforms fall back to the shared
-// full-file reader (Gguf::GgufFile). Tensor bytes are identical in both.
+// Host footprint: the file is mapped read-only (::mmap; mmap failure
+// throws) and each tensor's packed payload is deep-copied to the device
+// straight out of the mapping (see KokkosDNN_GlimmerGgufMap.hpp), with a
+// background prefetcher keeping disk reads overlapped with the H2D copies.
+// The host therefore never holds a second copy of the checkpoint: peak host
+// usage is the reclaimable file mapping, not 2x the file size.
 //
 // Expected GGUF names (llama.cpp `tn()` convention with the ".weight"
 // suffix; bare stems are also accepted):
