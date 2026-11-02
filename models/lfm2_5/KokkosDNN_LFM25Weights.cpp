@@ -266,7 +266,12 @@ template <class ExecSpace, class Scalar>
 void load_gguf(const Config& cfg, const std::string& path,
                Weights<ExecSpace, Scalar>& w) {
   w.allocate(cfg);
-  Gguf::GgufFile file(path);  // throws on missing/corrupt file
+  Gguf::GgufFile file(path);  // throws on missing/corrupt file (mmap'd)
+  // Fault the checkpoint into the page cache in the background while the
+  // tensors below are copied to the device: disk reads and H2D copies then
+  // overlap instead of serializing. Stopped (joined) below; the destructor
+  // also stops it on the throwing path.
+  file.start_prefetch();
   const size_t D = (size_t)cfg.dim;
   const size_t E = (size_t)cfg.n_experts;
 
@@ -344,6 +349,11 @@ void load_gguf(const Config& cfg, const std::string& path,
       }
     }
   }
+  // Every payload copy above reads straight out of the mapping; make sure
+  // all transfers have completed before the mapping is released (and join
+  // the prefetcher threads).
+  Kokkos::fence();
+  file.stop_prefetch();
 }
 
 // Explicit instantiations for the default execution space (defined here so
