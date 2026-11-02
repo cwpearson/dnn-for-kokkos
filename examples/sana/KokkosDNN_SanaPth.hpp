@@ -11,9 +11,11 @@
 // storage IDs) and one `data/<i>` record per fp32 storage blob. This header
 // declares a dependency-free reader for exactly that layout:
 //
-//   open_pth(path)      parse ZIP central directory + unpickle data.pkl into
-//                       an ordered tensor inventory (no tensor bytes loaded).
-//   read_pth_storage()  stream one fp32 storage record from disk.
+//   open_pth(path)      mmap the archive once (MAP_PRIVATE) and parse the ZIP
+//                       central directory + unpickle data.pkl into an ordered
+//                       tensor inventory (no tensor bytes copied).
+//   read_pth_storage()  return one fp32 storage record copied from the
+//                       archive mapping (no disk re-read).
 //   load_pth_weights()  fill Sana Weights from the archive, validating every
 //                       expected name/shape (throws on any mismatch).
 //
@@ -29,6 +31,7 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -51,7 +54,8 @@ struct PthTensorMeta {
 };
 
 // Parsed archive: ordered tensor inventory + byte ranges of each storage
-// record. Tensor bytes stay on disk until read_pth_storage() is called.
+// record. Tensor bytes stay on the mmap'd archive mapping until
+// read_pth_storage() copies them out.
 struct PthArchive {
   std::string path;
   std::string prefix;  // zip entry prefix, e.g. "Sana_600M_1024px_MultiLing/"
@@ -60,18 +64,26 @@ struct PthArchive {
   std::map<int, std::pair<uint64_t, uint64_t>> records;
   // state_dict _metadata (module prefix -> version); informational only.
   std::map<std::string, int64_t> metadata;
+  // Whole-archive mmap (MAP_PRIVATE) owning the bytes records offsets point
+  // into. Aliasing shared_ptr: ownership is the MappedFile, the pointer is
+  // the mapping base.
+  std::shared_ptr<const void> mapping;
+  size_t mapping_size = 0;
 };
 
 // Parse the ZIP index + data.pkl. Throws std::runtime_error on I/O errors
 // or an unrecognized layout (not a torch.save state_dict archive).
+// The whole archive is mmap'd (MAP_PRIVATE, hard error on failure) and the
+// mapping is retained in the returned archive; storage bytes are copied
+// out of it by read_pth_storage().
 PthArchive open_pth(const std::string& path);
 
 // Total parameter count over the inventory (sum of numel).
 int64_t pth_total_params(const PthArchive& archive);
 
-// Stream one storage record from disk as float32 (little-endian host
-// assumed, matching the archive byteorder marker). Throws if the record is
-// missing, short, or not float32.
+// Copy one storage record out of the archive mapping as float32 (little-endian
+// host assumed, matching the archive byteorder marker). Throws if the record
+// is missing, out of range, or not float32.
 std::vector<float> read_pth_storage(const PthArchive& archive, int storage_id);
 
 namespace Impl {

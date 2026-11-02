@@ -29,19 +29,12 @@
 #define SANAGEMMA_HAS_DIRENT 0
 #endif
 
-// mmap-backed checkpoint reads (POSIX) with bounded-ifstream fallback.
-#if !defined(KOKKOSDNN_HAS_MMAP)
-#if defined(__unix__) || defined(__unix) || defined(__APPLE__) || \
-    defined(__linux__)
-#define KOKKOSDNN_HAS_MMAP 1
+// mmap'd checkpoint reads (POSIX, MAP_PRIVATE). mmap failure is a hard
+// error: there is no ifstream fallback for weight-tensor loads.
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#else
-#define KOKKOSDNN_HAS_MMAP 0
-#endif
-#endif
 
 namespace KokkosDNN {
 namespace SanaGemma {
@@ -639,21 +632,18 @@ uint64_t load_le64(const char* p) {
   return v;
 }
 
-// One mapped (or fallback-readable) checkpoint shard. Tensors stream
-// per-tensor through a small host staging buffer; peak extra host RAM is
-// one chunk, not a full-model expansion.
+// One mapped checkpoint shard. Tensors stream per-tensor through a small
+// host staging buffer; peak extra host RAM is one chunk, not a full-model
+// expansion.
 struct ShardFile {
   std::string path;
   std::map<std::string, TensorMeta> metas;
   size_t data_start = 0;
   size_t file_size = 0;
-#if KOKKOSDNN_HAS_MMAP
   const char* map = nullptr;
-#endif
 
   explicit ShardFile(const std::string& p) : path(p) {
-#if KOKKOSDNN_HAS_MMAP
-    int fd = ::open(p.c_str(), O_RDONLY);
+    const int fd = ::open(p.c_str(), O_RDONLY);
     if (fd < 0) throw std::runtime_error("cannot open " + p);
     struct stat st;
     if (::fstat(fd, &st) != 0) {
@@ -669,7 +659,7 @@ struct ShardFile {
     ::close(fd);
     if (m == MAP_FAILED) throw std::runtime_error("mmap failed for " + p);
     map = static_cast<const char*>(m);
-    uint64_t n = load_le64(map);
+    const uint64_t n = load_le64(map);
     if (8 + n > file_size) {
       ::munmap(const_cast<char*>(map), file_size);
       map = nullptr;
@@ -677,32 +667,10 @@ struct ShardFile {
     }
     data_start = (size_t)(8 + n);
     metas = parse_header(std::string(map + 8, (size_t)n));
-#else
-    std::ifstream f(p, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot open " + p);
-    unsigned char lb[8];
-    f.read(reinterpret_cast<char*>(lb), 8);
-    if (!f) throw std::runtime_error("safetensors: truncated header length");
-    uint64_t n = 0;
-    for (int i = 7; i >= 0; --i) n = (n << 8) | lb[i];
-    std::string js((size_t)n, '\0');
-    f.read(js.data(), (std::streamsize)n);
-    if (!f) throw std::runtime_error("truncated JSON in " + p);
-    f.seekg(0, std::ios::end);
-    std::streamoff end = f.tellg();
-    if (end < 0) throw std::runtime_error("cannot stat " + p);
-    file_size = (size_t)end;
-    data_start = (size_t)(8 + n);
-    if (data_start > file_size)
-      throw std::runtime_error("truncated JSON in " + p);
-    metas = parse_header(js);
-#endif
   }
 
   ~ShardFile() {
-#if KOKKOSDNN_HAS_MMAP
     if (map) ::munmap(const_cast<char*>(map), file_size);
-#endif
   }
 
   ShardFile(const ShardFile&) = delete;
@@ -711,30 +679,14 @@ struct ShardFile {
       : path(std::move(o.path)),
         metas(std::move(o.metas)),
         data_start(o.data_start),
-        file_size(o.file_size)
-#if KOKKOSDNN_HAS_MMAP
-        ,
-        map(o.map)
-#endif
-  {
-#if KOKKOSDNN_HAS_MMAP
+        file_size(o.file_size),
+        map(o.map) {
     o.map = nullptr;
-#endif
     o.file_size = 0;
   }
   ShardFile& operator=(ShardFile&&) = delete;
 
-#if KOKKOSDNN_HAS_MMAP
   const char* data_ptr(size_t off) const { return map + data_start + off; }
-#else
-  void read_bytes(size_t off, char* dst, size_t n) const {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot open " + path);
-    f.seekg((std::streamoff)(data_start + off));
-    f.read(dst, (std::streamsize)n);
-    if (!f) throw std::runtime_error("safetensors: truncated tensor data");
-  }
-#endif
 };
 
 inline constexpr size_t kStreamChunkElems = size_t{1} << 18;
@@ -784,7 +736,6 @@ void stream_to_mat(const ShardFile& sh, const std::string& name,
   if (rows == 0 || cols == 0) return;
   size_t rows_per_chunk =
       std::max<size_t>(1, kStreamChunkElems / std::max<size_t>(cols, 1));
-#if KOKKOSDNN_HAS_MMAP
   for (size_t r0 = 0; r0 < rows; r0 += rows_per_chunk) {
     size_t r1 = std::min(rows, r0 + rows_per_chunk);
     size_t n = (r1 - r0) * cols;
@@ -800,26 +751,6 @@ void stream_to_mat(const ShardFile& sh, const std::string& name,
     Kokkos::deep_copy(
         Kokkos::subview(dst, std::make_pair(r0, r1), Kokkos::ALL()), h);
   }
-#else
-  size_t es = dtype_elem_bytes(m.dtype, name);
-  std::vector<char> raw;
-  std::vector<float> stage;
-  for (size_t r0 = 0; r0 < rows; r0 += rows_per_chunk) {
-    size_t r1 = std::min(rows, r0 + rows_per_chunk);
-    size_t n = (r1 - r0) * cols;
-    raw.resize(n * es);
-    sh.read_bytes(m.begin + r0 * cols * es, raw.data(), n * es);
-    stage.resize(n);
-    convert_block_to_f32(raw.data(), m.dtype, stage.data(), n);
-    auto h = Kokkos::create_mirror_view(
-        Kokkos::subview(dst, std::make_pair(r0, r1), Kokkos::ALL()));
-    for (size_t i = 0; i < r1 - r0; ++i)
-      for (size_t j = 0; j < cols; ++j)
-        h(i, j) = static_cast<Scalar>(stage[i * cols + j]);
-    Kokkos::deep_copy(
-        Kokkos::subview(dst, std::make_pair(r0, r1), Kokkos::ALL()), h);
-  }
-#endif
 }
 
 template <class ExecSpace, class Scalar>
@@ -829,7 +760,6 @@ void stream_to_vec(const ShardFile& sh, const std::string& name,
   size_t n = dst.extent(0);
   check_tensor(sh, name, m, {n});
   if (n == 0) return;
-#if KOKKOSDNN_HAS_MMAP
   for (size_t o = 0; o < n; o += kStreamChunkElems) {
     size_t c = std::min(kStreamChunkElems, n - o);
     std::vector<float> stage(c);
@@ -841,22 +771,6 @@ void stream_to_vec(const ShardFile& sh, const std::string& name,
     for (size_t i = 0; i < c; ++i) h(i) = static_cast<Scalar>(stage[i]);
     Kokkos::deep_copy(Kokkos::subview(dst, std::make_pair(o, o + c)), h);
   }
-#else
-  size_t es = dtype_elem_bytes(m.dtype, name);
-  std::vector<char> raw;
-  std::vector<float> stage;
-  for (size_t o = 0; o < n; o += kStreamChunkElems) {
-    size_t c = std::min(kStreamChunkElems, n - o);
-    raw.resize(c * es);
-    sh.read_bytes(m.begin + o * es, raw.data(), c * es);
-    stage.resize(c);
-    convert_block_to_f32(raw.data(), m.dtype, stage.data(), c);
-    auto h = Kokkos::create_mirror_view(
-        Kokkos::subview(dst, std::make_pair(o, o + c)));
-    for (size_t i = 0; i < c; ++i) h(i) = static_cast<Scalar>(stage[i]);
-    Kokkos::deep_copy(Kokkos::subview(dst, std::make_pair(o, o + c)), h);
-  }
-#endif
 }
 
 }  // namespace

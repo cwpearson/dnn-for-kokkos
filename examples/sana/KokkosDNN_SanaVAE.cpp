@@ -4,24 +4,61 @@
 
 #include <cstdint>
 #include <cstring>
-#include <fstream>
 #include <map>
 #include <random>
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace KokkosDNN {
 namespace Sana {
 namespace VAE {
 namespace {
 
-// ---- minimal safetensors reader (F32 decoder tensors only) ----
-uint64_t read_le64(std::ifstream& f) {
-  unsigned char b[8];
-  f.read(reinterpret_cast<char*>(b), 8);
-  if (!f) throw std::runtime_error("vae safetensors: truncated header size");
+// ---- minimal safetensors reader (F32 decoder tensors only) via POSIX mmap ----
+uint64_t load_le64(const char* p) {
+  const auto* b = reinterpret_cast<const unsigned char*>(p);
   uint64_t v = 0;
   for (int i = 7; i >= 0; --i) v = (v << 8) | b[i];
   return v;
 }
+
+// Read-only mmap view of the checkpoint file (MAP_PRIVATE). mmap failure is
+// a hard error: there is no ifstream fallback for weight-tensor loads.
+struct MappedFile {
+  const char* data = nullptr;
+  size_t size = 0;
+
+  explicit MappedFile(const std::string& p) {
+    const int fd = ::open(p.c_str(), O_RDONLY);
+    if (fd < 0) throw std::runtime_error("vae: cannot open '" + p + "'");
+    struct stat st;
+    if (::fstat(fd, &st) != 0) {
+      ::close(fd);
+      throw std::runtime_error("vae: cannot stat '" + p + "'");
+    }
+    if (st.st_size < 8) {
+      ::close(fd);
+      throw std::runtime_error("vae: file too small to be safetensors: '" +
+                               p + "'");
+    }
+    size = (size_t)st.st_size;
+    void* m = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);  // the mapping keeps the file alive
+    if (m == MAP_FAILED)
+      throw std::runtime_error("vae: mmap failed for '" + p + "'");
+    data = static_cast<const char*>(m);
+  }
+
+  ~MappedFile() {
+    if (data) ::munmap(const_cast<char*>(data), size);
+  }
+
+  MappedFile(const MappedFile&) = delete;
+  MappedFile& operator=(const MappedFile&) = delete;
+};
 
 struct Entry {
   std::string dtype;
@@ -107,26 +144,18 @@ Entry parse_entry(const std::string& js, size_t key_pos) {
 
 struct SafeFile {
   std::string path;
+  MappedFile file;
   std::string header;
   size_t data_start = 0;
 
-  explicit SafeFile(const std::string& p) : path(p) {
-    std::ifstream f(p, std::ios::binary | std::ios::ate);
-    if (!f) throw std::runtime_error("vae: cannot open '" + p + "'");
-    const long long size = (long long)f.tellg();
-    if (size < 8)
-      throw std::runtime_error("vae: file too small to be safetensors: '" +
-                               p + "'");
-    f.seekg(0, std::ios::beg);
-    const uint64_t n = read_le64(f);
+  explicit SafeFile(const std::string& p) : path(p), file(p) {
+    const uint64_t n = load_le64(file.data);
     // Header JSON is KiBs for real checkpoints; anything absurd (or past
     // EOF) means this is not a safetensors file.
-    if (n > (uint64_t)size || n > (uint64_t)(1 << 26))
+    if (n > (uint64_t)file.size || n > (uint64_t)(1 << 26))
       throw std::runtime_error("vae: bad safetensors header size in '" + p +
                                "' (not a safetensors file?)");
-    header.resize((size_t)n);
-    f.read(header.data(), (std::streamsize)n);
-    if (!f) throw std::runtime_error("vae: truncated JSON in '" + p + "'");
+    header.assign(file.data + 8, (size_t)n);
     data_start = (size_t)(8 + n);
   }
 
@@ -166,12 +195,10 @@ struct SafeFile {
     const size_t n = numel(want);
     if (e.end - e.begin != n * 4)
       throw std::runtime_error("vae: byte-size mismatch for '" + name + "'");
+    if (data_start + e.end > file.size)
+      throw std::runtime_error("vae: truncated data for '" + name + "'");
     out.resize(n);
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("vae: cannot reopen '" + path + "'");
-    f.seekg((std::streamoff)(data_start + e.begin));
-    f.read(reinterpret_cast<char*>(out.data()), (std::streamsize)(n * 4));
-    if (!f) throw std::runtime_error("vae: truncated data for '" + name + "'");
+    std::memcpy(out.data(), file.data + data_start + e.begin, n * 4);
   }
 };
 
