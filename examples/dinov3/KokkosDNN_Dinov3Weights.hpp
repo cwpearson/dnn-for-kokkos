@@ -96,7 +96,7 @@ void random_init(const Config& cfg, Weights<ExecSpace, Scalar>& w,
 //   files : one or more .safetensors files (tensors are looked up across
 //           all files; the ViT-B checkpoint is a single shard).
 // On-disk dtypes F32/F16/BF16 are all converted to Scalar. Files are
-// mapped read-only (mmap; bounded chunked reads where mmap is unavailable)
+// mapped read-only (::mmap)
 // and each tensor streams from the mapping through a small (~1 MiB) host
 // staging buffer — no full-tensor/host-F32 expansion. Loading is lazy
 // per-tensor in call order (each tensor converts/copies once, files stay

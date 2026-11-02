@@ -21,11 +21,8 @@
 // cannot read out of bounds. A shard whose file changed under the mapping
 // (size/mtime) stops matching find() until the next warm().
 //
-// Portability: the mapping is POSIX mmap with sequential read-ahead. The
-// loader pattern mirrors the Glimmer GGUF mapper: non-POSIX builds report
-// KOKKOSDNN_QWEN21_HAS_MMAP == 0 and Qwen21MappedShard falls back to a
-// whole-file host buffer with the same access surface, so the loaders are
-// unchanged across platforms.
+// Portability: the mapping is POSIX mmap with sequential read-ahead;
+// mmap failure throws and there is no fallback path.
 
 #include "KokkosDNN_QwenImage21Config.hpp"
 
@@ -40,27 +37,15 @@
 #include <utility>
 #include <vector>
 
-#if !defined(KOKKOSDNN_QWEN21_HAS_MMAP)
-#if defined(__unix__) || defined(__unix) || defined(__APPLE__) || \
-    defined(__linux__)
-#define KOKKOSDNN_QWEN21_HAS_MMAP 1
-#else
-#define KOKKOSDNN_QWEN21_HAS_MMAP 0
-#endif
-#endif
-
-#if KOKKOSDNN_QWEN21_HAS_MMAP
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#endif
 
 namespace KokkosDNN {
 namespace QwenImage21 {
 namespace Impl {
 
-#if KOKKOSDNN_QWEN21_HAS_MMAP
 
 // Sink for the prefetcher's page touches, so the compiler cannot drop the
 // reads. Atomic because several prefetch threads report into it.
@@ -122,16 +107,13 @@ class Qwen21MappedPrefetcher {
   std::vector<std::thread> workers_;
 };
 
-#endif  // KOKKOSDNN_QWEN21_HAS_MMAP
 
-// One read-only safetensors shard: POSIX mmap where available, otherwise a
-// whole-file host buffer. Same access surface either way (entries parsed
-// once up front, data_ptr() bounds-checked). Non-copyable (the mapping is
+// One read-only safetensors shard: POSIX mmap (entries parsed once up
+// front, data_ptr() bounds-checked). Non-copyable (the mapping is
 // released in the destructor); held by unique_ptr in Qwen21MappedShardSet.
 class Qwen21MappedShard {
  public:
   explicit Qwen21MappedShard(const std::string& path) : path_(path) {
-#if KOKKOSDNN_QWEN21_HAS_MMAP
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0)
       throw std::runtime_error("QwenImage21: cannot open '" + path + "'");
@@ -161,25 +143,6 @@ class Qwen21MappedShard {
     }
     entries_ = qwen21_parse_header(
         std::string(map_ + 8, map_ + 8 + (size_t)hn), 8 + hn);
-#else
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) throw std::runtime_error("QwenImage21: cannot open '" + path + "'");
-    const auto e = f.tellg();
-    if (e <= 0)
-      throw std::runtime_error("QwenImage21: too small '" + path + "'");
-    size_ = (size_t)e;
-    bytes_.resize(size_);
-    f.seekg(0, std::ios::beg);
-    f.read(bytes_.data(), (std::streamsize)size_);
-    if (!f)
-      throw std::runtime_error("QwenImage21: short read '" + path + "'");
-    const uint64_t hn = qwen21_ld64(bytes_.data());
-    if (8 + hn > size_)
-      throw std::runtime_error("QwenImage21: bad header in '" + path + "'");
-    entries_ = qwen21_parse_header(
-        std::string(bytes_.data() + 8, bytes_.data() + 8 + (size_t)hn),
-        8 + hn);
-#endif
     std::error_code ec;
     const auto mt = std::filesystem::last_write_time(path, ec);
     if (!ec) mtime_ = mt;
@@ -192,10 +155,8 @@ class Qwen21MappedShard {
   }
 
   ~Qwen21MappedShard() {
-#if KOKKOSDNN_QWEN21_HAS_MMAP
     prefetch_.stop();
     if (map_ != nullptr) ::munmap(const_cast<char*>(map_), size_);
-#endif
   }
 
   Qwen21MappedShard(const Qwen21MappedShard&) = delete;
@@ -230,38 +191,25 @@ class Qwen21MappedShard {
   }
 
   // Start/stop sequential read-ahead over the whole shard. Idempotent; the
-  // prefetcher is always stopped (and joined) by the destructor. No-op
-  // without mmap (the fallback buffer is already resident).
+  // prefetcher is always stopped (and joined) by the destructor.
   void start_prefetch() {
-#if KOKKOSDNN_QWEN21_HAS_MMAP
     prefetch_.start(map_, map_ + size_);
-#endif
   }
   void stop_prefetch() {
-#if KOKKOSDNN_QWEN21_HAS_MMAP
     prefetch_.stop();
-#endif
   }
 
  private:
   const char* base() const noexcept {
-#if KOKKOSDNN_QWEN21_HAS_MMAP
     return map_;
-#else
-    return bytes_.data();
-#endif
   }
 
   std::string path_;
   size_t size_ = 0;
   std::map<std::string, Qwen21SafeEntry> entries_;
   std::filesystem::file_time_type mtime_{};
-#if KOKKOSDNN_QWEN21_HAS_MMAP
   const char* map_ = nullptr;
   Qwen21MappedPrefetcher prefetch_;
-#else
-  std::vector<char> bytes_;
-#endif
 };
 
 // Persistent mmap'd shard set for repeat loads. A long-lived process (or a

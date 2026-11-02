@@ -11,7 +11,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <iostream>
 #include <memory>
 #include <random>
@@ -19,40 +18,17 @@
 #include <type_traits>
 #include <utility>
 
-// mmap-backed zero-copy checkpoint reads (POSIX). Fallback: chunked
-// ifstream reads with the same bounded host staging when mmap is
-// unavailable (e.g. non-POSIX builds).
-#if !defined(KOKKOSDNN_HAS_MMAP)
-#if defined(__unix__) || defined(__unix) || defined(__APPLE__) || \
-    defined(__linux__)
-#define KOKKOSDNN_HAS_MMAP 1
+// mmap-backed zero-copy checkpoint reads (::mmap; Linux and macOS only).
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#else
-#define KOKKOSDNN_HAS_MMAP 0
-#endif
-#endif
 
 namespace KokkosDNN {
 namespace Glimmer {
 namespace {
 
 // ---- half-precision conversions (host side, loader only) ----
-#if !KOKKOSDNN_HAS_MMAP
-// Only the non-mmap (ifstream) checkpoint path uses this; guard the
-// definition so mmap builds do not see an unused function.
-uint64_t read_le64(std::ifstream& f) {
-  unsigned char b[8];
-  f.read(reinterpret_cast<char*>(b), 8);
-  if (!f) throw std::runtime_error("safetensors: truncated header length");
-  uint64_t v = 0;
-  for (int i = 7; i >= 0; --i) v = (v << 8) | b[i];
-  return v;
-}
-#endif
-
 static uint64_t load_le64(const char* p) {
   const auto* b = reinterpret_cast<const unsigned char*>(p);
   uint64_t v   = 0;
@@ -208,9 +184,9 @@ size_t dtype_elem_bytes(const std::string& dtype, const std::string& name) {
                            "' for tensor '" + name + "'");
 }
 
-// One mapped (or fallback-readable) checkpoint shard. The tensor data
+// One mapped checkpoint shard. The tensor data
 // section is never copied wholesale: conversions read directly from the
-// mmap window (or bounded ifstream chunk reads on non-mmap builds) and
+// mmap window and
 // stream into small host staging buffers, so peak extra host RAM is one
 // chunk (~1 MiB), not a full-model F32 expansion.
 struct ShardFile {
@@ -218,12 +194,9 @@ struct ShardFile {
   std::map<std::string, TensorMeta> metas;
   size_t data_start = 0;
   size_t file_size  = 0;
-#if KOKKOSDNN_HAS_MMAP
   const char* map = nullptr;
-#endif
 
   explicit ShardFile(const std::string& p) : path(p) {
-#if KOKKOSDNN_HAS_MMAP
     int fd = ::open(p.c_str(), O_RDONLY);
     if (fd < 0) throw std::runtime_error("cannot open " + p);
     struct stat st;
@@ -248,28 +221,10 @@ struct ShardFile {
     }
     data_start = (size_t)(8 + n);
     metas      = parse_header(std::string(map + 8, (size_t)n));
-#else
-    std::ifstream f(p, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot open " + p);
-    uint64_t n = read_le64(f);
-    std::string js(n, '\0');
-    f.read(js.data(), (std::streamsize)n);
-    if (!f) throw std::runtime_error("truncated JSON in " + p);
-    f.seekg(0, std::ios::end);
-    std::streamoff end = f.tellg();
-    if (end < 0) throw std::runtime_error("cannot stat " + p);
-    file_size  = (size_t)end;
-    data_start = (size_t)(8 + n);
-    if (data_start > file_size)
-      throw std::runtime_error("truncated JSON in " + p);
-    metas = parse_header(js);
-#endif
   }
 
   ~ShardFile() {
-#if KOKKOSDNN_HAS_MMAP
     if (map) ::munmap(const_cast<char*>(map), file_size);
-#endif
   }
 
   ShardFile(const ShardFile&)            = delete;
@@ -278,36 +233,16 @@ struct ShardFile {
       : path(std::move(o.path)),
         metas(std::move(o.metas)),
         data_start(o.data_start),
-        file_size(o.file_size)
-#if KOKKOSDNN_HAS_MMAP
-        ,
+        file_size(o.file_size),
         map(o.map)
-#endif
   {
-#if KOKKOSDNN_HAS_MMAP
     o.map       = nullptr;
-#endif
     o.file_size = 0;
   }
   ShardFile& operator=(ShardFile&&) = delete;
 
-  // Read n raw bytes at data-section offset `off` into dst. Only used by
-  // the non-mmap fallback streaming paths below; the mmap path uses
-  // data_ptr() instead.
-#if !KOKKOSDNN_HAS_MMAP
-  void read_bytes(size_t off, char* dst, size_t n) const {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot open " + path);
-    f.seekg((std::streamoff)(data_start + off));
-    f.read(dst, (std::streamsize)n);
-    if (!f) throw std::runtime_error("safetensors: truncated tensor data");
-  }
-#endif
-
-#if KOKKOSDNN_HAS_MMAP
   // Direct pointer into the mapped window (bounds-checked by caller).
   const char* data_ptr(size_t off) const { return map + data_start + off; }
-#endif
 };
 
 // Streaming chunk size (elements per host staging buffer). Bounds extra
@@ -407,20 +342,12 @@ void stream_to_packed(const ShardFile& sh, const std::string& name,
     const size_t n  = (r1 - r0) * cols * es;
     auto sub        = Kokkos::subview(
         dst.data, std::make_pair(r0 * rb, r1 * rb));
-#if KOKKOSDNN_HAS_MMAP
     const auto* bytes = reinterpret_cast<const uint8_t*>(
         sh.data_ptr(m.begin + r0 * cols * es));
     Kokkos::View<const uint8_t*, Kokkos::HostSpace,
                  Kokkos::MemoryTraits<Kokkos::Unmanaged>>
         stage(bytes, n);
     Kokkos::deep_copy(sub, stage);
-#else
-    std::vector<char> raw(n);
-    sh.read_bytes(m.begin + r0 * cols * es, raw.data(), n);
-    Kokkos::View<uint8_t*, Kokkos::HostSpace> stage("safetensors_chunk", n);
-    std::memcpy(stage.data(), raw.data(), n);
-    Kokkos::deep_copy(sub, stage);
-#endif
   }
 }
 
@@ -432,7 +359,6 @@ void stream_to_vec(const ShardFile& sh, const std::string& name,
   size_t n = dst.extent(0);
   check_tensor(sh, name, m, {n});
   if (n == 0) return;
-#if KOKKOSDNN_HAS_MMAP
   for (size_t o = 0; o < n; o += kStreamChunkElems) {
     size_t c = std::min(kStreamChunkElems, n - o);
     Kokkos::View<Scalar*, Kokkos::HostSpace> stage("safetensors_chunk", c);
@@ -443,20 +369,6 @@ void stream_to_vec(const ShardFile& sh, const std::string& name,
         dst, std::make_pair(o, o + c));
     Kokkos::deep_copy(sub, stage);
   }
-#else
-  size_t es = dtype_elem_bytes(m.dtype, name);
-  std::vector<char> raw;
-  for (size_t o = 0; o < n; o += kStreamChunkElems) {
-    size_t c = std::min(kStreamChunkElems, n - o);
-    raw.resize(c * es);
-    sh.read_bytes(m.begin + o * es, raw.data(), c * es);
-    Kokkos::View<Scalar*, Kokkos::HostSpace> stage("safetensors_chunk", c);
-    convert_block<Scalar>(raw.data(), m.dtype, stage.data(), c);
-    auto sub = Kokkos::subview(
-        dst, std::make_pair(o, o + c));
-    Kokkos::deep_copy(sub, stage);
-  }
-#endif
 }
 
 }  // namespace
@@ -556,8 +468,8 @@ void load_safetensors(const Config& cfg,
                       const std::vector<std::string>& files,
                       Weights<ExecSpace, Scalar>& w) {
   w.allocate(cfg);
-  // Map every shard read-only (mmap; bounded ifstream reads where mmap is
-  // unavailable) and index tensors across shards. Tensors stream per-tensor
+  // Map every shard read-only (::mmap) and index tensors across shards.
+  // Tensors stream per-tensor
   // from the mapping in chunks, so at most one ~1 MiB staging buffer plus
   // one target-sized device deep_copy chunk is live at a time — no
   // full-model (or full-tensor F32) host expansion. Later shards win on
@@ -641,13 +553,9 @@ void load_safetensors(const Config& cfg,
 
 namespace {
 
-// Checkpoint reader for the GGUF branch: the mapped, zero-copy reader where
-// POSIX mmap is available, the shared full-file reader otherwise.
-#if KOKKOSDNN_GLIMMER_HAS_MMAP
+// Checkpoint reader for the GGUF branch: the mapped, zero-copy reader
+// (::mmap; mmap failure throws).
 using CheckpointFile = Impl::MappedGgufFile;
-#else
-using CheckpointFile = Gguf::GgufFile;
-#endif
 
 // Opt-in checkpoint-load diagnostics: KOKKOSDNN_LOAD_TIMING=1 makes the
 // loaders below print per-phase wall times (header parse, per-tensor host
@@ -748,9 +656,7 @@ std::string gguf_shape_str(const Gguf::GgufTensorInfo& info) {
 }
 
 // Resolve stem+".weight", falling back to the bare stem. Returns nullptr
-// when neither is present (caller reports the missing tensor). Templated on
-// the checkpoint reader (mapped or Gguf::GgufFile) — both expose the same
-// contains()/find() surface.
+// when neither is present (caller reports the missing tensor).
 template <class File>
 const Gguf::GgufTensorInfo* gguf_resolve(const File& file,
                                          const std::string& stem) {
@@ -802,7 +708,7 @@ inline void permute_packed_rows_for_rope_range(
 }  // namespace Impl
 
 // Device copy of `n` raw bytes from a host-readable pointer (the checkpoint
-// mapping, or the fallback reader's buffer). The host side is a temporary
+// mapping). The host side is a temporary
 // unmanaged view, so no second copy of the bytes is materialized.
 template <class DstView>
 void gguf_copy_bytes_to_device(const DstView& dst, const uint8_t* src,
@@ -1085,22 +991,19 @@ void load_gguf(const Config& cfg, const std::string& path,
   LoadClock::time_point t_total;
   if (load_timing_enabled()) t_total = LoadClock::now();
   w.allocate(cfg);
-  // Map the checkpoint read-only where the platform supports it (POSIX), so
-  // tensor payloads are copied to the device straight out of the mapping
-  // instead of through a full-file host buffer. Elsewhere the shared reader
-  // (bounded ifstream reads) takes over.
+  // Map the checkpoint read-only (::mmap), so tensor payloads are copied
+  // to the device straight out of the mapping instead of through a
+  // full-file host buffer.
   std::unique_ptr<CheckpointFile> file_owner;
   {
     LoadPhase p("GGUF map/read + parse");
     file_owner = std::make_unique<CheckpointFile>(path);
   }
   const CheckpointFile& file = *file_owner;  // throws on corrupt file
-#if KOKKOSDNN_GLIMMER_HAS_MMAP
   // Read the rest of the file into the page cache in the background while
   // the tensors below are copied to the device: disk reads and H2D copies
   // then overlap instead of serializing.
   file_owner->start_prefetch();
-#endif
   {
     LoadPhase p("GGUF metadata check");
     gguf_validate_metadata(file, cfg);
@@ -1158,13 +1061,11 @@ void load_gguf(const Config& cfg, const std::string& path,
     // loading the synthesized tensors would be exactly equivalent. Files
     // with or without them load identically.
   }
-#if KOKKOSDNN_GLIMMER_HAS_MMAP
   // Every payload copy above reads straight out of the mapping, so make sure
   // all transfers have completed before the mapping is released (and before
   // the prefetcher threads are joined).
   Kokkos::fence();
   file_owner->stop_prefetch();
-#endif
   report_load_stats("tensor load total");
   if (load_timing_enabled())
     std::fprintf(stderr, "[load] %-24s %8.3f s\n", "load_gguf end-to-end",

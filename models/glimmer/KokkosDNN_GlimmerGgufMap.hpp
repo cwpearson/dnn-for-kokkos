@@ -21,8 +21,7 @@
 // untouched by either path.
 //
 // Portability: the mapping is POSIX mmap with a sequential-read-ahead
-// prefetcher. Non-POSIX builds report KOKKOSDNN_GLIMMER_HAS_MMAP == 0 and
-// the loader falls back to Gguf::GgufFile (bounded ifstream reads).
+// prefetcher. mmap failure throws; there is no fallback reader.
 
 #include <KokkosDNN_GGUF.hpp>
 
@@ -37,27 +36,15 @@
 #include <utility>
 #include <vector>
 
-#if !defined(KOKKOSDNN_GLIMMER_HAS_MMAP)
-#if defined(__unix__) || defined(__unix) || defined(__APPLE__) || \
-    defined(__linux__)
-#define KOKKOSDNN_GLIMMER_HAS_MMAP 1
-#else
-#define KOKKOSDNN_GLIMMER_HAS_MMAP 0
-#endif
-#endif
-
-#if KOKKOSDNN_GLIMMER_HAS_MMAP
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#endif
 
 namespace KokkosDNN {
 namespace Glimmer {
 namespace Impl {
 
-#if KOKKOSDNN_GLIMMER_HAS_MMAP
 
 // Sink for the prefetcher's page touches, so the compiler cannot drop the
 // reads. Atomic because several prefetch threads report into it.
@@ -356,7 +343,6 @@ class MappedGgufFile {
   MappedGgufPrefetcher prefetch_;
 };
 
-#endif  // KOKKOSDNN_GLIMMER_HAS_MMAP
 
 }  // namespace Impl
 }  // namespace Glimmer
