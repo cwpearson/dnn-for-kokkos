@@ -76,11 +76,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <fstream>
+#include <fcntl.h>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <type_traits>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -464,11 +467,11 @@ void random_init(const Config& cfg, Weights<ExecSpace>& w, uint64_t seed) {
 }
 
 // Strict F32 streaming loader for the diffusers-layout safetensors file
-// (vae/diffusion_pytorch_model.safetensors, single ~250 MB file). Reads the
-// JSON header once, then streams one tensor at a time (HostSpace chunk +
-// exactly 1 deep_copy per tensor), so peak host RAM is one tensor, not the
-// whole file. Throws on missing file, bad magic, non-F32 dtype, or any
-// shape/content mismatch.
+// (vae/diffusion_pytorch_model.safetensors, single ~250 MB file). Maps the
+// file read-only once (POSIX MAP_PRIVATE; mmap failure is a hard error)
+// and streams one tensor at a time from the mapping, so peak extra host RAM
+// is one tensor, not the whole file. Throws on missing file, bad magic,
+// non-F32 dtype, or any shape/content mismatch.
 template <class ExecSpace>
 void load_safetensors(const Config& cfg, const std::string& path,
                        Weights<ExecSpace>& w);
@@ -476,10 +479,8 @@ void load_safetensors(const Config& cfg, const std::string& path,
 namespace Impl {
 
 // ---- minimal safetensors reader (F32 decoder tensors only) ----
-inline uint64_t read_le64(std::ifstream& f) {
-  unsigned char b[8];
-  f.read(reinterpret_cast<char*>(b), 8);
-  if (!f) throw std::runtime_error("vae safetensors: truncated header size");
+inline uint64_t read_le64(const char* p) {
+  const auto* b = reinterpret_cast<const unsigned char*>(p);
   uint64_t v = 0;
   for (int i = 7; i >= 0; --i) v = (v << 8) | b[i];
   return v;
@@ -572,22 +573,43 @@ struct SafeFile {
   size_t data_start = 0;
 
   explicit SafeFile(const std::string& p) : path(p) {
-    std::ifstream f(p, std::ios::binary | std::ios::ate);
-    if (!f) throw std::runtime_error("vae: cannot open '" + p + "'");
-    const long long size = (long long)f.tellg();
-    if (size < 8)
+    // mmap-only shard view (POSIX MAP_PRIVATE, no read() fallback); the OS
+    // page cache is the host staging. mmap failure is a hard error.
+    const int fd = ::open(p.c_str(), O_RDONLY);
+    if (fd < 0) throw std::runtime_error("vae: cannot open '" + p + "'");
+    struct stat st;
+    if (::fstat(fd, &st) != 0) {
+      ::close(fd);
+      throw std::runtime_error("vae: cannot stat '" + p + "'");
+    }
+    if (st.st_size < 8) {
+      ::close(fd);
       throw std::runtime_error("vae: file too small to be safetensors: '" +
                                p + "'");
-    f.seekg(0, std::ios::beg);
-    const uint64_t n = read_le64(f);
-    if (n > (uint64_t)size || n > (uint64_t)(1 << 26))
+    }
+    size_ = (size_t)st.st_size;
+    void* m = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);  // the mapping keeps the file alive
+    if (m == MAP_FAILED)
+      throw std::runtime_error("vae: mmap failed for '" + p + "'");
+    map_ = static_cast<const char*>(m);
+    const uint64_t n = read_le64(map_);
+    if (n > (uint64_t)(1 << 26) || 8 + n > size_) {
+      ::munmap(const_cast<char*>(map_), size_);
+      map_ = nullptr;
       throw std::runtime_error("vae: bad safetensors header size in '" + p +
                                "' (not a safetensors file?)");
-    header.resize((size_t)n);
-    f.read(header.data(), (std::streamsize)n);
-    if (!f) throw std::runtime_error("vae: truncated JSON in '" + p + "'");
+    }
+    header.assign(map_ + 8, map_ + 8 + (size_t)n);
     data_start = (size_t)(8 + n);
   }
+
+  ~SafeFile() {
+    if (map_ != nullptr) ::munmap(const_cast<char*>(map_), size_);
+  }
+
+  SafeFile(const SafeFile&) = delete;
+  SafeFile& operator=(const SafeFile&) = delete;
 
   SafeEntry find(const std::string& name) const {
     const std::string q = "\"" + name + "\"";
@@ -602,6 +624,8 @@ struct SafeFile {
   }
 
   // Read one F32 tensor (exact shape) into a host buffer (row-major).
+  // Bytes stream straight from the read-only mapping (no second open,
+  // no whole-file staging); one memcpy per tensor.
   void read_f32(const SafeEntry& e, const std::string& name,
                 const std::vector<size_t>& want,
                 std::vector<float>& out) const {
@@ -626,13 +650,16 @@ struct SafeFile {
     const size_t n = safe_numel(want);
     if (e.end - e.begin != n * 4)
       throw std::runtime_error("vae: byte-size mismatch for '" + name + "'");
+    if (data_start + e.end > size_)
+      throw std::runtime_error("vae: tensor '" + name +
+                               "' out of mapped range in '" + path + "'");
     out.resize(n);
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("vae: cannot reopen '" + path + "'");
-    f.seekg((std::streamoff)(data_start + e.begin));
-    f.read(reinterpret_cast<char*>(out.data()), (std::streamsize)(n * 4));
-    if (!f) throw std::runtime_error("vae: truncated data for '" + name + "'");
+    std::memcpy(out.data(), map_ + data_start + e.begin, n * 4);
   }
+
+ private:
+  const char* map_ = nullptr;
+  size_t size_ = 0;
 };
 
 // ---- elementwise glue (native portable kernels; no TPL expresses these) ----

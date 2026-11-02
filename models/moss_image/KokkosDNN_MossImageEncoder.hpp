@@ -49,10 +49,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <fstream>
+#include <fcntl.h>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
 
 #include "KokkosDNN_Activation.hpp"
@@ -594,6 +598,44 @@ void qwen_rmsnorm_gated(const CView& core, const ZView& z, const WView& w,
 // "data_offsets": [begin, end]}, ...} plus __metadata__.
 // Only F32/BF16 payloads are accepted; anything else throws.
 // Little-endian host required (checked at load).
+//
+// Shards are mapped read-only (POSIX MAP_PRIVATE, no read() fallback);
+// the OS page cache is the host staging. mmap failure is a hard error.
+// Non-copyable; munmap on destruction.
+struct MossMmap {
+  const char* map = nullptr;
+  size_t size = 0;
+
+  explicit MossMmap(const std::string& path) : path_(path) {
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) throw std::runtime_error("cannot open safetensors file: " + path);
+    struct stat st;
+    if (::fstat(fd, &st) != 0) {
+      ::close(fd);
+      throw std::runtime_error("cannot stat safetensors file: " + path);
+    }
+    if (st.st_size < 8) {
+      ::close(fd);
+      throw std::runtime_error("safetensors file too small: " + path);
+    }
+    size = (size_t)st.st_size;
+    void* m = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);  // the mapping keeps the file alive
+    if (m == MAP_FAILED)
+      throw std::runtime_error("mmap failed for safetensors file: " + path);
+    map = static_cast<const char*>(m);
+  }
+
+  ~MossMmap() {
+    if (map != nullptr) ::munmap(const_cast<char*>(map), size);
+  }
+
+  MossMmap(const MossMmap&) = delete;
+  MossMmap& operator=(const MossMmap&) = delete;
+
+ private:
+  std::string path_;
+};
 struct SafeTensorInfo {
   std::string dtype;           // "F32" or "BF16"
   std::vector<int64_t> shape;  // row-major extents
@@ -794,23 +836,19 @@ struct JsonParser {
   }
 };
 
-// Parse one .safetensors header; returns name map + total header size
-// (8 + json_len) so callers can seek to payloads. Throws on I/O or
-// schema errors.
+// Parse one .safetensors header from an existing read-only mapping;
+// returns name map + total header size (8 + json_len) so callers can locate
+// payloads. Throws on schema errors or out-of-range offsets.
 inline std::map<std::string, SafeTensorInfo> read_safetensors_header(
-    const std::string& path, uint64_t& header_size) {
-  std::ifstream f(path, std::ios::binary);
-  if (!f) throw std::runtime_error("cannot open safetensors file: " + path);
+    const MossMmap& mm, const std::string& path, uint64_t& header_size) {
+  if (mm.size < 8)
+    throw std::runtime_error("cannot read safetensors header: " + path);
   uint64_t json_len = 0;
-  f.read(reinterpret_cast<char*>(&json_len), 8);
-  if (!f) throw std::runtime_error("cannot read safetensors header: " + path);
-  if (json_len > (uint64_t{1} << 32))
+  std::memcpy(&json_len, mm.map, 8);  // LE host required (checked at load)
+  if (json_len > (uint64_t{1} << 32) || 8 + json_len > mm.size)
     throw std::runtime_error("safetensors header implausibly large: " + path);
-  std::string js((size_t)json_len, '\0');
-  f.read(js.data(), (std::streamsize)json_len);
-  if (!f) throw std::runtime_error("cannot read safetensors JSON: " + path);
   header_size = 8 + json_len;
-  JsonParser ps{js.data(), js.data() + js.size()};
+  JsonParser ps{mm.map + 8, mm.map + 8 + (size_t)json_len};
   JsonVal root = ps.parse();
   if (root.type != JsonVal::T::Obj) throw std::runtime_error("bad header");
   std::map<std::string, SafeTensorInfo> out;
@@ -848,9 +886,20 @@ inline std::map<std::string, SafeTensorInfo> read_safetensors_header(
     if (en < b) throw std::runtime_error("bad offsets: " + kv.first);
     info.data_begin = header_size + b;
     info.nbytes = en - b;
+    if (info.data_begin + info.nbytes > mm.size)
+      throw std::runtime_error("tensor '" + kv.first +
+                               "' out of mapped range in '" + path + "'");
     out[kv.first] = info;
   }
   return out;
+}
+
+// Parse one .safetensors header straight from disk via a transient
+// read-only mapping (same mmap-only path, unmapped on return).
+inline std::map<std::string, SafeTensorInfo> read_safetensors_header(
+    const std::string& path, uint64_t& header_size) {
+  const MossMmap mm(path);
+  return read_safetensors_header(mm, path, header_size);
 }
 // Convert one raw payload (F32/BF16, row-major, contiguous) into a fresh
 // host float buffer. Validates byte size against numel.
@@ -1093,10 +1142,11 @@ struct Weights {
   }
 };
 // ---- checkpoint loading (defined after Weights) ---------------------------
-// Streaming .safetensors loader: each required tensor is located via the
-// per-file header map, read with one fseek+fread into a host buffer
-// (never slurps whole multi-GB shards), converted F32/BF16 -> Scalar,
-// and moved to device with exactly one deep_copy per tensor (see
+// Streaming .safetensors loader: each shard is mapped read-only once
+// (POSIX MAP_PRIVATE; mmap failure is a hard error) and every required
+// tensor is converted F32/BF16 -> Scalar straight from the mapped pages
+// into a host buffer (never slurps whole multi-GB shards), then moved to
+// device with exactly one deep_copy per tensor (see
 // Impl::fill_from_float). Accepts all shards
 // (model-0000{1..4}-of-00004.safetensors); visual.* tensors are ignored.
 template <class ExecSpace, class Scalar>
@@ -1171,15 +1221,21 @@ void load_weights_safetensors(Weights<ExecSpace, Scalar>& w,
     }
   }
 
-  // Header maps for all shards (small: JSON only, no payloads).
+  // Map every shard read-only once (header parsed from the mapping; no
+  // payload reads). Tensors below stream straight from the mappings.
   struct Shard {
     std::string path;
+    std::unique_ptr<Impl::MossMmap> mm;
     std::map<std::string, Impl::SafeTensorInfo> map;
   };
   std::vector<Shard> shards;
   for (const auto& f : files) {
+    Shard sh;
+    sh.path = f;
+    sh.mm = std::make_unique<Impl::MossMmap>(f);
     uint64_t hs = 0;
-    shards.push_back({f, Impl::read_safetensors_header(f, hs)});
+    sh.map = Impl::read_safetensors_header(*sh.mm, f, hs);
+    shards.push_back(std::move(sh));
   }
   auto find = [&shards](const std::string& n, const Shard*& s,
                         const Impl::SafeTensorInfo*& info) -> bool {
@@ -1194,7 +1250,8 @@ void load_weights_safetensors(Weights<ExecSpace, Scalar>& w,
     return false;
   };
 
-  // Group needs by shard so each file is opened once (streaming reads).
+  // Group needs by shard so each mapping is walked once (streaming from
+  // the mapped pages, never slurping whole multi-GB shards).
   std::map<size_t, std::vector<const Need*>> by_shard;
   for (const auto& nd : needs) {
     const Shard* s = nullptr;
@@ -1252,12 +1309,19 @@ void load_weights_safetensors(Weights<ExecSpace, Scalar>& w,
     return V2();
   };
 
-  std::vector<char> raw;
   std::vector<float> host;
+  // Payload pointer straight into the shard mapping (range-checked up
+  // front; convert_payload_to_float validates dtype/size against numel).
+  auto payload_of = [](const Shard& sh, const Impl::SafeTensorInfo& info,
+                       const std::string& name) {
+    if (info.data_begin + info.nbytes > sh.mm->size)
+      throw std::runtime_error("tensor " + name +
+                               ": payload out of mapped range in '" + sh.path +
+                               "'");
+    return sh.mm->map + info.data_begin;
+  };
   for (const auto& kv : by_shard) {
     const Shard& sh = shards[kv.first];
-    std::ifstream f(sh.path, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot open " + sh.path);
     for (const Need* ndp : kv.second) {
       const Need& nd = *ndp;
       auto it = sh.map.find(nd.name);
@@ -1269,23 +1333,16 @@ void load_weights_safetensors(Weights<ExecSpace, Scalar>& w,
           throw std::runtime_error("tensor " + nd.name +
                                    ": bad conv shape");
         int64_t numel = info.shape[0] * info.shape[2];
-        raw.resize((size_t)info.nbytes);
-        f.seekg((std::streamoff)info.data_begin);
-        f.read(raw.data(), (std::streamsize)info.nbytes);
-        if (!f) throw std::runtime_error("read failed: " + nd.name);
-        Impl::convert_payload_to_float(nd.name, info, raw.data(), numel,
-                                       host);
+        Impl::convert_payload_to_float(nd.name, info, payload_of(sh, info, nd.name),
+                                       numel, host);
         Impl::fill_from_float<ExecSpace, Scalar>(dest2(nd), host, nd.name);
         continue;
       }
       Impl::require_shape(nd.name, info, nd.shape);
       int64_t numel = 1;
       for (int64_t d : nd.shape) numel *= d;
-      raw.resize((size_t)info.nbytes);
-      f.seekg((std::streamoff)info.data_begin);
-      f.read(raw.data(), (std::streamsize)info.nbytes);
-      if (!f) throw std::runtime_error("read failed: " + nd.name);
-      Impl::convert_payload_to_float(nd.name, info, raw.data(), numel, host);
+      Impl::convert_payload_to_float(nd.name, info, payload_of(sh, info, nd.name),
+                                     numel, host);
       if (nd.kind == 0)
         Impl::fill_from_float<ExecSpace, Scalar>(dest1(nd), host, nd.name);
       else
