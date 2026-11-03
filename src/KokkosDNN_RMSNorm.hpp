@@ -191,6 +191,30 @@ struct QkRmsNorm3dTeam {
   }
 };
 
+// Rank-0 reduction functor for the single-row RMSNorm variants below:
+// accumulates sum(x^2) and folds the host-side inv-scale tweak into final(),
+// so the norm stays on device (no host round-trip/fence) via a rank-0 View.
+template <class ExecSpace, class Scalar>
+struct RmsRowInvFunctor {
+  using value_type = float;
+  Kokkos::View<Scalar*, ExecSpace> x;
+  size_t D = 0;
+  float eps = 0.0f;
+  KOKKOS_INLINE_FUNCTION
+  void operator()(size_t d, float& acc) const {
+    const float v = static_cast<float>(x(d));
+    acc += v * v;
+  }
+  KOKKOS_INLINE_FUNCTION
+  void init(float& v) const { v = 0.0f; }
+  KOKKOS_INLINE_FUNCTION
+  void join(float& dst, const float& src) const { dst += src; }
+  KOKKOS_INLINE_FUNCTION
+  void final(float& v) const {
+    v = 1.0f / Kokkos::sqrtf(v / static_cast<float>(D) + eps);
+  }
+};
+
 }  // namespace Impl
 
 // RMSNorm (Llama variant, no mean-centering, no bias):
@@ -245,18 +269,16 @@ void rmsnorm_row(const Kokkos::View<Scalar*, ExecSpace>& x,
                  const Kokkos::View<Scalar*, ExecSpace>& y,
                  const std::string& label = "KokkosDNN::rmsnorm_row") {
   const size_t D = x.extent(0);
-  // Two-pass: norm then scale. Single thread-range is fine for D=4096.
-  float ss = 0;
-  Kokkos::parallel_reduce(
-      label + "_reduce", Kokkos::RangePolicy<ExecSpace>(0, D),
-      KOKKOS_LAMBDA(size_t d, float& acc) {
-        float v = static_cast<float>(x(d));
-        acc += v * v;
-      },
-      ss);
-  float inv = 1.0f / std::sqrt(ss / (float)D + eps);
+  if (D == 0) return;
+  // Two-pass: norm then scale. The sum-of-squares reduce folds the inv-scale
+  // tweak into final() and lands in a rank-0 View, so no host round-trip.
+  Kokkos::View<float, ExecSpace> inv_view(label + "_inv_view");
+  Impl::RmsRowInvFunctor<ExecSpace, Scalar> f{x, D, eps};
+  Kokkos::parallel_reduce(label + "_reduce",
+                          Kokkos::RangePolicy<ExecSpace>(0, D), f, inv_view);
   Kokkos::parallel_for(
       label, Kokkos::RangePolicy<ExecSpace>(0, D), KOKKOS_LAMBDA(size_t d) {
+        const float inv = inv_view();
         y(d) = static_cast<Scalar>(static_cast<float>(x(d)) * inv *
                                    static_cast<float>(w(d)));
       });
@@ -764,17 +786,13 @@ void rmsnorm_row_noscale(
   if (y.extent(0) != D)
     throw std::invalid_argument("rmsnorm_row_noscale: dimension mismatch");
   if (D == 0) return;
-  float ss = 0;
-  Kokkos::parallel_reduce(
-      label + "_reduce", Kokkos::RangePolicy<ExecSpace>(0, D),
-      KOKKOS_LAMBDA(size_t d, float& acc) {
-        float v = static_cast<float>(x(d));
-        acc += v * v;
-      },
-      ss);
-  float inv = 1.0f / std::sqrt(ss / (float)D + eps);
+  Kokkos::View<float, ExecSpace> inv_view(label + "_inv_view");
+  Impl::RmsRowInvFunctor<ExecSpace, Scalar> f{x, D, eps};
+  Kokkos::parallel_reduce(label + "_reduce",
+                          Kokkos::RangePolicy<ExecSpace>(0, D), f, inv_view);
   Kokkos::parallel_for(
       label, Kokkos::RangePolicy<ExecSpace>(0, D), KOKKOS_LAMBDA(size_t d) {
+        const float inv = inv_view();
         y(d) = static_cast<Scalar>(static_cast<float>(x(d)) * inv);
       });
 }

@@ -345,6 +345,26 @@ void random_init(const Config& cfg, Weights<ExecSpace, Scalar>& w,
   Kokkos::fence();
 }
 
+// Caption-mean reduction for the placeholder head below: accumulates
+// sum(y) and folds the mean divide into final(), landing in a rank-0 View
+// so the conditioning signal stays on device (no host round-trip/fence).
+template <class TokView>
+struct PlaceholderCapMeanFunctor {
+  using value_type = double;
+  TokView y;
+  double n = 0.0;
+  KOKKOS_INLINE_FUNCTION
+  void operator()(size_t b, size_t l, size_t c, double& acc) const {
+    acc += static_cast<double>(y(b, l, c));
+  }
+  KOKKOS_INLINE_FUNCTION
+  void init(double& v) const { v = 0.0; }
+  KOKKOS_INLINE_FUNCTION
+  void join(double& dst, const double& src) const { dst += src; }
+  KOKKOS_INLINE_FUNCTION
+  void final(double& v) const { v = (n > 0.0) ? v / n : 0.0; }
+};
+
 // Placeholder velocity head: out = a*x + b*mean(y). Cheap, finite, and
 // caption-dependent, so the --tiny smoke run exercises the full
 // CFG/nearest-grid loop with real conditioning signal.
@@ -364,29 +384,23 @@ class Model {
     const size_t B = x.extent(0), C = x.extent(1), H = x.extent(2),
                  W = x.extent(3);
     const size_t L = y.extent(1), Cc = y.extent(2);
-    double mean = 0.0;
+    const double n = (double)(B * L * Cc);
+    Kokkos::View<double, ExecSpace> cap_view("qwen21_capmean_view");
+    PlaceholderCapMeanFunctor<TokR> cap_f{y, n};
     Kokkos::parallel_reduce(
         "qwen21_capmean",
         Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<3>>({0, 0, 0},
                                                          {B, L, Cc}),
-        KOKKOS_LAMBDA(size_t b, size_t l, size_t c, double& acc) {
-          acc += static_cast<double>(y(b, l, c));
-        },
-        mean);
-    const double n = (double)(B * L * Cc);
-    const float cap = (n > 0.0) ? (float)(mean / n) : 0.0f;
-    float t0 = 0.0f;
-    {
-      auto th = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), t);
-      t0 = th(0);
-    }
-    const float tscale = t0 / 1000.0f;
+        cap_f, cap_view);
     Kokkos::parallel_for(
         "qwen21_placeholder_fwd",
         Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<4>>({0, 0, 0, 0},
                                                          {B, C, H, W}),
         KOKKOS_LAMBDA(size_t b, size_t c, size_t h, size_t w) {
           const float xv = static_cast<float>(x(b, c, h, w));
+          const float cap = static_cast<float>(cap_view());
+          const float tscale =
+              (t.extent(0) > 0) ? (t(0) / 1000.0f) : 0.0f;
           out(b, c, h, w) =
               static_cast<Scalar>(0.02f * xv + 0.01f * cap + 0.001f * tscale);
         });

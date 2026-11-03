@@ -145,6 +145,49 @@ struct LayerNormNoAffine3DFunctor {
   }
 };
 
+// Rank-0 reduction functors for the single-row layernorm_row below: the
+// mean reduce folds its divide into final(), and the variance reduce reads
+// that on-device mean View and folds the inv-scale tweak into its own
+// final(), so both stages stay on device (no host round-trip/fence).
+template <class ExecSpace, class Scalar>
+struct LayerNormRowMeanFunctor {
+  using value_type = float;
+  Kokkos::View<Scalar*, ExecSpace> x;
+  size_t D = 0;
+  KOKKOS_INLINE_FUNCTION
+  void operator()(size_t d, float& acc) const {
+    acc += static_cast<float>(x(d));
+  }
+  KOKKOS_INLINE_FUNCTION
+  void init(float& v) const { v = 0.0f; }
+  KOKKOS_INLINE_FUNCTION
+  void join(float& dst, const float& src) const { dst += src; }
+  KOKKOS_INLINE_FUNCTION
+  void final(float& v) const { v /= static_cast<float>(D); }
+};
+
+template <class ExecSpace, class Scalar>
+struct LayerNormRowVarInvFunctor {
+  using value_type = float;
+  Kokkos::View<Scalar*, ExecSpace> x;
+  Kokkos::View<float, ExecSpace> mean;
+  size_t D = 0;
+  float eps = 0.0f;
+  KOKKOS_INLINE_FUNCTION
+  void operator()(size_t d, float& acc) const {
+    const float c = static_cast<float>(x(d)) - mean();
+    acc += c * c;
+  }
+  KOKKOS_INLINE_FUNCTION
+  void init(float& v) const { v = 0.0f; }
+  KOKKOS_INLINE_FUNCTION
+  void join(float& dst, const float& src) const { dst += src; }
+  KOKKOS_INLINE_FUNCTION
+  void final(float& v) const {
+    v = 1.0f / Kokkos::sqrtf(v / static_cast<float>(D) + eps);
+  }
+};
+
 }  // namespace Impl
 
 // LayerNorm (biased variant used by ViT/DINOv3, no RMSNorm substitution):
@@ -183,28 +226,21 @@ void layernorm_row(
     throw std::invalid_argument("layernorm_row: dimension mismatch");
   if (D == 0) return;
   // Two reductions (mean, then variance) followed by the elementwise
-  // normalize/scale/shift. Reductions keep the row variant correct on
-  // device execution spaces.
-  float sum = 0;
-  Kokkos::parallel_reduce(
-      label + "_mean", Kokkos::RangePolicy<ExecSpace>(0, D),
-      KOKKOS_LAMBDA(size_t d, float& acc) {
-        acc += static_cast<float>(x(d));
-      },
-      sum);
-  const float mean = sum / static_cast<float>(D);
-  float sq = 0;
-  Kokkos::parallel_reduce(
-      label + "_var", Kokkos::RangePolicy<ExecSpace>(0, D),
-      KOKKOS_LAMBDA(size_t d, float& acc) {
-        float c = static_cast<float>(x(d)) - mean;
-        acc += c * c;
-      },
-      sq);
-  const float inv =
-      1.0f / std::sqrt(sq / static_cast<float>(D) + eps);
+  // normalize/scale/shift. Both reductions land in rank-0 Views with the
+  // host-side tweaks folded into final(), so the row variant stays on device.
+  Kokkos::View<float, ExecSpace> mean_view(label + "_mean_view");
+  Kokkos::View<float, ExecSpace> inv_view(label + "_inv_view");
+  Impl::LayerNormRowMeanFunctor<ExecSpace, Scalar> mean_f{x, D};
+  Kokkos::parallel_reduce(label + "_mean", Kokkos::RangePolicy<ExecSpace>(0, D),
+                          mean_f, mean_view);
+  Impl::LayerNormRowVarInvFunctor<ExecSpace, Scalar> var_f{x, mean_view, D,
+                                                           eps};
+  Kokkos::parallel_reduce(label + "_var", Kokkos::RangePolicy<ExecSpace>(0, D),
+                          var_f, inv_view);
   Kokkos::parallel_for(
       label, Kokkos::RangePolicy<ExecSpace>(0, D), KOKKOS_LAMBDA(size_t d) {
+        const float mean = mean_view();
+        const float inv = inv_view();
         y(d) = static_cast<Scalar>((static_cast<float>(x(d)) - mean) * inv *
                                        static_cast<float>(weight(d)) +
                                    static_cast<float>(bias(d)));
