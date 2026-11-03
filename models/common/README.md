@@ -26,6 +26,27 @@ tokenizer-agnostic, no Kokkos dependency):
 Rule: the server must use these headers for SSE deltas, stop truncation,
 usage, and finish reasons — no own buffering/truncation logic.
 
+## Shared generate/session/prefix-cache concepts
+
+- `KokkosDNN_ModelConcepts.hpp` — generic `Common::DecoderConfig`,
+  `Common::DecoderWeights`, `Common::DecoderModel`,
+  `Common::PrefixCacheCoreConcept`, `Common::DecodingSession` concepts.
+  Per-arch Configs keep their own field names (`eos` vs `eos_token` vs
+  `default_stop_ids`); only the pieces the shared driver touches
+  (`max_seq_len`, `reset()`/`forward()`/`seq_len`) are constrained.
+- `KokkosDNN_Generate.hpp` — `Common::generate_impl(model, ...)` plus
+  `Common::TokenCallback` and `Common::normalize_stop_ids()`. Every
+  decoder-only Model keeps only its `forward()` math; its `generate()`
+  wrapper resolves its default stop set and delegates here.
+- `KokkosDNN_SessionTypes.hpp` — `Common::SessionOptions`,
+  `Common::StepOutcome`, `Common::CachedPrefillOutcome`,
+  `Common::ISession`. Per-arch Sessions alias these types and keep only
+  their state math (KV vs KV+conv, split vs merged suffix forwards).
+- `KokkosDNN_PrefixCacheCore.hpp` — `Common::PrefixCacheCore`, the
+  storage-agnostic longest-prefix lookup. Per-arch `PrefixCacheCore`
+  names alias it; view-owning `PrefixCache` subclasses stay per-arch
+  (conv states vs dense/int8 KV rows differ).
+
 ## Planned extractions (from `models/*`, when duplicated a second time)
 
 - Minimal JSON helpers (today each model carries its own flat parser)

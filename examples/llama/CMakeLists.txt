@@ -8,7 +8,7 @@ add_library(kokkosdnn_llama STATIC
   KokkosDNN_Tokenizer.cpp
 )
 add_library(KokkosDNN::llama ALIAS kokkosdnn_llama)
-target_link_libraries(kokkosdnn_llama PUBLIC KokkosDNN::kokkosdnn)
+target_link_libraries(kokkosdnn_llama PUBLIC KokkosDNN::kokkosdnn KokkosDNN::common)
 target_include_directories(kokkosdnn_llama PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
 )

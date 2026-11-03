@@ -21,6 +21,7 @@
 #include "KokkosDNN_RMSNorm.hpp"
 #include "KokkosDNN_RoPE.hpp"
 #include "KokkosDNN_Sampler.hpp"
+#include "KokkosDNN_Generate.hpp"
 #include "KokkosDNN_Gemma4Config.hpp"
 #include "KokkosDNN_Gemma4Weights.hpp"
 
@@ -677,7 +678,10 @@ class Model {
     return logits;
   }
 
-  // Host convenience: prefill + sampled decode loop.
+  // Host convenience: prefill + sampled decode loop. Shared driver
+  // (Common::generate_impl); this wrapper only resolves the
+  // generation_config defaults {eos 1, 106, 50}. Per-arch forward()
+  // above owns all the math.
   // Returns all ids (prompt + generated). Stops at any id in stop_ids
   // (the stop token itself is included) or max_new. An empty stop_ids
   // means the generation_config defaults {eos 1, 106, 50}.
@@ -689,58 +693,15 @@ class Model {
   // prior token (prompt + tokens generated so far, deduped). `on_token` is
   // the streaming hook: invoked once per generated token, in order,
   // immediately after it is sampled (before the next forward()).
-  using TokenCallback = std::function<void(int)>;
+  using TokenCallback = ::KokkosDNN::Common::TokenCallback;
   std::vector<int> generate(const std::vector<int>& prompt, int max_new,
                             const std::vector<int>& stop_ids,
                             const SampleOptions& opt, HostRNG* rng = nullptr,
                             TokenCallback on_token = nullptr) {
-    reset();
-    std::vector<int> out = prompt;
-    std::vector<int> stops = stop_ids.empty() ? cfg.default_stop_ids
-                                              : stop_ids;
-    std::sort(stops.begin(), stops.end());
-    stops.erase(std::unique(stops.begin(), stops.end()), stops.end());
-    auto is_stop = [&](int id) {
-      return std::binary_search(stops.begin(), stops.end(), id);
-    };
-    const int max_seq = cfg.max_seq_len;
-    HostRNG local_rng(opt.seed);
-    HostRNG& r = rng ? *rng : local_rng;
-    ensure_tok(prompt.size());
-    auto toks = Kokkos::subview(tok_buf_, std::make_pair(size_t(0), prompt.size()));
-    {
-      auto h = Kokkos::subview(tok_host_, std::make_pair(size_t(0), prompt.size()));
-      for (size_t i = 0; i < prompt.size(); ++i) h(i) = prompt[i];
-      Kokkos::deep_copy(toks, h);
-    }
-    auto logits = forward(toks);
-    int nxt = sample_token<ExecSpace, Scalar>(logits, opt, out, r);
-    if ((int)out.size() < max_seq) out.push_back(nxt);
-    if (on_token) on_token(nxt);
-    if (one_buf_.extent(0) != 1) {
-      one_buf_ = ViewInt("one", 1);
-    }
-    for (int s = 1; s < max_new; ++s) {
-      if (is_stop(nxt)) break;
-      if ((int)out.size() >= max_seq) break;
-      // Device-side single-token staging: no host mirror + deep_copy per
-      // token. Hoisted to a local: device lambdas must not capture `this`.
-      // Logits likewise stay on device until sampling needs them (greedy
-      // argmax runs on-device; only non-greedy sampling mirrors once).
-      auto one = one_buf_;
-      const int tok = nxt;
-      Kokkos::parallel_for(
-          "fill_one", Kokkos::RangePolicy<ExecSpace>(0, 1),
-          KOKKOS_LAMBDA(int i) {
-            (void)i;
-            one(0) = tok;
-          });
-      logits = forward(one_buf_);
-      nxt = sample_token<ExecSpace, Scalar>(logits, opt, out, r);
-      out.push_back(nxt);
-      if (on_token) on_token(nxt);
-    }
-    return out;
+    const std::vector<int> stops =
+        stop_ids.empty() ? cfg.default_stop_ids : stop_ids;
+    return ::KokkosDNN::Common::generate_impl(*this, prompt, max_new, stops,
+                                              opt, rng, std::move(on_token));
   }
 
   std::vector<int> generate(const std::vector<int>& prompt, int max_new,

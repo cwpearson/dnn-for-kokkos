@@ -11,7 +11,7 @@ add_library(kokkosdnn_smollm2 STATIC
   KokkosDNN_SmolLM2Tokenizer.cpp
 )
 add_library(KokkosDNN::smollm2 ALIAS kokkosdnn_smollm2)
-target_link_libraries(kokkosdnn_smollm2 PUBLIC KokkosDNN::kokkosdnn)
+target_link_libraries(kokkosdnn_smollm2 PUBLIC KokkosDNN::kokkosdnn KokkosDNN::common)
 target_include_directories(kokkosdnn_smollm2 PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
 )

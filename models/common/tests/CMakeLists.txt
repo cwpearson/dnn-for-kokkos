@@ -15,3 +15,15 @@ target_link_libraries(test_common_usage PRIVATE KokkosDNN::common KokkosDNN::gte
 set_target_properties(test_common_usage PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
 kokkosdnn_enable_compiler_warnings(test_common_usage)
 kokkosdnn_discover_tests(test_common_usage)
+
+add_executable(test_common_generate Test_Generate.cpp)
+target_link_libraries(test_common_generate PRIVATE KokkosDNN::common KokkosDNN::gtest_main)
+set_target_properties(test_common_generate PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+kokkosdnn_enable_compiler_warnings(test_common_generate)
+kokkosdnn_discover_tests(test_common_generate)
+
+add_executable(test_common_session_types Test_SessionTypes.cpp)
+target_link_libraries(test_common_session_types PRIVATE KokkosDNN::common KokkosDNN::gtest_main)
+set_target_properties(test_common_session_types PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+kokkosdnn_enable_compiler_warnings(test_common_session_types)
+kokkosdnn_discover_tests(test_common_session_types)

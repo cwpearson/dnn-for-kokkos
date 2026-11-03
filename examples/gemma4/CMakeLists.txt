@@ -11,7 +11,7 @@ add_library(kokkosdnn_gemma4 STATIC
   KokkosDNN_Gemma4Tokenizer.cpp
 )
 add_library(KokkosDNN::gemma4 ALIAS kokkosdnn_gemma4)
-target_link_libraries(kokkosdnn_gemma4 PUBLIC KokkosDNN::kokkosdnn)
+target_link_libraries(kokkosdnn_gemma4 PUBLIC KokkosDNN::kokkosdnn KokkosDNN::common)
 target_include_directories(kokkosdnn_gemma4 PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
 )
