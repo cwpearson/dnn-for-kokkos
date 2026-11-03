@@ -1499,8 +1499,14 @@ class MossImageDitModel {
     auto vv3 = Impl::dit_alias_attn<ExecSpace, Scalar>(v2, Sv, Nh, Hd);
     V2 ao2 = Sc.c2.get("tao", Sv, D);
     auto ao3 = Impl::dit_alias_attn<ExecSpace, Scalar>(ao2, Sv, Nh, Hd);
-    MossImage::moss_qk_rmsnorm_rope_forward<ExecSpace, Scalar>(
-        q4, T.qn, k4, T.kn, kNormEps, trope, q4, k4, label + "_tqknrope");
+    // Per-head QK norms (core qk_rmsnorm4d) then pipeline-layout RoPE
+    // applies (model): same op order as the unfused norm->rope sequence.
+    qk_rmsnorm4d<ExecSpace, Scalar>(q4, T.qn, kNormEps, q4, label + "_tqkn");
+    qk_rmsnorm4d<ExecSpace, Scalar>(k4, T.kn, kNormEps, k4, label + "_tkkn");
+    MossImage::moss_rope_apply_forward<ExecSpace, Scalar>(q4, trope, q4,
+                                                         label + "_tqrope");
+    MossImage::moss_rope_apply_forward<ExecSpace, Scalar>(k4, trope, k4,
+                                                         label + "_tkrope");
     attention_mha_bidirectional<ExecSpace, Scalar>(
         handle_,
         Kokkos::subview(q4, 0, Kokkos::ALL(), Kokkos::ALL(), Kokkos::ALL()),
@@ -1566,16 +1572,24 @@ class MossImageDitModel {
     for (int li = 0; li < cfg_.num_layers; ++li) {
       if (std::find(skips.begin(), skips.end(), li) != skips.end()) continue;
       const auto& L = W.blocks[(size_t)li];
-      MossImage::moss_rmsnorm_modulate_forward<ExecSpace, Scalar>(
-          joint, L.norm1, kNormEps, sh_a1, sc_a1, nrm3, label + "_norm1");
+      rmsnorm_modulate<ExecSpace, Scalar>(joint, L.norm1, kNormEps, sh_a1,
+                                            sc_a1, nrm3, label + "_norm1");
       gemm<ExecSpace, Scalar>(handle_, static_cast<Scalar>(1), nrm2, L.q_W,
                               static_cast<Scalar>(0), q2, label + "_q");
       gemm<ExecSpace, Scalar>(handle_, static_cast<Scalar>(1), nrm2, L.k_W,
                               static_cast<Scalar>(0), k2, label + "_k");
       gemm<ExecSpace, Scalar>(handle_, static_cast<Scalar>(1), nrm2, L.v_W,
                               static_cast<Scalar>(0), v2, label + "_v");
-      MossImage::moss_qk_rmsnorm_rope_forward<ExecSpace, Scalar>(
-          q4, L.qn, k4, L.kn, kNormEps, rope, q4, k4, label + "_qknrope");
+      // Per-head QK norms (core qk_rmsnorm4d) then pipeline-layout RoPE
+      // applies (model): same op order as the unfused norm->rope sequence.
+      qk_rmsnorm4d<ExecSpace, Scalar>(q4, L.qn, kNormEps, q4,
+                                     label + "_qkn");
+      qk_rmsnorm4d<ExecSpace, Scalar>(k4, L.kn, kNormEps, k4,
+                                     label + "_kkn");
+      MossImage::moss_rope_apply_forward<ExecSpace, Scalar>(q4, rope, q4,
+                                                           label + "_qrope");
+      MossImage::moss_rope_apply_forward<ExecSpace, Scalar>(k4, rope, k4,
+                                                           label + "_krope");
       attention_mha_bidirectional<ExecSpace, Scalar>(
           handle_,
           Kokkos::subview(q4, 0, Kokkos::ALL(), Kokkos::ALL(), Kokkos::ALL()),
@@ -1585,8 +1599,8 @@ class MossImageDitModel {
                               static_cast<Scalar>(0), prao, label + "_o");
       MossImage::moss_gate_residual_forward<ExecSpace, Scalar>(
           joint, prao3, gt_a1, joint, label + "_res");
-      MossImage::moss_rmsnorm_modulate_forward<ExecSpace, Scalar>(
-          joint, L.norm2, kNormEps, sh_f1, sc_f1, nrm3, label + "_norm2");
+      rmsnorm_modulate<ExecSpace, Scalar>(joint, L.norm2, kNormEps, sh_f1,
+                                            sc_f1, nrm3, label + "_norm2");
       gemm<ExecSpace, Scalar>(handle_, static_cast<Scalar>(1), nrm2,
                               L.up_gate_W, static_cast<Scalar>(0), ug,
                               label + "_ug");

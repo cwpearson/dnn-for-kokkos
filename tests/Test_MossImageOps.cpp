@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 // SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 // MOSS-Image ops vs host reference: shift-aware timestep embedding,
-// fused RMSNorm+AdaLN-zero modulation, gated residuals, batched QK RMSNorm,
-// 4-coordinate RoPE build/apply, joint attention wrapper, CFG/SLG
-// combiners, VAE denormalize/depth-to-space, SiTU activation.
+// core RMSNorm+AdaLN-zero modulation (rmsnorm_modulate) and batched QK
+// RMSNorm (qk_rmsnorm4d) at model geometry, gated residuals, 4-coordinate
+// RoPE build/apply, joint attention wrapper, CFG/SLG combiners, VAE
+// denormalize/depth-to-space, SiTU activation.
 #include <gtest/gtest.h>
 
 #include <Kokkos_Core.hpp>
@@ -84,8 +85,7 @@ void check_rmsnorm_modulate(float tol) {
   Kokkos::deep_copy(shift, hsh);
   Kokkos::deep_copy(scale, hsc);
   const float eps = 1e-6f;
-  KokkosDNN::MossImage::moss_rmsnorm_modulate_forward<Exec, Scalar>(
-      x, w, eps, shift, scale, y);
+  KokkosDNN::rmsnorm_modulate<Exec, Scalar>(x, w, eps, shift, scale, y);
   Kokkos::fence();
   auto got = Kokkos::create_mirror_view(y);
   Kokkos::deep_copy(got, y);
@@ -164,7 +164,7 @@ void check_qk_rmsnorm(float tol) {
   Kokkos::deep_copy(q, hq);
   Kokkos::deep_copy(w, hw);
   const float eps = 1e-6f;
-  KokkosDNN::MossImage::moss_qk_rmsnorm_forward<Exec, Scalar>(q, w, eps, out);
+  KokkosDNN::qk_rmsnorm4d<Exec, Scalar>(q, w, eps, out);
   Kokkos::fence();
   auto got = Kokkos::create_mirror_view(out);
   Kokkos::deep_copy(got, out);
@@ -190,11 +190,10 @@ void check_qk_rmsnorm(float tol) {
 TEST(MossQkRmsnorm, Float) { check_qk_rmsnorm<float>(1e-5f); }
 TEST(MossQkRmsnorm, BHalf) { check_qk_rmsnorm<bhalf>(5e-2f); }
 
-// Fused QK-norm+RoPE must match the unfused norm->rope sequence to
-// tolerance (the write-back keeps the same Scalar rounding of the
-// normalized values and FP32 op order, but the team-parallel reductions
-// may reorder summation at ~ulp level). In-place fused (as the blocks call
-// it) vs out-of-place unfused.
+// Core QK-norm (qk_rmsnorm4d) + model RoPE apply must match the
+// out-of-place norm->rope sequence to tolerance (the team-parallel
+// reductions may reorder summation at ~ulp level). In-place (as the DiT
+// blocks call it) vs out-of-place.
 template <class Scalar>
 void check_qk_rmsnorm_rope_fused(float tol) {
   const int B = 2, S = 5, H = 2, Dh = 8;
@@ -232,13 +231,15 @@ void check_qk_rmsnorm_rope_fused(float tol) {
   KokkosDNN::MossImage::moss_rope_build_forward<Exec>(1, S, 0, 10000.0f, rope);
   const float eps = 1e-6f;
   // Unfused reference sequence, out of place.
-  KokkosDNN::MossImage::moss_qk_rmsnorm_forward<Exec, Scalar>(q, qw, eps, qn);
-  KokkosDNN::MossImage::moss_qk_rmsnorm_forward<Exec, Scalar>(k, kw, eps, kn);
+  KokkosDNN::qk_rmsnorm4d<Exec, Scalar>(q, qw, eps, qn);
+  KokkosDNN::qk_rmsnorm4d<Exec, Scalar>(k, kw, eps, kn);
   KokkosDNN::MossImage::moss_rope_apply_forward<Exec, Scalar>(qn, rope, rq);
   KokkosDNN::MossImage::moss_rope_apply_forward<Exec, Scalar>(kn, rope, rk);
-  // Fused, in place (the DiT call pattern).
-  KokkosDNN::MossImage::moss_qk_rmsnorm_rope_forward<Exec, Scalar>(
-      qf, qw, kf, kw, eps, rope, qf, kf);
+  // In place (the DiT call pattern): core norm then model rope apply.
+  KokkosDNN::qk_rmsnorm4d<Exec, Scalar>(qf, qw, eps, qf);
+  KokkosDNN::qk_rmsnorm4d<Exec, Scalar>(kf, kw, eps, kf);
+  KokkosDNN::MossImage::moss_rope_apply_forward<Exec, Scalar>(qf, rope, qf);
+  KokkosDNN::MossImage::moss_rope_apply_forward<Exec, Scalar>(kf, rope, kf);
   Kokkos::fence();
   auto grq = Kokkos::create_mirror_view(rq);
   auto grk = Kokkos::create_mirror_view(rk);

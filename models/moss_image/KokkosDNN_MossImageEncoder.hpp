@@ -178,39 +178,6 @@ KOKKOS_INLINE_FUNCTION float qwen_l2inv(float ss, int n, float eps) {
 inline float bf16_to_float(uint16_t b) {
   return ::KokkosDNN::Safetensors::bf16_to_float(b);
 }
-// -- (1+w) per-head QK RMSNorm ---------------------------------------------
-// Qwen3_5RMSNorm applied per attention head (full-layer q_norm/k_norm):
-//   out[t,h,d] = x[t,h,:]/rms(x[t,h,:],eps) * (1 + w[d]).
-// The core qk_rmsnorm3d op uses a plain multiply, so this local kernel pins
-// the (1+w) variant. In-place safe. Dispatch: native elementwise (no TPL).
-template <class ExecSpace, class Scalar, class XView, class WView,
-          class YView>
-void qk_rmsnorm_oneplus_3d(const XView& x, const WView& w, float eps,
-                           const YView& y,
-                           const std::string& label = "Qwen35::qk_norm") {
-  const size_t T = x.extent(0), H = x.extent(1), D = x.extent(2);
-  if (y.extent(0) != T || y.extent(1) != H || y.extent(2) != D ||
-      w.extent(0) != D)
-    throw std::invalid_argument("qk_rmsnorm_oneplus_3d: dim mismatch");
-  if (!(eps >= 0.0f) || !std::isfinite(eps))
-    throw std::invalid_argument("qk_rmsnorm_oneplus_3d: bad eps");
-  if (T == 0 || H == 0 || D == 0) return;
-  Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, H}),
-      KOKKOS_LAMBDA(size_t t, size_t h) {
-        float ss = 0;
-        for (size_t d = 0; d < D; ++d) {
-          float v = static_cast<float>(x(t, h, d));
-          ss += v * v;
-        }
-        float inv = qwen_l2inv(ss, static_cast<int>(D), eps);
-        for (size_t d = 0; d < D; ++d)
-          y(t, h, d) = static_cast<Scalar>(
-              static_cast<float>(x(t, h, d)) * inv *
-              (1.0f + static_cast<float>(w(d))));
-      });
-}
-
 // -- Qwen partial rotary apply (in-place) -----------------------------------
 // Reference: modeling_qwen3_5.apply_rotary_pos_emb with rotary_dim = R
 // (first R dims), rotate_half pairs (d, d+R/2), angles pos*inv[j],
@@ -550,41 +517,6 @@ void qwen_gated_delta_recurrent(const QView& q, const KView& k, const VView& v,
   Kokkos::parallel_for(label, policy, f);
 }
 
-// -- Gated RMSNorm (linear-layer norm) -------------------------------------------
-// Qwen3_5RMSNormGated: out = rms(core,eps) * w * silu(z), fp32.
-// core/z/out: [T, H, D]; w: [D] (ones-init, plain multiply).
-// Same-index math; out may alias core and/or z.
-// Dispatch: native elementwise (no TPL).
-template <class ExecSpace, class Scalar, class CView, class ZView, class WView,
-          class OView>
-void qwen_rmsnorm_gated(const CView& core, const ZView& z, const WView& w,
-                        float eps, const OView& out,
-                        const std::string& label = "Qwen35::rms_gated") {
-  const size_t T = core.extent(0), H = core.extent(1), D = core.extent(2);
-  if (z.extent(0) != T || z.extent(1) != H || z.extent(2) != D ||
-      out.extent(0) != T || out.extent(1) != H || out.extent(2) != D ||
-      w.extent(0) != D)
-    throw std::invalid_argument("qwen_rmsnorm_gated: dim mismatch");
-  if (!(eps >= 0.0f) || !std::isfinite(eps))
-    throw std::invalid_argument("qwen_rmsnorm_gated: bad eps");
-  if (T == 0 || H == 0 || D == 0) return;
-  Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, H}),
-      KOKKOS_LAMBDA(size_t t, size_t h) {
-        float ss = 0;
-        for (size_t d = 0; d < D; ++d) {
-          float c = static_cast<float>(core(t, h, d));
-          ss += c * c;
-        }
-        float inv = qwen_l2inv(ss, static_cast<int>(D), eps);
-        for (size_t d = 0; d < D; ++d) {
-          const float n = static_cast<float>(core(t, h, d)) * inv *
-                          static_cast<float>(w(d));
-          out(t, h, d) = static_cast<Scalar>(
-              n * qwen_silu(static_cast<float>(z(t, h, d))));
-        }
-      });
-}
 // -- Minimal safetensors reader ----------------------------------------------
 // Central implementation lives in src/KokkosDNN_Safetensors.hpp (next to
 // KokkosDNN_GGUF.hpp): header framing, torch-subset JSON scan, F32/BF16
@@ -1226,12 +1158,12 @@ void forward_full_layer(
   // launch order already guarantees visibility (a fence only idles host).
   UView3 q(q2.data(), T, Nq, Hd);
   UView2 gate(gate2.data(), T, Qd);
-  Impl::qk_rmsnorm_oneplus_3d<ExecSpace, Scalar>(q, L.full.q_norm, cfg.rms_eps,
+  qk_rmsnorm_oneplus_3d<ExecSpace, Scalar>(q, L.full.q_norm, cfg.rms_eps,
                                                  q, "Qwen35::qn");
   UView3 k(k2.data(), T, Nk, Hd);
   UView3 v(v2.data(), T, Nk, Hd);
-  Impl::qk_rmsnorm_oneplus_3d<ExecSpace, Scalar>(k, L.full.k_norm, cfg.rms_eps,
-                                                k, "Qwen35::kn");
+  qk_rmsnorm_oneplus_3d<ExecSpace, Scalar>(k, L.full.k_norm, cfg.rms_eps,
+                                                 k, "Qwen35::kn");
   Impl::qwen_partial_rope_inplace<ExecSpace, Scalar>(q, rope_inv,
                                                     cfg.rotary_dim(),
                                                     "Qwen35::rope_q");
@@ -1344,8 +1276,8 @@ void forward_linear_layer(
   Impl::qwen_gated_delta_recurrent<ExecSpace, Scalar>(q32, k32, vv, beta, gg,
                                                      state, core,
                                                      "Qwen35::gdn");
-  Impl::qwen_rmsnorm_gated<ExecSpace, Scalar>(core, z3, L.lin.norm, cfg.rms_eps,
-                                             core, "Qwen35::gnorm");
+  rmsnorm_gated_3d<ExecSpace, Scalar>(core, z3, L.lin.norm, cfg.rms_eps,
+                                              core, "Qwen35::gnorm");
   View2 o = Kokkos::subview(sc.o, rT, Kokkos::ALL);
   gemm(handle, Scalar(1), coref, L.lin.out_proj, Scalar(0), o, "Qwen35::o");
   Impl::qwen_residual_add<ExecSpace, Scalar>(h, o, "Qwen35::res1");

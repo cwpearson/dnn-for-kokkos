@@ -465,6 +465,231 @@ struct QkVRmsNormFusedTeam {
     }
   }
 };
+
+// Rank-4 batched per-head QK RMSNorm worker: one team per (b, s, h) row
+// of D. Same reduce-then-scale structure as QkRmsNorm3dTeam; views are
+// layout-agnostic (managed or unmanaged aliases alike; only extents and
+// operator() are used). In-place safe: the reduce completes before any
+// write.
+template <class ExecSpace, class Scalar, class QView, class WView,
+          class OView>
+struct QkRmsNorm4dTeam {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  QView q;
+  WView w;
+  OView out;
+  size_t S;
+  size_t H;
+  size_t D;
+  float eps;
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& team) const {
+    const QView q_     = q;
+    const OView out_   = out;
+    const WView w_     = w;
+    const float eps_   = eps;
+    const size_t S_ = S, H_ = H, D_ = D;
+    const size_t id = static_cast<size_t>(team.league_rank());
+    const size_t t  = id / H_;
+    const size_t h  = id % H_;
+    // t folds (b, s): t = b * S + s.
+    const size_t b = t / S_;
+    const size_t s = t % S_;
+    float ss = 0;
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(team, D_),
+        KOKKOS_LAMBDA(size_t d, float& acc) {
+          const float v = static_cast<float>(q_(b, s, h, d));
+          acc += v * v;
+        },
+        ss);
+    const float inv = 1.0f / Kokkos::sqrtf(ss / static_cast<float>(D_) + eps_);
+    Kokkos::parallel_for(
+        Kokkos::TeamThreadRange(team, D_), KOKKOS_LAMBDA(size_t d) {
+          out_(b, s, h, d) = static_cast<Scalar>(
+              static_cast<float>(q_(b, s, h, d)) * inv *
+              static_cast<float>(w_(d)));
+        });
+  }
+};
+
+// Per-head QK RMSNorm with the Gemma2/Qwen3.5 zero-initialized (1+w)
+// weight convention: out[t,h,d] = q[t,h,:]/rms * (1 + w[d]).
+// Same team-parallel structure as QkRmsNorm3dTeam; view-generic so
+// unmanaged zero-copy reshapes bind directly. In-place safe.
+template <class ExecSpace, class Scalar, class QView, class WView,
+          class OView>
+struct QkRmsNormOnePlus3dTeam {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  QView q;
+  WView w;
+  OView out;
+  size_t H;
+  size_t D;
+  float eps;
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& team) const {
+    const QView q_   = q;
+    const OView out_ = out;
+    const WView w_   = w;
+    const float eps_ = eps;
+    const size_t H_ = H, D_ = D;
+    const size_t id = static_cast<size_t>(team.league_rank());
+    const size_t t  = id / H_;
+    const size_t h  = id % H_;
+    float ss = 0;
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(team, D_),
+        KOKKOS_LAMBDA(size_t d, float& acc) {
+          const float v = static_cast<float>(q_(t, h, d));
+          acc += v * v;
+        },
+        ss);
+    const float inv = 1.0f / Kokkos::sqrtf(ss / static_cast<float>(D_) + eps_);
+    Kokkos::parallel_for(
+        Kokkos::TeamThreadRange(team, D_), KOKKOS_LAMBDA(size_t d) {
+          out_(t, h, d) = static_cast<Scalar>(
+              static_cast<float>(q_(t, h, d)) * inv *
+              (1.0f + static_cast<float>(w_(d))));
+        });
+  }
+};
+
+// Fused RMSNorm + AdaLN-zero modulation worker, rank-2 rows:
+//   y[t,d] = rms(x[t,:])[d] * w[d] * (1 + scale[d]) + shift[d].
+// View-generic (managed or unmanaged); in-place safe (x may alias y:
+// the reduction completes before any write).
+template <class ExecSpace, class Scalar, class XView, class WView, class CView,
+          class YView>
+struct RmsNormModulateTeam {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  XView x;
+  WView w;
+  CView shift;
+  CView scale;
+  YView y;
+  float eps;
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& team) const {
+    const XView x_ = x;
+    const YView y_ = y;
+    const WView w_ = w;
+    const CView shift_ = shift, scale_ = scale;
+    const float eps_ = eps;
+    const size_t t = static_cast<size_t>(team.league_rank());
+    const size_t D = x_.extent(1);
+    float ss = 0;
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(team, D),
+        KOKKOS_LAMBDA(size_t d, float& acc) {
+          const float v = static_cast<float>(x_(t, d));
+          acc += v * v;
+        },
+        ss);
+    const float inv = 1.0f / Kokkos::sqrtf(ss / static_cast<float>(D) + eps_);
+    Kokkos::parallel_for(
+        Kokkos::TeamThreadRange(team, D), KOKKOS_LAMBDA(size_t d) {
+          const float n = static_cast<float>(x_(t, d)) * inv *
+                          static_cast<float>(w_(d));
+          y_(t, d) = static_cast<Scalar>(
+              n * (1.0f + static_cast<float>(scale_(d))) +
+              static_cast<float>(shift_(d)));
+        });
+  }
+};
+
+// Rank-3 batched variant: x, y [B, T, D]; w [D]; shift, scale [B, D]
+// broadcast over the token axis (per-sample conditioning). One team per
+// (b, t) row. In-place safe (x may alias y).
+template <class ExecSpace, class Scalar, class XView, class WView, class CView,
+          class YView>
+struct RmsNormModulateBatchedTeam {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  XView x;
+  WView w;
+  CView shift;
+  CView scale;
+  YView y;
+  size_t T;
+  float eps;
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& team) const {
+    const XView x_ = x;
+    const YView y_ = y;
+    const WView w_ = w;
+    const CView shift_ = shift, scale_ = scale;
+    const float eps_ = eps;
+    const size_t T_ = T;
+    const size_t row = static_cast<size_t>(team.league_rank());
+    const size_t b   = row / T_;
+    const size_t t   = row % T_;
+    const size_t D   = x_.extent(2);
+    float ss = 0;
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(team, D),
+        KOKKOS_LAMBDA(size_t d, float& acc) {
+          const float v = static_cast<float>(x_(b, t, d));
+          acc += v * v;
+        },
+        ss);
+    const float inv = 1.0f / Kokkos::sqrtf(ss / static_cast<float>(D) + eps_);
+    Kokkos::parallel_for(
+        Kokkos::TeamThreadRange(team, D), KOKKOS_LAMBDA(size_t d) {
+          const float n = static_cast<float>(x_(b, t, d)) * inv *
+                          static_cast<float>(w_(d));
+          y_(b, t, d) = static_cast<Scalar>(
+              n * (1.0f + static_cast<float>(scale_(b, d))) +
+              static_cast<float>(shift_(b, d)));
+        });
+  }
+};
+
+// Fused gated RMSNorm worker (Qwen3.5 linear-attention output norm):
+//   out[t,h,d] = rms(core[t,h,:])[d] * w[d] * silu(z[t,h,d]).
+// silu is evaluated inline (x / (1 + exp(-x)) in FP32) so this header
+// stays dependency-free. View-generic; out may alias core and/or z
+// (same-index math; the row reduction completes before any write).
+template <class ExecSpace, class Scalar, class CView, class ZView, class WView,
+          class OView>
+struct RmsNormGated3dTeam {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  CView core;
+  ZView z;
+  WView w;
+  OView out;
+  size_t H;
+  size_t D;
+  float eps;
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& team) const {
+    const CView core_ = core;
+    const ZView z_    = z;
+    const OView out_  = out;
+    const WView w_    = w;
+    const float eps_  = eps;
+    const size_t H_ = H, D_ = D;
+    const size_t id = static_cast<size_t>(team.league_rank());
+    const size_t t  = id / H_;
+    const size_t h  = id % H_;
+    float ss = 0;
+    Kokkos::parallel_reduce(
+        Kokkos::TeamThreadRange(team, D_),
+        KOKKOS_LAMBDA(size_t d, float& acc) {
+          const float v = static_cast<float>(core_(t, h, d));
+          acc += v * v;
+        },
+        ss);
+    const float inv = 1.0f / Kokkos::sqrtf(ss / static_cast<float>(D_) + eps_);
+    Kokkos::parallel_for(
+        Kokkos::TeamThreadRange(team, D_), KOKKOS_LAMBDA(size_t d) {
+          const float n = static_cast<float>(core_(t, h, d)) * inv *
+                          static_cast<float>(w_(d));
+          const float zv   = static_cast<float>(z_(t, h, d));
+          const float silu = zv / (1.0f + Kokkos::expf(-zv));
+          out_(t, h, d) = static_cast<Scalar>(n * silu);
+        });
+  }
+};
 }  // namespace Impl
 
 // Gemma2 RMSNorm variant (zero-initialized weights multiply as (1 + w)):
@@ -622,6 +847,139 @@ void qk_rmsnorm_qkv_fused(
       Impl::QkVRmsNormFusedTeam<ExecSpace, Scalar>{
           qflat, wq, qout, kflat, wk, kout, vflat, vout, NH, NKV, eps},
       T * (NH + 2 * NKV), HD, label);
+}
+
+// Fused RMSNorm + AdaLN-zero modulation:
+//   rank-2: y[t,d] = rms(x[t,:])[d] * w[d] * (1 + scale[d]) + shift[d]
+//     with x, y [T, D] and w, shift, scale [D];
+//   rank-3: y[b,t,d] = rms(x[b,t,:])[d] * w[d] * (1 + scale[b,d])
+//     + shift[b,d] with x, y [B, T, D], w [D], shift, scale [B, D]
+//     (per-sample conditioning broadcast over the token axis).
+// Same FP32 RMSNorm math as rmsnorm(); the residual gate multiplies
+// outside. View-generic (managed or unmanaged aliases alike; only extents
+// and operator() are used). Team-parallel, one team per row. In-place safe
+// (x may alias y).
+template <class ExecSpace, class Scalar, class XView, class WView, class CView,
+          class YView>
+void rmsnorm_modulate(const XView& x, const WView& w, float eps,
+                      const CView& shift, const CView& scale, const YView& y,
+                      const std::string& label = "KokkosDNN::rmsnorm_modulate") {
+  static_assert(XView::rank == 2 || XView::rank == 3,
+                "rmsnorm_modulate: x must be rank 2 or 3");
+  static_assert(XView::rank == YView::rank,
+                "rmsnorm_modulate: x and y must have the same rank");
+  static_assert(WView::rank == 1, "rmsnorm_modulate: w must be rank 1");
+  if constexpr (XView::rank == 2) {
+    static_assert(CView::rank == 1,
+                  "rmsnorm_modulate: rank-2 shift/scale must be rank 1");
+    const size_t T = x.extent(0), D = x.extent(1);
+    if (y.extent(0) != T || y.extent(1) != D || w.extent(0) != D ||
+        shift.extent(0) != D || scale.extent(0) != D)
+      throw std::invalid_argument("rmsnorm_modulate: dimension mismatch");
+    if (!(eps >= 0.0f) || !std::isfinite(eps))
+      throw std::invalid_argument("rmsnorm_modulate: bad eps");
+    if (T == 0 || D == 0) return;
+    Impl::rmsnorm_team_launch<ExecSpace>(
+        Impl::RmsNormModulateTeam<ExecSpace, Scalar, XView, WView, CView,
+                                  YView>{x, w, shift, scale, y, eps},
+        T, D, label);
+  } else {
+    static_assert(CView::rank == 2,
+                  "rmsnorm_modulate: rank-3 shift/scale must be rank 2");
+    const size_t B = x.extent(0), T = x.extent(1), D = x.extent(2);
+    if (y.extent(0) != B || y.extent(1) != T || y.extent(2) != D ||
+        w.extent(0) != D || shift.extent(0) != B || shift.extent(1) != D ||
+        scale.extent(0) != B || scale.extent(1) != D)
+      throw std::invalid_argument("rmsnorm_modulate: dimension mismatch");
+    if (!(eps >= 0.0f) || !std::isfinite(eps))
+      throw std::invalid_argument("rmsnorm_modulate: bad eps");
+    if (B == 0 || T == 0 || D == 0) return;
+    Impl::rmsnorm_team_launch<ExecSpace>(
+        Impl::RmsNormModulateBatchedTeam<ExecSpace, Scalar, XView, WView,
+                                         CView, YView>{x, w, shift, scale, y,
+                                                       T, eps},
+        B * T, D, label);
+  }
+}
+
+// Batched per-head QK RMSNorm: out[b,s,h,d] = q[b,s,h,:]/rms * w[d].
+// Rank-4 extension of qk_rmsnorm3d (q/out [T, H, D]) over a batch of joint
+// sequences. Same per-(b, s, h) math. Scalar-agnostic; norm accumulated in
+// FP32. View-generic (managed or unmanaged aliases alike). Team-parallel,
+// one team per (b, s, h) row. In-place safe (q may alias out).
+template <class ExecSpace, class Scalar, class QView, class WView, class OView>
+void qk_rmsnorm4d(const QView& q, const WView& w, float eps, const OView& out,
+                  const std::string& label = "KokkosDNN::qk_rmsnorm4d") {
+  static_assert(QView::rank == 4, "qk_rmsnorm4d: q must be rank 4");
+  static_assert(OView::rank == 4, "qk_rmsnorm4d: out must be rank 4");
+  static_assert(WView::rank == 1, "qk_rmsnorm4d: w must be rank 1");
+  const size_t B = q.extent(0), S = q.extent(1), H = q.extent(2),
+               D = q.extent(3);
+  if (out.extent(0) != B || out.extent(1) != S || out.extent(2) != H ||
+      out.extent(3) != D || w.extent(0) != D)
+    throw std::invalid_argument("qk_rmsnorm4d: dimension mismatch");
+  if (!(eps >= 0.0f) || !std::isfinite(eps))
+    throw std::invalid_argument("qk_rmsnorm4d: bad eps");
+  if (B == 0 || S == 0 || H == 0 || D == 0) return;
+  Impl::rmsnorm_team_launch<ExecSpace>(
+      Impl::QkRmsNorm4dTeam<ExecSpace, Scalar, QView, WView, OView>{
+          q, w, out, S, H, D, eps},
+      B * S * H, D, label);
+}
+
+// Per-head QK RMSNorm with the Gemma2/Qwen3.5 zero-initialized (1+w)
+// weight convention: out[t,h,d] = q[t,h,:]/rms(q[t,h,:], eps) * (1 + w[d]).
+// Same per-(t, h) math as qk_rmsnorm3d with a (1+w) multiply (matches HF
+// Qwen3_5RMSNorm applied per attention head). Scalar-agnostic; norm
+// accumulated in FP32. View-generic (managed or unmanaged aliases alike).
+// Team-parallel, one team per (t, h) row. In-place safe (q may alias out).
+template <class ExecSpace, class Scalar, class QView, class WView, class OView>
+void qk_rmsnorm_oneplus_3d(const QView& q, const WView& w, float eps,
+                           const OView& out,
+                           const std::string& label =
+                               "KokkosDNN::qk_rmsnorm_oneplus_3d") {
+  static_assert(QView::rank == 3, "qk_rmsnorm_oneplus_3d: q must be rank 3");
+  static_assert(OView::rank == 3, "qk_rmsnorm_oneplus_3d: out must be rank 3");
+  static_assert(WView::rank == 1, "qk_rmsnorm_oneplus_3d: w must be rank 1");
+  const size_t T = q.extent(0), H = q.extent(1), D = q.extent(2);
+  if (out.extent(0) != T || out.extent(1) != H || out.extent(2) != D ||
+      w.extent(0) != D)
+    throw std::invalid_argument("qk_rmsnorm_oneplus_3d: dimension mismatch");
+  if (!(eps >= 0.0f) || !std::isfinite(eps))
+    throw std::invalid_argument("qk_rmsnorm_oneplus_3d: bad eps");
+  if (T == 0 || H == 0 || D == 0) return;
+  Impl::rmsnorm_team_launch<ExecSpace>(
+      Impl::QkRmsNormOnePlus3dTeam<ExecSpace, Scalar, QView, WView, OView>{
+          q, w, out, H, D, eps},
+      T * H, D, label);
+}
+
+// Fused gated RMSNorm (Qwen3.5 linear-attention output norm):
+//   out[t,h,d] = rms(core[t,h,:])[d] * w[d] * silu(z[t,h,d]).
+// core/z/out [T, H, D]; w [D] (ones-init, plain multiply). Same-index math;
+// out may alias core and/or z. Scalar-agnostic; norm accumulated in FP32,
+// silu in FP32. View-generic. Team-parallel, one team per (t, h) row.
+template <class ExecSpace, class Scalar, class CView, class ZView, class WView,
+          class OView>
+void rmsnorm_gated_3d(const CView& core, const ZView& z, const WView& w,
+                      float eps, const OView& out,
+                      const std::string& label = "KokkosDNN::rmsnorm_gated_3d") {
+  static_assert(CView::rank == 3, "rmsnorm_gated_3d: core must be rank 3");
+  static_assert(ZView::rank == 3, "rmsnorm_gated_3d: z must be rank 3");
+  static_assert(OView::rank == 3, "rmsnorm_gated_3d: out must be rank 3");
+  static_assert(WView::rank == 1, "rmsnorm_gated_3d: w must be rank 1");
+  const size_t T = core.extent(0), H = core.extent(1), D = core.extent(2);
+  if (z.extent(0) != T || z.extent(1) != H || z.extent(2) != D ||
+      out.extent(0) != T || out.extent(1) != H || out.extent(2) != D ||
+      w.extent(0) != D)
+    throw std::invalid_argument("rmsnorm_gated_3d: dimension mismatch");
+  if (!(eps >= 0.0f) || !std::isfinite(eps))
+    throw std::invalid_argument("rmsnorm_gated_3d: bad eps");
+  if (T == 0 || H == 0 || D == 0) return;
+  Impl::rmsnorm_team_launch<ExecSpace>(
+      Impl::RmsNormGated3dTeam<ExecSpace, Scalar, CView, ZView, WView, OView>{
+          core, z, w, out, H, D, eps},
+      T * H, D, label);
 }
 
 }  // namespace KokkosDNN

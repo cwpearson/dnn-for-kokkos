@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 // SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
-// Qwen3.5 text-encoder tests: config/layer-type pattern, (1+w) QK-norm
-// golden, partial-rotary golden, gated-delta-rule golden, gated-RMSNorm
-// golden, and a tiny-config full-model forward vs a host double reference.
+// Qwen3.5 text-encoder tests: config/layer-type pattern, core (1+w) QK-norm
+// (qk_rmsnorm_oneplus_3d) golden, partial-rotary golden, gated-delta-rule
+// golden, core gated-RMSNorm (rmsnorm_gated_3d) golden, and a tiny-config
+// full-model forward vs a host double reference.
 #include <gtest/gtest.h>
 
 #include <Kokkos_Core.hpp>
@@ -93,7 +94,7 @@ TEST(Qwen35QkNorm, Golden) {
   for (int d = 0; d < D; ++d) hw(d) = 0.05f * (d - 1);
   Kokkos::deep_copy(x, hx);
   Kokkos::deep_copy(w, hw);
-  QI::qk_rmsnorm_oneplus_3d<Exec, float>(x, w, 1e-6f, y);
+  KokkosDNN::qk_rmsnorm_oneplus_3d<Exec, float>(x, w, 1e-6f, y);
   Kokkos::fence();
   auto got = Kokkos::create_mirror_view(y);
   Kokkos::deep_copy(got, y);
@@ -231,7 +232,7 @@ TEST(Qwen35RmsGated, Golden) {
   Kokkos::deep_copy(c, hc);
   Kokkos::deep_copy(z, hz);
   Kokkos::deep_copy(w, hw);
-  QI::qwen_rmsnorm_gated<Exec, float>(c, z, w, 1e-6f, o);
+  KokkosDNN::rmsnorm_gated_3d<Exec, float>(c, z, w, 1e-6f, o);
   Kokkos::fence();
   auto got = Kokkos::create_mirror_view(o);
   Kokkos::deep_copy(got, o);

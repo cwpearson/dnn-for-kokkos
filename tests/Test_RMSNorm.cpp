@@ -372,3 +372,365 @@ TEST(QkRmsNormQkvFused, BHalf) {
   check_qk_rmsnorm_qkv_fused<Kokkos::Experimental::bhalf_t>();
 }
 
+
+// Fused RMSNorm + AdaLN-zero modulation (rank-2 and rank-3) vs host
+// reference (float + bfloat16). Rank-2 conditions on [D], rank-3 on
+// per-sample [B, D] rows broadcast over tokens.
+template <class Scalar>
+void check_rmsnorm_modulate(float tol) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  const float eps = 1e-6f;
+  // Rank-2.
+  {
+    const int T = 3, D = 8;
+    Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> x("x", T, D),
+        y("y", T, D);
+    Kokkos::View<Scalar*, Exec> w("w", D), shift("sh", D), scale("sc", D);
+    auto hx = Kokkos::create_mirror_view(x);
+    auto hw = Kokkos::create_mirror_view(w);
+    auto hsh = Kokkos::create_mirror_view(shift);
+    auto hsc = Kokkos::create_mirror_view(scale);
+    for (int t = 0; t < T; ++t)
+      for (int d = 0; d < D; ++d)
+        hx(t, d) = static_cast<Scalar>(0.4f * (t + 1) - 0.2f * d);
+    for (int d = 0; d < D; ++d) {
+      hw(d) = static_cast<Scalar>(1.0f + 0.05f * d);
+      hsh(d) = static_cast<Scalar>(0.1f * d);
+      hsc(d) = static_cast<Scalar>(-0.02f * d);
+    }
+    Kokkos::deep_copy(x, hx);
+    Kokkos::deep_copy(w, hw);
+    Kokkos::deep_copy(shift, hsh);
+    Kokkos::deep_copy(scale, hsc);
+    KokkosDNN::rmsnorm_modulate<Exec, Scalar>(x, w, eps, shift, scale, y);
+    Kokkos::fence();
+    auto got = Kokkos::create_mirror_view(y);
+    Kokkos::deep_copy(got, y);
+    for (int t = 0; t < T; ++t) {
+      double ss = 0;
+      for (int d = 0; d < D; ++d) {
+        double v = static_cast<double>(hx(t, d));
+        ss += v * v;
+      }
+      double inv = 1.0 / std::sqrt(ss / D + eps);
+      for (int d = 0; d < D; ++d) {
+        double n =
+            static_cast<double>(hx(t, d)) * inv * static_cast<double>(hw(d));
+        double want = n * (1.0 + static_cast<double>(hsc(d))) +
+                      static_cast<double>(hsh(d));
+        EXPECT_NEAR(static_cast<double>(got(t, d)), want, tol)
+            << "rank-2 mismatch at (" << t << "," << d << ")";
+      }
+    }
+  }
+  // Rank-3 batched.
+  {
+    const int B = 2, T = 3, D = 8;
+    Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec> x("x", B, T, D),
+        y("y", B, T, D);
+    Kokkos::View<Scalar*, Exec> w("w", D);
+    Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> shift("sh", B, D),
+        scale("sc", B, D);
+    auto hx = Kokkos::create_mirror_view(x);
+    auto hw = Kokkos::create_mirror_view(w);
+    auto hsh = Kokkos::create_mirror_view(shift);
+    auto hsc = Kokkos::create_mirror_view(scale);
+    for (int b = 0; b < B; ++b)
+      for (int t = 0; t < T; ++t)
+        for (int d = 0; d < D; ++d)
+          hx(b, t, d) =
+              static_cast<Scalar>(0.2f * b - 0.15f * t + 0.1f * d - 0.3f);
+    for (int d = 0; d < D; ++d) hw(d) = static_cast<Scalar>(1.0f + 0.05f * d);
+    for (int b = 0; b < B; ++b)
+      for (int d = 0; d < D; ++d) {
+        hsh(b, d) = static_cast<Scalar>(0.05f * b + 0.1f * d);
+        hsc(b, d) = static_cast<Scalar>(-0.03f * b + 0.02f * d);
+      }
+    Kokkos::deep_copy(x, hx);
+    Kokkos::deep_copy(w, hw);
+    Kokkos::deep_copy(shift, hsh);
+    Kokkos::deep_copy(scale, hsc);
+    // Snapshots: on host-space backends (Serial) mirrors may alias the
+    // device views, which the in-place call below overwrites.
+    std::vector<float> mxref((size_t)B * T * D), mwref((size_t)D),
+        mshref((size_t)B * D), mscref((size_t)B * D);
+    for (int b = 0; b < B; ++b)
+      for (int t = 0; t < T; ++t)
+        for (int d = 0; d < D; ++d)
+          mxref[((size_t)b * T + t) * D + d] =
+              static_cast<float>(hx(b, t, d));
+    for (int d = 0; d < D; ++d) mwref[(size_t)d] = static_cast<float>(hw(d));
+    for (int b = 0; b < B; ++b)
+      for (int d = 0; d < D; ++d) {
+        mshref[(size_t)b * D + d] = static_cast<float>(hsh(b, d));
+        mscref[(size_t)b * D + d] = static_cast<float>(hsc(b, d));
+      }
+    KokkosDNN::rmsnorm_modulate<Exec, Scalar>(x, w, eps, shift, scale, y);
+    // In-place safe: x may alias y.
+    KokkosDNN::rmsnorm_modulate<Exec, Scalar>(x, w, eps, shift, scale, x);
+    Kokkos::fence();
+    auto got = Kokkos::create_mirror_view(y);
+    Kokkos::deep_copy(got, y);
+    auto got_ip = Kokkos::create_mirror_view(x);
+    Kokkos::deep_copy(got_ip, x);
+    for (int b = 0; b < B; ++b)
+      for (int t = 0; t < T; ++t) {
+        double ss = 0;
+        for (int d = 0; d < D; ++d) {
+          double v = mxref[((size_t)b * T + t) * D + d];
+          ss += v * v;
+        }
+        double inv = 1.0 / std::sqrt(ss / D + eps);
+        for (int d = 0; d < D; ++d) {
+          double n = mxref[((size_t)b * T + t) * D + d] * inv *
+                     mwref[(size_t)d];
+          double want = n * (1.0 + mscref[(size_t)b * D + d]) +
+                        mshref[(size_t)b * D + d];
+          EXPECT_NEAR(static_cast<double>(got(b, t, d)), want, tol)
+              << "rank-3 mismatch at (" << b << "," << t << "," << d << ")";
+          EXPECT_NEAR(static_cast<double>(got_ip(b, t, d)), want, tol)
+              << "rank-3 in-place mismatch at (" << b << "," << t << ","
+              << d << ")";
+        }
+      }
+  }
+  // Dimension mismatch throws (rank-2 and rank-3).
+  {
+    const int D = 8;
+    Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> x("x", 2, D),
+        bad("bad", 2, D - 1);
+    Kokkos::View<Scalar*, Exec> w("w", D), c("c", D);
+    EXPECT_THROW(
+        (KokkosDNN::rmsnorm_modulate<Exec, Scalar>(x, w, eps, c, c, bad)),
+        std::invalid_argument);
+    Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec> x3("x3", 1, 2, D),
+        bad3("bad3", 1, 2, D - 1);
+    Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> c2("c2", 1, D);
+    EXPECT_THROW(
+        (KokkosDNN::rmsnorm_modulate<Exec, Scalar>(x3, w, eps, c2, c2, bad3)),
+        std::invalid_argument);
+  }
+}
+
+TEST(RMSNormModulate, Float) { check_rmsnorm_modulate<float>(1e-5f); }
+
+TEST(RMSNormModulate, BHalf) {
+  check_rmsnorm_modulate<Kokkos::Experimental::bhalf_t>(5e-2f);
+}
+
+// Batched (rank-4) per-head QK RMSNorm vs host reference.
+template <class Scalar>
+void check_qk_rmsnorm4d(float tol) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  const int B = 2, S = 3, H = 2, D = 8;
+  const float eps = 1e-6f;
+  Kokkos::View<Scalar****, Kokkos::LayoutRight, Exec> q("q", B, S, H, D),
+      out("o", B, S, H, D);
+  Kokkos::View<Scalar*, Exec> w("w", D);
+  auto hq = Kokkos::create_mirror_view(q);
+  auto hw = Kokkos::create_mirror_view(w);
+  for (int b = 0; b < B; ++b)
+    for (int s = 0; s < S; ++s)
+      for (int h = 0; h < H; ++h)
+        for (int d = 0; d < D; ++d)
+          hq(b, s, h, d) = static_cast<Scalar>(0.13f * (b + 1) -
+                                               0.07f * (s + 1) +
+                                               0.11f * (h + 1) + 0.05f * d);
+  for (int d = 0; d < D; ++d) hw(d) = static_cast<Scalar>(0.9f + 0.03f * d);
+  Kokkos::deep_copy(q, hq);
+  Kokkos::deep_copy(w, hw);
+  // Snapshot: on host-space backends mirrors may alias the device views,
+  // which the in-place call below overwrites.
+  std::vector<float> q4ref((size_t)B * S * H * D), w4ref((size_t)D);
+  for (int b = 0; b < B; ++b)
+    for (int s = 0; s < S; ++s)
+      for (int h = 0; h < H; ++h)
+        for (int d = 0; d < D; ++d)
+          q4ref[(((size_t)b * S + s) * H + h) * D + d] =
+              static_cast<float>(hq(b, s, h, d));
+  for (int d = 0; d < D; ++d) w4ref[(size_t)d] = static_cast<float>(hw(d));
+  KokkosDNN::qk_rmsnorm4d<Exec, Scalar>(q, w, eps, out);
+  // In-place safe.
+  KokkosDNN::qk_rmsnorm4d<Exec, Scalar>(q, w, eps, q);
+  Kokkos::fence();
+  auto got = Kokkos::create_mirror_view(out);
+  Kokkos::deep_copy(got, out);
+  auto got_ip = Kokkos::create_mirror_view(q);
+  Kokkos::deep_copy(got_ip, q);
+  for (int b = 0; b < B; ++b)
+    for (int s = 0; s < S; ++s)
+      for (int h = 0; h < H; ++h) {
+        double ss = 0;
+        for (int d = 0; d < D; ++d) {
+          double v = q4ref[(((size_t)b * S + s) * H + h) * D + d];
+          ss += v * v;
+        }
+        double inv = 1.0 / std::sqrt(ss / D + eps);
+        for (int d = 0; d < D; ++d) {
+          double want = q4ref[(((size_t)b * S + s) * H + h) * D + d] * inv *
+                        w4ref[(size_t)d];
+          EXPECT_NEAR(static_cast<double>(got(b, s, h, d)), want, tol)
+              << "mismatch at (" << b << "," << s << "," << h << "," << d
+              << ")";
+          EXPECT_NEAR(static_cast<double>(got_ip(b, s, h, d)), want, tol)
+              << "in-place mismatch at (" << b << "," << s << "," << h
+              << "," << d << ")";
+        }
+      }
+  // Unmanaged zero-copy reshapes (the DiT alias pattern) bind directly.
+  {
+    Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> flat("flat", S, H * D);
+    auto hflat = Kokkos::create_mirror_view(flat);
+    for (int s = 0; s < S; ++s)
+      for (int h = 0; h < H; ++h)
+        for (int d = 0; d < D; ++d)
+          hflat(s, h * D + d) =
+              static_cast<Scalar>(q4ref[((size_t)s * H + h) * D + d]);
+    Kokkos::deep_copy(flat, hflat);
+    Kokkos::View<Scalar****, Kokkos::LayoutRight, Exec,
+                 Kokkos::MemoryTraits<Kokkos::Unmanaged>>
+        alias(flat.data(), 1, S, H, D);
+    KokkosDNN::qk_rmsnorm4d<Exec, Scalar>(alias, w, eps, alias);
+    Kokkos::fence();
+    auto gflat = Kokkos::create_mirror_view(flat);
+    Kokkos::deep_copy(gflat, flat);
+    for (int s = 0; s < S; ++s)
+      for (int h = 0; h < H; ++h)
+        for (int d = 0; d < D; ++d)
+          EXPECT_NEAR(static_cast<double>(gflat(s, h * D + d)),
+                      static_cast<double>(got(0, s, h, d)), tol)
+              << "unmanaged mismatch at (" << s << "," << h << "," << d
+              << ")";
+  }
+  // Dimension mismatch throws.
+  Kokkos::View<Scalar****, Kokkos::LayoutRight, Exec> bad("bad", B, S, H,
+                                                          D - 1);
+  EXPECT_THROW((KokkosDNN::qk_rmsnorm4d<Exec, Scalar>(q, w, eps, bad)),
+               std::invalid_argument);
+}
+
+TEST(QkRmsNorm4d, Float) { check_qk_rmsnorm4d<float>(1e-5f); }
+
+TEST(QkRmsNorm4d, BHalf) {
+  check_qk_rmsnorm4d<Kokkos::Experimental::bhalf_t>(5e-2f);
+}
+
+// Per-head QK RMSNorm with the (1+w) convention vs host reference.
+template <class Scalar>
+void check_qk_rmsnorm_oneplus_3d(float tol) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  const int T = 3, H = 2, D = 4;
+  const float eps = 1e-6f;
+  Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec> x("x", T, H, D),
+      y("y", T, H, D);
+  Kokkos::View<Scalar*, Exec> w("w", D);
+  auto hx = Kokkos::create_mirror_view(x);
+  auto hw = Kokkos::create_mirror_view(w);
+  for (int t = 0; t < T; ++t)
+    for (int h = 0; h < H; ++h)
+      for (int d = 0; d < D; ++d)
+        hx(t, h, d) = static_cast<Scalar>(0.3f * (t + 1) - 0.2f * (h + 1) +
+                                          0.1f * (d + 1));
+  for (int d = 0; d < D; ++d) hw(d) = static_cast<Scalar>(0.05f * (d - 1));
+  Kokkos::deep_copy(x, hx);
+  Kokkos::deep_copy(w, hw);
+  // Snapshot: on host-space backends mirrors may alias the device views,
+  // which the in-place call below overwrites.
+  std::vector<float> opref((size_t)T * H * D), owref((size_t)D);
+  for (int t = 0; t < T; ++t)
+    for (int h = 0; h < H; ++h)
+      for (int d = 0; d < D; ++d)
+        opref[((size_t)t * H + h) * D + d] =
+            static_cast<float>(hx(t, h, d));
+  for (int d = 0; d < D; ++d) owref[(size_t)d] = static_cast<float>(hw(d));
+  KokkosDNN::qk_rmsnorm_oneplus_3d<Exec, Scalar>(x, w, eps, y);
+  // In-place safe.
+  KokkosDNN::qk_rmsnorm_oneplus_3d<Exec, Scalar>(x, w, eps, x);
+  Kokkos::fence();
+  auto got = Kokkos::create_mirror_view(y);
+  Kokkos::deep_copy(got, y);
+  auto got_ip = Kokkos::create_mirror_view(x);
+  Kokkos::deep_copy(got_ip, x);
+  for (int t = 0; t < T; ++t)
+    for (int h = 0; h < H; ++h) {
+      double ss = 0;
+      for (int d = 0; d < D; ++d) {
+        double v = opref[((size_t)t * H + h) * D + d];
+        ss += v * v;
+      }
+      double inv = 1.0 / std::sqrt(ss / D + eps);
+      for (int d = 0; d < D; ++d) {
+        double want = opref[((size_t)t * H + h) * D + d] * inv *
+                      (1.0 + owref[(size_t)d]);
+        EXPECT_NEAR(static_cast<double>(got(t, h, d)), want, tol)
+            << t << h << d;
+        EXPECT_NEAR(static_cast<double>(got_ip(t, h, d)), want, tol)
+            << "in-place " << t << h << d;
+      }
+    }
+  Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec> bad("bad", T, H, D - 1);
+  EXPECT_THROW(
+      (KokkosDNN::qk_rmsnorm_oneplus_3d<Exec, Scalar>(x, w, eps, bad)),
+      std::invalid_argument);
+}
+
+TEST(QkRmsNormOnePlus3d, Float) { check_qk_rmsnorm_oneplus_3d<float>(1e-5f); }
+
+TEST(QkRmsNormOnePlus3d, BHalf) {
+  check_qk_rmsnorm_oneplus_3d<Kokkos::Experimental::bhalf_t>(5e-2f);
+}
+
+// Fused gated RMSNorm (silu gate) vs host reference.
+template <class Scalar>
+void check_rmsnorm_gated_3d(float tol) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  const int T = 3, H = 2, D = 4;
+  const float eps = 1e-6f;
+  Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec> c("c", T, H, D),
+      z("z", T, H, D), o("o", T, H, D);
+  Kokkos::View<Scalar*, Exec> w("w", D);
+  auto hc = Kokkos::create_mirror_view(c);
+  auto hz = Kokkos::create_mirror_view(z);
+  auto hw = Kokkos::create_mirror_view(w);
+  for (int t = 0; t < T; ++t)
+    for (int h = 0; h < H; ++h)
+      for (int d = 0; d < D; ++d) {
+        hc(t, h, d) = static_cast<Scalar>(0.2f * (t + 1) - 0.1f * (d + h));
+        hz(t, h, d) = static_cast<Scalar>(0.15f * (d + 1) + 0.05f * (t - h));
+      }
+  for (int d = 0; d < D; ++d) hw(d) = static_cast<Scalar>(1.0f + 0.02f * d);
+  Kokkos::deep_copy(c, hc);
+  Kokkos::deep_copy(z, hz);
+  Kokkos::deep_copy(w, hw);
+  KokkosDNN::rmsnorm_gated_3d<Exec, Scalar>(c, z, w, eps, o);
+  Kokkos::fence();
+  auto got = Kokkos::create_mirror_view(o);
+  Kokkos::deep_copy(got, o);
+  for (int t = 0; t < T; ++t)
+    for (int h = 0; h < H; ++h) {
+      double ss = 0;
+      for (int d = 0; d < D; ++d) {
+        double x = static_cast<double>(hc(t, h, d));
+        ss += x * x;
+      }
+      double inv = 1.0 / std::sqrt(ss / D + eps);
+      for (int d = 0; d < D; ++d) {
+        double zv = static_cast<double>(hz(t, h, d));
+        double silu = zv / (1.0 + std::exp(-zv));
+        double want = static_cast<double>(hc(t, h, d)) * inv *
+                      static_cast<double>(hw(d)) * silu;
+        EXPECT_NEAR(static_cast<double>(got(t, h, d)), want, tol)
+            << t << h << d;
+      }
+    }
+  Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec> bad("bad", T, H, D - 1);
+  EXPECT_THROW(
+      (KokkosDNN::rmsnorm_gated_3d<Exec, Scalar>(c, z, w, eps, bad)),
+      std::invalid_argument);
+}
+
+TEST(RMSNormGated3d, Float) { check_rmsnorm_gated_3d<float>(1e-5f); }
+
+TEST(RMSNormGated3d, BHalf) {
+  check_rmsnorm_gated_3d<Kokkos::Experimental::bhalf_t>(5e-2f);
+}
