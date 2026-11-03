@@ -49,17 +49,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <fcntl.h>
 #include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 #include <vector>
 
 #include "KokkosDNN_Activation.hpp"
+#include "KokkosDNN_Safetensors.hpp"
 #include "KokkosDNN_Attention.hpp"
 #include "KokkosDNN_Conv1D.hpp"
 #include "KokkosDNN_Embedding.hpp"
@@ -179,10 +176,7 @@ KOKKOS_INLINE_FUNCTION float qwen_l2inv(float ss, int n, float eps) {
 
 // bfloat16 -> float (host; safetensors BF16 payloads).
 inline float bf16_to_float(uint16_t b) {
-  uint32_t x = static_cast<uint32_t>(b) << 16;
-  float f = 0.0f;
-  std::memcpy(&f, &x, sizeof(float));
-  return f;
+  return ::KokkosDNN::Safetensors::bf16_to_float(b);
 }
 // -- (1+w) per-head QK RMSNorm ---------------------------------------------
 // Qwen3_5RMSNorm applied per attention head (full-layer q_norm/k_norm):
@@ -592,50 +586,21 @@ void qwen_rmsnorm_gated(const CView& core, const ZView& z, const WView& w,
       });
 }
 // -- Minimal safetensors reader ----------------------------------------------
-// Reads the per-file header (u64 LE length + JSON) and builds a
-// name -> {dtype, shape, data_begin} map for exactly the producer schema:
-// {"name": {"dtype": "F32"|"BF16", "shape": [...],
-// "data_offsets": [begin, end]}, ...} plus __metadata__.
-// Only F32/BF16 payloads are accepted; anything else throws.
-// Little-endian host required (checked at load).
+// Central implementation lives in src/KokkosDNN_Safetensors.hpp (next to
+// KokkosDNN_GGUF.hpp): header framing, torch-subset JSON scan, F32/BF16
+// element sizes, and the mmap-only shard view. SafeTensorInfo below keeps
+// the encoder's {data_begin, nbytes} surface; the DOM parser is retired in
+// favor of the shared scanner. Only F32/BF16 payloads are accepted;
+// anything else throws. Little-endian host required (checked at load).
 //
 // Shards are mapped read-only (POSIX MAP_PRIVATE, no read() fallback);
 // the OS page cache is the host staging. mmap failure is a hard error.
 // Non-copyable; munmap on destruction.
-struct MossMmap {
-  const char* map = nullptr;
-  size_t size = 0;
-
-  explicit MossMmap(const std::string& path) : path_(path) {
-    const int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) throw std::runtime_error("cannot open safetensors file: " + path);
-    struct stat st;
-    if (::fstat(fd, &st) != 0) {
-      ::close(fd);
-      throw std::runtime_error("cannot stat safetensors file: " + path);
-    }
-    if (st.st_size < 8) {
-      ::close(fd);
-      throw std::runtime_error("safetensors file too small: " + path);
-    }
-    size = (size_t)st.st_size;
-    void* m = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);  // the mapping keeps the file alive
-    if (m == MAP_FAILED)
-      throw std::runtime_error("mmap failed for safetensors file: " + path);
-    map = static_cast<const char*>(m);
-  }
-
-  ~MossMmap() {
-    if (map != nullptr) ::munmap(const_cast<char*>(map), size);
-  }
-
-  MossMmap(const MossMmap&) = delete;
-  MossMmap& operator=(const MossMmap&) = delete;
-
- private:
-  std::string path_;
+struct MossMmap : ::KokkosDNN::Safetensors::MappedFile {
+  explicit MossMmap(const std::string& p)
+      : ::KokkosDNN::Safetensors::MappedFile(p, "safetensors") {}
 };
+
 struct SafeTensorInfo {
   std::string dtype;           // "F32" or "BF16"
   std::vector<int64_t> shape;  // row-major extents
@@ -643,249 +608,33 @@ struct SafeTensorInfo {
   uint64_t nbytes = 0;
 };
 
-// Tiny JSON value tree (objects/arrays/strings/numbers only).
-struct JsonVal {
-  enum class T { Null, Num, Str, Arr, Obj } type = T::Null;
-  double num = 0;
-  std::string str;
-  std::vector<JsonVal> arr;
-  std::map<std::string, JsonVal> obj;
-};
-
-struct JsonParser {
-  const char* p = nullptr;
-  const char* end = nullptr;
-  [[noreturn]] void fail(const std::string& m) {
-    throw std::runtime_error("safetensors header JSON: " + m);
-  }
-  void ws() {
-    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
-      ++p;
-  }
-  char peek() {
-    if (p >= end) fail("unexpected end");
-    return *p;
-  }
-  void expect(const char* lit) {
-    for (const char* q = lit; *q; ++q, ++p)
-      if (p >= end || *p != *q) fail("bad literal");
-  }
-  JsonVal parse() {
-    ws();
-    JsonVal v = parse_val();
-    ws();
-    if (p != end) fail("trailing characters");
-    return v;
-  }
-  JsonVal parse_val() {
-    ws();
-    char c = peek();
-    if (c == '{') return parse_obj();
-    if (c == '[') return parse_arr();
-    if (c == '"') {
-      JsonVal v;
-      v.type = JsonVal::T::Str;
-      v.str = parse_str();
-      return v;
-    }
-    if (c == 'n') {
-      expect("null");
-      return JsonVal{};
-    }
-    if (c == 't') {
-      expect("true");
-      JsonVal v;
-      v.type = JsonVal::T::Num;
-      v.num = 1;
-      return v;
-    }
-    if (c == 'f') {
-      expect("false");
-      JsonVal v;
-      v.type = JsonVal::T::Num;
-      v.num = 0;
-      return v;
-    }
-    return parse_num();
-  }
-  JsonVal parse_obj() {
-    JsonVal v;
-    v.type = JsonVal::T::Obj;
-    ++p;  // {
-    ws();
-    if (peek() == '}') {
-      ++p;
-      return v;
-    }
-    while (true) {
-      ws();
-      if (peek() != '"') fail("object key must be a string");
-      std::string k = parse_str();
-      ws();
-      if (peek() != ':') fail("expected ':'");
-      ++p;
-      v.obj[k] = parse_val();
-      ws();
-      char c = peek();
-      if (c == ',') {
-        ++p;
-        continue;
-      }
-      if (c == '}') {
-        ++p;
-        break;
-      }
-      fail("expected ',' or '}'");
-    }
-    return v;
-  }
-  JsonVal parse_arr() {
-    JsonVal v;
-    v.type = JsonVal::T::Arr;
-    ++p;  // [
-    ws();
-    if (peek() == ']') {
-      ++p;
-      return v;
-    }
-    while (true) {
-      v.arr.push_back(parse_val());
-      ws();
-      char c = peek();
-      if (c == ',') {
-        ++p;
-        continue;
-      }
-      if (c == ']') {
-        ++p;
-        break;
-      }
-      fail("expected ',' or ']'");
-    }
-    return v;
-  }
-  std::string parse_str() {
-    ++p;  // opening quote
-    std::string s;
-    while (true) {
-      if (p >= end) fail("unterminated string");
-      char c = *p++;
-      if (c == '"') break;
-      if (c == '\\') {
-        if (p >= end) fail("bad escape");
-        char e = *p++;
-        switch (e) {
-          case '"': s += '"'; break;
-          case '\\': s += '\\'; break;
-          case '/': s += '/'; break;
-          case 'n': s += '\n'; break;
-          case 't': s += '\t'; break;
-          case 'r': s += '\r'; break;
-          case 'u': {
-            if (end - p < 4) fail("bad \\u escape");
-            unsigned cp = 0;
-            for (int i = 0; i < 4; ++i) {
-              char h = *p++;
-              cp <<= 4;
-              if (h >= '0' && h <= '9') cp += (unsigned)(h - '0');
-              else if (h >= 'a' && h <= 'f') cp += (unsigned)(h - 'a') + 10;
-              else if (h >= 'A' && h <= 'F') cp += (unsigned)(h - 'A') + 10;
-              else fail("bad \\u escape");
-            }
-            // Encode BMP code point as UTF-8 (headers are ASCII in
-            // practice; lone surrogates are replaced).
-            if (cp < 0x80) {
-              s += (char)cp;
-            } else if (cp < 0x800) {
-              s += (char)(0xC0 | (cp >> 6));
-              s += (char)(0x80 | (cp & 0x3F));
-            } else {
-              s += (char)(0xE0 | (cp >> 12));
-              s += (char)(0x80 | ((cp >> 6) & 0x3F));
-              s += (char)(0x80 | (cp & 0x3F));
-            }
-            break;
-          }
-          default: fail("bad escape");
-        }
-      } else {
-        s += c;
-      }
-    }
-    return s;
-  }
-  JsonVal parse_num() {
-    const char* b = p;
-    if (p < end && (*p == '-' || *p == '+')) ++p;
-    bool any = false;
-    while (p < end &&
-           ((*p >= '0' && *p <= '9') || *p == '.' || *p == 'e' ||
-            *p == 'E' || *p == '-' || *p == '+')) {
-      ++p;
-      any = true;
-    }
-    if (!any) fail("bad number");
-    JsonVal v;
-    v.type = JsonVal::T::Num;
-    try {
-      v.num = std::stod(std::string(b, p));
-    } catch (...) {
-      fail("bad number");
-    }
-    return v;
-  }
-};
-
 // Parse one .safetensors header from an existing read-only mapping;
 // returns name map + total header size (8 + json_len) so callers can locate
-// payloads. Throws on schema errors or out-of-range offsets.
+// payloads. The header JSON itself is parsed once by the central
+// Safetensors::MappedFile ctor (src/KokkosDNN_Safetensors.hpp); this wrapper
+// only enforces the encoder's F32/BF16 restriction and converts to the
+// encoder's {data_begin, nbytes} surface. Throws on schema errors or
+// out-of-range offsets.
 inline std::map<std::string, SafeTensorInfo> read_safetensors_header(
     const MossMmap& mm, const std::string& path, uint64_t& header_size) {
   if (mm.size < 8)
     throw std::runtime_error("cannot read safetensors header: " + path);
-  uint64_t json_len = 0;
-  std::memcpy(&json_len, mm.map, 8);  // LE host required (checked at load)
+  const uint64_t json_len = ::KokkosDNN::Safetensors::ld64_le(mm.map);
   if (json_len > (uint64_t{1} << 32) || 8 + json_len > mm.size)
     throw std::runtime_error("safetensors header implausibly large: " + path);
   header_size = 8 + json_len;
-  JsonParser ps{mm.map + 8, mm.map + 8 + (size_t)json_len};
-  JsonVal root = ps.parse();
-  if (root.type != JsonVal::T::Obj) throw std::runtime_error("bad header");
   std::map<std::string, SafeTensorInfo> out;
-  for (const auto& kv : root.obj) {
-    if (kv.first == "__metadata__") continue;
-    const JsonVal& e = kv.second;
-    if (e.type != JsonVal::T::Obj) throw std::runtime_error("bad entry");
-    auto it_d = e.obj.find("dtype");
-    auto it_s = e.obj.find("shape");
-    auto it_o = e.obj.find("data_offsets");
-    if (it_d == e.obj.end() || it_s == e.obj.end() || it_o == e.obj.end())
-      throw std::runtime_error("entry missing keys: " + kv.first);
-    if (it_d->second.type != JsonVal::T::Str)
-      throw std::runtime_error("bad dtype: " + kv.first);
-    SafeTensorInfo info;
-    info.dtype = it_d->second.str;
-    if (info.dtype != "F32" && info.dtype != "BF16")
-      throw std::runtime_error("unsupported dtype '" + info.dtype +
+  for (const auto& kv : mm.entries()) {
+    const ::KokkosDNN::Safetensors::Entry& en = kv.second;
+    if (en.dtype != "F32" && en.dtype != "BF16")
+      throw std::runtime_error("unsupported dtype '" + en.dtype +
                                "' for tensor " + kv.first +
                                " (only F32/BF16)");
-    if (it_s->second.type != JsonVal::T::Arr)
-      throw std::runtime_error("bad shape: " + kv.first);
-    for (const auto& d : it_s->second.arr) {
-      if (d.type != JsonVal::T::Num || d.num < 0)
-        throw std::runtime_error("bad shape dim: " + kv.first);
-      info.shape.push_back((int64_t)d.num);
-    }
-    if (it_o->second.type != JsonVal::T::Arr ||
-        it_o->second.arr.size() != 2 ||
-        it_o->second.arr[0].type != JsonVal::T::Num ||
-        it_o->second.arr[1].type != JsonVal::T::Num)
-      throw std::runtime_error("bad data_offsets: " + kv.first);
-    uint64_t b = (uint64_t)it_o->second.arr[0].num;
-    uint64_t en = (uint64_t)it_o->second.arr[1].num;
-    if (en < b) throw std::runtime_error("bad offsets: " + kv.first);
-    info.data_begin = header_size + b;
-    info.nbytes = en - b;
+    SafeTensorInfo info;
+    info.dtype = en.dtype;
+    info.shape = en.shape;
+    info.data_begin = en.begin;
+    info.nbytes = en.end - en.begin;
     if (info.data_begin + info.nbytes > mm.size)
       throw std::runtime_error("tensor '" + kv.first +
                                "' out of mapped range in '" + path + "'");

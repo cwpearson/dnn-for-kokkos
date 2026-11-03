@@ -6,6 +6,8 @@
 
 #include "KokkosDNN_SanaPth.hpp"
 
+#include "KokkosDNN_Zip.hpp"
+
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -14,144 +16,14 @@
 #include <utility>
 #include <vector>
 
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 namespace KokkosDNN {
 namespace Sana {
 namespace Impl {
 namespace {
 
-// ---- Little-endian readers (over the mmap'd archive mapping) ----------------
-uint16_t rd_u16(const char* b, size_t p) {
-  uint16_t v = 0;
-  std::memcpy(&v, b + p, 2);
-  return v;
-}
-
-uint32_t rd_u32(const char* b, size_t p) {
-  uint32_t v = 0;
-  std::memcpy(&v, b + p, 4);
-  return v;
-}
-
-// ---- Stored-entry ZIP index ------------------------------------------------
-// Central-directory entry we care about.
-struct ZipEntry {
-  std::string name;
-  uint16_t method = 0;
-  uint32_t size = 0;
-  uint32_t local_offset = 0;
-};
-
-constexpr uint32_t kEocdSig = 0x06054b50;
-constexpr uint32_t kCdSig = 0x02014b50;
-constexpr uint32_t kLocalSig = 0x04034b50;
-
-// Read-only mmap view of the whole .pth archive (MAP_PRIVATE). The ZIP
-// central directory, data.pkl, and every storage blob are parsed/copied
-// straight from this mapping; mmap failure is a hard error (no fallback).
-struct MappedFile {
-  const char* data = nullptr;
-  size_t size = 0;
-
-  explicit MappedFile(const std::string& path) {
-    const int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0)
-      throw std::runtime_error("open_pth: cannot open '" + path + "'");
-    struct stat st;
-    if (::fstat(fd, &st) != 0) {
-      ::close(fd);
-      throw std::runtime_error("open_pth: cannot stat '" + path + "'");
-    }
-    if (st.st_size <= 0) {
-      ::close(fd);
-      throw std::runtime_error("open_pth: empty file '" + path + "'");
-    }
-    size = (size_t)st.st_size;
-    void* m = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);  // the mapping keeps the file alive
-    if (m == MAP_FAILED)
-      throw std::runtime_error("open_pth: mmap failed for '" + path + "'");
-    data = static_cast<const char*>(m);
-  }
-
-  ~MappedFile() {
-    if (data) ::munmap(const_cast<char*>(data), size);
-  }
-
-  MappedFile(const MappedFile&) = delete;
-  MappedFile& operator=(const MappedFile&) = delete;
-  MappedFile(MappedFile&& o) noexcept : data(o.data), size(o.size) {
-    o.data = nullptr;
-    o.size = 0;
-  }
-  MappedFile& operator=(MappedFile&&) = delete;
-};
-
-std::vector<ZipEntry> read_central_directory(const char* buf, size_t n,
-                                             const std::string& path) {
-  // EOCD is within the last 22 + 64 KiB (max comment length).
-  if (n < 22) throw std::runtime_error("open_pth: '" + path + "' too small");
-  const size_t lo = (n > (22 + 65535)) ? n - (22 + 65535) : 0;
-  size_t eocd = n;  // not found
-  for (size_t p = n - 22;; --p) {
-    if (rd_u32(buf, p) == kEocdSig) {
-      eocd = p;
-      break;
-    }
-    if (p == lo) break;
-  }
-  if (eocd == n)
-    throw std::runtime_error("open_pth: '" + path + "': EOCD not found");
-  const uint32_t count = rd_u16(buf, eocd + 10);
-  const uint32_t cd_size = rd_u32(buf, eocd + 12);
-  const uint32_t cd_off = rd_u32(buf, eocd + 16);
-  if ((uint64_t)cd_off + cd_size > n)
-    throw std::runtime_error("open_pth: '" + path + "': bad central dir");
-  std::vector<ZipEntry> out;
-  size_t p = cd_off;
-  for (uint32_t i = 0; i < count; ++i) {
-    if (p + 46 > n || rd_u32(buf, p) != kCdSig)
-      throw std::runtime_error("open_pth: '" + path + "': bad entry");
-    ZipEntry e;
-    e.method = rd_u16(buf, p + 10);
-    e.size = rd_u32(buf, p + 24);
-    e.local_offset = rd_u32(buf, p + 42);
-    const uint16_t nl = rd_u16(buf, p + 28), el = rd_u16(buf, p + 30),
-                   cl = rd_u16(buf, p + 32);
-    if (p + 46 + nl > n)
-      throw std::runtime_error("open_pth: '" + path + "': bad name");
-    e.name.assign(buf + p + 46, nl);
-    p += 46 + nl + el + cl;
-    out.push_back(e);
-  }
-  return out;
-}
-
-// Byte range of a stored record's payload.
-std::pair<uint64_t, uint64_t> record_range(
-    const char* buf, size_t n, const std::vector<ZipEntry>& entries,
-    const std::string& name, const std::string& path) {
-  for (const auto& e : entries) {
-    if (e.name != name) continue;
-    if (e.method != 0)
-      throw std::runtime_error("open_pth: '" + path + "': '" + name +
-                               "' uses deflate; only stored records supported");
-    const size_t lh = (size_t)e.local_offset;
-    if (lh + 30 > n || rd_u32(buf, lh) != kLocalSig)
-      throw std::runtime_error("open_pth: '" + path + "': bad local header");
-    const uint16_t nl = rd_u16(buf, lh + 26), el = rd_u16(buf, lh + 28);
-    const uint64_t data = (uint64_t)lh + 30 + nl + el;
-    if (data + e.size > n)
-      throw std::runtime_error("open_pth: '" + path + "': truncated record");
-    return {data, e.size};
-  }
-  throw std::runtime_error("open_pth: '" + path + "': missing record '" +
-                           name + "'");
-}
+// ZIP framing (EOCD scan, central directory, stored-entry ranges) is the
+// central src/KokkosDNN_Zip.hpp reader (next to KokkosDNN_GGUF.hpp); the
+// pickle VM below is unchanged.
 
 // ---- Minimal pickle VM -----------------------------------------------------
 // Closed opcode set torch.save emits for a cpu fp32 state_dict (protocol 2).
@@ -582,25 +454,27 @@ std::vector<std::pair<std::string, std::vector<int64_t>>> sana_pth_expected(
 PthArchive open_pth(const std::string& path) {
   // Shared ownership: the aliasing mapping below keeps this alive, so the
   // record offsets in the returned archive stay valid (no disk re-reads).
-  const auto mapped = std::make_shared<Impl::MappedFile>(path);
-  const char* base = mapped->data;
+  // ZIP framing is the central src/KokkosDNN_Zip.hpp reader (next to
+  // KokkosDNN_GGUF.hpp); the pickle VM below is unchanged.
+  const auto mapped =
+      std::make_shared<::KokkosDNN::Zip::MappedFile>(path, "open_pth");
+  const char* base = mapped->map;
   const size_t n = mapped->size;
-  const std::vector<Impl::ZipEntry> entries =
-      Impl::read_central_directory(base, n, path);
+  const ::KokkosDNN::Zip::Archive za(*mapped, "open_pth");
+  const auto& entries = za.entries;
   // Locate data.pkl and derive the record prefix.
   std::string pkl_name;
   for (const auto& e : entries) {
-    if (e.name.size() >= 8 &&
-        e.name.compare(e.name.size() - 8, 8, "data.pkl") == 0) {
-      pkl_name = e.name;
+    if (e.first.size() >= 8 &&
+        e.first.compare(e.first.size() - 8, 8, "data.pkl") == 0) {
+      pkl_name = e.first;
       break;
     }
   }
   if (pkl_name.empty())
     throw std::runtime_error("open_pth: '" + path + "': no data.pkl record");
   const std::string prefix = pkl_name.substr(0, pkl_name.size() - 8);
-  const auto pkl_range =
-      Impl::record_range(base, n, entries, pkl_name, path);
+  const auto pkl_range = za.record_range(pkl_name);
   Impl::Unpickler up(base + pkl_range.first, (size_t)pkl_range.second);
   Impl::Value top = up.run();
   if (top.type != Impl::Value::Type::Dict || !top.dict || top.dict->empty())
@@ -641,8 +515,12 @@ PthArchive open_pth(const std::string& path) {
     if (!ar.records.count(v.storage_id)) {
       const std::string rec =
           prefix + "data/" + std::to_string(v.storage_id);
-      ar.records[v.storage_id] =
-          Impl::record_range(base, n, entries, rec, path);
+      try {
+        ar.records[v.storage_id] = za.record_range(rec);
+      } catch (const std::runtime_error&) {
+        throw std::runtime_error("open_pth: '" + path + "': missing record '" +
+                                 rec + "'");
+      }
     }
   }
   if (up.pending_metadata_) {

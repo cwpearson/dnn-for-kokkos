@@ -13,9 +13,10 @@ kokkosdnn_enable_compiler_warnings(moss_image_generate)
 
 if(KokkosDNN_ENABLE_TESTS)
   # Synthetic-ZIP test for the .pth central-directory reader: no real
-  # checkpoint needed. Links only gtest_main + the header under test.
+  # checkpoint needed. Links gtest_main + the header under test (which pulls
+  # the central src/KokkosDNN_Zip.hpp reader via KokkosDNN::kokkosdnn).
   add_executable(test_moss_zip Test_MossZip.cpp)
-  target_link_libraries(test_moss_zip PRIVATE KokkosDNN::gtest_main)
+  target_link_libraries(test_moss_zip PRIVATE KokkosDNN::gtest_main KokkosDNN::kokkosdnn)
   set_target_properties(test_moss_zip PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
   kokkosdnn_enable_compiler_warnings(test_moss_zip)
   kokkosdnn_discover_tests(test_moss_zip)

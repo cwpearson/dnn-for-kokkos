@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 #include "KokkosDNN_MossWeights.hpp"
 #include "KokkosDNN_MossZip.hpp"
+#include "KokkosDNN_Safetensors.hpp"
 
 #include <Kokkos_Half.hpp>
 
@@ -93,198 +94,27 @@ void stream_vec(const FileReader& fr, uint64_t off,
 }
 
 // ---- safetensors header parsing ----
-struct SafeEntry {
-  std::string dtype;
-  std::vector<int64_t> shape;
-  uint64_t begin = 0, end = 0;  // file offsets of the data slice
-};
+// Central implementation lives in src/KokkosDNN_Safetensors.hpp (next to
+// KokkosDNN_GGUF.hpp); the names below are thin compatibility wrappers so
+// existing call sites keep compiling with identical diagnostics.
+using SafeEntry = ::KokkosDNN::Safetensors::Entry;
 
-std::string parse_json_string(const std::string& s, size_t& pos) {
-  // s[pos] == '"'; returns unescaped string, pos after closing quote.
-  ++pos;
-  std::string out;
-  while (pos < s.size()) {
-    char c = s[pos++];
-    if (c == '"') return out;
-    if (c == '\\' && pos < s.size()) {
-      out += s[pos++];
-    } else {
-      out += c;
-    }
-  }
-  throw std::runtime_error("moss: malformed safetensors header (string)");
+inline std::string parse_json_string(const std::string& s, size_t& pos) {
+  return ::KokkosDNN::Safetensors::parse_json_string(s, pos, "moss");
 }
 
 // Parse the safetensors header JSON into name -> entry. Only understands
 // the subset torch saves: {"__metadata__":{...},"name":{"dtype":...,
 // "shape":[...],"data_offsets":[a,b]},...}.
-std::map<std::string, SafeEntry> parse_safetensors_header(
+inline std::map<std::string, SafeEntry> parse_safetensors_header(
     const std::string& js, uint64_t data_base) {
-  std::map<std::string, SafeEntry> out;
-  size_t pos = 0;
-  auto skip_ws = [&]() {
-    while (pos < js.size() &&
-           (js[pos] == ' ' || js[pos] == '\t' || js[pos] == '\n' ||
-            js[pos] == '\r'))
-      ++pos;
-  };
-  skip_ws();
-  if (pos >= js.size() || js[pos] != '{')
-    throw std::runtime_error("moss: malformed safetensors header");
-  ++pos;
-  while (true) {
-    skip_ws();
-    if (pos >= js.size()) throw std::runtime_error("moss: truncated header");
-    if (js[pos] == '}') break;
-    if (js[pos] != '"') throw std::runtime_error("moss: bad header key");
-    std::string name = parse_json_string(js, pos);
-    skip_ws();
-    if (pos >= js.size() || js[pos] != ':')
-      throw std::runtime_error("moss: bad header separator");
-    ++pos;
-    skip_ws();
-    if (name == "__metadata__") {
-      // Skip a nested object (one level).
-      if (pos >= js.size() || js[pos] != '{')
-        throw std::runtime_error("moss: bad __metadata__");
-      int depth = 0;
-      bool in_str = false;
-      while (pos < js.size()) {
-        char c = js[pos++];
-        if (in_str) {
-          if (c == '\\') {
-            if (pos < js.size()) ++pos;
-          } else if (c == '"') {
-            in_str = false;
-          }
-        } else {
-          if (c == '"') in_str = true;
-          if (c == '{') ++depth;
-          if (c == '}') {
-            if (--depth == 0) break;
-          }
-        }
-      }
-    } else {
-      // Tensor entry object.
-      if (pos >= js.size() || js[pos] != '{')
-        throw std::runtime_error("moss: bad tensor entry for " + name);
-      ++pos;
-      SafeEntry e;
-      bool have_dtype = false, have_shape = false, have_off = false;
-      while (true) {
-        skip_ws();
-        if (pos >= js.size())
-          throw std::runtime_error("moss: truncated entry " + name);
-        if (js[pos] == '}') {
-          ++pos;
-          break;
-        }
-        if (js[pos] != '"')
-          throw std::runtime_error("moss: bad entry key for " + name);
-        std::string k = parse_json_string(js, pos);
-        skip_ws();
-        if (pos >= js.size() || js[pos] != ':')
-          throw std::runtime_error("moss: bad entry separator " + name);
-        ++pos;
-        skip_ws();
-        if (k == "dtype") {
-          if (pos >= js.size() || js[pos] != '"')
-            throw std::runtime_error("moss: bad dtype " + name);
-          e.dtype = parse_json_string(js, pos);
-          have_dtype = true;
-        } else if (k == "shape") {
-          if (pos >= js.size() || js[pos] != '[')
-            throw std::runtime_error("moss: bad shape " + name);
-          ++pos;
-          e.shape.clear();
-          while (true) {
-            skip_ws();
-            if (pos < js.size() && js[pos] == ']') {
-              ++pos;
-              break;
-            }
-            size_t st = pos;
-            while (pos < js.size() &&
-                   (isdigit((unsigned char)js[pos]) || js[pos] == '-'))
-              ++pos;
-            if (st == pos)
-              throw std::runtime_error("moss: bad shape num " + name);
-            e.shape.push_back(std::stoll(js.substr(st, pos - st)));
-            skip_ws();
-            if (pos < js.size() && js[pos] == ',') ++pos;
-          }
-          have_shape = true;
-        } else if (k == "data_offsets") {
-          if (pos >= js.size() || js[pos] != '[')
-            throw std::runtime_error("moss: bad offsets " + name);
-          ++pos;
-          uint64_t a = 0, b = 0;
-          skip_ws();
-          {
-            size_t st = pos;
-            while (pos < js.size() && isdigit((unsigned char)js[pos])) ++pos;
-            a = std::stoull(js.substr(st, pos - st));
-          }
-          skip_ws();
-          if (pos >= js.size() || js[pos] != ',')
-            throw std::runtime_error("moss: bad offsets " + name);
-          ++pos;
-          skip_ws();
-          {
-            size_t st = pos;
-            while (pos < js.size() && isdigit((unsigned char)js[pos])) ++pos;
-            b = std::stoull(js.substr(st, pos - st));
-          }
-          skip_ws();
-          if (pos >= js.size() || js[pos] != ']')
-            throw std::runtime_error("moss: bad offsets " + name);
-          ++pos;
-          e.begin = data_base + a;
-          e.end = data_base + b;
-          have_off = true;
-        } else {
-          // Unknown field: skip value (string/number/array/object 1-level).
-          if (pos < js.size() && js[pos] == '"') {
-            (void)parse_json_string(js, pos);
-          } else if (pos < js.size() && js[pos] == '[') {
-            int d = 0;
-            bool q = false;
-            while (pos < js.size()) {
-              char c = js[pos++];
-              if (q) {
-                if (c == '\\') {
-                  if (pos < js.size()) ++pos;
-                } else if (c == '"')
-                  q = false;
-              } else {
-                if (c == '"') q = true;
-                if (c == '[') ++d;
-                if (c == ']') {
-                  if (--d == 0) break;
-                }
-              }
-            }
-          } else {
-            while (pos < js.size() && js[pos] != ',' && js[pos] != '}') ++pos;
-          }
-        }
-        skip_ws();
-        if (pos < js.size() && js[pos] == ',') ++pos;
-      }
-      if (!have_dtype || !have_shape || !have_off)
-        throw std::runtime_error("moss: incomplete entry " + name);
-      out[name] = e;
-    }
-    skip_ws();
-    if (pos < js.size() && js[pos] == ',') ++pos;
-  }
-  return out;
+  return ::KokkosDNN::Safetensors::parse_header(js, data_base, "moss");
 }
 
 // Find an entry by suffix (prefix-agnostic, e.g. "model." prefixes).
-const SafeEntry& find_entry(const std::map<std::string, SafeEntry>& m,
-                            const std::string& suffix) {
+// Shortest full-name wins (historical moss policy; Dit longest-wins).
+inline const SafeEntry& find_entry(
+    const std::map<std::string, SafeEntry>& m, const std::string& suffix) {
   const SafeEntry* best = nullptr;
   size_t best_len = 0;
   for (const auto& kv : m) {
@@ -598,7 +428,7 @@ void load_torch_pth(const Config& cfg, const std::string& pth_path,
   // HostSpace chunks (no full-tensor std::vector<float> staging).
   size_t n = 0;
   auto take_mat = [&](auto& v) {
-    const ZipEntry& ze = za.entries.at(storages[n]);
+    const auto& ze = za.entries.at(storages[n]);
     const size_t expect = v.extent(0) * v.extent(1);
     if (ze.uncomp_size != expect * 4)
       throw std::runtime_error("moss: .pth storage for '" + keys[n] +
@@ -613,7 +443,7 @@ void load_torch_pth(const Config& cfg, const std::string& pth_path,
     ++n;
   };
   auto take_vec = [&](auto& v) {
-    const ZipEntry& ze = za.entries.at(storages[n]);
+    const auto& ze = za.entries.at(storages[n]);
     const size_t expect = v.extent(0);
     if (ze.uncomp_size != expect * 4)
       throw std::runtime_error("moss: .pth storage for '" + keys[n] +

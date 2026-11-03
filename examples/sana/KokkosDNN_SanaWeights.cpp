@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 #include "KokkosDNN_SanaWeights.hpp"
 
+#include "KokkosDNN_Zip.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -14,144 +16,35 @@
 #include <utility>
 #include <vector>
 
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 namespace KokkosDNN {
 namespace Sana {
 namespace {
 
-// ---- little-endian loads ----
-uint16_t ld16(const char* p) {
-  const auto* b = reinterpret_cast<const unsigned char*>(p);
-  return (uint16_t)(b[0] | ((uint16_t)b[1] << 8));
-}
-uint32_t ld32(const char* p) {
-  const auto* b = reinterpret_cast<const unsigned char*>(p);
-  return b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) |
-         ((uint32_t)b[3] << 24);
-}
-
-// ---- file reader: read-only mmap view (MAP_PRIVATE) ----
-// mmap failure is a hard error: there is no ifstream fallback for
-// weight-tensor loads.
-struct FileReader {
-  std::string path;
-  size_t size = 0;
-  const char* map = nullptr;
-  explicit FileReader(const std::string& p) : path(p) {
-    const int fd = ::open(p.c_str(), O_RDONLY);
-    if (fd < 0) throw std::runtime_error("sana: cannot open " + p);
-    struct stat st;
-    if (::fstat(fd, &st) != 0) {
-      ::close(fd);
-      throw std::runtime_error("sana: cannot stat " + p);
-    }
-    if (st.st_size <= 0) {
-      ::close(fd);
-      throw std::runtime_error("sana: empty file: " + p);
-    }
-    size    = (size_t)st.st_size;
-    void* m = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);
-    if (m == MAP_FAILED) throw std::runtime_error("sana: mmap failed: " + p);
-    map = static_cast<const char*>(m);
-  }
-  ~FileReader() {
-    if (map) ::munmap(const_cast<char*>(map), size);
-  }
-  FileReader(const FileReader&)            = delete;
-  FileReader& operator=(const FileReader&) = delete;
-
-  void read_bytes(uint64_t off, char* dst, size_t n) const {
-    if (off + n > size)
-      throw std::runtime_error("sana: read out of range");
-    std::memcpy(dst, map + off, n);
-  }
-  std::string read_str(uint64_t off, size_t n) const {
-    std::string s(n, '\0');
-    if (n) read_bytes(off, s.data(), n);
-    return s;
-  }
-};
-
-// ---- minimal ZIP central-directory reader (stored entries) ----
-struct ZipEntry {
-  uint16_t method = 0;
-  uint64_t comp_size = 0, uncomp_size = 0, local_off = 0;
+// ---- ZIP framing ----
+// Central implementation lives in src/KokkosDNN_Zip.hpp (next to
+// KokkosDNN_GGUF.hpp); the names below preserve this file's historical API
+// (FileReader/ZipArchive with entries/read_entry/data_offset) and the "sana"
+// error prefix. New code should use ::KokkosDNN::Zip directly.
+struct FileReader : ::KokkosDNN::Zip::MappedFile {
+  explicit FileReader(const std::string& p)
+      : ::KokkosDNN::Zip::MappedFile(p, "sana") {}
 };
 
 struct ZipArchive {
-  const FileReader& fr;
-  std::map<std::string, ZipEntry> entries;
-  explicit ZipArchive(const FileReader& r) : fr(r) {
-    if (fr.size < 22) throw std::runtime_error("sana: not a zip file");
-    // Locate EOCD (max 64K comment).
-    const size_t tail =
-        std::min<size_t>(fr.size, (size_t)65535 + 22);
-    std::string buf = fr.read_str(fr.size - tail, tail);
-    size_t eocd = std::string::npos;
-    for (size_t i = buf.size() - 22;; --i) {
-      if (ld32(buf.data() + i) == 0x06054b50) {
-        eocd = i;
-        break;
-      }
-      if (i == 0) break;
-    }
-    if (eocd == std::string::npos)
-      throw std::runtime_error("sana: zip EOCD not found");
-    const char* e      = buf.data() + eocd;
-    uint64_t cd_count  = ld16(e + 10);
-    uint64_t cd_size   = ld32(e + 12);
-    uint64_t cd_offset = ld32(e + 16);
-    (void)cd_size;
-    if (cd_offset >= fr.size)
-      throw std::runtime_error("sana: bad zip central directory offset");
-    // Walk central directory.
-    uint64_t p = cd_offset;
-    for (uint64_t k = 0; k < cd_count; ++k) {
-      char hdr[46];
-      fr.read_bytes(p, hdr, 46);
-      if (ld32(hdr) != 0x02014b50)
-        throw std::runtime_error("sana: bad zip central header");
-      ZipEntry ze;
-      ze.method      = ld16(hdr + 10);
-      ze.comp_size   = ld32(hdr + 20);
-      ze.uncomp_size = ld32(hdr + 24);
-      uint16_t fn_len = ld16(hdr + 28);
-      uint16_t ex_len = ld16(hdr + 30);
-      uint16_t fc_len = ld16(hdr + 32);
-      ze.local_off   = ld32(hdr + 42);
-      std::string name = fr.read_str(p + 46, fn_len);
-      entries[name]    = ze;
-      p += 46 + fn_len + ex_len + fc_len;
-    }
-  }
+  const ::KokkosDNN::Zip::MappedFile& fr;
+  ::KokkosDNN::Zip::Archive za;
+  std::map<std::string, ::KokkosDNN::Zip::Entry> entries;
+  explicit ZipArchive(const ::KokkosDNN::Zip::MappedFile& r)
+      : fr(r), za(r, "sana"), entries(za.entries) {}
 
   // Absolute file offset of an entry's data (via its local header).
   uint64_t data_offset(const std::string& name) const {
-    auto it = entries.find(name);
-    if (it == entries.end())
-      throw std::runtime_error("sana: zip entry not found: " + name);
-    char lh[30];
-    fr.read_bytes(it->second.local_off, lh, 30);
-    if (ld32(lh) != 0x04034b50)
-      throw std::runtime_error("sana: bad zip local header for " + name);
-    uint16_t fn_len = ld16(lh + 26);
-    uint16_t ex_len = ld16(lh + 28);
-    return it->second.local_off + 30 + fn_len + ex_len;
+    return za.record_range(name).first;
   }
 
   std::string read_entry(const std::string& name) const {
-    auto it = entries.find(name);
-    if (it == entries.end())
-      throw std::runtime_error("sana: zip entry not found: " + name);
-    if (it->second.method != 0)
-      throw std::runtime_error("sana: unsupported zip compression for " +
-                               name + " (only stored entries are supported)");
-    return fr.read_str(data_offset(name), (size_t)it->second.uncomp_size);
+    return za.read_stored(name);
   }
 };
 

@@ -3,7 +3,7 @@
 #ifndef KOKKOSDNN_MOSSIMAGEDIT_HPP
 #define KOKKOSDNN_MOSSIMAGEDIT_HPP
 
-#include "KokkosDNN_JsonLite.hpp"
+#include "KokkosDNN_Safetensors.hpp"
 
 // TRUE MOSS-Image flow transformer (MOSSImageTransformer) + weights loader +
 // flow-grid scheduler, on top of KokkosDNN_MossImage.hpp ops.
@@ -74,11 +74,6 @@
 
 #include <Kokkos_Core.hpp>
 #include <Kokkos_Half.hpp>
-
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <cmath>
@@ -454,261 +449,44 @@ auto dit_alias_seq(
 }
 
 // ---- host-side safetensors parsing (F32/BF16, header-only) ----
+// Central implementation lives in src/KokkosDNN_Safetensors.hpp (next to
+// KokkosDNN_GGUF.hpp); the names below are thin compatibility wrappers so
+// existing call sites keep compiling with identical diagnostics.
 
 inline uint64_t dit_ld64(const char* p) {
-  uint64_t v = 0;
-  const auto* b = reinterpret_cast<const unsigned char*>(p);
-  for (int i = 7; i >= 0; --i) v = (v << 8) | b[i];
-  return v;
+  return ::KokkosDNN::Safetensors::ld64_le(p);
 }
 
 inline float dit_bf16_to_float(uint16_t h) {
-  uint32_t u = (uint32_t)h << 16;
-  float f;
-  std::memcpy(&f, &u, 4);
-  return f;
+  return ::KokkosDNN::Safetensors::bf16_to_float(h);
 }
 
 // Round-to-nearest-even float32 -> bf16, preserving Inf/NaN payloads.
 inline uint16_t dit_float_to_bf16(float f) {
-  uint32_t u;
-  std::memcpy(&u, &f, 4);
-  if ((u & 0x7F800000u) == 0x7F800000u) {
-    uint16_t h = (uint16_t)(u >> 16);
-    if ((u & 0x007FFFFFu) != 0) h |= (uint16_t)0x0040u;  // keep NaN quiet
-    return h;
-  }
-  const uint32_t bias = 0x7FFFu + ((u >> 16) & 1u);
-  return (uint16_t)((u + bias) >> 16);
+  return ::KokkosDNN::Safetensors::float_to_bf16(f);
 }
 
-struct DitSafeEntry {
-  std::string dtype;
-  std::vector<int64_t> shape;
-  uint64_t begin = 0, end = 0;  // absolute file offsets of the data slice
-};
+using DitSafeEntry = ::KokkosDNN::Safetensors::Entry;
 
 inline std::string dit_parse_json_string(const std::string& s, size_t& pos) {
-  // Shared JSON-lite core (models/common/KokkosDNN_JsonLite.hpp); the former
-  // ASCII-only loop is removed. Valid safetensors headers are ASCII, so the
-  // full decoder agrees there; the trailing check preserves the historical
-  // malformed-header diagnostic.
-  std::string out =
-      ::KokkosDNN::Common::JsonLite::json_parse_string(s, pos);
-  if (pos == 0 || pos > s.size() || s[pos - 1] != '"')
-    throw std::runtime_error("MossImageDit: malformed safetensors header");
-  return out;
+  return ::KokkosDNN::Safetensors::parse_json_string(s, pos, "MossImageDit");
 }
 
 // Minimal header-JSON scanner: only the torch-saved subset
 // {"__metadata__":{...},"name":{"dtype":..,"shape":[..],"data_offsets":[a,b]}}.
 inline std::map<std::string, DitSafeEntry> dit_parse_header(
     const std::string& js, uint64_t data_base) {
-  std::map<std::string, DitSafeEntry> out;
-  size_t pos = 0;
-  auto skip_ws = [&]() {
-    while (pos < js.size() && (js[pos] == ' ' || js[pos] == '\t' ||
-                               js[pos] == '\n' || js[pos] == '\r'))
-      ++pos;
-  };
-  skip_ws();
-  if (pos >= js.size() || js[pos] != '{')
-    throw std::runtime_error("MossImageDit: malformed safetensors header");
-  ++pos;
-  while (true) {
-    skip_ws();
-    if (pos >= js.size())
-      throw std::runtime_error("MossImageDit: truncated safetensors header");
-    if (js[pos] == '}') break;
-    if (js[pos] != '"')
-      throw std::runtime_error("MossImageDit: bad header key");
-    std::string name = dit_parse_json_string(js, pos);
-    skip_ws();
-    if (pos >= js.size() || js[pos] != ':')
-      throw std::runtime_error("MossImageDit: bad header separator");
-    ++pos;
-    skip_ws();
-    if (name == "__metadata__") {
-      if (pos >= js.size() || js[pos] != '{')
-        throw std::runtime_error("MossImageDit: bad __metadata__");
-      int depth = 0;
-      bool in_str = false;
-      while (pos < js.size()) {
-        char c = js[pos++];
-        if (in_str) {
-          if (c == '\\') {
-            if (pos < js.size()) ++pos;
-          } else if (c == '"') {
-            in_str = false;
-          }
-        } else {
-          if (c == '"') in_str = true;
-          if (c == '{') ++depth;
-          if (c == '}') {
-            if (--depth == 0) break;
-          }
-        }
-      }
-    } else {
-      if (pos >= js.size() || js[pos] != '{')
-        throw std::runtime_error("MossImageDit: bad entry for " + name);
-      ++pos;
-      DitSafeEntry e;
-      bool have_dtype = false, have_shape = false, have_off = false;
-      while (true) {
-        skip_ws();
-        if (pos >= js.size())
-          throw std::runtime_error("MossImageDit: truncated entry " + name);
-        if (js[pos] == '}') {
-          ++pos;
-          break;
-        }
-        if (js[pos] != '"')
-          throw std::runtime_error("MossImageDit: bad entry key " + name);
-        std::string k = dit_parse_json_string(js, pos);
-        skip_ws();
-        if (pos >= js.size() || js[pos] != ':')
-          throw std::runtime_error("MossImageDit: bad entry sep " + name);
-        ++pos;
-        skip_ws();
-        if (k == "dtype") {
-          if (pos >= js.size() || js[pos] != '"')
-            throw std::runtime_error("MossImageDit: bad dtype " + name);
-          e.dtype = dit_parse_json_string(js, pos);
-          have_dtype = true;
-        } else if (k == "shape") {
-          if (pos >= js.size() || js[pos] != '[')
-            throw std::runtime_error("MossImageDit: bad shape " + name);
-          ++pos;
-          e.shape.clear();
-          while (true) {
-            skip_ws();
-            if (pos < js.size() && js[pos] == ']') {
-              ++pos;
-              break;
-            }
-            size_t st = pos;
-            while (pos < js.size() &&
-                   (isdigit((unsigned char)js[pos]) || js[pos] == '-'))
-              ++pos;
-            if (st == pos)
-              throw std::runtime_error("MossImageDit: bad shape num " + name);
-            e.shape.push_back(std::stoll(js.substr(st, pos - st)));
-            skip_ws();
-            if (pos < js.size() && js[pos] == ',') ++pos;
-          }
-          have_shape = true;
-        } else if (k == "data_offsets") {
-          if (pos >= js.size() || js[pos] != '[')
-            throw std::runtime_error("MossImageDit: bad offsets " + name);
-          ++pos;
-          auto num = [&]() {
-            skip_ws();
-            size_t st = pos;
-            while (pos < js.size() && isdigit((unsigned char)js[pos])) ++pos;
-            if (st == pos)
-              throw std::runtime_error("MossImageDit: bad offset " + name);
-            uint64_t v = std::stoull(js.substr(st, pos - st));
-            skip_ws();
-            return v;
-          };
-          uint64_t a = num();
-          if (pos >= js.size() || js[pos] != ',')
-            throw std::runtime_error("MossImageDit: bad offsets " + name);
-          ++pos;
-          uint64_t b = num();
-          skip_ws();
-          if (pos >= js.size() || js[pos] != ']')
-            throw std::runtime_error("MossImageDit: bad offsets " + name);
-          ++pos;
-          if (b < a)
-            throw std::runtime_error("MossImageDit: bad offsets " + name);
-          e.begin = data_base + a;
-          e.end = data_base + b;
-          have_off = true;
-        } else {
-          if (pos < js.size() && js[pos] == '"') {
-            (void)dit_parse_json_string(js, pos);
-          } else {
-            while (pos < js.size() && js[pos] != ',' && js[pos] != '}') ++pos;
-          }
-        }
-        skip_ws();
-        if (pos < js.size() && js[pos] == ',') ++pos;
-      }
-      if (!have_dtype || !have_shape || !have_off)
-        throw std::runtime_error("MossImageDit: incomplete entry " + name);
-      out[name] = e;
-    }
-    skip_ws();
-    if (pos < js.size() && js[pos] == ',') ++pos;
-  }
-  return out;
+  return ::KokkosDNN::Safetensors::parse_header(js, data_base, "MossImageDit");
 }
 
 // ---- mmap-only shard view (POSIX MAP_PRIVATE, no fallback) ----
-// Read-only mapping of one safetensors shard; the OS page cache is the
-// host staging. mmap failure is a hard error. Non-copyable; munmap on
-// destruction. Header entries carry absolute file offsets.
-struct DitMappedFile {
-  std::string path;
-  const char* map = nullptr;
-  size_t size = 0;
-  std::map<std::string, DitSafeEntry> entries;
-
-  explicit DitMappedFile(const std::string& p) : path(p) {
-    const int fd = ::open(p.c_str(), O_RDONLY);
-    if (fd < 0)
-      throw std::runtime_error(
-          "MossImageDitWeights::load_safetensors: cannot open '" + p + "'");
-    struct stat st;
-    if (::fstat(fd, &st) != 0) {
-      ::close(fd);
-      throw std::runtime_error(
-          "MossImageDitWeights::load_safetensors: cannot stat '" + p + "'");
-    }
-    if (st.st_size < 8) {
-      ::close(fd);
-      throw std::runtime_error(
-          "MossImageDitWeights::load_safetensors: too small '" + p + "'");
-    }
-    size = (size_t)st.st_size;
-    void* m = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);
-    if (m == MAP_FAILED)
-      throw std::runtime_error(
-          "MossImageDitWeights::load_safetensors: mmap failed for '" + p +
-          "'");
-    map = static_cast<const char*>(m);
-#if defined(MADV_SEQUENTIAL)
-    ::madvise(const_cast<char*>(map), size, MADV_SEQUENTIAL);
-#endif
-    const uint64_t hn = dit_ld64(map);
-    if (8 + hn > size) {
-      ::munmap(const_cast<char*>(map), size);
-      map = nullptr;
-      throw std::runtime_error(
-          "MossImageDitWeights::load_safetensors: bad header in '" + p + "'");
-    }
-    entries = dit_parse_header(std::string(map + 8, map + 8 + (size_t)hn),
-                               8 + hn);
-    for (const auto& kv : entries) {
-      if (kv.second.begin > kv.second.end || kv.second.end > size) {
-        ::munmap(const_cast<char*>(map), size);
-        map = nullptr;
-        throw std::runtime_error(
-            "MossImageDitWeights::load_safetensors: tensor '" + kv.first +
-            "' out of range in '" + p + "'");
-      }
-    }
-  }
-
-  ~DitMappedFile() {
-    if (map != nullptr) ::munmap(const_cast<char*>(map), size);
-  }
-
-  DitMappedFile(const DitMappedFile&) = delete;
-  DitMappedFile& operator=(const DitMappedFile&) = delete;
+// Central Safetensors::MappedFile (src/KokkosDNN_Safetensors.hpp) with the
+// historical MossImageDit error prefix; entries() preserves the parsed
+// header. Call sites use shard.map (base) + shard.entries().
+struct DitMappedFile : ::KokkosDNN::Safetensors::MappedFile {
+  explicit DitMappedFile(const std::string& p)
+      : ::KokkosDNN::Safetensors::MappedFile(
+            p, "MossImageDitWeights::load_safetensors") {}
 };
 
 // Grow-only view cache: exact-size managed views keyed by (tag, extents).
@@ -1025,7 +803,7 @@ struct MossImageDitWeights {
 
     for (const std::string& path : shard_paths) {
       Impl::DitMappedFile shard(path);
-      const auto& entries = shard.entries;
+      const auto& entries = shard.entries();
       for (const auto& kv : entries) {
         const std::string& full = kv.first;
         const Impl::DitSafeEntry& en = kv.second;
@@ -1072,23 +850,12 @@ struct MossImageDitWeights {
   // `base` is the shard mmap base; entry offsets are absolute.
   void load_one_tensor(const char* base, const std::string& full,
                        const Impl::DitSafeEntry& en, const DitTensorSpec& s) {
-    size_t elsize = 0;
-    if (en.dtype == "F32") {
-      elsize = 4;
-    } else if (en.dtype == "BF16") {
-      elsize = 2;
-    } else {
-      throw std::runtime_error(
-          "MossImageDitWeights::load_safetensors: tensor '" + full +
-          "' has dtype " + en.dtype + " (only F32/BF16 supported)");
-    }
-    int64_t numel = 1;
-    for (int64_t d : en.shape) {
-      if (d < 0)
-        throw std::runtime_error(
-            "MossImageDitWeights::load_safetensors: bad shape '" + full + "'");
-      numel *= d;
-    }
+    static constexpr const char* kWhat =
+        "MossImageDitWeights::load_safetensors";
+    const size_t elsize =
+        ::KokkosDNN::Safetensors::entry_elsize(en, full, kWhat);
+    const int64_t numel =
+        ::KokkosDNN::Safetensors::entry_numel(en, full, kWhat);
     const size_t want =
         s.matrix ? (size_t)s.d0 * (size_t)s.d1 : (size_t)s.d0;
     if ((size_t)numel != want)
@@ -1122,30 +889,11 @@ struct MossImageDitWeights {
   // Mapping bytes -> host mirror in bounded chunks, then one deep_copy.
   void stream_into(const char* payload, size_t n, size_t elsize,
                    Scalar* dev_ptr, size_t n_elems) {
-    using HostV = Kokkos::View<Scalar*, Kokkos::HostSpace>;
-    HostV host("dit_load", n_elems);
-    constexpr size_t kChunk = size_t{1} << 18;
-    const bool fast_f32 = std::is_same_v<Scalar, float> && elsize == 4;
-    for (size_t o = 0; o < n;) {
-      const size_t m = std::min(n - o, kChunk);
-      const char* src = payload + o * elsize;
-      if (fast_f32) {
-        std::memcpy(host.data() + o, src, m * 4);
-      } else if (elsize == 4) {  // F32 file -> Scalar (float or bhalf_t)
-        const float* fsrc = reinterpret_cast<const float*>(src);
-        for (size_t i = 0; i < m; ++i)
-          host(o + i) = static_cast<Scalar>(fsrc[i]);
-      } else {  // BF16 file -> Scalar via FP32
-        const uint16_t* usrc = reinterpret_cast<const uint16_t*>(src);
-        for (size_t i = 0; i < m; ++i)
-          host(o + i) =
-              static_cast<Scalar>(Impl::dit_bf16_to_float(usrc[i]));
-      }
-      o += m;
-    }
-    Kokkos::View<Scalar*, ExecSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>
-        dev(dev_ptr, n_elems);
-    Kokkos::deep_copy(dev, host);
+    if (n != n_elems)
+      throw std::runtime_error(
+          "MossImageDitWeights::load_safetensors: stream size mismatch");
+    ::KokkosDNN::Safetensors::stream_into<ExecSpace, Scalar>(payload, n,
+                                                             elsize, dev_ptr);
   }
 
   void resolve_tensor(const std::string& name, V2*& out2, V1*& out1) {

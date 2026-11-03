@@ -9,7 +9,7 @@
 #ifndef KOKKOSDNN_QWENIMAGE21CONFIG_HPP
 #define KOKKOSDNN_QWENIMAGE21CONFIG_HPP
 
-#include "KokkosDNN_JsonLite.hpp"
+#include "KokkosDNN_Safetensors.hpp"
 
 // Shared Config + tiny host-side safetensors parsing used by the DiT,
 // encoder, and VAE headers. Ground truth (Qwen-Image-2.1-Turbo, from HF
@@ -173,218 +173,47 @@ struct Qwen21ViewCache {
 };
 
 // ---- host-side safetensors parsing (F32/BF16, header-only) ----
+// Central implementation lives in src/KokkosDNN_Safetensors.hpp (next to
+// KokkosDNN_GGUF.hpp); the names below are thin compatibility wrappers so
+// existing call sites keep compiling with identical diagnostics.
 
 inline uint64_t qwen21_ld64(const char* p) {
-  uint64_t v = 0;
-  const auto* b = reinterpret_cast<const unsigned char*>(p);
-  for (int i = 7; i >= 0; --i) v = (v << 8) | b[i];
-  return v;
+  return ::KokkosDNN::Safetensors::ld64_le(p);
 }
 
 inline float qwen21_bf16_to_float(uint16_t h) {
-  uint32_t u = (uint32_t)h << 16;
-  float f;
-  std::memcpy(&f, &u, 4);
-  return f;
+  return ::KokkosDNN::Safetensors::bf16_to_float(h);
 }
 
-struct Qwen21SafeEntry {
-  std::string dtype;
-  std::vector<int64_t> shape;
-  uint64_t begin = 0, end = 0;  // absolute file offsets of the data slice
-};
+using Qwen21SafeEntry = ::KokkosDNN::Safetensors::Entry;
 
 inline std::string qwen21_parse_json_string(const std::string& s,
                                             size_t& pos) {
-  // Shared JSON-lite core (models/common/KokkosDNN_JsonLite.hpp); see
-  // dit_parse_json_string for the ASCII-equivalence note.
-  std::string out =
-      ::KokkosDNN::Common::JsonLite::json_parse_string(s, pos);
-  if (pos == 0 || pos > s.size() || s[pos - 1] != '"')
-    throw std::runtime_error("QwenImage21: malformed safetensors header");
-  return out;
+  return ::KokkosDNN::Safetensors::parse_json_string(s, pos, "QwenImage21");
 }
 
 // Minimal header-JSON scanner: only the torch-saved subset
 // {"__metadata__":{...},"name":{"dtype":..,"shape":[..],"data_offsets":[a,b]}}.
 inline std::map<std::string, Qwen21SafeEntry> qwen21_parse_header(
     const std::string& js, uint64_t data_base) {
-  std::map<std::string, Qwen21SafeEntry> out;
-  size_t pos = 0;
-  auto skip_ws = [&]() {
-    while (pos < js.size() && (js[pos] == ' ' || js[pos] == '\t' ||
-                               js[pos] == '\n' || js[pos] == '\r'))
-      ++pos;
-  };
-  skip_ws();
-  if (pos >= js.size() || js[pos] != '{')
-    throw std::runtime_error("QwenImage21: malformed safetensors header");
-  ++pos;
-  while (true) {
-    skip_ws();
-    if (pos >= js.size())
-      throw std::runtime_error("QwenImage21: truncated safetensors header");
-    if (js[pos] == '}') break;
-    if (js[pos] != '"')
-      throw std::runtime_error("QwenImage21: bad header key");
-    std::string name = qwen21_parse_json_string(js, pos);
-    skip_ws();
-    if (pos >= js.size() || js[pos] != ':')
-      throw std::runtime_error("QwenImage21: bad header separator");
-    ++pos;
-    skip_ws();
-    if (name == "__metadata__") {
-      if (pos >= js.size() || js[pos] != '{')
-        throw std::runtime_error("QwenImage21: bad __metadata__");
-      int depth = 0;
-      bool in_str = false;
-      while (pos < js.size()) {
-        char c = js[pos++];
-        if (in_str) {
-          if (c == '\\') {
-            if (pos < js.size()) ++pos;
-          } else if (c == '"') {
-            in_str = false;
-          }
-        } else {
-          if (c == '"') in_str = true;
-          if (c == '{') ++depth;
-          if (c == '}') {
-            if (--depth == 0) break;
-          }
-        }
-      }
-    } else {
-      if (pos >= js.size() || js[pos] != '{')
-        throw std::runtime_error("QwenImage21: bad entry for " + name);
-      ++pos;
-      Qwen21SafeEntry e;
-      bool have_dtype = false, have_shape = false, have_off = false;
-      while (true) {
-        skip_ws();
-        if (pos >= js.size())
-          throw std::runtime_error("QwenImage21: truncated entry " + name);
-        if (js[pos] == '}') {
-          ++pos;
-          break;
-        }
-        if (js[pos] != '"')
-          throw std::runtime_error("QwenImage21: bad entry key " + name);
-        std::string k = qwen21_parse_json_string(js, pos);
-        skip_ws();
-        if (pos >= js.size() || js[pos] != ':')
-          throw std::runtime_error("QwenImage21: bad entry sep " + name);
-        ++pos;
-        skip_ws();
-        if (k == "dtype") {
-          if (pos >= js.size() || js[pos] != '"')
-            throw std::runtime_error("QwenImage21: bad dtype " + name);
-          e.dtype = qwen21_parse_json_string(js, pos);
-          have_dtype = true;
-        } else if (k == "shape") {
-          if (pos >= js.size() || js[pos] != '[')
-            throw std::runtime_error("QwenImage21: bad shape " + name);
-          ++pos;
-          e.shape.clear();
-          while (true) {
-            skip_ws();
-            if (pos < js.size() && js[pos] == ']') {
-              ++pos;
-              break;
-            }
-            size_t st = pos;
-            while (pos < js.size() &&
-                   (isdigit((unsigned char)js[pos]) || js[pos] == '-'))
-              ++pos;
-            if (st == pos)
-              throw std::runtime_error("QwenImage21: bad shape num " + name);
-            e.shape.push_back(std::stoll(js.substr(st, pos - st)));
-            skip_ws();
-            if (pos < js.size() && js[pos] == ',') ++pos;
-          }
-          have_shape = true;
-        } else if (k == "data_offsets") {
-          if (pos >= js.size() || js[pos] != '[')
-            throw std::runtime_error("QwenImage21: bad offsets " + name);
-          ++pos;
-          auto num = [&]() {
-            skip_ws();
-            size_t st = pos;
-            while (pos < js.size() && isdigit((unsigned char)js[pos])) ++pos;
-            if (st == pos)
-              throw std::runtime_error("QwenImage21: bad offset " + name);
-            uint64_t v = std::stoull(js.substr(st, pos - st));
-            skip_ws();
-            return v;
-          };
-          uint64_t a = num();
-          if (pos >= js.size() || js[pos] != ',')
-            throw std::runtime_error("QwenImage21: bad offsets " + name);
-          ++pos;
-          uint64_t b = num();
-          skip_ws();
-          if (pos >= js.size() || js[pos] != ']')
-            throw std::runtime_error("QwenImage21: bad offsets " + name);
-          ++pos;
-          if (b < a)
-            throw std::runtime_error("QwenImage21: bad offsets " + name);
-          e.begin = data_base + a;
-          e.end = data_base + b;
-          have_off = true;
-        } else {
-          if (pos < js.size() && js[pos] == '"') {
-            (void)qwen21_parse_json_string(js, pos);
-          } else {
-            while (pos < js.size() && js[pos] != ',' && js[pos] != '}') ++pos;
-          }
-        }
-        skip_ws();
-        if (pos < js.size() && js[pos] == ',') ++pos;
-      }
-      if (!have_dtype || !have_shape || !have_off)
-        throw std::runtime_error("QwenImage21: incomplete entry " + name);
-      out[name] = e;
-    }
-    skip_ws();
-    if (pos < js.size() && js[pos] == ',') ++pos;
-  }
-  return out;
+  return ::KokkosDNN::Safetensors::parse_header(js, data_base, "QwenImage21");
 }
 
 inline size_t qwen21_entry_elsize(const Qwen21SafeEntry& en,
                                    const std::string& full) {
-  if (en.dtype == "F32") return 4;
-  if (en.dtype == "BF16") return 2;
-  throw std::runtime_error("QwenImage21: tensor '" + full + "' has dtype " +
-                           en.dtype + " (only F32/BF16 supported)");
+  return ::KokkosDNN::Safetensors::entry_elsize(en, full, "QwenImage21");
 }
 
 inline int64_t qwen21_entry_numel(const Qwen21SafeEntry& en,
                                   const std::string& full) {
-  int64_t numel = 1;
-  for (int64_t d : en.shape) {
-    if (d < 0)
-      throw std::runtime_error("QwenImage21: bad shape '" + full + "'");
-    numel *= d;
-  }
-  return numel;
+  return ::KokkosDNN::Safetensors::entry_numel(en, full, "QwenImage21");
 }
 
 // Convert one chunk of file payload (F32/BF16) into Scalar outputs.
 template <class Scalar>
 void qwen21_convert_chunk(const char* raw, size_t elsize, Scalar* dst,
                           size_t m) {
-  const bool fast_f32 = std::is_same_v<Scalar, float> && elsize == 4;
-  if (fast_f32) {
-    std::memcpy(dst, raw, m * 4);
-  } else if (elsize == 4) {  // F32 file -> Scalar (float or bhalf_t)
-    const float* src = reinterpret_cast<const float*>(raw);
-    for (size_t i = 0; i < m; ++i) dst[i] = static_cast<Scalar>(src[i]);
-  } else {  // BF16 file -> Scalar via FP32
-    const uint16_t* src = reinterpret_cast<const uint16_t*>(raw);
-    for (size_t i = 0; i < m; ++i)
-      dst[i] = static_cast<Scalar>(qwen21_bf16_to_float(src[i]));
-  }
+  ::KokkosDNN::Safetensors::convert_chunk<Scalar>(raw, elsize, dst, m);
 }
 
 }  // namespace Impl

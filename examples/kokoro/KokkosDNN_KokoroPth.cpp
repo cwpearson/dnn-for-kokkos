@@ -5,10 +5,7 @@
 
 #include "KokkosDNN_KokoroPth.hpp"
 
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include "KokkosDNN_Zip.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -25,132 +22,11 @@ namespace Kokoro {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Little-endian readers over the mmap'd image.
-// ---------------------------------------------------------------------------
-uint16_t rd16(const char* b, size_t p) {
-  const auto* u = reinterpret_cast<const uint8_t*>(b);
-  return (uint16_t)(u[p] | ((uint16_t)u[p + 1] << 8));
-}
-uint32_t rd32(const char* b, size_t p) {
-  const auto* u = reinterpret_cast<const uint8_t*>(b);
-  return (uint32_t)(u[p] | ((uint32_t)u[p + 1] << 8) |
-                    ((uint32_t)u[p + 2] << 16) | ((uint32_t)u[p + 3] << 24));
-}
+// ZIP framing (EOCD scan, central directory, stored-entry ranges) is the
+// central src/KokkosDNN_Zip.hpp reader (next to KokkosDNN_GGUF.hpp); the
+// pickle VM below is unchanged. Local helpers kept for the pickle cursor
+// only; archive-level rd16/rd32/mmap/zip_index now come from Zip::.
 
-// ---------------------------------------------------------------------------
-// ZIP index (stored entries only).
-// ---------------------------------------------------------------------------
-struct ZipEntry {
-  std::string name;
-  uint64_t local_offset = 0;  // local file header offset
-  uint64_t comp_size = 0;
-  uint64_t uncomp_size = 0;
-  uint16_t method = 0;
-};
-
-// ---------------------------------------------------------------------------
-// Read-only MAP_PRIVATE file image. mmap failure is a hard error (throw);
-// there is no ifstream fallback anywhere on the weight path.
-// ---------------------------------------------------------------------------
-struct MmapDeleter {
-  size_t size = 0;
-  void operator()(const char* p) const noexcept {
-    if (p != nullptr) ::munmap(const_cast<char*>(p), size);
-  }
-};
-
-std::shared_ptr<const char> mmap_file(const std::string& path,
-                                      size_t& size_out, const char* what) {
-  const int fd = ::open(path.c_str(), O_RDONLY);
-  if (fd < 0)
-    throw std::runtime_error(std::string(what) + ": cannot open '" + path +
-                             "'");
-  struct stat st;
-  if (::fstat(fd, &st) != 0) {
-    ::close(fd);
-    throw std::runtime_error(std::string(what) + ": cannot stat '" + path +
-                             "'");
-  }
-  if (st.st_size <= 0) {
-    ::close(fd);
-    throw std::runtime_error(std::string(what) + ": empty file '" + path +
-                             "'");
-  }
-  const size_t size = (size_t)st.st_size;
-  void* m = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-  ::close(fd);  // the mapping keeps the file alive
-  if (m == MAP_FAILED)
-    throw std::runtime_error(std::string(what) + ": mmap failed for '" + path +
-                             "'");
-#if defined(MADV_SEQUENTIAL)
-  ::madvise(m, size, MADV_SEQUENTIAL);
-#endif
-  size_out = size;
-  return std::shared_ptr<const char>(static_cast<const char*>(m),
-                                     MmapDeleter{size});
-}
-
-std::vector<ZipEntry> zip_index(const char* buf, size_t n) {
-  if (n < 22) throw std::runtime_error("open_pth: too small for ZIP");
-  // Find EOCD (PK\x05\x06) scanning the tail (comment <= 64KB).
-  size_t eocd = n;
-  const size_t lo = (n > (65536 + 22)) ? n - (65536 + 22) : 0;
-  for (size_t p = n - 22; ; --p) {
-    if (buf[p] == 'P' && buf[p + 1] == 'K' && buf[p + 2] == '\x05' &&
-        buf[p + 3] == '\x06') {
-      eocd = p;
-      break;
-    }
-    if (p == lo) throw std::runtime_error("open_pth: EOCD not found");
-  }
-  const uint16_t nrec = rd16(buf, eocd + 8);
-  const uint32_t cd_size = rd32(buf, eocd + 12);
-  const uint32_t cd_off = rd32(buf, eocd + 16);
-  (void)cd_size;
-  std::vector<ZipEntry> out;
-  size_t p = cd_off;
-  for (uint16_t i = 0; i < nrec; ++i) {
-    if (p + 46 > n || !(buf[p] == 'P' && buf[p + 1] == 'K' && buf[p + 2] == '\x01' &&
-                        buf[p + 3] == '\x02'))
-      throw std::runtime_error("open_pth: bad central directory entry");
-    const uint16_t method = rd16(buf, p + 10);
-    const uint32_t cs = rd32(buf, p + 20), us = rd32(buf, p + 24);
-    const uint16_t nl = rd16(buf, p + 28), el = rd16(buf, p + 30),
-                   cl = rd16(buf, p + 32);
-    const uint32_t lh = rd32(buf, p + 42);
-    if (p + 46 + nl > n)
-      throw std::runtime_error("open_pth: central directory overrun");
-    ZipEntry e;
-    e.name.assign(buf + p + 46, nl);
-    e.method = method;
-    e.comp_size = cs;
-    e.uncomp_size = us;
-    e.local_offset = lh;
-    out.push_back(e);
-    p += 46 + nl + el + cl;
-  }
-  return out;
-}
-
-// Data range of a stored entry: local header gives name/extra lengths.
-std::pair<uint64_t, uint64_t> zip_data_range(const char* buf, size_t n,
-                                             const ZipEntry& e) {
-  if (e.method != 0)
-    throw std::runtime_error("open_pth: entry '" + e.name +
-                             "' is compressed (only stored supported)");
-  const size_t p = (size_t)e.local_offset;
-  if (p + 30 > n || !(buf[p] == 'P' && buf[p + 1] == 'K' &&
-                      buf[p + 2] == '\x03' && buf[p + 3] == '\x04'))
-    throw std::runtime_error("open_pth: bad local header for '" + e.name +
-                             "'");
-  const uint16_t nl = rd16(buf, p + 26), el = rd16(buf, p + 28);
-  const uint64_t start = (uint64_t)p + 30 + nl + el;
-  if (start + e.comp_size > n)
-    throw std::runtime_error("open_pth: entry '" + e.name + "' overruns file");
-  return {start, e.comp_size};
-}
-
-// ---------------------------------------------------------------------------
 // Pickle VM.
 // ---------------------------------------------------------------------------
 struct Node;
@@ -538,14 +414,19 @@ void collect(const NodePtr& n, const std::string& prefix,
 }  // namespace
 
 PthArchive open_pth(const std::string& path) {
-  size_t n = 0;
-  std::shared_ptr<const char> map = mmap_file(path, n, "open_pth");
-  const char* buf = map.get();
-  std::vector<ZipEntry> entries = zip_index(buf, n);
+  // ZIP framing is the central src/KokkosDNN_Zip.hpp reader (next to
+  // KokkosDNN_GGUF.hpp); the pickle VM below is unchanged.
+  auto mapped =
+      std::make_shared<::KokkosDNN::Zip::MappedFile>(path, "open_pth");
+  const char* buf = mapped->map;
+  const size_t n = mapped->size;
+  const ::KokkosDNN::Zip::Archive za(*mapped, "open_pth");
+  const auto& entries = za.entries;
   // Discover the prefix: entry ending in "/data.pkl".
   std::string prefix;
-  const ZipEntry* pkl = nullptr;
-  for (auto& e : entries) {
+  const ::KokkosDNN::Zip::Entry* pkl = nullptr;
+  for (const auto& kv : entries) {
+    const auto& e = kv.second;
     if (e.name.size() > 9 &&
         e.name.compare(e.name.size() - 9, 9, "/data.pkl") == 0) {
       prefix = e.name.substr(0, e.name.size() - 9);
@@ -556,9 +437,10 @@ PthArchive open_pth(const std::string& path) {
   if (!pkl) throw std::runtime_error("open_pth: no */data.pkl in '" + path + "'");
   // Byte order must be little (host assumption for the float records).
   bool have_bo = false;
-  for (auto& e : entries) {
+  for (const auto& kv : entries) {
+    const auto& e = kv.second;
     if (e.name == prefix + "/byteorder") {
-      auto r = zip_data_range(buf, n, e);
+      auto r = za.record_range(e.name);
       if (r.second < 6 ||
           std::string(buf + r.first, 6) != "little")
         throw std::runtime_error("open_pth: archive is not little-endian");
@@ -566,13 +448,15 @@ PthArchive open_pth(const std::string& path) {
     }
   }
   if (!have_bo) throw std::runtime_error("open_pth: no byteorder entry");
-  auto pr = zip_data_range(buf, n, *pkl);
+  auto pr = za.record_range(pkl->name);
   NodePtr root;
   parse_pickle(buf + pr.first, (size_t)pr.second, root);
   PthArchive a;
   a.path = path;
   a.prefix = prefix;
-  a.map = std::move(map);
+  // Retain the archive mapping in the returned archive (aliasing shared_ptr:
+  // ownership is the MappedFile, the pointer is the mapping base).
+  a.map = std::shared_ptr<const char>(mapped, buf);
   a.map_size = n;
   if (root->kind == Node::Kind::Tensor) {
     // Single-tensor pack (voice .pt): inventory holds one nameless entry.
@@ -586,10 +470,11 @@ PthArchive open_pth(const std::string& path) {
   }
   // Map storage records.
   const std::string dprefix = prefix + "/data/";
-  for (auto& e : entries) {
+  for (const auto& kv : entries) {
+    const auto& e = kv.second;
     if (e.name.size() > dprefix.size() &&
         e.name.compare(0, dprefix.size(), dprefix) == 0) {
-      auto r = zip_data_range(buf, n, e);
+      auto r = za.record_range(e.name);
       a.records[e.name.substr(dprefix.size())] = r;
     }
   }
@@ -610,15 +495,17 @@ std::vector<float> read_pth_storage(const PthArchive& archive,
                              "'");
   // The archive owns its mapping; fall back to a fresh MAP_PRIVATE view of
   // the same file only for archives that carry none (still mmap-only).
-  std::shared_ptr<const char> held;
+  std::shared_ptr<::KokkosDNN::Zip::MappedFile> held;
   const char* base = nullptr;
   size_t n = 0;
   if (archive.map) {
     base = archive.map.get();
     n = archive.map_size;
   } else {
-    held = mmap_file(archive.path, n, "read_pth_storage");
-    base = held.get();
+    held = std::make_shared<::KokkosDNN::Zip::MappedFile>(archive.path,
+                                                          "read_pth_storage");
+    base = held->map;
+    n = held->size;
   }
   const uint64_t off = it->second.first, nbytes = it->second.second;
   if (off + nbytes > n)

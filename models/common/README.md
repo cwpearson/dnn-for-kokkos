@@ -30,10 +30,17 @@ usage, and finish reasons — no own buffering/truncation logic.
   `tokenizer.json` helpers (`read_file`/`skip_ws`/`utf8_encode_cp`/
   `json_parse_string`/`find_key_value`/`match_bracket`/`object_body`/
   `array_body`/`parse_number`). Single home for the blocks previously
-  duplicated in every byte-level tokenizer plus the renamed safetensors
-  string scanners (`dit_parse_json_string`,
-  `qwen21_parse_json_string`); per-tokenizer code keeps only its regex
-  tables and added-token handling.
+  duplicated in every byte-level tokenizer; per-tokenizer code keeps
+  only its regex tables and added-token handling.
+  (Checkpoint container framing is NOT here: safetensors/ZIP header
+  readers live in `src/KokkosDNN_Safetensors.hpp` +
+  `src/KokkosDNN_Zip.hpp`, next to `src/KokkosDNN_GGUF.hpp`. Core
+  cannot include `models/common` — the dependency direction is
+  `models/* -> common -> core` — so the archive readers are
+  self-contained in `src/` and `models/*` + `examples/*` include them
+  from there. The former per-loader string scanners
+  (`dit_parse_json_string`, `qwen21_parse_json_string`) are retired in
+  favor of the central parser.)
 - `KokkosDNN_BpeCore.hpp` — `Common::Bpe`: GPT-2 `bytes_to_unicode` table
   + inverse plus the greedy lowest-rank BPE merge loop
   (`bpe_piece_bytelevel`) shared by the byte-level tokenizers
@@ -74,11 +81,22 @@ usage, and finish reasons — no own buffering/truncation logic.
 
 - Per-regex pre-tokenizers (Llama vs SmolLM2 vs LFM2 vs Glimmer Split
   patterns stay per-tokenizer; shared only when a fifth copy appears)
-- Full safetensors header parsers (`MossImageEncoder::JsonParser`,
-  `MossImageVae::parse_entry`, `QwenTokenizer::Cursor`) — currently only
-  their string scanners are shared via JsonLite
 - Samplers (today: `KokkosDNN_MossSampler`, flow-Euler image samplers stay
   separate from the LLM `src/KokkosDNN_Sampler.hpp` pipeline)
+
+## Completed extractions
+
+- Safetensors/ZIP header readers (done): `src/KokkosDNN_Safetensors.hpp`
+  (`Safetensors::parse_header`/`MappedFile`/`convert_chunk`/`stream_into`,
+  F32/BF16) + `src/KokkosDNN_Zip.hpp` (`Zip::Archive`/`MappedFile`,
+  stored entries) consolidate the loaders previously duplicated in
+  `models/moss_image/KokkosDNN_MossImage{Dit,Encoder,Vae}.hpp`,
+  `models/qwen_image_21/KokkosDNN_QwenImage21{Config,SafetensorsMap}.hpp`,
+  and `examples/{moss_image,sana,kokoro}` (`KokkosDNN_MossZip.hpp`,
+  `KokkosDNN_MossWeights.cpp`, `SanaWeightsPth.cpp`,
+  `KokkosDNN_SanaWeights.cpp`, `KokkosDNN_KokoroPth.cpp`). Per-loader
+  files keep only their expected-tensor inventories, exact/suffix match
+  policies, pickle VMs, and device fill logic.
 
 ## Rules
 

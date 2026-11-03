@@ -7,6 +7,9 @@
 // from models/* and examples/* (minimal JSON helpers, BPE tokenizers,
 // chat templates, samplers, streaming detokenizer + usage vocabulary
 // below, plus the shared generate/session/prefix-cache concepts).
+// Checkpoint container framing (safetensors/ZIP) is NOT here: it lives in
+// src/KokkosDNN_Safetensors.hpp + src/KokkosDNN_Zip.hpp next to
+// KokkosDNN_GGUF.hpp (core cannot include models/common).
 // No model-specific logic may live here; model libs (models/lfm2_5,
 // models/glimmer, ...) link KokkosDNN::common, never the reverse. See
 // models/common/README.md.

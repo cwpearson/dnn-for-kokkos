@@ -76,17 +76,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <fcntl.h>
 #include <random>
 #include <stdexcept>
 #include <string>
-#include <sys/mman.h>
-#include <sys/stat.h>
 #include <type_traits>
-#include <unistd.h>
 #include <utility>
 #include <vector>
 
+#include "KokkosDNN_Safetensors.hpp"
 #include "KokkosDNN_Attention.hpp"
 #include "KokkosDNN_Conv.hpp"
 #include "KokkosDNN_GemmBias.hpp"
@@ -479,17 +476,17 @@ void load_safetensors(const Config& cfg, const std::string& path,
 namespace Impl {
 
 // ---- minimal safetensors reader (F32 decoder tensors only) ----
+// Central implementation lives in src/KokkosDNN_Safetensors.hpp (next to
+// KokkosDNN_GGUF.hpp); SafeEntry/SafeFile below preserve the VAE's exact
+// lookup diagnostics while delegating mmap + header parsing.
 inline uint64_t read_le64(const char* p) {
-  const auto* b = reinterpret_cast<const unsigned char*>(p);
-  uint64_t v = 0;
-  for (int i = 7; i >= 0; --i) v = (v << 8) | b[i];
-  return v;
+  return ::KokkosDNN::Safetensors::ld64_le(p);
 }
 
 struct SafeEntry {
   std::string dtype;
   std::vector<size_t> shape;
-  size_t begin = 0, end = 0;
+  size_t begin = 0, end = 0;  // absolute file offsets of the data slice
 };
 
 inline size_t safe_numel(const std::vector<size_t>& s) {
@@ -498,129 +495,32 @@ inline size_t safe_numel(const std::vector<size_t>& s) {
   return n;
 }
 
-// Parse the {"dtype","shape","data_offsets"} object following `"name"`.
-inline SafeEntry parse_entry(const std::string& js, size_t key_pos) {
-  SafeEntry e;
-  const size_t ob = js.find('{', key_pos);
-  if (ob == std::string::npos)
-    throw std::runtime_error("vae safetensors: malformed header");
-  int depth = 0;
-  size_t cb = std::string::npos;
-  bool in_str = false, esc = false;
-  for (size_t i = ob; i < js.size(); ++i) {
-    const char c = js[i];
-    if (in_str) {
-      if (esc)
-        esc = false;
-      else if (c == '\\')
-        esc = true;
-      else if (c == '"')
-        in_str = false;
-    } else if (c == '"') {
-      in_str = true;
-    } else if (c == '{') {
-      ++depth;
-    } else if (c == '}') {
-      if (--depth == 0) {
-        cb = i;
-        break;
-      }
-    }
-  }
-  if (cb == std::string::npos)
-    throw std::runtime_error("vae safetensors: unbalanced header JSON");
-  const std::string obj = js.substr(ob, cb - ob + 1);
-  auto str_val = [&](const char* key) {
-    const std::string q = std::string("\"") + key + "\"";
-    const size_t p = obj.find(q);
-    if (p == std::string::npos) return std::string();
-    const size_t colon = obj.find(':', p + q.size());
-    const size_t a = obj.find('"', colon + 1);
-    const size_t b = obj.find('"', a + 1);
-    return obj.substr(a + 1, b - a - 1);
-  };
-  auto num_list = [&](const char* key) {
-    std::vector<size_t> v;
-    const std::string q = std::string("\"") + key + "\"";
-    const size_t p = obj.find(q);
-    if (p == std::string::npos) return v;
-    const size_t a = obj.find('[', p + q.size());
-    const size_t b = obj.find(']', a + 1);
-    const std::string inner = obj.substr(a + 1, b - a - 1);
-    size_t i = 0;
-    while (i < inner.size()) {
-      while (i < inner.size() && !(inner[i] >= '0' && inner[i] <= '9')) ++i;
-      size_t j = i;
-      while (j < inner.size() && inner[j] >= '0' && inner[j] <= '9') ++j;
-      if (j > i) v.push_back(std::stoull(inner.substr(i, j - i)));
-      i = j;
-    }
-    return v;
-  };
-  e.dtype = str_val("dtype");
-  e.shape = num_list("shape");
-  const std::vector<size_t> off = num_list("data_offsets");
-  if (off.size() == 2) {
-    e.begin = off[0];
-    e.end = off[1];
-  }
-  return e;
-}
-
 struct SafeFile {
   std::string path;
-  std::string header;
-  size_t data_start = 0;
 
-  explicit SafeFile(const std::string& p) : path(p) {
-    // mmap-only shard view (POSIX MAP_PRIVATE, no read() fallback); the OS
-    // page cache is the host staging. mmap failure is a hard error.
-    const int fd = ::open(p.c_str(), O_RDONLY);
-    if (fd < 0) throw std::runtime_error("vae: cannot open '" + p + "'");
-    struct stat st;
-    if (::fstat(fd, &st) != 0) {
-      ::close(fd);
-      throw std::runtime_error("vae: cannot stat '" + p + "'");
-    }
-    if (st.st_size < 8) {
-      ::close(fd);
-      throw std::runtime_error("vae: file too small to be safetensors: '" +
-                               p + "'");
-    }
-    size_ = (size_t)st.st_size;
-    void* m = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);  // the mapping keeps the file alive
-    if (m == MAP_FAILED)
-      throw std::runtime_error("vae: mmap failed for '" + p + "'");
-    map_ = static_cast<const char*>(m);
-    const uint64_t n = read_le64(map_);
-    if (n > (uint64_t)(1 << 26) || 8 + n > size_) {
-      ::munmap(const_cast<char*>(map_), size_);
-      map_ = nullptr;
-      throw std::runtime_error("vae: bad safetensors header size in '" + p +
-                               "' (not a safetensors file?)");
-    }
-    header.assign(map_ + 8, map_ + 8 + (size_t)n);
-    data_start = (size_t)(8 + n);
-  }
-
-  ~SafeFile() {
-    if (map_ != nullptr) ::munmap(const_cast<char*>(map_), size_);
-  }
+  explicit SafeFile(const std::string& p)
+      : path(p), file_(p, "vae") {}
 
   SafeFile(const SafeFile&) = delete;
   SafeFile& operator=(const SafeFile&) = delete;
 
   SafeEntry find(const std::string& name) const {
-    const std::string q = "\"" + name + "\"";
-    const size_t p = header.find(q);
-    if (p == std::string::npos)
+    const auto& entries = file_.entries();
+    auto it = entries.find(name);
+    if (it == entries.end())
       throw std::runtime_error("vae: tensor '" + name + "' not found in '" +
                                path +
                                "' (need the FLUX.2-small VAE file: "
                                "OpenMOSS-Team/MOSS-Image-SFT/vae/"
                                "diffusion_pytorch_model.safetensors)");
-    return parse_entry(header, p);
+    const ::KokkosDNN::Safetensors::Entry& en = it->second;
+    SafeEntry e;
+    e.dtype = en.dtype;
+    e.shape.reserve(en.shape.size());
+    for (int64_t d : en.shape) e.shape.push_back((size_t)d);
+    e.begin = (size_t)en.begin;
+    e.end = (size_t)en.end;
+    return e;
   }
 
   // Read one F32 tensor (exact shape) into a host buffer (row-major).
@@ -650,16 +550,15 @@ struct SafeFile {
     const size_t n = safe_numel(want);
     if (e.end - e.begin != n * 4)
       throw std::runtime_error("vae: byte-size mismatch for '" + name + "'");
-    if (data_start + e.end > size_)
+    if (e.end > file_.size)
       throw std::runtime_error("vae: tensor '" + name +
                                "' out of mapped range in '" + path + "'");
     out.resize(n);
-    std::memcpy(out.data(), map_ + data_start + e.begin, n * 4);
+    std::memcpy(out.data(), file_.map + e.begin, n * 4);
   }
 
  private:
-  const char* map_ = nullptr;
-  size_t size_ = 0;
+  ::KokkosDNN::Safetensors::MappedFile file_;
 };
 
 // ---- elementwise glue (native portable kernels; no TPL expresses these) ----

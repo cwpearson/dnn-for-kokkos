@@ -16,7 +16,8 @@
 // co-resident and the 24 GB fit is preserved with zero host-side weight
 // copies beyond the page cache.
 //
-// The header parse reuses qwen21_parse_header (same F32/BF16 subset), and
+// The header parse uses the central Safetensors::parse_header
+// (src/KokkosDNN_Safetensors.hpp; same F32/BF16 subset), and
 // every tensor [begin, end) range is validated up front so later access
 // cannot read out of bounds. A shard whose file changed under the mapping
 // (size/mtime) stops matching find() until the next warm().
@@ -36,11 +37,6 @@
 #include <thread>
 #include <utility>
 #include <vector>
-
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 namespace KokkosDNN {
 namespace QwenImage21 {
@@ -108,107 +104,63 @@ class Qwen21MappedPrefetcher {
 };
 
 
-// One read-only safetensors shard: POSIX mmap (entries parsed once up
-// front, data_ptr() bounds-checked). Non-copyable (the mapping is
-// released in the destructor); held by unique_ptr in Qwen21MappedShardSet.
+// One read-only safetensors shard: central Safetensors::MappedFile
+// (src/KokkosDNN_Safetensors.hpp; mmap/parse/range-validate once up front)
+// plus the Qwen-specific freshness snapshot and prefetcher. data_ptr() is
+// bounds-checked. Non-copyable (the mapping is released in the destructor);
+// held by unique_ptr in Qwen21MappedShardSet.
 class Qwen21MappedShard {
  public:
-  explicit Qwen21MappedShard(const std::string& path) : path_(path) {
-    const int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0)
-      throw std::runtime_error("QwenImage21: cannot open '" + path + "'");
-    struct stat st;
-    if (::fstat(fd, &st) != 0) {
-      ::close(fd);
-      throw std::runtime_error("QwenImage21: cannot stat '" + path + "'");
-    }
-    if (st.st_size < 8) {
-      ::close(fd);
-      throw std::runtime_error("QwenImage21: too small '" + path + "'");
-    }
-    size_ = (size_t)st.st_size;
-    void* mapped = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);  // the mapping keeps the file alive
-    if (mapped == MAP_FAILED)
-      throw std::runtime_error("QwenImage21: mmap failed for '" + path + "'");
-    map_ = static_cast<const char*>(mapped);
-#if defined(MADV_SEQUENTIAL)
-    ::madvise(const_cast<char*>(map_), size_, MADV_SEQUENTIAL);
-#endif
-    const uint64_t hn = qwen21_ld64(map_);
-    if (8 + hn > size_) {
-      ::munmap(const_cast<char*>(map_), size_);
-      map_ = nullptr;
-      throw std::runtime_error("QwenImage21: bad header in '" + path + "'");
-    }
-    entries_ = qwen21_parse_header(
-        std::string(map_ + 8, map_ + 8 + (size_t)hn), 8 + hn);
+  explicit Qwen21MappedShard(const std::string& path)
+      : file_(path, "QwenImage21") {
     std::error_code ec;
     const auto mt = std::filesystem::last_write_time(path, ec);
     if (!ec) mtime_ = mt;
-    // Validate every payload range up front so later access cannot OOB.
-    for (const auto& kv : entries_) {
-      if (kv.second.begin > kv.second.end || kv.second.end > size_)
-        throw std::runtime_error("QwenImage21: tensor '" + kv.first +
-                                 "' out of range in '" + path + "'");
-    }
   }
 
-  ~Qwen21MappedShard() {
-    prefetch_.stop();
-    if (map_ != nullptr) ::munmap(const_cast<char*>(map_), size_);
-  }
+  ~Qwen21MappedShard() { prefetch_.stop(); }
 
   Qwen21MappedShard(const Qwen21MappedShard&) = delete;
   Qwen21MappedShard& operator=(const Qwen21MappedShard&) = delete;
 
-  const std::string& path() const { return path_; }
-  size_t file_size() const { return size_; }
+  const std::string& path() const { return file_.path; }
+  size_t file_size() const { return file_.size; }
   const std::map<std::string, Qwen21SafeEntry>& entries() const {
-    return entries_;
+    return file_.entries();
   }
 
   // Bounds-checked pointer to a tensor's payload (valid for the lifetime
   // of this object). Throws when the slice reaches outside the shard
   // (shard changed under the mapping after a stale find()).
   const char* data_ptr(const Qwen21SafeEntry& en) const {
-    if (en.begin > en.end || en.end > size_)
+    try {
+      return file_.data_ptr(en, "QwenImage21");
+    } catch (const std::runtime_error&) {
       throw std::runtime_error(
-          "QwenImage21: tensor slice out of mapped range in '" + path_ +
+          "QwenImage21: tensor slice out of mapped range in '" + file_.path +
           "' (shard changed under the mapping?)");
-    return base() + en.begin;
+    }
   }
 
   // True when the file on disk still matches this mapping (size + mtime).
   // Never throws: stat failures report stale (fail open to a disk read).
   bool fresh() const noexcept {
     std::error_code ec;
-    const auto sz = std::filesystem::file_size(path_, ec);
-    if (ec || sz != (uintmax_t)size_) return false;
-    const auto mt = std::filesystem::last_write_time(path_, ec);
+    const auto sz = std::filesystem::file_size(file_.path, ec);
+    if (ec || sz != (uintmax_t)file_.size) return false;
+    const auto mt = std::filesystem::last_write_time(file_.path, ec);
     if (ec || mt != mtime_) return false;
     return true;
   }
 
   // Start/stop sequential read-ahead over the whole shard. Idempotent; the
   // prefetcher is always stopped (and joined) by the destructor.
-  void start_prefetch() {
-    prefetch_.start(map_, map_ + size_);
-  }
-  void stop_prefetch() {
-    prefetch_.stop();
-  }
+  void start_prefetch() { prefetch_.start(file_.map, file_.map + file_.size); }
+  void stop_prefetch() { prefetch_.stop(); }
 
  private:
-  const char* base() const noexcept {
-    return map_;
-  }
-
-  std::string path_;
-  size_t size_ = 0;
-  std::map<std::string, Qwen21SafeEntry> entries_;
+  ::KokkosDNN::Safetensors::MappedFile file_;
   std::filesystem::file_time_type mtime_{};
-  const char* map_ = nullptr;
   Qwen21MappedPrefetcher prefetch_;
 };
 
@@ -268,24 +220,15 @@ class Qwen21MappedShardSet {
 
 // Mapping twin of the file streamer in Config.hpp: same chunking,
 // conversion, and single deep_copy, but sourced from a Qwen21MappedShard
-// (the OS page cache, no disk I/O, no host-side weight copy).
+// (the OS page cache, no disk I/O, no host-side weight copy). Delegates to
+// the central Safetensors::stream_into.
 template <class ExecSpace, class Scalar>
 void qwen21_stream_into(const Qwen21MappedShard& shard,
                         const Qwen21SafeEntry& en, size_t n, size_t elsize,
                         Scalar* dev_ptr) {
   const char* base = shard.data_ptr(en);  // range-checked
-  using HostV = Kokkos::View<Scalar*, Kokkos::HostSpace>;
-  HostV host("qwen21_load", n);
-  constexpr size_t kChunk = size_t{1} << 18;
-  for (size_t o = 0; o < n;) {
-    const size_t m = std::min(n - o, kChunk);
-    qwen21_convert_chunk<Scalar>(base + o * elsize, elsize, host.data() + o,
-                                 m);
-    o += m;
-  }
-  Kokkos::View<Scalar*, ExecSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>> dev(
-      dev_ptr, n);
-  Kokkos::deep_copy(dev, host);
+  ::KokkosDNN::Safetensors::stream_into<ExecSpace, Scalar>(base, n, elsize,
+                                                           dev_ptr);
 }
 
 }  // namespace Impl
