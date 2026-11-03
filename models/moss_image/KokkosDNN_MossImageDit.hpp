@@ -3,6 +3,8 @@
 #ifndef KOKKOSDNN_MOSSIMAGEDIT_HPP
 #define KOKKOSDNN_MOSSIMAGEDIT_HPP
 
+#include "KokkosDNN_JsonLite.hpp"
+
 // TRUE MOSS-Image flow transformer (MOSSImageTransformer) + weights loader +
 // flow-grid scheduler, on top of KokkosDNN_MossImage.hpp ops.
 //
@@ -487,18 +489,15 @@ struct DitSafeEntry {
 };
 
 inline std::string dit_parse_json_string(const std::string& s, size_t& pos) {
-  ++pos;  // opening quote
-  std::string out;
-  while (pos < s.size()) {
-    char c = s[pos++];
-    if (c == '"') return out;
-    if (c == '\\' && pos < s.size()) {
-      out += s[pos++];
-    } else {
-      out += c;
-    }
-  }
-  throw std::runtime_error("MossImageDit: malformed safetensors header");
+  // Shared JSON-lite core (models/common/KokkosDNN_JsonLite.hpp); the former
+  // ASCII-only loop is removed. Valid safetensors headers are ASCII, so the
+  // full decoder agrees there; the trailing check preserves the historical
+  // malformed-header diagnostic.
+  std::string out =
+      ::KokkosDNN::Common::JsonLite::json_parse_string(s, pos);
+  if (pos == 0 || pos > s.size() || s[pos - 1] != '"')
+    throw std::runtime_error("MossImageDit: malformed safetensors header");
+  return out;
 }
 
 // Minimal header-JSON scanner: only the torch-saved subset

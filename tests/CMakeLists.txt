@@ -49,6 +49,7 @@ if(KokkosDNN_ENABLE_MODEL_MOSS)
   # MOSS/Qwen tests get that directory on their include path.
   foreach(t test_mossimage test_mossimageddit test_mossimage_encoder test_qwen_tokenizer test_mossimagevae)
     target_include_directories(${t} PRIVATE ${CMAKE_SOURCE_DIR}/models/moss_image)
+    target_link_libraries(${t} PRIVATE KokkosDNN::common)
   endforeach()
 endif()
 
@@ -62,12 +63,15 @@ if(KokkosDNN_ENABLE_MODEL_QWEN_IMAGE_21)
   kokkosdnn_add_test(test_qwen_image_21_vision Test_QwenImage21Vision.cpp)
   target_include_directories(test_qwen_image_21_vision PRIVATE
     ${CMAKE_SOURCE_DIR}/models/qwen_image_21)
+  target_link_libraries(test_qwen_image_21_vision PRIVATE KokkosDNN::common)
   kokkosdnn_add_test(test_qwen_image_21_vae Test_QwenImage21Vae.cpp)
   target_include_directories(test_qwen_image_21_vae PRIVATE
     ${CMAKE_SOURCE_DIR}/models/qwen_image_21)
+  target_link_libraries(test_qwen_image_21_vae PRIVATE KokkosDNN::common)
   kokkosdnn_add_test(test_qwen_image_21_safetensors_map
     Test_QwenImage21SafetensorsMap.cpp)
   target_include_directories(test_qwen_image_21_safetensors_map PRIVATE
     ${CMAKE_SOURCE_DIR}/models/qwen_image_21)
+  target_link_libraries(test_qwen_image_21_safetensors_map PRIVATE KokkosDNN::common)
 endif()
 

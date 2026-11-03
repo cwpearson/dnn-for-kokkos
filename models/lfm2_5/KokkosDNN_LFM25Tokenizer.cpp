@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 // SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 #include "KokkosDNN_LFM25Tokenizer.hpp"
+#include "KokkosDNN_BpeCore.hpp"
+#include "KokkosDNN_ChatStop.hpp"
+#include "KokkosDNN_JsonLite.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -16,167 +19,17 @@ namespace KokkosDNN {
 namespace LFM25 {
 namespace {
 
-// ---------------------------------------------------------------------------
-// File + JSON helpers (schema-targeted, no third-party JSON dependency).
-// ---------------------------------------------------------------------------
-
-std::string read_file(const std::string& p) {
-  std::ifstream f(p, std::ios::binary);
-  if (!f) throw std::runtime_error("tokenizer: cannot open " + p);
-  std::ostringstream ss;
-  ss << f.rdbuf();
-  return ss.str();
-}
-
-size_t skip_ws(const std::string& s, size_t p) {
-  while (p < s.size() &&
-         (s[p] == ' ' || s[p] == '\t' || s[p] == '\n' || s[p] == '\r'))
-    ++p;
-  return p;
-}
-
-void utf8_encode_cp(uint32_t cp, std::string& out) {
-  if (cp < 0x80) {
-    out += (char)cp;
-  } else if (cp < 0x800) {
-    out += (char)(0xC0 | (cp >> 6));
-    out += (char)(0x80 | (cp & 0x3F));
-  } else if (cp < 0x10000) {
-    out += (char)(0xE0 | (cp >> 12));
-    out += (char)(0x80 | ((cp >> 6) & 0x3F));
-    out += (char)(0x80 | (cp & 0x3F));
-  } else {
-    out += (char)(0xF0 | (cp >> 18));
-    out += (char)(0x80 | ((cp >> 12) & 0x3F));
-    out += (char)(0x80 | ((cp >> 6) & 0x3F));
-    out += (char)(0x80 | (cp & 0x3F));
-  }
-}
-
-// Decode a JSON string; s[q] must be the opening quote. Returns the decoded
-// value and advances q past the closing quote. Handles all standard escapes
-// including \uXXXX with UTF-16 surrogate pairs.
-std::string json_parse_string(const std::string& s, size_t& q) {
-  ++q;  // opening quote
-  std::string out;
-  while (q < s.size()) {
-    char c = s[q++];
-    if (c == '"') break;
-    if (c != '\\') {
-      out += c;
-      continue;
-    }
-    if (q >= s.size()) break;
-    char e = s[q++];
-    switch (e) {
-      case 'n': out += '\n'; break;
-      case 't': out += '\t'; break;
-      case 'r': out += '\r'; break;
-      case 'b': out += '\b'; break;
-      case 'f': out += '\f'; break;
-      case '/': out += '/'; break;
-      case '"': out += '"'; break;
-      case '\\': out += '\\'; break;
-      case 'u': {
-        if (q + 4 > s.size())
-          throw std::runtime_error("tokenizer: bad \\u escape");
-        uint32_t cp = std::stoul(s.substr(q, 4), nullptr, 16);
-        q += 4;
-        // surrogate pair?
-        if (cp >= 0xD800 && cp <= 0xDBFF && q + 6 <= s.size() &&
-            s[q] == '\\' && s[q + 1] == 'u') {
-          uint32_t lo = std::stoul(s.substr(q + 2, 4), nullptr, 16);
-          if (lo >= 0xDC00 && lo <= 0xDFFF) {
-            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-            q += 6;
-          }
-        }
-        utf8_encode_cp(cp, out);
-        break;
-      }
-      default: out += e; break;
-    }
-  }
-  return out;
-}
-
-// Find `"key"` used as an object key at/after `from`: returns the position
-// just past the ':' or npos. A match only counts when followed by ':'.
-size_t find_key_value(const std::string& js, const char* key, size_t from) {
-  std::string pat = std::string("\"") + key + "\"";
-  size_t p = from;
-  while ((p = js.find(pat, p)) != std::string::npos) {
-    size_t c = skip_ws(js, p + pat.size());
-    if (c < js.size() && js[c] == ':') return c + 1;
-    p += pat.size();
-  }
-  return std::string::npos;
-}
-
-// Given the position of an opening bracket, find the matching closer,
-// respecting JSON strings. Returns npos on unbalanced input.
-size_t match_bracket(const std::string& js, size_t open, char oc, char cc) {
-  bool in_str = false, esc = false;
-  int depth = 0;
-  for (size_t i = open; i < js.size(); ++i) {
-    char c = js[i];
-    if (in_str) {
-      if (esc) esc = false;
-      else if (c == '\\') esc = true;
-      else if (c == '"') in_str = false;
-    } else {
-      if (c == '"') in_str = true;
-      else if (c == oc) ++depth;
-      else if (c == cc && --depth == 0) return i;
-    }
-  }
-  return std::string::npos;
-}
-
-// Extract the body (without outer braces) of the object value of `key`
-// searched from `from`. Throws when absent/unbalanced.
-std::string object_body(const std::string& js, const char* key, size_t from,
-                        const char* what) {
-  size_t v = find_key_value(js, key, from);
-  if (v == std::string::npos)
-    throw std::runtime_error(std::string("tokenizer: no ") + what);
-  v = skip_ws(js, v);
-  if (v >= js.size() || js[v] != '{')
-    throw std::runtime_error(std::string("tokenizer: ") + what +
-                             " is not an object");
-  size_t close = match_bracket(js, v, '{', '}');
-  if (close == std::string::npos)
-    throw std::runtime_error(std::string("tokenizer: unbalanced ") + what);
-  return js.substr(v + 1, close - v - 1);
-}
-
-// Same for an array value.
-std::string array_body(const std::string& js, const char* key, size_t from,
-                       const char* what) {
-  size_t v = find_key_value(js, key, from);
-  if (v == std::string::npos)
-    throw std::runtime_error(std::string("tokenizer: no ") + what);
-  v = skip_ws(js, v);
-  if (v >= js.size() || js[v] != '[')
-    throw std::runtime_error(std::string("tokenizer: ") + what +
-                             " is not an array");
-  size_t close = match_bracket(js, v, '[', ']');
-  if (close == std::string::npos)
-    throw std::runtime_error(std::string("tokenizer: unbalanced ") + what);
-  return js.substr(v + 1, close - v - 1);
-}
-
-long parse_number(const std::string& s, size_t& p) {
-  p = skip_ws(s, p);
-  size_t e = p;
-  if (e < s.size() && (s[e] == '-' || s[e] == '+')) ++e;
-  while (e < s.size() && std::isdigit((unsigned char)s[e])) ++e;
-  if (e == p) throw std::runtime_error("tokenizer: expected number");
-  long v = std::stol(s.substr(p, e - p));
-  p = e;
-  return v;
-}
-
+// Shared JSON-lite helpers live in models/common/KokkosDNN_JsonLite.hpp.
+// (Former anonymous-namespace copies removed; behavior unchanged.)
+using ::KokkosDNN::Common::JsonLite::array_body;
+using ::KokkosDNN::Common::JsonLite::find_key_value;
+using ::KokkosDNN::Common::JsonLite::json_parse_string;
+using ::KokkosDNN::Common::JsonLite::match_bracket;
+using ::KokkosDNN::Common::JsonLite::object_body;
+using ::KokkosDNN::Common::JsonLite::parse_number;
+using ::KokkosDNN::Common::JsonLite::read_file;
+using ::KokkosDNN::Common::JsonLite::skip_ws;
+using ::KokkosDNN::Common::JsonLite::utf8_encode_cp;
 // ---------------------------------------------------------------------------
 // UTF-8 <-> codepoints.
 // ---------------------------------------------------------------------------
@@ -509,69 +362,10 @@ std::vector<std::string> split_pretokens_lfm2(const std::string& text) {
   return pieces;
 }
 
-// ---------------------------------------------------------------------------
-// GPT-2 style byte mapping: every byte <-> one unicode char.
-// ---------------------------------------------------------------------------
-
-struct ByteMaps {
-  std::string enc[256];  // byte -> UTF-8 of mapped char
-  std::unordered_map<std::string, unsigned char> dec;  // UTF-8 -> byte
-  ByteMaps() {
-    // bs = printable ASCII + Latin-1 supplement ranges, then the rest.
-    bool in_bs[256] = {};
-    for (int b = 0x21; b <= 0x7E; ++b) in_bs[b] = true;
-    for (int b = 0xA1; b <= 0xAC; ++b) in_bs[b] = true;
-    for (int b = 0xAE; b <= 0xFF; ++b) in_bs[b] = true;
-    std::vector<int> bs, cs;
-    for (int b = 0; b < 256; ++b)
-      if (in_bs[b]) {
-        bs.push_back(b);
-        cs.push_back(b);
-      }
-    int m = 0;
-    for (int b = 0; b < 256; ++b)
-      if (!in_bs[b]) {
-        bs.push_back(b);
-        cs.push_back(0x100 + m++);
-      }
-    for (size_t k = 0; k < bs.size(); ++k) {
-      utf8_encode_cp((uint32_t)cs[k], enc[bs[k]]);
-      dec[enc[bs[k]]] = (unsigned char)bs[k];
-    }
-  }
-};
-
-const ByteMaps& byte_maps() {
-  static ByteMaps m;
-  return m;
-}
-
-std::string bytes_to_unicode(const std::string& bytes) {
-  const ByteMaps& m = byte_maps();
-  std::string out;
-  for (unsigned char b : bytes) out += m.enc[b];
-  return out;
-}
-
-// Inverse: mapped unicode chars -> original bytes. Chars outside the table
-// (should not occur) pass through as UTF-8.
-std::string unicode_to_bytes(const std::string& s) {
-  const ByteMaps& m = byte_maps();
-  std::string out;
-  std::vector<uint32_t> cp = utf8_decode(s);
-  for (uint32_t c : cp) {
-    std::string u;
-    utf8_encode_cp(c, u);
-    auto it = m.dec.find(u);
-    if (it != m.dec.end()) {
-      out += (char)it->second;
-    } else {
-      out += u;  // lenient
-    }
-  }
-  return out;
-}
-
+// Shared byte-level BPE core lives in models/common/KokkosDNN_BpeCore.hpp.
+using ::KokkosDNN::Common::Bpe::byte_maps;
+using ::KokkosDNN::Common::Bpe::bytes_to_unicode;
+using ::KokkosDNN::Common::Bpe::unicode_to_bytes;
 }  // namespace
 
 void Tokenizer::load(const std::string& path) {
@@ -768,46 +562,8 @@ void Tokenizer::load(const std::string& path) {
 
 void Tokenizer::bpe_piece(const std::string& piece,
                           std::vector<int>& out) const {
-  if (piece.empty()) return;
-  // split into single unicode chars (UTF-8 aware)
-  std::vector<std::string> parts;
-  for (size_t i = 0; i < piece.size();) {
-    unsigned char c = piece[i];
-    size_t len = 1;
-    if (c >= 0x80) {
-      if ((c >> 5) == 0x6) len = 2;
-      else if ((c >> 4) == 0xE) len = 3;
-      else if ((c >> 3) == 0x1E) len = 4;
-    }
-    parts.push_back(piece.substr(i, len));
-    i += len;
-  }
-  // greedily merge the lowest-rank adjacent pair
-  while (parts.size() > 1) {
-    int best_rank = -1;
-    size_t best = 0;
-    for (size_t k = 0; k + 1 < parts.size(); ++k) {
-      auto it = merge_rank_.find(parts[k] + " " + parts[k + 1]);
-      if (it != merge_rank_.end() &&
-          (best_rank < 0 || it->second < best_rank)) {
-        best_rank = it->second;
-        best = k;
-      }
-    }
-    if (best_rank < 0) break;
-    parts[best] += parts[best + 1];
-    parts.erase(parts.begin() + best + 1);
-  }
-  // byte-fallback encode path: with no applicable merge each single
-  // byte-mapped char must resolve to a base vocab id (the 256 byte-level
-  // entries); anything else is a corrupt/foreign file.
-  for (auto& s : parts) {
-    auto it = token_to_id_.find(s);
-    if (it == token_to_id_.end())
-      throw std::runtime_error("tokenizer: BPE token missing from vocab: " +
-                               unicode_to_bytes(s));
-    out.push_back(it->second);
-  }
+  ::KokkosDNN::Common::Bpe::bpe_piece_bytelevel(piece, token_to_id_,
+                                                merge_rank_, out);
 }
 
 std::vector<int> Tokenizer::encode(const std::string& text,
@@ -882,34 +638,20 @@ std::string Tokenizer::decode(const std::vector<int>& ids,
 std::vector<ChatMessage> make_chat_messages(const std::string& prompt,
                                             const std::string& system,
                                             const std::string& role) {
-  std::vector<ChatMessage> msgs;
-  if (!system.empty()) msgs.push_back({"system", system, "", {}, ""});
-  msgs.push_back({role.empty() ? "user" : role, prompt, "", {}, ""});
-  return msgs;
+  return ::KokkosDNN::Common::Chat::make_chat_messages<ChatMessage>(
+      prompt, system, role);
 }
 
 std::vector<int> ensure_bos(const std::vector<int>& ids, int bos_id,
                             bool want_bos) {
-  size_t k = 0;
-  while (k < ids.size() && ids[k] == bos_id) ++k;
-  if (want_bos) {
-    std::vector<int> out;
-    out.reserve(ids.size() - k + 1);
-    out.push_back(bos_id);
-    out.insert(out.end(), ids.begin() + (long)k, ids.end());
-    return out;
-  }
-  return std::vector<int>(ids.begin() + (long)k, ids.end());
+  return ::KokkosDNN::Common::Chat::ensure_bos(ids, bos_id, want_bos);
 }
 
 std::vector<int> encode_rendered_chat(const Tokenizer& tok,
                                       const std::string& rendered,
                                       bool add_bos) {
-  // add_bos=false here: the literal BOS in `rendered` (if any) is picked
-  // up by the special-token split; ensure_bos() then enforces the
-  // exactly-one (or zero) invariant on top.
-  std::vector<int> body = tok.encode(rendered, false);
-  return ensure_bos(body, tok.bos(), add_bos);
+  return ::KokkosDNN::Common::Chat::encode_rendered_chat(tok, rendered,
+                                                         add_bos);
 }
 
 std::string render_lfm25_chatml(const std::vector<ChatMessage>& messages,
@@ -2539,25 +2281,14 @@ ToolParseResult ToolCallStreamParser::finish() {
 size_t find_stop_string(const std::string& text,
                         const std::vector<std::string>& stop_strings,
                         std::string* matched) {
-  size_t best = std::string::npos;
-  const std::string* which = nullptr;
-  for (const auto& s : stop_strings) {
-    if (s.empty()) continue;
-    size_t p = text.find(s);
-    if (p != std::string::npos && (best == std::string::npos || p < best)) {
-      best  = p;
-      which = &s;
-    }
-  }
-  if (matched) *matched = (which ? *which : std::string());
-  return best;
+  return ::KokkosDNN::Common::Chat::find_stop_string(text, stop_strings,
+                                                     matched);
 }
 
 std::string truncate_at_stop_strings(
     const std::string& text, const std::vector<std::string>& stop_strings) {
-  size_t p = find_stop_string(text, stop_strings);
-  if (p == std::string::npos) return text;
-  return text.substr(0, p);
+  return ::KokkosDNN::Common::Chat::truncate_at_stop_strings(text,
+                                                             stop_strings);
 }
 
 std::vector<std::string> default_stop_strings() { return {kEosToken}; }

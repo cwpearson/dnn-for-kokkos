@@ -26,7 +26,8 @@ set_target_properties(kokkosdnn_common PROPERTIES EXPORT_NAME common)
 install(TARGETS kokkosdnn_common EXPORT KokkosDNNTargets)
 install(FILES KokkosDNN_Common.hpp KokkosDNN_Detokenizer.hpp KokkosDNN_Usage.hpp
   KokkosDNN_Generate.hpp KokkosDNN_SessionTypes.hpp KokkosDNN_PrefixCacheCore.hpp
-  KokkosDNN_ModelConcepts.hpp
+  KokkosDNN_ModelConcepts.hpp KokkosDNN_JsonLite.hpp KokkosDNN_BpeCore.hpp
+  KokkosDNN_ChatStop.hpp
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 if(KokkosDNN_ENABLE_TESTS)

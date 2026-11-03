@@ -6,8 +6,8 @@ library back (dependency direction: `models/* -> common -> core`).
 
 ## Status
 
-`KokkosDNN_Common.hpp` umbrellas two header-only utilities (both
-tokenizer-agnostic, no Kokkos dependency):
+`KokkosDNN_Common.hpp` umbrellas header-only utilities (all
+tokenizer-agnostic unless noted, no Kokkos dependency):
 
 - `KokkosDNN_Detokenizer.hpp` — `Common::IncrementalDetokenizer`:
   streaming detokenizer with stop-string handling. Construct with the
@@ -25,6 +25,29 @@ tokenizer-agnostic, no Kokkos dependency):
 
 Rule: the server must use these headers for SSE deltas, stop truncation,
 usage, and finish reasons — no own buffering/truncation logic.
+
+- `KokkosDNN_JsonLite.hpp` — `Common::JsonLite`: dependency-free
+  `tokenizer.json` helpers (`read_file`/`skip_ws`/`utf8_encode_cp`/
+  `json_parse_string`/`find_key_value`/`match_bracket`/`object_body`/
+  `array_body`/`parse_number`). Single home for the blocks previously
+  duplicated in every byte-level tokenizer plus the renamed safetensors
+  string scanners (`dit_parse_json_string`,
+  `qwen21_parse_json_string`); per-tokenizer code keeps only its regex
+  tables and added-token handling.
+- `KokkosDNN_BpeCore.hpp` — `Common::Bpe`: GPT-2 `bytes_to_unicode` table
+  + inverse plus the greedy lowest-rank BPE merge loop
+  (`bpe_piece_bytelevel`) shared by the byte-level tokenizers
+  (Llama/SmolLM2/LFM25/Glimmer). SentencePiece-style tokenizers
+  (Gemma4, Sana text encoder) keep their own byte-fallback paths.
+- `KokkosDNN_ChatStop.hpp` — `Common::Chat`: `find_stop_string`,
+  `truncate_at_stop_strings`, `ensure_bos`, plus generic
+  `make_chat_messages<Message>` / `encode_rendered_chat<Tokenizer>`
+  templates. Per-namespace `ChatMessage` types, renderers, and
+  `encode_chat(ml)` wrappers stay (markup differs); they forward the
+  shared logic here.
+- Sampling stays central in `src/KokkosDNN_Sampler.hpp`
+  (`is_greedy_sample`, `apply_*`, `top_*_keep`,
+  `sample_host_logits[_result]`); model-local copies are deleted.
 
 ## Shared generate/session/prefix-cache concepts
 
@@ -49,10 +72,13 @@ usage, and finish reasons — no own buffering/truncation logic.
 
 ## Planned extractions (from `models/*`, when duplicated a second time)
 
-- Minimal JSON helpers (today each model carries its own flat parser)
-- BPE tokenizer core (today: `KokkosDNN_LFM25Tokenizer`, `KokkosDNN_QwenTokenizer`)
-- Chat templates / prompt formatting
-- Samplers (today: `KokkosDNN_MossSampler`)
+- Per-regex pre-tokenizers (Llama vs SmolLM2 vs LFM2 vs Glimmer Split
+  patterns stay per-tokenizer; shared only when a fifth copy appears)
+- Full safetensors header parsers (`MossImageEncoder::JsonParser`,
+  `MossImageVae::parse_entry`, `QwenTokenizer::Cursor`) — currently only
+  their string scanners are shared via JsonLite
+- Samplers (today: `KokkosDNN_MossSampler`, flow-Euler image samplers stay
+  separate from the LLM `src/KokkosDNN_Sampler.hpp` pipeline)
 
 ## Rules
 

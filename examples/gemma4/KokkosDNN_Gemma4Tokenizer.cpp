@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 // SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 #include "KokkosDNN_Gemma4Tokenizer.hpp"
+#include "KokkosDNN_BpeCore.hpp"
+#include "KokkosDNN_ChatStop.hpp"
+#include "KokkosDNN_JsonLite.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -20,163 +23,17 @@ namespace {
 // Same style as the Llama/SmolLM2 tokenizers.
 // ---------------------------------------------------------------------------
 
-std::string read_file(const std::string& p) {
-  std::ifstream f(p, std::ios::binary);
-  if (!f) throw std::runtime_error("tokenizer: cannot open " + p);
-  std::ostringstream ss;
-  ss << f.rdbuf();
-  return ss.str();
-}
-
-size_t skip_ws(const std::string& s, size_t p) {
-  while (p < s.size() &&
-         (s[p] == ' ' || s[p] == '\t' || s[p] == '\n' || s[p] == '\r'))
-    ++p;
-  return p;
-}
-
-void utf8_encode_cp(uint32_t cp, std::string& out) {
-  if (cp < 0x80) {
-    out += (char)cp;
-  } else if (cp < 0x800) {
-    out += (char)(0xC0 | (cp >> 6));
-    out += (char)(0x80 | (cp & 0x3F));
-  } else if (cp < 0x10000) {
-    out += (char)(0xE0 | (cp >> 12));
-    out += (char)(0x80 | ((cp >> 6) & 0x3F));
-    out += (char)(0x80 | (cp & 0x3F));
-  } else {
-    out += (char)(0xF0 | (cp >> 18));
-    out += (char)(0x80 | ((cp >> 12) & 0x3F));
-    out += (char)(0x80 | ((cp >> 6) & 0x3F));
-    out += (char)(0x80 | (cp & 0x3F));
-  }
-}
-
-// Decode a JSON string; s[q] must be the opening quote. Returns the decoded
-// value and advances q past the closing quote. Handles all standard escapes
-// including \uXXXX with UTF-16 surrogate pairs.
-std::string json_parse_string(const std::string& s, size_t& q) {
-  ++q;  // opening quote
-  std::string out;
-  while (q < s.size()) {
-    char c = s[q++];
-    if (c == '"') break;
-    if (c != '\\') {
-      out += c;
-      continue;
-    }
-    if (q >= s.size()) break;
-    char e = s[q++];
-    switch (e) {
-      case 'n': out += '\n'; break;
-      case 't': out += '\t'; break;
-      case 'r': out += '\r'; break;
-      case 'b': out += '\b'; break;
-      case 'f': out += '\f'; break;
-      case '/': out += '/'; break;
-      case '"': out += '"'; break;
-      case '\\': out += '\\'; break;
-      case 'u': {
-        if (q + 4 > s.size())
-          throw std::runtime_error("tokenizer: bad \\u escape");
-        uint32_t cp = std::stoul(s.substr(q, 4), nullptr, 16);
-        q += 4;
-        // surrogate pair?
-        if (cp >= 0xD800 && cp <= 0xDBFF && q + 6 <= s.size() &&
-            s[q] == '\\' && s[q + 1] == 'u') {
-          uint32_t lo = std::stoul(s.substr(q + 2, 4), nullptr, 16);
-          if (lo >= 0xDC00 && lo <= 0xDFFF) {
-            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-            q += 6;
-          }
-        }
-        utf8_encode_cp(cp, out);
-        break;
-      }
-      default: out += e; break;
-    }
-  }
-  return out;
-}
-
-// Find `"key"` used as an object key at/after `from`: returns the position
-// just past the ':' or npos. A match only counts when followed by ':'.
-size_t find_key_value(const std::string& js, const char* key, size_t from) {
-  std::string pat = std::string("\"") + key + "\"";
-  size_t p = from;
-  while ((p = js.find(pat, p)) != std::string::npos) {
-    size_t c = skip_ws(js, p + pat.size());
-    if (c < js.size() && js[c] == ':') return c + 1;
-    p += pat.size();
-  }
-  return std::string::npos;
-}
-
-// Given the position of an opening bracket, find the matching closer,
-// respecting JSON strings. Returns npos on unbalanced input.
-size_t match_bracket(const std::string& js, size_t open, char oc, char cc) {
-  bool in_str = false, esc = false;
-  int depth = 0;
-  for (size_t i = open; i < js.size(); ++i) {
-    char c = js[i];
-    if (in_str) {
-      if (esc) esc = false;
-      else if (c == '\\') esc = true;
-      else if (c == '"') in_str = false;
-    } else {
-      if (c == '"') in_str = true;
-      else if (c == oc) ++depth;
-      else if (c == cc && --depth == 0) return i;
-    }
-  }
-  return std::string::npos;
-}
-
-// Extract the body (without outer braces) of the object value of `key`
-// searched from `from`. Throws when absent/unbalanced.
-std::string object_body(const std::string& js, const char* key, size_t from,
-                        const char* what) {
-  size_t v = find_key_value(js, key, from);
-  if (v == std::string::npos)
-    throw std::runtime_error(std::string("tokenizer: no ") + what);
-  v = skip_ws(js, v);
-  if (v >= js.size() || js[v] != '{')
-    throw std::runtime_error(std::string("tokenizer: ") + what +
-                             " is not an object");
-  size_t close = match_bracket(js, v, '{', '}');
-  if (close == std::string::npos)
-    throw std::runtime_error(std::string("tokenizer: unbalanced ") + what);
-  return js.substr(v + 1, close - v - 1);
-}
-
-// Same for an array value.
-std::string array_body(const std::string& js, const char* key, size_t from,
-                       const char* what) {
-  size_t v = find_key_value(js, key, from);
-  if (v == std::string::npos)
-    throw std::runtime_error(std::string("tokenizer: no ") + what);
-  v = skip_ws(js, v);
-  if (v >= js.size() || js[v] != '[')
-    throw std::runtime_error(std::string("tokenizer: ") + what +
-                             " is not an array");
-  size_t close = match_bracket(js, v, '[', ']');
-  if (close == std::string::npos)
-    throw std::runtime_error(std::string("tokenizer: unbalanced ") + what);
-  return js.substr(v + 1, close - v - 1);
-}
-
-long parse_number(const std::string& s, size_t& p) {
-  p = skip_ws(s, p);
-  size_t e = p;
-  if (e < s.size() && (s[e] == '-' || s[e] == '+')) ++e;
-  while (e < s.size() && std::isdigit((unsigned char)s[e])) ++e;
-  if (e == p) throw std::runtime_error("tokenizer: expected number");
-  long v = std::stol(s.substr(p, e - p));
-  p = e;
-  return v;
-}
-
+// Shared JSON-lite helpers live in models/common/KokkosDNN_JsonLite.hpp.
+// (Former anonymous-namespace copies removed; behavior unchanged.)
+using ::KokkosDNN::Common::JsonLite::array_body;
+using ::KokkosDNN::Common::JsonLite::find_key_value;
+using ::KokkosDNN::Common::JsonLite::json_parse_string;
+using ::KokkosDNN::Common::JsonLite::match_bracket;
+using ::KokkosDNN::Common::JsonLite::object_body;
+using ::KokkosDNN::Common::JsonLite::parse_number;
+using ::KokkosDNN::Common::JsonLite::read_file;
+using ::KokkosDNN::Common::JsonLite::skip_ws;
+using ::KokkosDNN::Common::JsonLite::utf8_encode_cp;
 // ---------------------------------------------------------------------------
 // SentencePiece-▁ helpers.
 // ---------------------------------------------------------------------------
@@ -553,40 +410,20 @@ std::string Tokenizer::decode(const std::vector<int>& ids,
 
 std::vector<int> ensure_bos(const std::vector<int>& ids, int bos_id,
                             bool want_bos) {
-  size_t k = 0;
-  while (k < ids.size() && ids[k] == bos_id) ++k;
-  if (want_bos) {
-    std::vector<int> out;
-    out.reserve(ids.size() - k + 1);
-    out.push_back(bos_id);
-    out.insert(out.end(), ids.begin() + (long)k, ids.end());
-    return out;
-  }
-  return std::vector<int>(ids.begin() + (long)k, ids.end());
+  return ::KokkosDNN::Common::Chat::ensure_bos(ids, bos_id, want_bos);
 }
 
 size_t find_stop_string(const std::string& text,
                         const std::vector<std::string>& stop_strings,
                         std::string* matched) {
-  size_t best = std::string::npos;
-  const std::string* which = nullptr;
-  for (const auto& s : stop_strings) {
-    if (s.empty()) continue;
-    size_t p = text.find(s);
-    if (p != std::string::npos && (best == std::string::npos || p < best)) {
-      best  = p;
-      which = &s;
-    }
-  }
-  if (matched) *matched = (which ? *which : std::string());
-  return best;
+  return ::KokkosDNN::Common::Chat::find_stop_string(text, stop_strings,
+                                                     matched);
 }
 
 std::string truncate_at_stop_strings(
     const std::string& text, const std::vector<std::string>& stop_strings) {
-  size_t p = find_stop_string(text, stop_strings);
-  if (p == std::string::npos) return text;
-  return text.substr(0, p);
+  return ::KokkosDNN::Common::Chat::truncate_at_stop_strings(text,
+                                                             stop_strings);
 }
 
 }  // namespace Gemma4

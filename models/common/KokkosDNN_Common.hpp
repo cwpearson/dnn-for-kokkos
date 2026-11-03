@@ -11,8 +11,11 @@
 // models/glimmer, ...) link KokkosDNN::common, never the reverse. See
 // models/common/README.md.
 
+#include "KokkosDNN_BpeCore.hpp"
+#include "KokkosDNN_ChatStop.hpp"
 #include "KokkosDNN_Detokenizer.hpp"
 #include "KokkosDNN_Generate.hpp"
+#include "KokkosDNN_JsonLite.hpp"
 #include "KokkosDNN_ModelConcepts.hpp"
 #include "KokkosDNN_PrefixCacheCore.hpp"
 #include "KokkosDNN_SessionTypes.hpp"
@@ -35,6 +38,16 @@ namespace Common {
 // lookup; per-arch PrefixCache subclasses keep only view snapshots.
 // DecoderModel et al. (KokkosDNN_ModelConcepts.hpp): the structural
 // contracts the shared driver relies on.
+// JsonLite (KokkosDNN_JsonLite.hpp): dependency-free tokenizer.json
+// helpers (read_file/skip_ws/json_parse_string/find_key_value/
+// match_bracket/object_body/array_body/parse_number); the per-tokenizer
+// anonymous-namespace copies forward to it.
+// BpeCore (KokkosDNN_BpeCore.hpp): GPT-2 bytes_to_unicode table + inverse
+// plus the greedy lowest-rank BPE merge loop shared by the byte-level
+// tokenizers (Llama/SmolLM2/LFM25/Glimmer).
+// ChatStop (KokkosDNN_ChatStop.hpp): find_stop_string/
+// truncate_at_stop_strings/ensure_bos plus generic make_chat_messages/
+// encode_rendered_chat templates; per-namespace wrappers preserve API.
 }  // namespace Common
 }  // namespace KokkosDNN
 

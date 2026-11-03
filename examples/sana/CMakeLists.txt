@@ -11,7 +11,7 @@ add_library(kokkosdnn_sana STATIC
   KokkosDNN_SanaTextEncoder.cpp
 )
 add_library(KokkosDNN::sana ALIAS kokkosdnn_sana)
-target_link_libraries(kokkosdnn_sana PUBLIC KokkosDNN::kokkosdnn)
+target_link_libraries(kokkosdnn_sana PUBLIC KokkosDNN::kokkosdnn KokkosDNN::common)
 target_include_directories(kokkosdnn_sana PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
 )

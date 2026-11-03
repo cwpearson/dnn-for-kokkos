@@ -21,6 +21,8 @@
 #include "KokkosDNN_RMSNorm.hpp"
 #include "KokkosDNN_RoPE.hpp"
 
+#include "KokkosDNN_JsonLite.hpp"
+
 #if defined(__unix__) || defined(__unix) || defined(__APPLE__) || \
     defined(__linux__)
 #define SANAGEMMA_HAS_DIRENT 1
@@ -926,152 +928,21 @@ void load_safetensors(const Config& cfg,
 
 namespace {
 
-std::string read_file(const std::string& p) {
-  std::ifstream f(p, std::ios::binary);
-  if (!f) throw std::runtime_error("tokenizer: cannot open " + p);
-  std::ostringstream ss;
-  ss << f.rdbuf();
-  return ss.str();
-}
+// Shared JSON-lite helpers (models/common/KokkosDNN_JsonLite.hpp). The
+// former tok_* copies are removed; tok_skip_ws remains as a thin alias
+// because the file's call sites use that spelling.
+using ::KokkosDNN::Common::JsonLite::array_body;
+using ::KokkosDNN::Common::JsonLite::find_key_value;
+using ::KokkosDNN::Common::JsonLite::json_parse_string;
+using ::KokkosDNN::Common::JsonLite::match_bracket;
+using ::KokkosDNN::Common::JsonLite::object_body;
+using ::KokkosDNN::Common::JsonLite::parse_number;
+using ::KokkosDNN::Common::JsonLite::read_file;
+using ::KokkosDNN::Common::JsonLite::utf8_encode_cp;
 
-size_t tok_skip_ws(const std::string& s, size_t p) {
-  while (p < s.size() &&
-         (s[p] == ' ' || s[p] == '\t' || s[p] == '\n' || s[p] == '\r'))
-    ++p;
-  return p;
+inline size_t tok_skip_ws(const std::string& s, size_t p) {
+  return ::KokkosDNN::Common::JsonLite::skip_ws(s, p);
 }
-
-void utf8_encode_cp(uint32_t cp, std::string& out) {
-  if (cp < 0x80) {
-    out += (char)cp;
-  } else if (cp < 0x800) {
-    out += (char)(0xC0 | (cp >> 6));
-    out += (char)(0x80 | (cp & 0x3F));
-  } else if (cp < 0x10000) {
-    out += (char)(0xE0 | (cp >> 12));
-    out += (char)(0x80 | ((cp >> 6) & 0x3F));
-    out += (char)(0x80 | (cp & 0x3F));
-  } else {
-    out += (char)(0xF0 | (cp >> 18));
-    out += (char)(0x80 | ((cp >> 12) & 0x3F));
-    out += (char)(0x80 | ((cp >> 6) & 0x3F));
-    out += (char)(0x80 | (cp & 0x3F));
-  }
-}
-
-std::string json_parse_string(const std::string& s, size_t& q) {
-  ++q;
-  std::string out;
-  while (q < s.size()) {
-    char c = s[q++];
-    if (c == '"') break;
-    if (c != '\\') {
-      out += c;
-      continue;
-    }
-    if (q >= s.size()) break;
-    char e = s[q++];
-    switch (e) {
-      case 'n': out += '\n'; break;
-      case 't': out += '\t'; break;
-      case 'r': out += '\r'; break;
-      case 'b': out += '\b'; break;
-      case 'f': out += '\f'; break;
-      case '/': out += '/'; break;
-      case '"': out += '"'; break;
-      case '\\': out += '\\'; break;
-      case 'u': {
-        if (q + 4 > s.size())
-          throw std::runtime_error("tokenizer: bad \\u escape");
-        uint32_t cp = std::stoul(s.substr(q, 4), nullptr, 16);
-        q += 4;
-        if (cp >= 0xD800 && cp <= 0xDBFF && q + 6 <= s.size() &&
-            s[q] == '\\' && s[q + 1] == 'u') {
-          uint32_t lo = std::stoul(s.substr(q + 2, 4), nullptr, 16);
-          if (lo >= 0xDC00 && lo <= 0xDFFF) {
-            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-            q += 6;
-          }
-        }
-        utf8_encode_cp(cp, out);
-        break;
-      }
-      default: out += e; break;
-    }
-  }
-  return out;
-}
-
-size_t find_key_value(const std::string& js, const char* key, size_t from) {
-  std::string pat = std::string("\"") + key + "\"";
-  size_t p = from;
-  while ((p = js.find(pat, p)) != std::string::npos) {
-    size_t c = tok_skip_ws(js, p + pat.size());
-    if (c < js.size() && js[c] == ':') return c + 1;
-    p += pat.size();
-  }
-  return std::string::npos;
-}
-
-size_t match_bracket(const std::string& js, size_t open, char oc, char cc) {
-  bool in_str = false, esc = false;
-  int depth = 0;
-  for (size_t i = open; i < js.size(); ++i) {
-    char c = js[i];
-    if (in_str) {
-      if (esc) esc = false;
-      else if (c == '\\') esc = true;
-      else if (c == '"') in_str = false;
-    } else {
-      if (c == '"') in_str = true;
-      else if (c == oc) ++depth;
-      else if (c == cc && --depth == 0) return i;
-    }
-  }
-  return std::string::npos;
-}
-
-std::string object_body(const std::string& js, const char* key, size_t from,
-                        const char* what) {
-  size_t v = find_key_value(js, key, from);
-  if (v == std::string::npos)
-    throw std::runtime_error(std::string("tokenizer: no ") + what);
-  v = tok_skip_ws(js, v);
-  if (v >= js.size() || js[v] != '{')
-    throw std::runtime_error(std::string("tokenizer: ") + what +
-                             " is not an object");
-  size_t close = match_bracket(js, v, '{', '}');
-  if (close == std::string::npos)
-    throw std::runtime_error(std::string("tokenizer: unbalanced ") + what);
-  return js.substr(v + 1, close - v - 1);
-}
-
-std::string array_body(const std::string& js, const char* key, size_t from,
-                       const char* what) {
-  size_t v = find_key_value(js, key, from);
-  if (v == std::string::npos)
-    throw std::runtime_error(std::string("tokenizer: no ") + what);
-  v = tok_skip_ws(js, v);
-  if (v >= js.size() || js[v] != '[')
-    throw std::runtime_error(std::string("tokenizer: ") + what +
-                             " is not an array");
-  size_t close = match_bracket(js, v, '[', ']');
-  if (close == std::string::npos)
-    throw std::runtime_error(std::string("tokenizer: unbalanced ") + what);
-  return js.substr(v + 1, close - v - 1);
-}
-
-long parse_number(const std::string& s, size_t& p) {
-  p = tok_skip_ws(s, p);
-  size_t e = p;
-  if (e < s.size() && (s[e] == '-' || s[e] == '+')) ++e;
-  while (e < s.size() && std::isdigit((unsigned char)s[e])) ++e;
-  if (e == p) throw std::runtime_error("tokenizer: expected number");
-  long v = std::stol(s.substr(p, e - p));
-  p = e;
-  return v;
-}
-
 inline const char* sp_space() { return "\xe2\x96\x81"; }
 
 std::string normalize_spaces(const std::string& s) {

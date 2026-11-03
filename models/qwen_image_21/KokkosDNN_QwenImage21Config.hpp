@@ -9,6 +9,8 @@
 #ifndef KOKKOSDNN_QWENIMAGE21CONFIG_HPP
 #define KOKKOSDNN_QWENIMAGE21CONFIG_HPP
 
+#include "KokkosDNN_JsonLite.hpp"
+
 // Shared Config + tiny host-side safetensors parsing used by the DiT,
 // encoder, and VAE headers. Ground truth (Qwen-Image-2.1-Turbo, from HF
 // research, not guessed):
@@ -194,18 +196,13 @@ struct Qwen21SafeEntry {
 
 inline std::string qwen21_parse_json_string(const std::string& s,
                                             size_t& pos) {
-  ++pos;  // opening quote
-  std::string out;
-  while (pos < s.size()) {
-    char c = s[pos++];
-    if (c == '"') return out;
-    if (c == '\\' && pos < s.size()) {
-      out += s[pos++];
-    } else {
-      out += c;
-    }
-  }
-  throw std::runtime_error("QwenImage21: malformed safetensors header");
+  // Shared JSON-lite core (models/common/KokkosDNN_JsonLite.hpp); see
+  // dit_parse_json_string for the ASCII-equivalence note.
+  std::string out =
+      ::KokkosDNN::Common::JsonLite::json_parse_string(s, pos);
+  if (pos == 0 || pos > s.size() || s[pos - 1] != '"')
+    throw std::runtime_error("QwenImage21: malformed safetensors header");
+  return out;
 }
 
 // Minimal header-JSON scanner: only the torch-saved subset
