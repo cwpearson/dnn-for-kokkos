@@ -7,7 +7,7 @@
 #include <Kokkos_Half.hpp>
 #include <cmath>
 
-#include "KokkosDNN.hpp"
+#include "KokkosDNN_Gemm.hpp"
 
 template <class Scalar>
 void check_gemm(float tol) {

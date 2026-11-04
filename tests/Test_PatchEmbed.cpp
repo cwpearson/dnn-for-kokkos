@@ -9,7 +9,7 @@
 #include <Kokkos_Half.hpp>
 #include <stdexcept>
 
-#include "KokkosDNN.hpp"
+#include "KokkosDNN_PatchEmbed.hpp"
 
 // Naive host Conv2d reference: out[b, ph*Wp+pw, d] =
 //   bias[d] + sum_{c,kh,kw} img[b,c,ph*S+kh,pw*S+kw] * wt[d, c*K*K+kh*K+kw].

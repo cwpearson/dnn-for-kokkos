@@ -8,7 +8,7 @@
 #include <cmath>
 #include <stdexcept>
 
-#include "KokkosDNN.hpp"
+#include "KokkosDNN_LayerNorm.hpp"
 
 template <class Scalar>
 void check_layernorm(float tol) {

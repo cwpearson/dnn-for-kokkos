@@ -8,7 +8,7 @@
 #include <cmath>
 #include <stdexcept>
 
-#include "KokkosDNN.hpp"
+#include "KokkosDNN_DepthwiseConv.hpp"
 
 namespace {
 

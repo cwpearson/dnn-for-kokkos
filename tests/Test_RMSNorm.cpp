@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <vector>
 
-#include "KokkosDNN.hpp"
+#include "KokkosDNN_RMSNorm.hpp"
 
 template <class Scalar>
 void check_rmsnorm(float tol) {

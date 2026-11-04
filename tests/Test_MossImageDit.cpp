@@ -15,7 +15,10 @@
 #include <unistd.h>
 #include <vector>
 
-#include "KokkosDNN.hpp"
+#include "KokkosDNN_GemmBias.hpp"
+#include "KokkosDNN_Activation.hpp"
+#include "KokkosDNN_RMSNorm.hpp"
+#include "KokkosDNN_Diffusion.hpp"
 #include "KokkosDNN_MossImageDit.hpp"
 
 namespace {

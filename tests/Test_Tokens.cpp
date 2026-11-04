@@ -9,7 +9,7 @@
 #include <Kokkos_Half.hpp>
 #include <stdexcept>
 
-#include "KokkosDNN.hpp"
+#include "KokkosDNN_Tokens.hpp"
 
 namespace {
 

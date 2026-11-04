@@ -7,7 +7,7 @@
 #include <Kokkos_Half.hpp>
 #include <cmath>
 
-#include "KokkosDNN.hpp"
+#include "KokkosDNN_Softmax.hpp"
 
 template <class Scalar>
 void check_softmax(float tol) {

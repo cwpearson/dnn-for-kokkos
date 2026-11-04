@@ -21,7 +21,7 @@
 #include <string>
 #include <vector>
 
-#include "KokkosDNN.hpp"
+#include "KokkosDNN_GGUF.hpp"
 
 namespace {
 

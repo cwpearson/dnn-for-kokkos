@@ -10,9 +10,10 @@
 #include <Kokkos_Half.hpp>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <vector>
 
-#include "KokkosDNN.hpp"
+#include "KokkosDNN_RMSNorm.hpp"
 #include "KokkosDNN_MossImageEncoder.hpp"
 
 namespace {

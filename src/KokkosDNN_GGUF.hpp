@@ -47,11 +47,9 @@
 #include <climits>
 #include <cstdint>
 #include <cstring>
-#include <fstream>
 #include <map>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -416,69 +414,41 @@ struct GgufTensorInfo {
 // over the mapping; exposes bounds-checked payload access. mmap failure is
 // a hard error (std::runtime_error, no fallback). Linux + macOS only.
 //
-// A sequential read-ahead prefetcher (start_prefetch/stop_prefetch) faults
-// the mapping into the page cache while the loader copies earlier tensors
-// to the device, so disk reads and H2D copies overlap instead of
-// serializing.
+// A synchronous sequential read-ahead prefetcher
+// (start_prefetch/stop_prefetch) faults the mapping into the page cache;
+// it is single-threaded on purpose so this widely included header avoids
+// <thread>.
 // ---------------------------------------------------------------------------
 namespace Impl {
 
 // Sink for the prefetcher's page touches, so the compiler cannot drop the
-// reads. Atomic because several prefetch threads report into it.
+// reads.
 inline void gguf_prefetch_sink_byte(unsigned char v) {
   static std::atomic<unsigned char> sink{0};
   sink.fetch_xor(v, std::memory_order_relaxed);
 }
 
-// Sequential read-ahead threads that fault the mapping into the page cache
-// while the loader copies earlier tensors to the device.
+// Single-threaded sequential read-ahead that faults the mapping into the
+// page cache while the loader copies earlier tensors to the device.
+// Deliberately synchronous (no <thread>): this header is widely included,
+// and one linear pass still triggers the kernel's read-ahead without
+// widening every including TU with thread support. start() warms the range
+// and returns; stop() is a no-op kept for API compatibility.
 class GgufMappedPrefetcher {
  public:
   GgufMappedPrefetcher() = default;
-  ~GgufMappedPrefetcher() { stop(); }
   GgufMappedPrefetcher(const GgufMappedPrefetcher&)            = delete;
   GgufMappedPrefetcher& operator=(const GgufMappedPrefetcher&) = delete;
 
-  // Split [begin, end) across a few threads and touch one byte per page in
-  // order. Page faults (and the kernel's read-ahead) then pull the file in
-  // at roughly the parallel-IO rate of the backing device.
   void start(const char* begin, const char* end) {
-    stop();
-    stop_.store(false, std::memory_order_relaxed);
-    const size_t nbytes = (size_t)(end - begin);
-    if (nbytes == 0) return;
-    unsigned hw = std::thread::hardware_concurrency();
-    if (hw == 0) hw = 4;
-    const size_t nthreads = std::min<size_t>(4, hw);
-    const size_t chunk    = nbytes / nthreads + 1;
-    workers_.reserve(nthreads);
-    for (size_t i = 0; i < nthreads; ++i) {
-      const char* lo = begin + i * chunk;
-      if (lo >= end) break;
-      const char* hi = std::min(end, lo + chunk);
-      workers_.emplace_back([this, lo, hi] { run(lo, hi); });
-    }
-  }
-
-  void stop() {
-    stop_.store(true, std::memory_order_relaxed);
-    for (auto& t : workers_)
-      if (t.joinable()) t.join();
-    workers_.clear();
-  }
-
- private:
-  void run(const char* lo, const char* hi) {
     constexpr size_t kPage = 4096;  // conservative: <= every page size
     unsigned char acc      = 0;
-    for (const char* p = lo; p < hi && !stop_.load(std::memory_order_relaxed);
-         p += kPage)
+    for (const char* p = begin; p < end; p += kPage)
       acc = (unsigned char)(acc + *reinterpret_cast<const unsigned char*>(p));
     gguf_prefetch_sink_byte(acc);
   }
 
-  std::atomic<bool> stop_{true};
-  std::vector<std::thread> workers_;
+  void stop() {}
 };
 
 }  // namespace Impl
@@ -624,14 +594,14 @@ class GgufFile {
   size_t data_start() const { return data_start_; }
   size_t file_size() const { return size_; }
 
-  // Start/stop sequential read-ahead over the whole mapping. Idempotent;
-  // the prefetcher is always stopped (and joined) by the destructor.
+  // Start/stop sequential read-ahead over the whole mapping. Synchronous:
+  // start() warms the range and returns; stop() is a no-op.
   void start_prefetch() { prefetch_.start(map_, map_ + size_); }
   void stop_prefetch() { prefetch_.stop(); }
 
  private:
   void move_from(GgufFile&& other) noexcept {
-    other.prefetch_.stop();  // a moved-from mapping must go quiet first
+    other.prefetch_.stop();
     map_        = other.map_;
     size_       = other.size_;
     version_    = other.version_;
@@ -2963,166 +2933,8 @@ void dequant_to_dense(
   }
 }
 
-// ---------------------------------------------------------------------------
-// Synthetic GGUF writer (for tests: build small files without real weights).
-// `dims` are in ggml order; `raw` must hold exactly the packed payload bytes.
-// Each tensor's file offset is 32-byte aligned; the data section starts
-// 32-aligned after the tensor infos.
-// ---------------------------------------------------------------------------
-struct SyntheticTensor {
-  std::string name;
-  GgmlType dtype = GgmlType::F32;
-  std::vector<uint64_t> dims;  // ggml order
-  std::vector<uint8_t> raw;    // packed payload
-};
-
-// Typed key-value metadata for write_synthetic_gguf. Implicitly constructible
-// from a string map so existing (path, tensors, string_map) calls keep
-// working; the writer emits F32/U32/BOOL-array entries after the strings.
-struct SyntheticKV {
-  std::map<std::string, std::string> strings;
-  std::map<std::string, float> f32;
-  std::map<std::string, uint32_t> u32;
-  std::map<std::string, std::vector<char>> bool_arrays;  // 0/1 bytes
-  SyntheticKV() = default;
-  SyntheticKV(const std::map<std::string, std::string>& s) : strings(s) {}
-};
-
-inline void write_synthetic_gguf(
-    const std::string& path, const std::vector<SyntheticTensor>& tensors,
-    const SyntheticKV& kv = {}) {
-  std::ofstream f(path, std::ios::binary | std::ios::trunc);
-  if (!f) throw std::runtime_error("write_synthetic_gguf: cannot open '" +
-                                   path + "'");
-  const std::map<std::string, std::string>& string_kv = kv.strings;
-  auto put = [&](const void* p, size_t n) {
-    f.write((const char*)p, (std::streamsize)n);
-  };
-  auto u32 = [&](uint32_t v) { put(&v, 4); };
-  auto u64 = [&](uint64_t v) { put(&v, 8); };
-  auto str = [&](const std::string& s) {
-    u64(s.size());
-    put(s.data(), s.size());
-  };
-  // Header (magic bytes written explicitly; endian-independent).
-  const char magic[4] = {'G', 'G', 'U', 'F'};
-  put(magic, 4);
-  u32(GgufFile::kVersion);
-  u64(tensors.size());
-  const uint64_t n_kv = (uint64_t)(string_kv.size() + kv.f32.size() +
-                                   kv.u32.size() + kv.bool_arrays.size());
-  u64(n_kv);
-  for (const auto& [k, v] : string_kv) {
-    str(k);
-    u32(8);  // GGUF_TYPE_STRING
-    str(v);
-  }
-  for (const auto& [k, v] : kv.f32) {
-    str(k);
-    u32(6);  // GGUF_TYPE_FLOAT32
-    put(&v, 4);
-  }
-  for (const auto& [k, v] : kv.u32) {
-    str(k);
-    u32(4);  // GGUF_TYPE_UINT32
-    uint32_t x = v;
-    put(&x, 4);
-  }
-  for (const auto& [k, v] : kv.bool_arrays) {
-    str(k);
-    u32(9);  // GGUF_TYPE_ARRAY
-    u32(7);  // GGUF_TYPE_BOOL elements
-    u64(v.size());
-    if (!v.empty()) put(v.data(), v.size());
-  }
-  // Tensor infos + expected payload sizes.
-  std::vector<uint64_t> nbytes;
-  nbytes.reserve(tensors.size());
-  for (const auto& t : tensors) {
-    if (t.dims.empty() || t.dims.size() > 4)
-      throw std::invalid_argument("write_synthetic_gguf: bad dims for '" +
-                                  t.name + "'");
-    uint64_t numel = 1;
-    for (auto d : t.dims) numel *= d;
-    const uint32_t bl = ggml_block_len(t.dtype);
-    if (numel % bl != 0)
-      throw std::invalid_argument(
-          "write_synthetic_gguf: numel not a multiple of block length for '" +
-          t.name + "'");
-    const uint64_t nb = (numel / bl) * ggml_type_size(t.dtype);
-    if (t.raw.size() != nb)
-      throw std::invalid_argument(
-          "write_synthetic_gguf: raw size " + std::to_string(t.raw.size()) +
-          " != expected " + std::to_string(nb) + " for '" + t.name + "'");
-    nbytes.push_back(nb);
-    str(t.name);
-    u32((uint32_t)t.dims.size());
-    for (auto d : t.dims) u64(d);
-    u32((uint32_t)t.dtype);
-    // Offset: filled in below (offsets must precede data, so buffer them).
-    u64(0);  // placeholder
-  }
-  // Patch offsets: data starts 32-aligned after infos; each tensor 32-aligned.
-  const size_t infos_end = (size_t)f.tellp();
-  const size_t data_start =
-      (infos_end + GgufFile::kAlign - 1) & ~(GgufFile::kAlign - 1);
-  // Revisit offset fields: their file positions were recorded implicitly;
-  // simplest is to recompute: header(24) + KVs + per-tensor info sizes.
-  // Instead of seeking back, require no padding ambiguity by construction:
-  // offsets are assigned sequentially here and written by seeking.
-  size_t off_pos = 24;
-  for (const auto& [k, v] : string_kv)
-    off_pos += 8 + k.size() + 4 + 8 + v.size();
-  for (const auto& [k, v] : kv.f32) {
-    (void)v;
-    off_pos += 8 + k.size() + 4 + 4;
-  }
-  for (const auto& [k, v] : kv.u32) {
-    (void)v;
-    off_pos += 8 + k.size() + 4 + 4;
-  }
-  for (const auto& [k, v] : kv.bool_arrays)
-    off_pos += 8 + k.size() + 4 + 4 + 8 + v.size();
-  std::vector<size_t> off_fields;
-  for (const auto& t : tensors) {
-    size_t p = off_pos + 8 + t.name.size() + 4 + 8 * t.dims.size() + 4;
-    off_fields.push_back(p);
-    off_pos = p + 8;
-  }
-  uint64_t cur = 0;
-  for (size_t i = 0; i < tensors.size(); ++i) {
-    cur = (cur + GgufFile::kAlign - 1) & ~(GgufFile::kAlign - 1);
-    f.seekp((std::streamoff)off_fields[i]);
-    u64(cur);
-    cur += nbytes[i];
-  }
-  // Data section.
-  f.seekp((std::streamoff)data_start);
-  cur = 0;
-  const char pad[32] = {};
-  for (size_t i = 0; i < tensors.size(); ++i) {
-    const uint64_t want = (cur + GgufFile::kAlign - 1) & ~(GgufFile::kAlign - 1);
-    if (want > cur) {
-      put(pad, (size_t)(want - cur));
-      cur = want;
-    }
-    put(tensors[i].raw.data(), tensors[i].raw.size());
-    cur += nbytes[i];
-  }
-  f.flush();
-  if (!f) throw std::runtime_error("write_synthetic_gguf: write failed '" +
-                                   path + "'");
-}
-
-// Backward-compatible string-KV-only overload (no default argument, so
-// two-argument calls unambiguously select the SyntheticKV overload above).
-inline void write_synthetic_gguf(
-    const std::string& path, const std::vector<SyntheticTensor>& tensors,
-    const std::map<std::string, std::string>& string_kv) {
-  SyntheticKV kv;
-  kv.strings = string_kv;
-  write_synthetic_gguf(path, tensors, kv);
-}
+// Synthetic test writer moved to KokkosDNN_GGUF_Synthetic.hpp (keeps <fstream>
+// out of this widely included header).
 
 }  // namespace Gguf
 }  // namespace KokkosDNN

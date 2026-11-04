@@ -8,7 +8,7 @@
 #include <Kokkos_Half.hpp>
 #include <cmath>
 
-#include "KokkosDNN.hpp"
+#include "KokkosDNN_Diffusion.hpp"
 
 namespace {
 

@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "KokkosDNN_GGUF.hpp"
+#include "KokkosDNN_GGUF_Synthetic.hpp"
 #include "KokkosDNN_GlimmerConfig.hpp"
 #include "KokkosDNN_GlimmerModel.hpp"
 #include "KokkosDNN_GlimmerWeights.hpp"

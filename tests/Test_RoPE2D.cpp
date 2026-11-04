@@ -9,7 +9,7 @@
 #include <cmath>
 #include <vector>
 
-#include "KokkosDNN.hpp"
+#include "KokkosDNN_RoPE.hpp"
 
 namespace {
 

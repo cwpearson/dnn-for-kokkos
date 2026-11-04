@@ -12,7 +12,7 @@
 #include <stdexcept>
 #include <vector>
 
-#include "KokkosDNN.hpp"
+#include "KokkosDNN_RMSNorm.hpp"
 #include "KokkosDNN_MoE.hpp"
 
 namespace {

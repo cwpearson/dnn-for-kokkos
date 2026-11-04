@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "KokkosDNN_GGUF.hpp"
+#include "KokkosDNN_GGUF_Synthetic.hpp"
 #include "KokkosDNN_LFM25Config.hpp"
 #include "KokkosDNN_LFM25Weights.hpp"
 

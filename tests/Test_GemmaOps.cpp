@@ -17,7 +17,12 @@
 #include <stdexcept>
 #include <vector>
 
-#include "KokkosDNN.hpp"
+#include "KokkosDNN_Embedding.hpp"
+#include "KokkosDNN_Activation.hpp"
+#include "KokkosDNN_RMSNorm.hpp"
+#include "KokkosDNN_LayerScale.hpp"
+#include "KokkosDNN_RoPE.hpp"
+#include "KokkosDNN_Attention.hpp"
 
 namespace {
 

@@ -10,7 +10,7 @@
 #include <Kokkos_Half.hpp>
 #include <stdexcept>
 
-#include "KokkosDNN.hpp"
+#include "KokkosDNN_LayerScale.hpp"
 
 namespace {
 

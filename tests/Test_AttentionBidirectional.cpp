@@ -12,7 +12,7 @@
 #include <cstddef>
 #include <vector>
 
-#include "KokkosDNN.hpp"
+#include "KokkosDNN_Attention.hpp"
 
 // Host reference: dense softmax over ALL keys, FP32 accumulation.
 template <class Scalar, class HQ, class HK, class HV>

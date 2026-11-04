@@ -10,7 +10,8 @@
 #include <stdexcept>
 #include <utility>
 
-#include "KokkosDNN.hpp"
+#include "KokkosDNN_Attention.hpp"
+#include "KokkosDNN_Embedding.hpp"
 
 template <class Scalar>
 void check_attention(float tol) {

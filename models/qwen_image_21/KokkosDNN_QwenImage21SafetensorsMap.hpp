@@ -26,6 +26,7 @@
 // mmap failure throws and there is no fallback path.
 
 #include "KokkosDNN_QwenImage21Config.hpp"
+#include "KokkosDNN_SafetensorsLoad.hpp"
 
 #include <atomic>
 #include <cstdint>

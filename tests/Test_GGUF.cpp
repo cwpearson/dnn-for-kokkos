@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "KokkosDNN_GGUF.hpp"
+#include "KokkosDNN_GGUF_Synthetic.hpp"
 
 namespace {
 

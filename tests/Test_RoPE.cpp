@@ -7,7 +7,7 @@
 #include <Kokkos_Half.hpp>
 #include <cmath>
 
-#include "KokkosDNN.hpp"
+#include "KokkosDNN_RoPE.hpp"
 
 template <class Scalar>
 void check_rope(float abs_tol, float rel_tol) {

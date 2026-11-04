@@ -8,7 +8,7 @@
 #include <Kokkos_Half.hpp>
 #include <stdexcept>
 
-#include "KokkosDNN.hpp"
+#include "KokkosDNN_GemmBias.hpp"
 
 template <class Scalar>
 void check_gemm_bias(float tol) {

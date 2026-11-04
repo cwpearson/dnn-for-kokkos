@@ -8,7 +8,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <mutex>
 #include <type_traits>
 #include <utility>
 #include "KokkosDNN_config.h"
@@ -89,8 +88,11 @@ inline void tpl_dump_counters() {
 }
 
 inline void tpl_arm_dump_once() {
-  static std::once_flag arm;
-  std::call_once(arm, [] { std::atexit(tpl_dump_counters); });
+  // Function-local statics are initialized exactly once (thread-safe since
+  // C++11), so no <mutex>/<once_flag> is needed to arm the atexit hook.
+  static const bool armed =
+      ([] { std::atexit(tpl_dump_counters); return true; })();
+  (void)armed;
 }
 
 inline void tpl_note(std::atomic<uint64_t>& took_tpl,

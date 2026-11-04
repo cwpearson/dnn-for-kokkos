@@ -29,6 +29,7 @@
 #include "KokkosDNN_Optimizer.hpp"
 #include "KokkosDNN_GGUF.hpp"
 #include "KokkosDNN_Safetensors.hpp"
+#include "KokkosDNN_SafetensorsLoad.hpp"
 #include "KokkosDNN_Zip.hpp"
 #include "KokkosDNN_MoE.hpp"
 #include "KokkosDNN_Conv1D.hpp"

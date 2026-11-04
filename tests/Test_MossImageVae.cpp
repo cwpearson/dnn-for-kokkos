@@ -15,7 +15,7 @@
 #include <fstream>
 #include <vector>
 
-#include "KokkosDNN.hpp"
+#include "KokkosDNN_GroupNorm.hpp"
 #include "KokkosDNN_MossImageVae.hpp"
 
 namespace {

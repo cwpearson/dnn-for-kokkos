@@ -4,6 +4,7 @@
 #define KOKKOSDNN_MOSSIMAGEDIT_HPP
 
 #include "KokkosDNN_Safetensors.hpp"
+#include "KokkosDNN_SafetensorsLoad.hpp"
 
 // TRUE MOSS-Image flow transformer (MOSSImageTransformer) + weights loader +
 // flow-grid scheduler, on top of KokkosDNN_MossImage.hpp ops.

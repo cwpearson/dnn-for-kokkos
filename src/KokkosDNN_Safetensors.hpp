@@ -42,8 +42,11 @@
 // failure is a hard error; there is no read() fallback. Little-endian host
 // assumed for the u64 header length (matches every previous loader, which
 // memcpy'd the length on LE hosts).
-
-#include <Kokkos_Core.hpp>
+//
+// Kokkos-free by design: this header parses into STL containers only. The
+// Kokkos-dependent device streamer (stream_into, HostSpace staging +
+// deep_copy) lives in KokkosDNN_SafetensorsLoad.hpp so parser-only users
+// don't pull Kokkos.
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -57,6 +60,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -403,23 +407,6 @@ void convert_chunk(const char* raw, size_t elsize, Scalar* dst, size_t m) {
     for (size_t i = 0; i < m; ++i)
       dst[i] = static_cast<Scalar>(bf16_to_float(src[i]));
   }
-}
-
-// Stream n elements from a mapping through a bounded HostSpace chunk with a
-// single deep_copy (no 2x device residency).
-template <class ExecSpace, class Scalar>
-void stream_into(const char* base, size_t n, size_t elsize, Scalar* dev_ptr) {
-  using HostV = Kokkos::View<Scalar*, Kokkos::HostSpace>;
-  HostV host("safetensors_load", n);
-  constexpr size_t kChunk = size_t{1} << 18;
-  for (size_t o = 0; o < n;) {
-    const size_t m = std::min(n - o, kChunk);
-    convert_chunk<Scalar>(base + o * elsize, elsize, host.data() + o, m);
-    o += m;
-  }
-  Kokkos::View<Scalar*, ExecSpace, Kokkos::MemoryTraits<Kokkos::Unmanaged>>
-      dev(dev_ptr, n);
-  Kokkos::deep_copy(dev, host);
 }
 
 // ---- mmap-only shard view (POSIX MAP_PRIVATE, no fallback) ----

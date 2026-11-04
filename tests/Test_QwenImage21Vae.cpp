@@ -11,7 +11,6 @@
 #include <cmath>
 #include <vector>
 
-#include "KokkosDNN.hpp"
 #include "KokkosDNN_Handle.hpp"
 #include "KokkosDNN_QwenImage21Vae.hpp"
 
