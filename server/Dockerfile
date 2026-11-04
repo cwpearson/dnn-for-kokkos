@@ -92,7 +92,7 @@ ARG CMAKE_BUILD_TYPE
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates cmake g++ git libstb-dev \
+      ca-certificates cmake g++ git \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -113,6 +113,8 @@ RUN git clone --depth 1 --branch ${KOKKOS_VERSION} \
  && cmake --install kokkos-build
 
 # Server only: tests/examples/benchmarks stay OFF to keep the image lean.
+# The image I/O component is OFF too (the server serves text-only chat;
+# nothing under server/ links KokkosDNN::image).
 # TPL dispatch (cuBLAS GEMM, cuDNN SDPA) is ON — the cudnn-devel image above
 # ships both. cudnn-frontend / cpp-httplib / nlohmann_json are fetched at
 # configure time, so this step needs network access.
@@ -131,6 +133,7 @@ RUN cmake -S /src/kokkosdnn -B /src/kokkosdnn-build \
       -DKokkosDNN_ENABLE_TESTS=OFF \
       -DKokkosDNN_ENABLE_EXAMPLES=OFF \
       -DKokkosDNN_ENABLE_BENCHMARKS=OFF \
+      -DKokkosDNN_ENABLE_IMAGE=OFF \
       -DKokkosDNN_ENABLE_SERVER=ON \
       -DKokkosDNN_ENABLE_MODEL_LFM25=ON \
       -DKokkosDNN_ENABLE_MODEL_GLIMMER=ON \
