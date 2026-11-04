@@ -365,7 +365,7 @@ struct EncoderStage {
                        const std::string& negative_prompt,
                        const std::string& tokenizer_dir,
                        const std::string& encoder_path) {
-    namespace QT = KokkosDNN::QwenTokenizer;
+    namespace QT = KokkosDNN::Moss::QwenTokenizer;
     const std::string tok_json = tokenizer_dir + "/tokenizer.json";
     if (!file_exists(tok_json))
       throw std::runtime_error(

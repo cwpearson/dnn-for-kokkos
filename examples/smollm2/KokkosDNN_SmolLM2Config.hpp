@@ -24,7 +24,7 @@ namespace SmolLM2 {
 inline constexpr int kMaxSupportedSeqLen = 8192;
 inline constexpr int kMinSupportedSeqLen = 1;
 
-namespace config_detail {
+namespace Impl {
 
 // ---- Minimal JSON lookup (dependency-free) ----
 // Flat key lookup on the root object, string-aware (keys inside nested
@@ -282,7 +282,7 @@ inline bool iequals(const std::string& a, const std::string& b) {
   return to_lower_str(a) == to_lower_str(b);
 }
 
-}  // namespace config_detail
+}  // namespace Impl
 
 // Hyperparameters for SmolLM2-135M (HuggingFaceTB, 2024).
 // Reference: HF HuggingFaceTB/SmolLM2-135M config.json: dim 576,
@@ -444,7 +444,7 @@ struct Config {
       bad("rms_norm_eps must be positive and finite");
     if (!(rope_theta > 0) || !std::isfinite(rope_theta))
       bad("rope_theta must be positive and finite");
-    if (!config_detail::iequals(hidden_act, "silu"))
+    if (!Impl::iequals(hidden_act, "silu"))
       throw std::runtime_error(
           "Config::validate: hidden_act '" + hidden_act +
           "' is not supported: only 'silu' is supported (Model hardcodes "
@@ -506,7 +506,7 @@ struct Config {
   // unsupported rope_scaling types (only null/absent and "llama3" allowed).
   static Config from_json_string(const std::string& text,
                                  const Config& base = smollm2_135m()) {
-    using namespace config_detail;
+    using namespace Impl;
     Config c = base;
     long long iv = 0;
     double dv    = 0;

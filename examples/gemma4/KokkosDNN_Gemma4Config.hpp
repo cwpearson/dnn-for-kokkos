@@ -25,7 +25,7 @@ namespace Gemma4 {
 inline constexpr int kMaxSupportedSeqLen = 131072;
 inline constexpr int kMinSupportedSeqLen = 1;
 
-namespace config_detail {
+namespace Impl {
 
 // ---- Minimal JSON lookup (dependency-free) ----
 // Flat key lookup on an object, string-aware (keys inside nested
@@ -300,7 +300,7 @@ inline bool get_string(const std::string& s, const std::string& key,
   throw std::runtime_error("config: '" + key + "' must be a string");
 }
 
-}  // namespace config_detail
+}  // namespace Impl
 
 // Hyperparameters for the Gemma4 text path (E2B-it, 2026).
 // Reference: HF google/gemma-4-E2B-it config.json `text_config`: dim 1536,
@@ -489,7 +489,7 @@ struct Config {
     if (ple_vocab <= 0) bad("vocab_size_per_layer_input must be > 0");
     if (!(final_logit_softcap > 0) || !std::isfinite(final_logit_softcap))
       bad("final_logit_softcapping must be positive and finite");
-    if (!config_detail::iequals(hidden_activation, "gelu_pytorch_tanh"))
+    if (!Impl::iequals(hidden_activation, "gelu_pytorch_tanh"))
       throw std::runtime_error(
           "Config::validate: hidden_activation '" + hidden_activation +
           "' is not supported: only 'gelu_pytorch_tanh' is supported (Model "
@@ -515,7 +515,7 @@ struct Config {
   // the text_config object when the file is a full config.json).
   static Config from_json_scope(const std::string& text,
                                 const Config& base = gemma4_e2b_it()) {
-    using namespace config_detail;
+    using namespace Impl;
     Config c = base;
     long long iv = 0;
     double dv    = 0;
@@ -688,7 +688,7 @@ struct Config {
   // ignored. Throws on malformed JSON or incompatible dims.
   static Config from_json_string(const std::string& text,
                                  const Config& base = gemma4_e2b_it()) {
-    using namespace config_detail;
+    using namespace Impl;
     std::string scope = text;
     std::string sub;
     if (get_raw(text, "text_config", sub)) {

@@ -43,10 +43,11 @@
 // headers moved to models/moss_image/
 // (KokkosDNN_MossImage{,Dit,Encoder,Vae}.hpp, KokkosDNN_QwenTokenizer.hpp);
 // include them from there, e.g. via the kokkosdnn_moss target.
-
-#ifdef KOKKOSDNN_ENABLE_IMAGE
-#include "images/KokkosDNN_Image.hpp"
-#endif
+//
+// NOTE: the optional image component (KokkosDNN::image,
+// src/images/KokkosDNN_Image.hpp) is NOT included here: core never couples
+// to it. Image consumers include images/KokkosDNN_Image.hpp directly and
+// link KokkosDNN::image (see src/images/CMakeLists.txt).
 
 #include <iosfwd>
 

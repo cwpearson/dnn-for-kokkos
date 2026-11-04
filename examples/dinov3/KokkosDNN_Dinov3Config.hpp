@@ -14,7 +14,7 @@
 namespace KokkosDNN {
 namespace Dinov3 {
 
-namespace config_detail {
+namespace Impl {
 
 // ---- Minimal JSON lookup (dependency-free) ----
 // Flat key lookup on the root object, string-aware (keys inside nested
@@ -290,7 +290,7 @@ inline bool iequals(const std::string& a, const std::string& b) {
   return to_lower_str(a) == to_lower_str(b);
 }
 
-}  // namespace config_detail
+}  // namespace Impl
 
 // Hyperparameters for HF `dinov3_vit` (DINOv3 ViT-B/16 pretrain-lvd1689m).
 // Reference: facebook/dinov3-vitb16-pretrain-lvd1689m config.json: patch 16,
@@ -398,7 +398,7 @@ struct Config {
       bad("rope_theta must be positive and finite");
     if (!std::isfinite(layerscale_value))
       bad("layerscale_value must be finite");
-    if (!config_detail::iequals(hidden_act, "gelu"))
+    if (!Impl::iequals(hidden_act, "gelu"))
       throw std::runtime_error(
           "Config::validate: hidden_act '" + hidden_act +
           "' is not supported: only 'gelu' is supported");
@@ -406,7 +406,7 @@ struct Config {
       throw std::runtime_error(
           "Config::validate: 'use_gated_mlp' must be false: gated/SwiGLU MLP "
           "is unsupported (dinov3_vit uses plain gelu MLP)");
-    if (!config_detail::iequals(model_type, "dinov3_vit"))
+    if (!Impl::iequals(model_type, "dinov3_vit"))
       throw std::runtime_error(
           "Config::validate: model_type '" + model_type +
           "' is not supported: only 'dinov3_vit' is supported");
@@ -418,7 +418,7 @@ struct Config {
   // failure. `head_dim` is derived (hidden/heads), never read from JSON.
   static Config from_json_string(const std::string& text,
                                  const Config& base = vitb16()) {
-    using namespace config_detail;
+    using namespace Impl;
     Config c = base;
     long long iv = 0;
     double dv    = 0;

@@ -3,8 +3,9 @@ API reference
 
 All public entry points live in namespace ``KokkosDNN`` and are declared in
 ``src/KokkosDNN_*.hpp``. The umbrella header ``src/KokkosDNN.hpp`` pulls in
-every core component (plus ``images/KokkosDNN_Image.hpp`` when
-``KokkosDNN_ENABLE_IMAGE`` is on).
+every core component. The optional image component
+(``src/images/KokkosDNN_Image.hpp``, ``KokkosDNN::image``) is NOT included
+there: include it directly and link ``KokkosDNN::image``.
 
 Conventions
 -----------

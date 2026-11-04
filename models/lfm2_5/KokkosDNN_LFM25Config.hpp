@@ -27,7 +27,7 @@ namespace LFM25 {
 inline constexpr int kMaxSupportedSeqLen = 131072;
 inline constexpr int kMinSupportedSeqLen = 1;
 
-namespace config_detail {
+namespace Impl {
 
 // ---- Minimal JSON lookup (dependency-free) ----
 // Flat key lookup on the root object, string-aware (keys inside nested
@@ -286,7 +286,7 @@ inline bool iequals(const std::string& a, const std::string& b) {
   return to_lower_str(a) == to_lower_str(b);
 }
 
-}  // namespace config_detail
+}  // namespace Impl
 
 // Hyperparameters for LFM2.5-24B-A2B (Liquid AI): hybrid short-convolution
 // + full-attention decoder with mixture-of-experts feedforwards.
@@ -484,11 +484,11 @@ struct Config {
           ") must equal num_hidden_layers (" + std::to_string(n_layers) + ")");
     if (num_attention_layers() == 0)
       bad("layer_types must contain at least one full-attention layer");
-    if (!config_detail::iequals(hidden_act, "silu"))
+    if (!Impl::iequals(hidden_act, "silu"))
       throw std::runtime_error(
           "Config::validate: hidden_act '" + hidden_act +
           "' is not supported: only 'silu' is supported");
-    if (!config_detail::iequals(model_type, "lfm2_moe"))
+    if (!Impl::iequals(model_type, "lfm2_moe"))
       throw std::runtime_error(
           "Config::validate: model_type '" + model_type +
           "' is not supported: only 'lfm2_moe' is supported");
@@ -523,7 +523,7 @@ struct Config {
   // layer_types entries, or unsupported hidden_act/model_type.
   static Config from_json_string(const std::string& text,
                                  const Config& base = lfm2_5_24b_a2b()) {
-    using namespace config_detail;
+    using namespace Impl;
     Config c = base;
     long long iv = 0;
     double dv    = 0;

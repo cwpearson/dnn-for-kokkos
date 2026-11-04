@@ -43,6 +43,7 @@
 #include "KokkosDNN_QwenTokenizerTables.inc"
 
 namespace KokkosDNN {
+namespace Moss {
 namespace QwenTokenizer {
 
 namespace Impl {
@@ -1011,6 +1012,7 @@ class Tokenizer {
 };
 
 }  // namespace QwenTokenizer
+}  // namespace Moss
 }  // namespace KokkosDNN
 
 #endif

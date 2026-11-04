@@ -311,8 +311,10 @@ last block wins); `--vae-weights` = FLUX.2 VAE `.safetensors` (single
   per-phase `[memory phase=...]` logging. The embeds stay resident on the
   device across the encoder-release / DiT-load boundary (device-to-device
   staging into the sample loop, no disk, no second process).
-- Targets (`CMakeLists.txt`): `kokkosdnn_moss` lib + `moss_image_generate`.
-  Sources: `KokkosDNN_Moss{Config,Weights,Model,Sampler}` + driver.
+- Targets (`models/moss_image/CMakeLists.txt`): `kokkosdnn_moss` compiled
+  STATIC lib (like LFM25/Glimmer: `KokkosDNN_Moss{Config,Weights,Model,
+  Sampler}` sources + header-only true pipeline) + `moss_image_generate`
+  driver (`examples/moss_image/CMakeLists.txt`, links `KokkosDNN::moss`).
   Wired into `examples/CMakeLists.txt` (`add_subdirectory(moss_image)`,
   same unconditional style as the other examples).
 

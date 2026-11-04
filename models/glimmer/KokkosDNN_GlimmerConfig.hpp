@@ -25,7 +25,7 @@ namespace Glimmer {
 inline constexpr int kMaxSupportedSeqLen = 131072;
 inline constexpr int kMinSupportedSeqLen = 1;
 
-namespace config_detail {
+namespace Impl {
 
 // ---- Minimal JSON lookup (dependency-free) ----
 // Flat key lookup on an object, string-aware (keys inside nested
@@ -300,7 +300,7 @@ inline bool get_string(const std::string& s, const std::string& key,
   throw std::runtime_error("config: '" + key + "' must be a string");
 }
 
-}  // namespace config_detail
+}  // namespace Impl
 
 // Hyperparameters for the Muse Glimmer 30B text path (2026).
 // Reference: HF darkc0de/Muse-Glimmer-30B-heretic config.json `text_config`:
@@ -501,7 +501,7 @@ struct Config {
       bad("qk_scale_factor must be positive and finite");
     if (!(output_multiplier > 0) || !std::isfinite(output_multiplier))
       bad("output_multiplier must be positive and finite");
-    if (!config_detail::iequals(hidden_activation, "silu"))
+    if (!Impl::iequals(hidden_activation, "silu"))
       throw std::runtime_error(
           "Config::validate: hidden_activation '" + hidden_activation +
           "' is not supported: only 'silu' is supported (Model hardcodes "
@@ -527,7 +527,7 @@ struct Config {
   // the text_config object when the file is a full config.json).
   static Config from_json_scope(const std::string& text,
                                 const Config& base = glimmer_30b()) {
-    using namespace config_detail;
+    using namespace Impl;
     Config c = base;
     long long iv = 0;
     double dv    = 0;
@@ -762,7 +762,7 @@ struct Config {
   // ignored. Throws on malformed JSON or incompatible dims.
   static Config from_json_string(const std::string& text,
                                  const Config& base = glimmer_30b()) {
-    using namespace config_detail;
+    using namespace Impl;
     std::string scope = text;
     std::string sub;
     if (get_raw(text, "text_config", sub)) {

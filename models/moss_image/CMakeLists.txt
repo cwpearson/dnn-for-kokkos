@@ -1,14 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 # SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
 # MOSS-Image model library: installable component (KokkosDNN::moss).
-# Header-only pipeline (KokkosDNN_MossImage{,Dit,Encoder,Vae}.hpp,
-# KokkosDNN_QwenTokenizer.hpp + tables .inc live here); there are no .cpp
-# sources, hence INTERFACE. The example-local support code
-# (KokkosDNN_Moss{Config,Model,Sampler}.hpp, KokkosDNN_MossWeights.cpp)
-# stays in examples/moss_image and compiles into the driver there.
+# Compiled STATIC library like LFM25/Glimmer: the placeholder Moss geometry
+# (KokkosDNN_Moss{Config,Model,Sampler}.hpp compiled via
+# KokkosDNN_MossWeights.cpp, plus the KokkosDNN_MossZip.hpp ZIP-reader
+# wrapper) lives here alongside the header-only true pipeline
+# (KokkosDNN_MossImage{,Dit,Encoder,Vae}.hpp, KokkosDNN_QwenTokenizer.hpp +
+# tables .inc). The driver (moss_image_generate) in examples/moss_image links
+# this target and holds no model sources of its own.
 
-kokkosdnn_add_header_only_model_library(kokkosdnn_moss
+kokkosdnn_add_compiled_model_library(kokkosdnn_moss
   EXPORT_NAME moss
+  SOURCES
+    KokkosDNN_MossWeights.cpp
   LINK_LIBRARIES KokkosDNN::kokkosdnn KokkosDNN::common
   WITH_IMAGE
 )

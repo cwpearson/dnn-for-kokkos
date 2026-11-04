@@ -54,13 +54,11 @@ endif()
 # third-party stb warnings are silenced portably on GCC/Clang without
 # per-warning pragmas (a blanket `#pragma ... ignored "-w"` is rejected by
 # both compilers).
-# The core umbrella (KokkosDNN.hpp) includes this component when
-# KOKKOSDNN_ENABLE_IMAGE is defined, and KokkosDNN_ImageIO.hpp needs
-# stb_image.h at compile time, so the stb dir is also exposed through the
-# core target (build tree only) for existing core consumers. This is not a
-# dependency on kokkosdnn_image itself: core never links it.
-target_include_directories(kokkosdnn SYSTEM PUBLIC
-  $<BUILD_INTERFACE:${KokkosDNN_STB_INCLUDE_DIR}>)
+# KokkosDNN_ImageIO.hpp needs stb_image.h at compile time, so the stb dir
+# is scoped to the image target only: kokkosdnn_image links KokkosDNN::stb
+# PUBLIC below (build tree and install tree), which propagates the -isystem
+# dir to image consumers. Core (kokkosdnn) never carries it: the core
+# umbrella (KokkosDNN.hpp) does not include the image component.
 # Installable stb header target: part of the KokkosDNNTargets export set so
 # installed KokkosDNN::image can link it. Headers are installed under
 # <prefix>/include/kokkosdnn_stb so installed KokkosDNN_ImageIO.hpp (which

@@ -19,8 +19,8 @@
 
 namespace {
 
-namespace QT = KokkosDNN::QwenTokenizer;
-namespace QI = KokkosDNN::QwenTokenizer::Impl;
+namespace QT = KokkosDNN::Moss::QwenTokenizer;
+namespace QI = KokkosDNN::Moss::QwenTokenizer::Impl;
 
 std::vector<uint32_t> cp(const std::string& s) {
   return QI::utf8_decode(s);

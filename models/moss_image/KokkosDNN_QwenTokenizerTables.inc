@@ -9,6 +9,7 @@
 #pragma once
 #include <cstdint>
 namespace KokkosDNN {
+namespace Moss {
 namespace QwenTokenizer {
 namespace Impl {
 inline constexpr uint32_t kStripCps[] = {
@@ -4937,4 +4938,5 @@ inline constexpr ComposeEntry kCompose[] = {
 };
 }  // namespace Impl
 }  // namespace QwenTokenizer
+}  // namespace Moss
 }  // namespace KokkosDNN

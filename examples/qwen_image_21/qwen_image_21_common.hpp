@@ -922,7 +922,7 @@ struct RawQwenTables {
 };
 
 namespace RawQwenDetail {
-namespace QT = KokkosDNN::QwenTokenizer;
+namespace QT = KokkosDNN::Moss::QwenTokenizer;
 
 inline void parse_vocab(QT::Impl::JsonCursor& cur, RawQwenTables& t) {
   cur.ws();
@@ -1094,7 +1094,7 @@ inline void parse_added(QT::Impl::JsonCursor& cur, RawQwenTables& t) {
 }  // namespace RawQwenDetail
 
 inline RawQwenTables load_raw_qwen_tables(const std::string& path) {
-  namespace QT = KokkosDNN::QwenTokenizer;
+  namespace QT = KokkosDNN::Moss::QwenTokenizer;
   std::ifstream f(path, std::ios::binary);
   if (!f)
     throw std::runtime_error("raw Qwen tables: cannot open '" + path + "'");
@@ -1163,7 +1163,7 @@ inline RawQwenTables load_raw_qwen_tables(const std::string& path) {
 inline std::vector<int> encode_qwen_raw(const RawQwenTables& t,
                                         const std::string& text,
                                         size_t max_len) {
-  namespace QT = KokkosDNN::QwenTokenizer;
+  namespace QT = KokkosDNN::Moss::QwenTokenizer;
   if (max_len == 0)
     throw std::invalid_argument("encode_qwen_raw: max_len == 0");
   std::vector<int> ids;

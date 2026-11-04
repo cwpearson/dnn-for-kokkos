@@ -34,10 +34,10 @@ kokkosdnn_add_test(test_audiodsp Test_AudioDSP.cpp)
 # MOSS-Image unit tests build only when the MOSS model component is enabled,
 # mirroring models/CMakeLists.txt and examples/CMakeLists.txt (both guard
 # their MOSS subdirectories on KokkosDNN_ENABLE_MODEL_MOSS).
-# The model pipeline headers belong to the KokkosDNN::moss interface (its
-# INTERFACE include dir + KokkosDNN::common link), so these tests link the
-# model target instead of reaching into models/moss_image/ with a private
-# include path.
+# The model library (KokkosDNN::moss, compiled STATIC like LFM25/Glimmer:
+# its PUBLIC include dir + KokkosDNN::common link) carries the pipeline
+# headers, so these tests link the model target instead of reaching into
+# models/moss_image/ with a private include path.
 if(KokkosDNN_ENABLE_MODEL_MOSS)
   kokkosdnn_add_test(test_mossimage Test_MossImageOps.cpp LINK_LIBRARIES KokkosDNN::moss)
   kokkosdnn_add_test(test_mossimageddit Test_MossImageDit.cpp LINK_LIBRARIES KokkosDNN::moss)
