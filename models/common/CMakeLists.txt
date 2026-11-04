@@ -12,18 +12,11 @@
 # samplers. See README.md.
 # Every model lib links KokkosDNN::common; nothing here links a model lib.
 
-add_library(kokkosdnn_common INTERFACE)
-add_library(KokkosDNN::common ALIAS kokkosdnn_common)
-target_link_libraries(kokkosdnn_common INTERFACE KokkosDNN::kokkosdnn)
-target_include_directories(kokkosdnn_common INTERFACE
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
-  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+kokkosdnn_add_header_only_model_library(kokkosdnn_common
+  EXPORT_NAME common
+  LINK_LIBRARIES KokkosDNN::kokkosdnn
 )
-target_compile_features(kokkosdnn_common INTERFACE cxx_std_20)
-kokkosdnn_enable_compiler_warnings(kokkosdnn_common)
-set_target_properties(kokkosdnn_common PROPERTIES EXPORT_NAME common)
 
-install(TARGETS kokkosdnn_common EXPORT KokkosDNNTargets)
 install(FILES KokkosDNN_Common.hpp KokkosDNN_Detokenizer.hpp KokkosDNN_Usage.hpp
   KokkosDNN_Generate.hpp KokkosDNN_SessionTypes.hpp KokkosDNN_PrefixCacheCore.hpp
   KokkosDNN_ModelConcepts.hpp KokkosDNN_JsonLite.hpp KokkosDNN_BpeCore.hpp

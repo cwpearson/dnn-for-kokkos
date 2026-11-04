@@ -42,21 +42,12 @@ option(BUILD_SHARED_LIBS "Build shared libraries" OFF)
 # -DKokkosDNN_ENABLE_TEST_DISCOVERY=OFF there; ctest then simply sees no
 # tests, which matches the compile-coverage-only intent.
 option(KokkosDNN_ENABLE_TEST_DISCOVERY "Register gtest tests via gtest_discover_tests (requires runnable test binaries)" ON)
-# Wrapper around gtest_discover_tests that no-ops when discovery is
-# disabled. Defined here (before any add_subdirectory) so tests/, examples/
-# and benchmarks/ can all use it. The call is deferred to configure time of
-# the caller, by which point include(GoogleTest) has run whenever
-# KokkosDNN_ENABLE_TESTS=ON.
-function(kokkosdnn_discover_tests TARGET)
-  if(KokkosDNN_ENABLE_TEST_DISCOVERY)
-    # DISCOVERY_TIMEOUT: discovery executes the test binary at build time.
-    # The default 5 s is too tight on loaded CI runners (parallel links
-    # starve the probe; macos-arm failed on test_lfm25_weights_gguf with
-    # "Process terminated due to timeout"), so allow 60 s. Belt-and-braces
-    # with GTestMain skipping Kokkos init for --gtest_list_tests probes.
-    gtest_discover_tests(${TARGET} DISCOVERY_TIMEOUT 60 ${ARGN})
-  endif()
-endfunction()
+# Wrapper around gtest_discover_tests is provided by
+# cmake/KokkosDNNHelpers.cmake (kokkosdnn_discover_tests), included below
+# before any add_subdirectory, so tests/, models/*/tests and examples/ can
+# all use it. The call is deferred to the caller scope, by which point
+# include(GoogleTest) has run whenever KokkosDNN_ENABLE_TESTS=ON.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/KokkosDNNHelpers.cmake)
 
 # ---------------------------------------------------------------------------
 # Options are mixed-case (KokkosDNN_ENABLE_*) but the config header and
@@ -66,29 +57,10 @@ endfunction()
 # is ON. Bridge explicitly. Also accept the all-caps -D spelling (a common
 # mistake given the macro name) by promoting it to the canonical option.
 # NOTE: this must run before the find_package calls below, so the promoted
-# option value is what the dependency search sees.
+# option value is what the dependency search sees. Suffix list lives in
+# cmake/KokkosDNNHelpers.cmake.
 # ---------------------------------------------------------------------------
-if(KOKKOSDNN_ENABLE_CUBLAS AND NOT KokkosDNN_ENABLE_CUBLAS)
-  set(KokkosDNN_ENABLE_CUBLAS ON)
-endif()
-if(KOKKOSDNN_ENABLE_CUDNN AND NOT KokkosDNN_ENABLE_CUDNN)
-  set(KokkosDNN_ENABLE_CUDNN ON)
-endif()
-if(KOKKOSDNN_ENABLE_HIPBLAS AND NOT KokkosDNN_ENABLE_HIPBLAS)
-  set(KokkosDNN_ENABLE_HIPBLAS ON)
-endif()
-if(KOKKOSDNN_ENABLE_MIOPEN AND NOT KokkosDNN_ENABLE_MIOPEN)
-  set(KokkosDNN_ENABLE_MIOPEN ON)
-endif()
-if(KOKKOSDNN_ENABLE_ACCELERATE AND NOT KokkosDNN_ENABLE_ACCELERATE)
-  set(KokkosDNN_ENABLE_ACCELERATE ON)
-endif()
-if(KOKKOSDNN_ENABLE_IMAGE AND NOT KokkosDNN_ENABLE_IMAGE)
-  set(KokkosDNN_ENABLE_IMAGE ON)
-endif()
-if(KOKKOSDNN_ENABLE_IMAGE_WEBP AND NOT KokkosDNN_ENABLE_IMAGE_WEBP)
-  set(KokkosDNN_ENABLE_IMAGE_WEBP ON)
-endif()
+kokkosdnn_bridge_tpl_options()
 
 # ---------------------------------------------------------------------------
 # Dependencies
@@ -187,15 +159,27 @@ configure_file(cmake/KokkosDNN_config.h.in
   ${CMAKE_CURRENT_BINARY_DIR}/KokkosDNN_config.h @ONLY)
 
 # ---------------------------------------------------------------------------
-# Library: core DNN operators only (no model-specific code) + headers
+# Library: core DNN operators only (no model-specific code) + headers.
+# TPL dispatch TUs are attached conditionally below: each carries an
+# internal #if guard so an unconditional build is harmless, but compiling
+# them only when the option is ON keeps the default build free of CUDA/
+# HIP-only sources.
 # ---------------------------------------------------------------------------
 add_library(kokkosdnn
   src/KokkosDNN_PrintConfiguration.cpp
-  src/tpl/cudnn/KokkosDNN_CuDNN_SDPA.cpp
-  src/tpl/cudnn/KokkosDNN_CuDNN_ConvForward.cpp
-  src/tpl/miopen/KokkosDNN_MIOpen_SDPA.cpp
-  src/tpl/miopen/KokkosDNN_MIOpen_ConvForward.cpp
 )
+if(KokkosDNN_ENABLE_CUDNN)
+  target_sources(kokkosdnn PRIVATE
+    src/tpl/cudnn/KokkosDNN_CuDNN_SDPA.cpp
+    src/tpl/cudnn/KokkosDNN_CuDNN_ConvForward.cpp
+  )
+endif()
+if(KokkosDNN_ENABLE_MIOPEN)
+  target_sources(kokkosdnn PRIVATE
+    src/tpl/miopen/KokkosDNN_MIOpen_SDPA.cpp
+    src/tpl/miopen/KokkosDNN_MIOpen_ConvForward.cpp
+  )
+endif()
 add_library(KokkosDNN::kokkosdnn ALIAS kokkosdnn)
 
 target_include_directories(kokkosdnn PUBLIC
@@ -243,22 +227,8 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/KokkosDNNCompilerWarnings.cmake)
 
 # Third-party policy (warnings are enforced on first-party code only):
 # silence every TPL target so its headers cannot trip -Werror in our TUs.
-if(KokkosDNN_ENABLE_CUBLAS)
-  kokkosdnn_suppress_third_party_warnings(CUDA::cublas)
-  kokkosdnn_suppress_third_party_warnings(CUDA::cublasLt)
-endif()
-if(KokkosDNN_ENABLE_CUDNN)
-  kokkosdnn_suppress_third_party_warnings(cudnn_frontend)
-  kokkosdnn_suppress_third_party_warnings(CUDNN::cudnn)
-  kokkosdnn_suppress_third_party_warnings(CUDA::nvrtc)
-  kokkosdnn_suppress_third_party_warnings(CUDA::cudart)
-endif()
-if(KokkosDNN_ENABLE_HIPBLAS)
-  kokkosdnn_suppress_third_party_warnings(roc::hipblas)
-endif()
-if(KokkosDNN_ENABLE_MIOPEN)
-  kokkosdnn_suppress_third_party_warnings(MIOpen)
-endif()
+# Target lists live in cmake/KokkosDNNHelpers.cmake.
+kokkosdnn_suppress_tpl_warnings()
 
 if(KokkosDNN_ENABLE_ACCELERATE)
   # Apple-only system framework (AMX/SME-backed sgemm, no install needed).
@@ -275,9 +245,7 @@ if(KokkosDNN_ENABLE_ACCELERATE)
   target_compile_definitions(kokkosdnn PUBLIC ACCELERATE_NEW_LAPACK=1)
 endif()
 
-kokkosdnn_enable_compiler_warnings(kokkosdnn)
-
-set_target_properties(kokkosdnn PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+kokkosdnn_standardize_target(kokkosdnn)
 
 # ---------------------------------------------------------------------------
 # Optional image component (ON by default; no dependency from core target)
@@ -321,22 +289,18 @@ if(KokkosDNN_ENABLE_TESTS)
   # can never trip -Werror. Suppress all spellings/siblings: FetchContent
   # defines gtest+gtest_main (plus gmock+gmock_main when enabled), system
   # packages define GTest::gtest+GTest::gtest_main as IMPORTED (headers
-  # still need SYSTEM treatment). Missing targets are a no-op.
-  kokkosdnn_suppress_third_party_warnings(gtest)
-  kokkosdnn_suppress_third_party_warnings(gtest_main)
-  kokkosdnn_suppress_third_party_warnings(gmock)
-  kokkosdnn_suppress_third_party_warnings(gmock_main)
-  kokkosdnn_suppress_third_party_warnings(GTest::gtest)
-  kokkosdnn_suppress_third_party_warnings(GTest::gtest_main)
-  kokkosdnn_suppress_third_party_warnings(GTest::gmock)
-  kokkosdnn_suppress_third_party_warnings(GTest::gmock_main)
+  # still need SYSTEM treatment). Missing targets are a no-op. Target list
+  # lives in cmake/KokkosDNNHelpers.cmake.
+  foreach(_gtest_target IN LISTS KOKKOSDNN_TPL_GTEST_TARGETS)
+    kokkosdnn_suppress_third_party_warnings(${_gtest_target})
+  endforeach()
+  unset(_gtest_target)
   include(GoogleTest)
   # Shared GoogleTest main that initializes/finalizes Kokkos.
   add_library(kokkosdnn_gtest_main STATIC tests/GTestMain.cpp)
   add_library(KokkosDNN::gtest_main ALIAS kokkosdnn_gtest_main)
   target_link_libraries(kokkosdnn_gtest_main PUBLIC Kokkos::kokkos GTest::gtest)
-  set_target_properties(kokkosdnn_gtest_main PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
-  kokkosdnn_enable_compiler_warnings(kokkosdnn_gtest_main)
+  kokkosdnn_standardize_target(kokkosdnn_gtest_main)
 endif()
 
 # ---------------------------------------------------------------------------

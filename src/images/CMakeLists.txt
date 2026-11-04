@@ -77,7 +77,7 @@ set_target_properties(kokkosdnn_stb PROPERTIES
   INTERFACE_SYSTEM_INCLUDE_DIRECTORIES
     "$<BUILD_INTERFACE:${KokkosDNN_STB_INCLUDE_DIR}>;$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/kokkosdnn_stb>"
   EXPORT_NAME stb)
-kokkosdnn_enable_compiler_warnings(kokkosdnn_stb)
+kokkosdnn_standardize_target(kokkosdnn_stb)
 install(TARGETS kokkosdnn_stb EXPORT KokkosDNNTargets)
 foreach(_stb_header stb_image.h stb_image_write.h)
   if(NOT EXISTS "${KokkosDNN_STB_INCLUDE_DIR}/${_stb_header}")
@@ -179,9 +179,10 @@ if(KokkosDNN_ENABLE_IMAGE_WEBP)
       add_subdirectory(${libwebp_SOURCE_DIR} ${libwebp_BINARY_DIR} EXCLUDE_FROM_ALL)
       set(KOKKOSDNN_IMAGE_HAVE_WEBP ON)
       target_link_libraries(kokkosdnn_image PUBLIC webp)
-      kokkosdnn_suppress_third_party_warnings(webp)
-      kokkosdnn_suppress_third_party_warnings(sharpyuv)
-      kokkosdnn_suppress_third_party_warnings(webpdecoder)
+      foreach(_webp_target IN ITEMS webp sharpyuv webpdecoder)
+        kokkosdnn_suppress_third_party_warnings(${_webp_target})
+      endforeach()
+      unset(_webp_target)
       # The fetched targets carry PUBLIC_HEADERs we deliberately do not
       # ship (our installed headers never include webp/*.h; consumers only
       # link). Clear them so install() skips headers without a dev warning.
@@ -215,8 +216,8 @@ target_link_libraries(kokkosdnn_image PUBLIC Kokkos::kokkos KokkosDNN::stb)
 # stb warnings are silenced via the SYSTEM (-isystem) include above, so this
 # target keeps normal warning flags: only third-party stb code is muted,
 # our own code (here and header-inline in consumers) is still checked.
-set_target_properties(kokkosdnn_image PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON EXPORT_NAME image)
-kokkosdnn_enable_compiler_warnings(kokkosdnn_image)
+set_target_properties(kokkosdnn_image PROPERTIES EXPORT_NAME image)
+kokkosdnn_standardize_target(kokkosdnn_image)
 
 install(TARGETS kokkosdnn_image EXPORT KokkosDNNTargets
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}

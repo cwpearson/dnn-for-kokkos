@@ -10,8 +10,7 @@
 # always work.
 
 function(qwen_image_21_add_driver name src)
-  add_executable(${name} ${src})
-  set_target_properties(${name} PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+  kokkosdnn_add_executable(${name} ${src})
   if(TARGET kokkosdnn_qwen_image_21)
     target_link_libraries(${name} PRIVATE KokkosDNN::qwen_image_21)
   else()
@@ -20,7 +19,6 @@ function(qwen_image_21_add_driver name src)
   if(TARGET kokkosdnn_image)
     target_link_libraries(${name} PRIVATE KokkosDNN::image)
   endif()
-  kokkosdnn_enable_compiler_warnings(${name})
 endfunction()
 
 qwen_image_21_add_driver(qwen_image_21_generate qwen_image_21_generate.cpp)

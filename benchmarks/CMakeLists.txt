@@ -37,10 +37,11 @@ endif()
 # compiled target) and its headers reach kokkosdnn_bench as SYSTEM, so they
 # can never trip -Werror. Suppress both libs (benchmark+benchmark_main) in
 # both spellings (system packages provide benchmark::benchmark as IMPORTED).
-kokkosdnn_suppress_third_party_warnings(benchmark)
-kokkosdnn_suppress_third_party_warnings(benchmark_main)
-kokkosdnn_suppress_third_party_warnings(benchmark::benchmark)
-kokkosdnn_suppress_third_party_warnings(benchmark::benchmark_main)
+# Target list lives in cmake/KokkosDNNHelpers.cmake.
+foreach(_bench_target IN LISTS KOKKOSDNN_TPL_BENCHMARK_TARGETS)
+  kokkosdnn_suppress_third_party_warnings(${_bench_target})
+endforeach()
+unset(_bench_target)
 
 # Standalone bandwidth benchmark for the packed-quant GEMV (decode) path: reads
 # the real matrices of a GGUF checkpoint and reports GB/s per shape, which is
@@ -50,12 +51,10 @@ kokkosdnn_suppress_third_party_warnings(benchmark::benchmark_main)
 # rows/tpr/groups (default 0 = the shipped layout) drive the row-blocked kernel
 # directly, for tuning the layout against a real checkpoint.
 #   ./kokkosdnn_bench_gguf_gemv <model.gguf> 40 2 64 2 blk.0.ffn_gate.weight
-add_executable(kokkosdnn_bench_gguf_gemv Bench_GGUFGemv.cpp)
+kokkosdnn_add_executable(kokkosdnn_bench_gguf_gemv Bench_GGUFGemv.cpp)
 target_link_libraries(kokkosdnn_bench_gguf_gemv PRIVATE KokkosDNN::kokkosdnn)
-set_target_properties(kokkosdnn_bench_gguf_gemv PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
-kokkosdnn_enable_compiler_warnings(kokkosdnn_bench_gguf_gemv)
 
-add_executable(kokkosdnn_bench
+kokkosdnn_add_executable(kokkosdnn_bench
   BenchmarkMain.cpp
   Bench_Gemm.cpp
   Bench_GemmBias.cpp
@@ -68,8 +67,6 @@ add_executable(kokkosdnn_bench
   Bench_Sampler.cpp
 )
 target_link_libraries(kokkosdnn_bench PRIVATE KokkosDNN::kokkosdnn benchmark::benchmark)
-set_target_properties(kokkosdnn_bench PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
-kokkosdnn_enable_compiler_warnings(kokkosdnn_bench)
 # BENCHMARK() pastes __COUNTER__ into this TU; Clang-family compilers flag
 # it as a C2y extension under -pedantic. Probe-and-disable just that
 # warning for this target (GCC never warns here, MSVC has no equivalent).

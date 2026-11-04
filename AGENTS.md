@@ -33,7 +33,11 @@ cmake/           config header + package config templates
   (warning set mirroring `Kokkos_ENABLE_COMPILER_WARNINGS`, plus `-Werror`).
   Every first-party target gets the flags via
   `kokkosdnn_enable_compiler_warnings(<target>)`
-  (`cmake/KokkosDNNCompilerWarnings.cmake`); call it for each new target.
+  (`cmake/KokkosDNNCompilerWarnings.cmake`), usually applied through the
+  `cmake/KokkosDNNHelpers.cmake` wrappers (`kokkosdnn_add_executable()`,
+  `kokkosdnn_add_test()`, `kokkosdnn_add_compiled_model_library()`,
+  `kokkosdnn_add_header_only_model_library()`, or
+  `kokkosdnn_standardize_target()`); use a wrapper for each new target.
   CI enables the option on every workflow, so a warning introduced anywhere
   (library, tests, examples, benchmarks, server) fails CI.
 

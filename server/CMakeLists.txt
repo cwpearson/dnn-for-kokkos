@@ -61,14 +61,19 @@ endif()
 
 set(KOKKOSDNN_SERVER_BACKEND_SOURCES BackendLFM25.cpp BackendGlimmer.cpp)
 
-add_executable(kokkosdnn_server server_main.cpp ${KOKKOSDNN_SERVER_BACKEND_SOURCES})
-target_compile_definitions(kokkosdnn_server PRIVATE ${KOKKOSDNN_SERVER_BACKEND_DEFS})
-target_link_libraries(kokkosdnn_server PRIVATE
-  ${KOKKOSDNN_SERVER_BACKEND_LIBS} KokkosDNN::common
-  httplib::httplib nlohmann_json::nlohmann_json)
-set_target_properties(kokkosdnn_server PROPERTIES
-  CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
-kokkosdnn_enable_compiler_warnings(kokkosdnn_server)
+# Both binaries share the backend TUs, definitions, and links; the parsing
+# test only swaps the main TU (it #includes server_main.cpp with NO_MAIN).
+# kokkosdnn_add_executable() (cmake/KokkosDNNHelpers.cmake) covers the
+# repeated CXX_STANDARD + warnings pair.
+function(kokkosdnn_add_server_executable name)
+  kokkosdnn_add_executable(${name} ${ARGN} ${KOKKOSDNN_SERVER_BACKEND_SOURCES})
+  target_compile_definitions(${name} PRIVATE ${KOKKOSDNN_SERVER_BACKEND_DEFS})
+  target_link_libraries(${name} PRIVATE
+    ${KOKKOSDNN_SERVER_BACKEND_LIBS} KokkosDNN::common
+    httplib::httplib nlohmann_json::nlohmann_json)
+endfunction()
+
+kokkosdnn_add_server_executable(kokkosdnn_server server_main.cpp)
 
 # Parsing unit tests (pure JSON helpers; no weights/tokenizer needed).
 # NOTE: server/ is added before the top-level enable_testing(), so enable
@@ -78,14 +83,7 @@ if(KokkosDNN_ENABLE_TESTS)
   # NOTE: test_server_parsing.cpp #includes server_main.cpp (NO_MAIN), so
   # only the backend TUs are compiled in addition — never server_main.cpp
   # itself (that would duplicate main() and every helper).
-  add_executable(kokkosdnn_server_parsing_tests test_server_parsing.cpp ${KOKKOSDNN_SERVER_BACKEND_SOURCES})
-  target_compile_definitions(kokkosdnn_server_parsing_tests PRIVATE ${KOKKOSDNN_SERVER_BACKEND_DEFS})
-  target_link_libraries(kokkosdnn_server_parsing_tests PRIVATE
-    ${KOKKOSDNN_SERVER_BACKEND_LIBS} KokkosDNN::common
-    httplib::httplib nlohmann_json::nlohmann_json)
-  set_target_properties(kokkosdnn_server_parsing_tests PROPERTIES
-    CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
-  kokkosdnn_enable_compiler_warnings(kokkosdnn_server_parsing_tests)
+  kokkosdnn_add_server_executable(kokkosdnn_server_parsing_tests test_server_parsing.cpp)
   add_test(NAME kokkosdnn_server_parsing
     COMMAND kokkosdnn_server_parsing_tests)
 endif()
