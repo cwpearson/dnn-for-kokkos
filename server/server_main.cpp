@@ -545,6 +545,10 @@ struct ParsedRequest {
   bool tools_active = false;
   bool json_mode = false;
   bool parallel_tool_calls = true;
+  // Glimmer RLed reasoning cue ("low"|"medium"|"high"|"xhigh", default
+  // "high"). Parsed for every arch here (type-checked only); Glimmer
+  // backends validate/apply it at encode time, others ignore it.
+  std::string reasoning_strength = "high";
 };
 
 // Shared fields: model id, unsupported-feature gates, sampling options,
@@ -696,6 +700,18 @@ bool parse_common(const json& body, const std::vector<int>& default_stop_ids,
       return false;
     }
     out.parallel_tool_calls = body["parallel_tool_calls"].get<bool>();
+  }
+  // reasoning_effort: OpenAI reasoning cue ("low"|"medium"|"high"|"xhigh",
+  // default "high"). Type-checked here for every arch; the Glimmer backend
+  // validates the value at encode time (400 on unknown), other backends
+  // ignore it.
+  if (body.contains("reasoning_effort") &&
+      !body["reasoning_effort"].is_null()) {
+    if (!body["reasoning_effort"].is_string()) {
+      err = "'reasoning_effort' must be a string";
+      return false;
+    }
+    out.reasoning_strength = body["reasoning_effort"].get<std::string>();
   }
   // response_format: {"type":"text"} (default) | {"type":"json_object"} |
   // {"type":"json_schema","json_schema":{...}}. Soft enforcement: a JSON
@@ -1386,9 +1402,9 @@ bool check_tools_support(const ChatBackend& backend, const ParsedRequest& pr,
       // on backends with a prefix cache.
       const std::vector<int> content_ids = st.backend->encode(
           pr.messages, pr.tools_json, sys_suffix,
-          /*add_generation_prompt=*/false);
-      const std::vector<int> full_ids =
-          st.backend->encode(pr.messages, pr.tools_json, sys_suffix, true);
+          /*add_generation_prompt=*/false, pr.reasoning_strength);
+      const std::vector<int> full_ids = st.backend->encode(
+          pr.messages, pr.tools_json, sys_suffix, true, pr.reasoning_strength);
       tm.encode_ms = now_ms() - t_encode;
       // Every turn feeds raw per-step pieces (specials visible) through
       // the backend's stream parser: native call blocks become `tool_calls`
@@ -1479,9 +1495,9 @@ bool check_tools_support(const ChatBackend& backend, const ParsedRequest& pr,
           const std::string sys_suffix = make_system_suffix(p);
           const std::vector<int> content_ids = st.backend->encode(
               p.messages, p.tools_json, sys_suffix,
-              /*add_generation_prompt=*/false);
-          const std::vector<int> full_ids =
-              st.backend->encode(p.messages, p.tools_json, sys_suffix, true);
+              /*add_generation_prompt=*/false, p.reasoning_strength);
+          const std::vector<int> full_ids = st.backend->encode(
+              p.messages, p.tools_json, sys_suffix, true, p.reasoning_strength);
           tm.encode_ms = now_ms() - t_encode;
           bool sse_ok = true;
           size_t steps_since_poll = 0;
@@ -1636,9 +1652,10 @@ bool check_tools_support(const ChatBackend& backend, const ParsedRequest& pr,
     try {
       const double t_encode = now_ms();
       const std::vector<int> content_ids = st.backend->encode(
-          pr.messages, "", "", /*add_generation_prompt=*/false);
-      const std::vector<int> full_ids =
-          st.backend->encode(pr.messages, "", "", true);
+          pr.messages, "", "", /*add_generation_prompt=*/false,
+          pr.reasoning_strength);
+      const std::vector<int> full_ids = st.backend->encode(
+          pr.messages, "", "", true, pr.reasoning_strength);
       tm.encode_ms = now_ms() - t_encode;
       // Legacy envelope has no reasoning/tool channels: thinking traces
       // and any call blocks are stripped from the text (never leaked).
@@ -1723,9 +1740,10 @@ bool check_tools_support(const ChatBackend& backend, const ParsedRequest& pr,
           size_t steps_since_poll = 0;
           const double t_encode = now_ms();
           const std::vector<int> content_ids = st.backend->encode(
-              p.messages, "", "", /*add_generation_prompt=*/false);
-          const std::vector<int> full_ids =
-              st.backend->encode(p.messages, "", "", true);
+              p.messages, "", "", /*add_generation_prompt=*/false,
+              p.reasoning_strength);
+          const std::vector<int> full_ids = st.backend->encode(
+              p.messages, "", "", true, p.reasoning_strength);
           tm.encode_ms = now_ms() - t_encode;
           bool sse_ok = true;
           // Legacy envelope has no reasoning/tool channels: stream display

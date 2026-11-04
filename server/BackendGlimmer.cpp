@@ -234,10 +234,12 @@ class GlimmerBackend final : public ChatBackend {
   std::vector<int> encode(const std::vector<ServerChatMessage>& messages,
                           const std::string& tools_json,
                           const std::string& system_suffix,
-                          bool add_generation_prompt) const override {
+                          bool add_generation_prompt,
+                          const std::string& reasoning_strength = "high") const override {
     return Glimmer::encode_chatml_with_tools(tok_, to_native(messages),
                                              tools_json, system_suffix,
-                                             add_generation_prompt, true);
+                                             add_generation_prompt, true,
+                                             reasoning_strength);
   }
 
   void set_turn_options(const ServerSessionOptions& opts) override {
@@ -410,8 +412,8 @@ class GlimmerUnavailable final : public ChatBackend {
     return {};
   }
   std::vector<int> encode(const std::vector<ServerChatMessage>&,
-                          const std::string&, const std::string&,
-                          bool) const override {
+                          const std::string&, const std::string&, bool,
+                          const std::string& = "high") const override {
     return {};
   }
   void set_turn_options(const ServerSessionOptions&) override {}

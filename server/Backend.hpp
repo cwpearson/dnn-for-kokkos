@@ -158,11 +158,14 @@ class ChatBackend {
   // Render + encode. `tools_json` is the compact OpenAI tools array ("" =
   // none); `system_suffix` carries tool_choice/response_format directives.
   // add_generation_prompt=false encodes the cacheable history prefix (same
-  // encoding without the trailing generation prompt).
+  // encoding without the trailing generation prompt). `reasoning_strength`
+  // is the Glimmer RLed cue ("low"|"medium"|"high"|"xhigh", default "high");
+  // non-Glimmer backends ignore it.
   virtual std::vector<int> encode(const std::vector<ServerChatMessage>& messages,
                                   const std::string& tools_json,
                                   const std::string& system_suffix,
-                                  bool add_generation_prompt) const = 0;
+                                  bool add_generation_prompt,
+                                  const std::string& reasoning_strength = "high") const = 0;
 
   virtual void set_turn_options(const ServerSessionOptions& opts) = 0;
   // Throws std::invalid_argument on over-context prompts (mapped to 400).

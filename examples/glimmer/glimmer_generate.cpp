@@ -69,6 +69,7 @@ bool is_gguf_path(const std::string& p) {
 //                    [--max-seq-len N] [--kv-int8 | --kv-fp | --kv-quant MODE]
 //                    [--list-tensors]
 //                    [--chat] [--system "text"] [--role user]
+//                    [--reasoning-strength low|medium|high|xhigh]
 //                    [--add-bos | --no-add-bos] [--stop-string "str" ...]
 //                    [--temperature T] [--top-k K] [--top-p P] [--min-p P]
 //                    [--repetition-penalty R] [--seed S]
@@ -112,14 +113,12 @@ bool is_gguf_path(const std::string& p) {
 // (<|begin_of_text|>/200000); --no-add-bos strips it.
 //
 // Chat: --chat wraps --prompt as one `role` (default "user") turn via the
-// Muse-style template (<|begin_of_text|> + <|start|>{role}<|message|>
-// {content}<|eot|> blocks + open assistant header); --system prepends a
-// system turn (implies chat); --messages is a minimal alias wrapping its
-// value as the user turn (implies chat). NOTE: the driver keeps the minimal
-// one-block-per-turn framing here; the upstream `chat_template.jinja` (ATEM
-// tool protocol with `to=self`/`to=<tool>` channels, documented in
-// KokkosDNN_GlimmerTokenizer.hpp) is what kokkosdnn_server --arch glimmer
-// serves. Raw mode (default) encodes --prompt directly.
+// upstream ATEM template (system block with the RLed "Reasoning strength:
+// <level>." cue + valid-recipient list, then the user turn + open assistant
+// header); --system prepends a system turn (implies chat); --messages is a
+// minimal alias wrapping its value as the user turn (implies chat).
+// --reasoning-strength selects the cue (low|medium|high|xhigh, default high).
+// Raw mode (default) encodes --prompt directly.
 //
 // Stopping: by default the generation_config stop set {eos 200001,
 // eot 200008} (resolved through the tokenizer where possible);
@@ -133,6 +132,7 @@ int run_model(KokkosDNN::Glimmer::Config cfg,
               int prefill_chunk_override, int kv_quant_override, bool chat_mode,
               const std::string& system_prompt, const std::string& role,
               bool want_bos, const std::vector<std::string>& stop_strings,
+              const std::string& reasoning_strength,
               KokkosDNN::SampleOptions samp_opt) {
   using Exec = Kokkos::DefaultExecutionSpace;
   KokkosDNN::Glimmer::Weights<Exec, Scalar> w;
@@ -164,8 +164,13 @@ int run_model(KokkosDNN::Glimmer::Config cfg,
       auto msgs = KokkosDNN::Glimmer::make_chat_messages(
           prompt, system_prompt, role.empty() ? "user" : role);
       std::string rendered =
-          KokkosDNN::Glimmer::render_chat_template(msgs, true);
-      std::printf("[chat] %s\n", rendered.c_str());
+          KokkosDNN::Glimmer::render_glimmer_chatml_with_tools(
+              msgs, "", "", true, "", reasoning_strength);
+      std::printf("[chat reasoning=%s] %s\n",
+                  KokkosDNN::Glimmer::normalize_reasoning_strength(
+                      reasoning_strength)
+                      .c_str(),
+                  rendered.c_str());
       prompt_ids =
           KokkosDNN::Glimmer::encode_rendered_chat(tok, rendered, want_bos);
     } else {
@@ -184,7 +189,8 @@ int run_model(KokkosDNN::Glimmer::Config cfg,
     if (use_chat) {
       auto msgs = KokkosDNN::Glimmer::make_chat_messages(
           prompt, system_prompt, role.empty() ? "user" : role);
-      text = KokkosDNN::Glimmer::render_chat_template(msgs, true);
+      text = KokkosDNN::Glimmer::render_glimmer_chatml_with_tools(
+          msgs, "", "", true, "", reasoning_strength);
       std::printf("[chat, no tokenizer] %s\n", text.c_str());
     }
     if (want_bos) prompt_ids.push_back(cfg.bos_token % cfg.vocab_size);
@@ -308,6 +314,7 @@ int main(int argc, char** argv) {
     bool chat_mode = false;
     std::string system_prompt;
     std::string role = "user";
+    std::string reasoning_strength = "high";
     bool want_bos = true;  // --add-bos default (matches TemplateProcessing)
     std::vector<std::string> stop_strings;
     // Upstream generation_config.json: do_sample=false (greedy), no
@@ -365,6 +372,12 @@ int main(int argc, char** argv) {
         system_prompt = argv[++i];
       } else if (a == "--role" && i + 1 < argc) {
         role = argv[++i];
+      } else if (a == "--reasoning-strength" && i + 1 < argc) {
+        reasoning_strength = argv[++i];
+      } else if (a == "--reasoning" && i + 1 < argc) {
+        reasoning_strength = argv[++i];
+      } else if (a == "--reasoning-effort" && i + 1 < argc) {
+        reasoning_strength = argv[++i];
       } else if (a == "--messages" && i + 1 < argc) {
         // Minimal alias: wrap the value as the user turn (implies chat).
         prompt = argv[++i];
@@ -425,6 +438,14 @@ int main(int argc, char** argv) {
       samp_opt.seed = (uint64_t(rd()) << 32) | uint64_t(rd());
     }
 
+    try {
+      reasoning_strength =
+          KokkosDNN::Glimmer::normalize_reasoning_strength(reasoning_strength);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "error: --reasoning-strength: %s\n", e.what());
+      Kokkos::finalize();
+      return 1;
+    }
     KokkosDNN::print_configuration(std::cout);
     wfiles = expand_weight_patterns(wpatterns);
     // --list-tensors is a header-only inspection (no model build).
@@ -492,13 +513,14 @@ int main(int argc, char** argv) {
       rc = run_model<float>(cfg, wfiles, tiny, tok_path, prompt, max_new,
                             extra_stops, prefill_chunk_override,
                             kv_quant_override, chat_mode, system_prompt, role,
-                            want_bos, stop_strings, samp_opt);
+                            want_bos, stop_strings, reasoning_strength,
+                            samp_opt);
     } else {
       std::printf("[dtype bfloat16]\n");
       rc = run_model<KokkosDNN::Glimmer::DefaultScalar>(
           cfg, wfiles, tiny, tok_path, prompt, max_new, extra_stops,
           prefill_chunk_override, kv_quant_override, chat_mode, system_prompt,
-          role, want_bos, stop_strings, samp_opt);
+          role, want_bos, stop_strings, reasoning_strength, samp_opt);
     }
     Kokkos::finalize();
     return rc;

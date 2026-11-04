@@ -291,6 +291,7 @@ Route handlers are arch-agnostic: they parse OpenAI JSON once and drive the
 | `tools[]` | `[{type:"function", function:{name, description?, parameters?, strict?}}]` validated, then injected into the system prompt (arch-native tool format: LFM2.5 `List of tools: [...]` JSON, Glimmer ATEM catalogue); `[]` = no-op |
 | `tool_choice` | `"auto"` (default) \| `"none"` (no injection) \| `"required"` / `{"type":"function","function":{"name"}}` (best-effort `MUST call` system directive — prompted, not constrained) |
 | `parallel_tool_calls` | `false` keeps only the first parsed call (default `true`) |
+| `reasoning_effort` | Glimmer only: `"low"`\|`"medium"`\|`"high"` (default)\|`"xhigh"` selects the RLed `Reasoning strength: <level>.` system cue (case-insensitive; `null`/absent = `high`); unknown values are a 400 for `arch glimmer`, ignored for other archs |
 | `response_format` | `{"type":"text"}` (default) \| `{"type":"json_object"}` \| `{"type":"json_schema", json_schema:{...}}`: adds a JSON-only system instruction and strips ``` fences (non-streaming); the schema is recorded but **not enforced** (no grammar-constrained decoding — validate client-side) |
 | `temperature, top_p, top_k, min_p, repetition_penalty` | `SampleOptions` verbatim (absent = session default; `temperature` 0 = greedy) |
 | `frequency_penalty, presence_penalty` | `SampleOptions` verbatim |
@@ -515,8 +516,12 @@ settings above):
 - `chat_completions` must stay `true`; the server has no `/v1/responses`.
 - `name` must match the server's `--model` (default `glimmer-30b`), and
   `api_url` must end in `/v1` (Zed appends `/chat/completions`).
-- Do not set `reasoning_effort`: the server ignores it; setting a
-  non-`none` value only enables Zed's thinking controls for the model.
+- `reasoning_effort` selects the RLed reasoning cue: `"low"`, `"medium"`,
+  `"high"` (default), `"xhigh"` (case-insensitive). It renders as
+  `Reasoning strength: <level>.` in the system block, exactly as the
+  upstream `chat_template.jinja` `reasoning_strength` template argument
+  does. A caller-provided `Reasoning strength:` line is kept verbatim;
+  unknown values are a 400.
 
 ## Errors
 

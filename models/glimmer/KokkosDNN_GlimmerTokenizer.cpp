@@ -1741,6 +1741,26 @@ bool has_reasoning_strength(const std::string& s) {
   return lo.find("reasoning strength") != std::string::npos;
 }
 
+// Mirror the upstream jinja: callers sometimes write the directive as
+// "reasoning effort"; normalize the four realistic casings to the
+// "strength" spelling before the skip check below.
+void normalize_effort_spelling(std::string& s) {
+  static const std::pair<const char*, const char*> kReps[] = {
+      {"Reasoning effort", "Reasoning strength"},
+      {"Reasoning Effort", "Reasoning Strength"},
+      {"reasoning effort", "reasoning strength"},
+      {"REASONING EFFORT", "REASONING STRENGTH"},
+  };
+  for (const auto& [from, to] : kReps) {
+    const size_t flen = std::strlen(from);
+    size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::string::npos) {
+      s.replace(pos, flen, to);
+      pos += std::strlen(to);
+    }
+  }
+}
+
 // Resolve a "tool"-role message to its function name: the explicit `name`
 // wins, else the earlier assistant `tool_calls` entry with the same
 // `tool_call_id` (mirroring the upstream template), else the id itself,
@@ -1763,6 +1783,23 @@ std::string resolve_tool_name(const std::vector<ChatMessage>& messages,
 }
 
 }  // namespace
+
+std::string normalize_reasoning_strength(const std::string& s) {
+  size_t b = 0;
+  while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
+  size_t e = s.size();
+  while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
+  std::string lo;
+  lo.reserve(e - b);
+  for (size_t i = b; i < e; ++i)
+    lo += static_cast<char>(std::tolower(static_cast<unsigned char>(s[i])));
+  if (lo.empty()) return kDefaultReasoningStrength;
+  if (lo == "low" || lo == "medium" || lo == "high" || lo == "xhigh")
+    return lo;
+  throw std::invalid_argument(
+      "invalid reasoning strength '" + s +
+      "' (expected one of: low, medium, high, xhigh)");
+}
 
 std::string atem_value_to_json(const std::string& value) {
   try {
@@ -1907,7 +1944,9 @@ std::vector<ToolCall> parse_atem_invokes(const std::string& text) {
 std::string render_glimmer_chatml_with_tools(
     const std::vector<ChatMessage>& messages, const std::string& tools_json,
     const std::string& system_suffix, bool add_generation_prompt,
-    const std::string& default_system) {
+    const std::string& default_system,
+    const std::string& reasoning_strength) {
+  const std::string level = normalize_reasoning_strength(reasoning_strength);
   // Tool catalogue + recipient set (upstream apply_chat_template parity).
   std::vector<GlimmerToolDef> defs;
   std::vector<std::string> namespaces;
@@ -1932,7 +1971,9 @@ std::string render_glimmer_chatml_with_tools(
                      "2026-01-04."
                    : default_system;
   }
-  if (!has_reasoning_strength(sys_text)) sys_text += "\n\nReasoning strength: high.";
+  normalize_effort_spelling(sys_text);
+  if (!has_reasoning_strength(sys_text))
+    sys_text += "\n\nReasoning strength: " + level + ".";
   if (have_tools) sys_text += "\n\n" + render_tool_defs_block(defs, namespaces);
   if (!system_suffix.empty()) sys_text += "\n\n" + system_suffix;
   sys_text += "\n\n" + render_system_meta(namespaces);
@@ -1987,11 +2028,12 @@ std::string render_glimmer_chatml_with_tools(
 std::vector<int> encode_chatml_with_tools(
     const Tokenizer& tok, const std::vector<ChatMessage>& messages,
     const std::string& tools_json, const std::string& system_suffix,
-    bool add_generation_prompt, bool add_bos) {
+    bool add_generation_prompt, bool add_bos,
+    const std::string& reasoning_strength) {
   return encode_rendered_chat(
       tok, render_glimmer_chatml_with_tools(messages, tools_json,
-                                            system_suffix,
-                                            add_generation_prompt),
+                                            system_suffix, add_generation_prompt,
+                                            "", reasoning_strength),
       add_bos);
 }
 

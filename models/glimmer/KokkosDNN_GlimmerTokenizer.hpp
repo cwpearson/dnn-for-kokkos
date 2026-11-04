@@ -186,9 +186,15 @@ std::vector<int> encode_chat(const Tokenizer& tok,
 //     2026-01-04.", overridable via default_system) is used.
 //   - system_suffix ("" = none): extra instruction sentence(s) appended to
 //     the system block (tool_choice required/named directives, JSON-mode
-//     bias). "Reasoning strength: high." is ensured exactly once ahead of
+//     bias). "Reasoning strength: <level>." is ensured exactly once ahead of
 //     the catalogue (skipped when the system text already carries a
-//     reasoning-strength line in any casing).
+//     reasoning-strength line in any casing; a "reasoning effort" spelling
+//     is normalized to "reasoning strength", mirroring the upstream
+//     template).
+//   - reasoning_strength ("high" default): one of "low", "medium", "high",
+//     "xhigh" (case-insensitive; "" also selects the default). Rendered as
+//     "Reasoning strength: <level>." (the RLed cue). Invalid values throw
+//     std::invalid_argument.
 //   - assistant `thinking` renders as the `to=self` reasoning channel;
 //     assistant `tool_calls` render as `to=<tool>` ATEM channels (an
 //     assistant turn carrying `tool_calls` drops its plain `content`, as the
@@ -199,17 +205,27 @@ std::vector<int> encode_chat(const Tokenizer& tok,
 //     takes the turn-closer) and parse back, and the server truncates to the
 //     first when the request sets `parallel_tool_calls:false`.
 // ---------------------------------------------------------------------------
+// Canonical default when reasoning_strength is "" (upstream default).
+inline constexpr const char* kDefaultReasoningStrength = "high";
+
+// Normalize a reasoning-strength level to its canonical lower-case form
+// ("low", "medium", "high", "xhigh"). "" selects the default ("high").
+// Case-insensitive; throws std::invalid_argument on anything else.
+std::string normalize_reasoning_strength(const std::string& s);
+
 std::string render_glimmer_chatml_with_tools(
     const std::vector<ChatMessage>& messages, const std::string& tools_json,
     const std::string& system_suffix = "", bool add_generation_prompt = true,
-    const std::string& default_system = "");
+    const std::string& default_system = "",
+    const std::string& reasoning_strength = "high");
 
 // Render + encode with tool support (same BOS semantics as
 // encode_rendered_chat).
 std::vector<int> encode_chatml_with_tools(
     const Tokenizer& tok, const std::vector<ChatMessage>& messages,
     const std::string& tools_json, const std::string& system_suffix = "",
-    bool add_generation_prompt = true, bool add_bos = true);
+    bool add_generation_prompt = true, bool add_bos = true,
+    const std::string& reasoning_strength = "high");
 
 // Render one tool call as its upstream ATEM block (one
 // `<atem:function_calls>` wrapper per call). `arguments` is the OpenAI JSON

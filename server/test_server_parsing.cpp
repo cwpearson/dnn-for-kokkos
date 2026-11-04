@@ -234,6 +234,15 @@ int test_common() {
   CHECK(!pr.parallel_tool_calls);
   CHECK(!parse_ok(json::parse(R"({"parallel_tool_calls":"yes"})"), pr,
                   err));
+  // reasoning_effort: absent defaults to high; strings pass through
+  // (the Glimmer backend validates at encode time, others ignore it).
+  pr = ParsedRequest{};
+  CHECK(parse_ok(json::parse(R"({})"), pr, err));
+  CHECK(pr.reasoning_strength == "high");
+  CHECK(parse_ok(json::parse(R"({"reasoning_effort":"medium"})"), pr, err));
+  CHECK(pr.reasoning_strength == "medium");
+  CHECK(parse_ok(json::parse(R"({"reasoning_effort":null})"), pr, err));
+  CHECK(!parse_ok(json::parse(R"({"reasoning_effort":42})"), pr, err));
   // response_format: text/json_object/json_schema accepted + validated.
   CHECK(parse_ok(json::parse(R"({"response_format":{"type":"text"}})"), pr,
                  err));
@@ -744,6 +753,27 @@ int test_glimmer_tool_wire() {
     CHECK(tail.calls.empty());
     CHECK(fed.finish().text == tail.text);
     (void)tail;
+  }
+  // Reasoning strength levels render verbatim; invalid values throw.
+  {
+    using KokkosDNN::Glimmer::make_chat_messages;
+    using KokkosDNN::Glimmer::normalize_reasoning_strength;
+    CHECK(normalize_reasoning_strength("LOW") == "low");
+    CHECK(normalize_reasoning_strength("") == "high");
+    bool threw = false;
+    try {
+      (void)render_glimmer_chatml_with_tools(
+          make_chat_messages("hi", "", "user"), "", "", true, "", "none");
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    CHECK(threw);
+    for (const char* level : {"low", "medium", "high", "xhigh"}) {
+      const std::string r = render_glimmer_chatml_with_tools(
+          make_chat_messages("hi", "", "user"), "", "", true, "", level);
+      CHECK(r.find(std::string("Reasoning strength: ") + level + ".") !=
+            std::string::npos);
+    }
   }
   return 0;
 }

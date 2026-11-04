@@ -200,6 +200,51 @@ TEST(GlimmerTokenizer, ChatWithToolsAtem) {
             std::string::npos);
 }
 
+TEST(GlimmerTokenizer, ReasoningStrength) {
+  using namespace KokkosDNN::Glimmer;
+  EXPECT_EQ(normalize_reasoning_strength(""), "high");
+  EXPECT_EQ(normalize_reasoning_strength("high"), "high");
+  EXPECT_EQ(normalize_reasoning_strength("HIGH"), "high");
+  EXPECT_EQ(normalize_reasoning_strength("Medium"), "medium");
+  EXPECT_EQ(normalize_reasoning_strength("low"), "low");
+  EXPECT_EQ(normalize_reasoning_strength("xhigh"), "xhigh");
+  EXPECT_EQ(normalize_reasoning_strength("XHIGH"), "xhigh");
+  EXPECT_THROW(normalize_reasoning_strength("minimal"), std::invalid_argument);
+  EXPECT_THROW(normalize_reasoning_strength("none"), std::invalid_argument);
+  EXPECT_THROW(normalize_reasoning_strength("ultra"), std::invalid_argument);
+
+  auto msgs = make_chat_messages("abc", "sys", "user");
+  for (const char* level : {"low", "medium", "high", "xhigh"}) {
+    std::string r = render_glimmer_chatml_with_tools(
+        msgs, "", "", true, "", level);
+    EXPECT_NE(r.find(std::string("Reasoning strength: ") + level + "."),
+              std::string::npos)
+        << "level: " << level;
+  }
+  // Case-insensitive input renders canonical lower-case.
+  std::string up = render_glimmer_chatml_with_tools(msgs, "", "", true, "",
+                                                    "MEDIUM");
+  EXPECT_NE(up.find("Reasoning strength: medium."), std::string::npos);
+  EXPECT_EQ(up.find("Reasoning strength: MEDIUM."), std::string::npos);
+  // Invalid level throws (surfaces as a 400 from the server encode path).
+  EXPECT_THROW(render_glimmer_chatml_with_tools(msgs, "", "", true, "", "none"),
+               std::invalid_argument);
+  // A caller-provided strength line is kept verbatim (no duplicate).
+  auto custom = make_chat_messages("abc", "sys\n\nReasoning strength: low.",
+                                   "user");
+  std::string kept = render_glimmer_chatml_with_tools(custom, "", "", true, "",
+                                                       "high");
+  EXPECT_NE(kept.find("Reasoning strength: low."), std::string::npos);
+  EXPECT_EQ(kept.find("Reasoning strength: high."), std::string::npos);
+  // Upstream parity: "reasoning effort" spelling normalizes to strength.
+  auto effort = make_chat_messages("abc", "sys\n\nReasoning effort: low.",
+                                   "user");
+  std::string normed =
+      render_glimmer_chatml_with_tools(effort, "", "", true, "", "high");
+  EXPECT_NE(normed.find("Reasoning strength: low."), std::string::npos);
+  EXPECT_EQ(normed.find("Reasoning effort"), std::string::npos);
+}
+
 TEST(GlimmerTokenizer, DefaultStopsAndAtemTools) {
   using namespace KokkosDNN::Glimmer;
   // Only <|eot|> ends the turn: <|eom|> ends a message (e.g. the
