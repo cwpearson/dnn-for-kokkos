@@ -17,12 +17,13 @@ namespace KokkosDNN {
 namespace Glimmer {
 
 // Supported KV-cache context window. The attention kernel streams over keys
-// with O(1) extra memory and prefill is chunked, so the architecture window
-// (Muse Glimmer text advertises max_position_embeddings = 131072) is
-// supported; the bound below caps the rented KV-cache allocation. The PoC
-// *default* stays at 8192 so a plain run does not rent the full-window cache
-// by accident; raise via config.json or --max-seq-len.
-inline constexpr int kMaxSupportedSeqLen = 131072;
+// with O(1) extra memory and prefill is chunked, so contexts beyond the
+// architecture window (Muse Glimmer text advertises
+// max_position_embeddings = 131072) are allowed; the bound below caps the
+// rented KV-cache allocation. The PoC *default* stays at 8192 so a plain
+// run does not rent the full-window cache by accident; raise via config.json
+// or --max-seq-len.
+inline constexpr int kMaxSupportedSeqLen = 1000000;
 inline constexpr int kMinSupportedSeqLen = 1;
 
 namespace Impl {
@@ -347,7 +348,7 @@ struct Config {
   float qk_scale_factor = 3.87f;
   // Scalar multiplier on the final hidden states (before the head).
   double output_multiplier = 0.19611613513818404;
-  int max_seq_len    = 8192;  // PoC runtime cap; arch supports 131072
+  int max_seq_len    = 8192;  // PoC runtime cap; allocation cap is 1000000
   int bos_token      = 200000;
   int eos_token      = 200001;
   // HF pad_token_id is null (absent); -1 marks "no pad token".
