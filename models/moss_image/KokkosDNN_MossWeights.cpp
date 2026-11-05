@@ -99,10 +99,6 @@ void stream_vec(const FileReader& fr, uint64_t off,
 // existing call sites keep compiling with identical diagnostics.
 using SafeEntry = ::KokkosDNN::Safetensors::Entry;
 
-inline std::string parse_json_string(const std::string& s, size_t& pos) {
-  return ::KokkosDNN::Safetensors::parse_json_string(s, pos, "moss");
-}
-
 // Parse the safetensors header JSON into name -> entry. Only understands
 // the subset torch saves: {"__metadata__":{...},"name":{"dtype":...,
 // "shape":[...],"data_offsets":[a,b]},...}.

@@ -36,6 +36,21 @@
 // Portable: POSIX mmap (MAP_PRIVATE); mmap failure is a hard error; there
 // is no read() fallback.
 
+// FIXME: workaround for CUDA CI (nvcc 12.8 + GCC 13, Ubuntu 24.04): the
+// device frontend (cudafe++) fails to parse GCC 13's concepts-based
+// <string>/<map> headers when this header is the first to include them in
+// a CUDA TU without prior Kokkos/CUDA headers ("incomplete type
+// iterator_traits<char*>", "no member type" in __iter_concept_impl, at the
+// first std::string copy in MappedFile). Including Kokkos first (as
+// KokkosDNN_GGUF.hpp does) works around it. Guarded to that toolchain so
+// other compilers keep this header Kokkos-free. Remove once the CUDA image
+// moves to an nvcc/GCC pair without this skew, or once the host-only ZIP
+// users (Kokoro/Sana .pth readers) stop compiling under nvcc_wrapper.
+#if defined(__CUDACC__) && defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ == 12) && defined(__GNUC__) && (__GNUC__ == 13)
+#include <Kokkos_Core.hpp>
+#endif
+
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
