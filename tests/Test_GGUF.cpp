@@ -847,8 +847,7 @@ void check_dequant_to_dense(GgmlType dtype, size_t K, float tol) {
 // exactly, never "close".
 // ---------------------------------------------------------------------------
 template <class Scalar>
-void check_quant_gemv_int8(GgmlType dtype, size_t K, float tol) {
-  const size_t N = 5;
+void check_quant_gemv_int8(GgmlType dtype, size_t K, float tol, size_t N = 5) {
   std::vector<float> ref;
   std::vector<uint8_t> raw;
   build_case(dtype, N, K, ref, raw);
@@ -1106,6 +1105,14 @@ TEST(GgufQuantGemm, GemvInt8Float) {
       quant_gemv_int8_supported<Exec, float>(GgmlType::Q4_K, 128);
   EXPECT_FALSE(f32_supported);
   EXPECT_FALSE(unaligned_supported);
+  // Pin the fast path live on backends that offer it: without this, every
+  // check below would pass trivially through the portable fallback.
+  constexpr bool mmvq_live =
+      KokkosDNN::Impl::GgufMvq::available<Exec, float>;
+  EXPECT_EQ((quant_gemv_int8_supported<Exec, float>(GgmlType::Q4_K, 512)),
+            mmvq_live);
+  EXPECT_EQ((quant_gemv_int8_supported<Exec, float>(GgmlType::Q6_K, 6656)),
+            mmvq_live);
   check_quant_gemv_int8<float>(GgmlType::Q4_K, 512, 1e-3f);
   check_quant_gemv_int8<float>(GgmlType::Q4_K, 1024, 1e-3f);
   check_quant_gemv_int8<float>(GgmlType::Q4_K, 4096, 1e-3f);
@@ -1118,11 +1125,23 @@ TEST(GgufQuantGemm, GemvInt8Float) {
   check_quant_gemv_int8<float>(GgmlType::F32, 512, 1e-3f);
 }
 
+// Skinny decode shapes (attn_k/attn_v: N ~= 256, large K): these take the
+// split-K schedule (8 warps/row at K = 4096, 4 warps/row at K = 2048) while
+// the N = 5 cases above take the baseline, so both schedules are pinned
+// against the int8-aware host reference.
+TEST(GgufQuantGemm, GemvInt8SkinnyRows) {
+  check_quant_gemv_int8<float>(GgmlType::Q4_K, 4096, 1e-3f, 256);
+  check_quant_gemv_int8<float>(GgmlType::Q6_K, 2048, 1e-3f, 256);
+  check_quant_gemv_int8<float>(GgmlType::Q8_0, 4096, 1e-3f, 256);
+}
+
 TEST(GgufQuantGemm, GemvInt8BHalf) {
   using bhalf_t = Kokkos::Experimental::bhalf_t;
   check_quant_gemv_int8<bhalf_t>(GgmlType::Q4_K, 512, 1e-2f);
   check_quant_gemv_int8<bhalf_t>(GgmlType::Q6_K, 512, 1e-2f);
   check_quant_gemv_int8<bhalf_t>(GgmlType::Q8_0, 512, 1e-2f);
+  // Skinny split-K schedule with bf16 activations (8 warps/row).
+  check_quant_gemv_int8<bhalf_t>(GgmlType::Q4_K, 4096, 1e-2f, 256);
 }
 
 // Undersized staging and non-block-aligned K must fall back to the portable
