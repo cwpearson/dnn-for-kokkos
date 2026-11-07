@@ -2471,8 +2471,8 @@ void quant_gemv(
 }
 
 // ---------------------------------------------------------------------------
-// int8-dot decode GEMV (CUDA): stage the activation row into int8 blocks once
-// and run 4 `__dp4a` per 32 weight elements (see
+// int8-dot decode GEMV (portable MMVQ): stage the activation row into int8
+// blocks once and run integer dots per 16/32-element window (see
 // KokkosDNN_GGUFGemvCuda.hpp for the design and the numerics note).
 //
 // The staging buffer is caller-owned and reused across calls: decode runs
@@ -2485,8 +2485,8 @@ void quant_gemv(
 // callers that do not stage activations keep the portable kernel bit for bit,
 // which is what the exact-reference parity tests
 // (tests/Test_GGUF.cpp, examples/glimmer/Test_GlimmerWeightsGGUF.cpp) pin.
-// Even with a buffer, anything the fast path does not claim (non-CUDA
-// backends, unsupported dtypes, K not block-aligned, un-staged scalars,
+// Even with a buffer, anything the fast path does not claim (unsupported
+// dtypes, K not block-aligned, un-staged scalars,
 // failed launch) falls through to the same portable path.
 // ---------------------------------------------------------------------------
 
@@ -2516,9 +2516,9 @@ inline bool quant_int8_dtype(GgmlType dt,
 }  // namespace Impl
 
 // True when quant_gemv(handle, x, w, y, act_scratch) takes the int8-dot path
-// on this backend for this dtype/K (given a correctly sized staging buffer).
-// Other backends, unsupported dtypes, un-staged scalars and K values that are
-// not block aligned all report false and keep the portable kernel.
+// for this dtype/K (given a correctly sized staging buffer). Unsupported
+// dtypes, un-staged scalars and K values that are not block aligned all
+// report false and keep the portable kernel.
 template <class ExecSpace, class Scalar>
 inline bool quant_gemv_int8_supported(GgmlType dtype, size_t K) {
   if (!::KokkosDNN::Impl::GgufMvq::available<ExecSpace, Scalar>) return false;
