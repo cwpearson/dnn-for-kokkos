@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "KokkosDNN_RMSNorm.hpp"
+#include "KokkosDNN_RoPE.hpp"
 
 template <class Scalar>
 void check_rmsnorm(float tol) {
@@ -504,6 +505,144 @@ TEST(QkRmsNormQkvFused, Float) { check_qk_rmsnorm_qkv_fused<float>(); }
 
 TEST(QkRmsNormQkvFused, BHalf) {
   check_qk_rmsnorm_qkv_fused<Kokkos::Experimental::bhalf_t>();
+}
+
+// Fused Q/K norms + V reshape + conditional RoPE epilogue: bit-identical
+// to qk_rmsnorm_qkv_fused followed by rope_neoX_inplace (do_rope=true),
+// and to qk_rmsnorm_qkv_fused alone (do_rope=false, empty inv_freq).
+template <class Scalar>
+void check_qk_rmsnorm_qkv_fused_rope() {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  for (int T : {1, 3}) {
+    const int NH = 4, NKV = 2, HD = 8;
+    const float eps = 1e-6f;
+    Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> q2("q2", T, NH * HD),
+        k2("k2", T, NKV * HD), v2("v2", T, NKV * HD);
+    Kokkos::View<Scalar*, Exec> wq("wq", HD), wk("wk", HD);
+    Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec> q3r("q3r", T, NH, HD),
+        k3r("k3r", T, NKV, HD), v3r("v3r", T, NKV, HD), q3f("q3f", T, NH, HD),
+        k3f("k3f", T, NKV, HD), v3f("v3f", T, NKV, HD), q3n("q3n", T, NH, HD),
+        k3n("k3n", T, NKV, HD), v3n("v3n", T, NKV, HD);
+    auto hq = Kokkos::create_mirror_view(q2);
+    auto hk = Kokkos::create_mirror_view(k2);
+    auto hv = Kokkos::create_mirror_view(v2);
+    auto hwq = Kokkos::create_mirror_view(wq);
+    auto hwk = Kokkos::create_mirror_view(wk);
+    for (int t = 0; t < T; ++t) {
+      for (int i = 0; i < NH * HD; ++i)
+        hq(t, i) = static_cast<Scalar>(0.25f * ((t + 1) * (i % 7 + 1)) - 3.0f);
+      for (int i = 0; i < NKV * HD; ++i) {
+        hk(t, i) = static_cast<Scalar>(0.2f * ((t + 2) * (i % 5 + 1)) - 2.0f);
+        hv(t, i) = static_cast<Scalar>(0.3f * (i - t) + 0.5f);
+      }
+    }
+    for (int d = 0; d < HD; ++d) {
+      hwq(d) = static_cast<Scalar>(1.0f + 0.05f * d);
+      hwk(d) = static_cast<Scalar>(1.0f);
+    }
+    Kokkos::deep_copy(q2, hq);
+    Kokkos::deep_copy(k2, hk);
+    Kokkos::deep_copy(v2, hv);
+    Kokkos::deep_copy(wq, hwq);
+    Kokkos::deep_copy(wk, hwk);
+    auto inv = KokkosDNN::rope_inv_freq<Exec>(HD, 500000.0f);
+    Kokkos::View<int*, Exec> pos("pos", T);
+    {
+      auto hp = Kokkos::create_mirror_view(pos);
+      for (int t = 0; t < T; ++t) hp(t) = 3 + 5 * t;
+      Kokkos::deep_copy(pos, hp);
+    }
+    // Separate reference: fused norms + standalone RoPE.
+    KokkosDNN::qk_rmsnorm_qkv_fused<Exec, Scalar>(q2, wq, q3r, k2, wk, k3r,
+                                                 v2, v3r, eps);
+    KokkosDNN::rope_neoX_inplace<Exec, Scalar>(q3r, k3r, inv, HD, pos);
+    // Fused with RoPE.
+    KokkosDNN::qk_rmsnorm_qkv_fused_rope<Exec, Scalar>(
+        q2, wq, q3f, k2, wk, k3f, v2, v3f, eps, inv, pos, true);
+    Kokkos::fence();
+    auto gq = Kokkos::create_mirror_view(q3f);
+    Kokkos::deep_copy(gq, q3f);
+    auto wq3 = Kokkos::create_mirror_view(q3r);
+    Kokkos::deep_copy(wq3, q3r);
+    auto gk = Kokkos::create_mirror_view(k3f);
+    Kokkos::deep_copy(gk, k3f);
+    auto wk3 = Kokkos::create_mirror_view(k3r);
+    Kokkos::deep_copy(wk3, k3r);
+    auto gv = Kokkos::create_mirror_view(v3f);
+    Kokkos::deep_copy(gv, v3f);
+    auto wv3 = Kokkos::create_mirror_view(v3r);
+    Kokkos::deep_copy(wv3, v3r);
+    for (int t = 0; t < T; ++t)
+      for (int h = 0; h < NH; ++h)
+        for (int d = 0; d < HD; ++d)
+          EXPECT_EQ(gq(t, h, d), wq3(t, h, d))
+              << "fused_rope q mismatch at T=" << T << " (" << t << "," << h
+              << "," << d << ")";
+    for (int t = 0; t < T; ++t)
+      for (int h = 0; h < NKV; ++h)
+        for (int d = 0; d < HD; ++d) {
+          EXPECT_EQ(gk(t, h, d), wk3(t, h, d))
+              << "fused_rope k mismatch at T=" << T << " (" << t << "," << h
+              << "," << d << ")";
+          EXPECT_EQ(gv(t, h, d), wv3(t, h, d))
+              << "fused_rope v mismatch at T=" << T << " (" << t << "," << h
+              << "," << d << ")";
+        }
+    // NoPE path: do_rope=false with an empty table matches the plain fused
+    // norms exactly (V reshape included).
+    Kokkos::View<float*, Exec> empty_inv("empty_inv", 0);
+    KokkosDNN::qk_rmsnorm_qkv_fused_rope<Exec, Scalar>(
+        q2, wq, q3n, k2, wk, k3n, v2, v3n, eps, empty_inv, pos, false);
+    Kokkos::fence();
+    auto nq = Kokkos::create_mirror_view(q3n);
+    Kokkos::deep_copy(nq, q3n);
+    // Reference for the NoPE path is the pre-RoPE fused result: recompute
+    // without the in-place rotation above (q3r/k3r were rotated).
+    KokkosDNN::qk_rmsnorm_qkv_fused<Exec, Scalar>(q2, wq, q3r, k2, wk, k3r,
+                                                 v2, v3r, eps);
+    Kokkos::fence();
+    Kokkos::deep_copy(wq3, q3r);
+    Kokkos::deep_copy(wk3, k3r);
+    Kokkos::deep_copy(wv3, v3r);
+    auto nk = Kokkos::create_mirror_view(k3n);
+    Kokkos::deep_copy(nk, k3n);
+    auto nv = Kokkos::create_mirror_view(v3n);
+    Kokkos::deep_copy(nv, v3n);
+    for (int t = 0; t < T; ++t)
+      for (int h = 0; h < NH; ++h)
+        for (int d = 0; d < HD; ++d)
+          EXPECT_EQ(nq(t, h, d), wq3(t, h, d))
+              << "nope q mismatch at T=" << T;
+    for (int t = 0; t < T; ++t)
+      for (int h = 0; h < NKV; ++h)
+        for (int d = 0; d < HD; ++d) {
+          EXPECT_EQ(nk(t, h, d), wk3(t, h, d))
+              << "nope k mismatch at T=" << T;
+          EXPECT_EQ(nv(t, h, d), wv3(t, h, d))
+              << "nope v mismatch at T=" << T;
+        }
+  }
+  // Bad RoPE table length throws when do_rope=true (accepted when false).
+  const int HD = 8;
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> q2("q2", 2, 4 * HD),
+      k2("k2", 2, 2 * HD), v2("v2", 2, 2 * HD);
+  Kokkos::View<Scalar*, Exec> wq("wq", HD), wk("wk", HD);
+  Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec> q3("q3", 2, 4, HD),
+      k3("k3", 2, 2, HD), v3("v3", 2, 2, HD);
+  Kokkos::View<float*, Exec> bad_inv("bad_inv", (size_t)HD / 2 + 1);
+  Kokkos::View<int*, Exec> pos("pos", 2);
+  Kokkos::View<float*, Exec> empty_inv("empty_inv2", 0);
+  EXPECT_THROW((KokkosDNN::qk_rmsnorm_qkv_fused_rope<Exec, Scalar>(
+                   q2, wq, q3, k2, wk, k3, v2, v3, 1e-6f, bad_inv, pos, true)),
+               std::invalid_argument);
+  EXPECT_NO_THROW((KokkosDNN::qk_rmsnorm_qkv_fused_rope<Exec, Scalar>(
+      q2, wq, q3, k2, wk, k3, v2, v3, 1e-6f, empty_inv, pos, false)));
+}
+
+TEST(QkRmsNormQkvFusedRope, Float) { check_qk_rmsnorm_qkv_fused_rope<float>(); }
+
+TEST(QkRmsNormQkvFusedRope, BHalf) {
+  check_qk_rmsnorm_qkv_fused_rope<Kokkos::Experimental::bhalf_t>();
 }
 
 

@@ -527,14 +527,14 @@ class Model {
                                               "wk", q8_act_buf_);
         Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp, b.wv, deq_kv_, v2,
                                               "wv", q8_act_buf_);
-        // Fused Q/K per-head norms + V reshape (one launch instead of
-        // qk q + qk k + reshape_v; bit-identical, see
-        // KokkosDNN_RMSNorm.hpp).
-        qk_rmsnorm_qkv_fused<ExecSpace, Scalar>(q2, qscale, q3, k2, ones, k3,
-                                               v2, v3, EPS);
-        if (!nope) {
+        // Fused Q/K per-head norms + V reshape with a conditional RoPE
+        // epilogue (one launch instead of norm + rope-q + rope-k; bit-identical,
+        // see KokkosDNN_RMSNorm.hpp). rope_inv_ is empty on NoPE layers, where
+        // do_rope=false skips the rotation.
+        {
           auto inv = rope_inv_[(size_t)l];
-          rope_neoX_inplace<ExecSpace, Scalar>(q3, k3, inv, HD, pos);
+          qk_rmsnorm_qkv_fused_rope<ExecSpace, Scalar>(
+              q2, qscale, q3, k2, ones, k3, v2, v3, EPS, inv, pos, !nope);
         }
         // KV write + attention, branched once per layer on the
         // construction-time mode (views hoisted to locals above: indexing

@@ -556,8 +556,133 @@ struct QkVRmsNormFusedTeam {
   }
 };
 
-// Rank-4 batched per-head QK RMSNorm worker: one team per (b, s, h) row
-// of D. Same reduce-then-scale structure as QkRmsNorm3dTeam; views are
+// Fused Q/K per-head RMSNorm + V reshape + conditional NeoX RoPE epilogue:
+// one team per (token, head-slot) with the same slot map as
+// QkVRmsNormFusedTeam. When do_rope is true, each q/k team rotates its
+// just-written (token, head) row in place after a team barrier: phase 1
+// writes the same Scalar norms as QkVRmsNormFusedTeam, phase 2 reads them
+// back (as the separate rope_neoX_inplace kernel would) and applies the
+// same FP32 rotation, so the result is bit-identical to the two-kernel
+// sequence while saving its launches and its extra global-memory round
+// trip. When do_rope is false (NoPE layers), the rotation is skipped and
+// inv_freq/positions may be empty. Replaces three launches (qk qkv fused
+// norm, rope q, rope k) with one on RoPE layers.
+template <class ExecSpace, class Scalar, class FView, class PView>
+struct QkVRmsNormFusedRopeTeam {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  using View2 = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
+  using View1 = Kokkos::View<Scalar*, ExecSpace>;
+  using View3 = Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>;
+  View2 qflat;
+  View1 wq;
+  View3 qout;
+  View2 kflat;
+  View1 wk;
+  View3 kout;
+  View2 vflat;
+  View3 vout;
+  size_t NH;
+  size_t NKV;
+  float eps;
+  FView inv_freq;    // [HD/2] FP32 table; ignored (may be empty) when !do_rope
+  PView positions;   // [T] absolute positions; ignored when !do_rope
+  bool do_rope;
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& team) const {
+    const View2 qflat_ = qflat, kflat_ = kflat, vflat_ = vflat;
+    const View1 wq_ = wq, wk_ = wk;
+    const View3 qout_ = qout, kout_ = kout, vout_ = vout;
+    const float eps_ = eps;
+    const size_t NH_ = NH, NKV_ = NKV;
+    const size_t HD_ = wq_.extent(0);
+    const size_t T_  = qflat_.extent(0);
+    const FView inv_ = inv_freq;
+    const PView pos_ = positions;
+    const bool rope_ = do_rope;
+    const size_t id  = static_cast<size_t>(team.league_rank());
+    const size_t qn  = T_ * NH_;
+    const size_t kn  = T_ * NKV_;
+    if (id < qn) {
+      const size_t t = id / NH_;
+      const size_t h = id % NH_;
+      const size_t base = h * HD_;
+      float ss = 0;
+      Kokkos::parallel_reduce(
+          Kokkos::TeamThreadRange(team, HD_),
+          KOKKOS_LAMBDA(size_t d, float& acc) {
+            const float v = static_cast<float>(qflat_(t, base + d));
+            acc += v * v;
+          },
+          ss);
+      const float inv =
+          1.0f / Kokkos::sqrtf(ss / static_cast<float>(HD_) + eps_);
+      Kokkos::parallel_for(
+          Kokkos::TeamThreadRange(team, HD_), KOKKOS_LAMBDA(size_t d) {
+            qout_(t, h, d) = static_cast<Scalar>(
+                static_cast<float>(qflat_(t, base + d)) * inv *
+                static_cast<float>(wq_(d)));
+          });
+      if (rope_) {
+        team.team_barrier();
+        const float p = static_cast<float>(pos_(t));
+        const size_t half = HD_ / 2;
+        Kokkos::parallel_for(
+            Kokkos::TeamThreadRange(team, half), KOKKOS_LAMBDA(size_t d) {
+              const float ang = p * static_cast<float>(inv_(d));
+              const float c = Kokkos::cosf(ang), s = Kokkos::sinf(ang);
+              const float a = static_cast<float>(qout_(t, h, d));
+              const float b = static_cast<float>(qout_(t, h, d + half));
+              qout_(t, h, d) = static_cast<Scalar>(a * c - b * s);
+              qout_(t, h, d + half) = static_cast<Scalar>(a * s + b * c);
+            });
+      }
+    } else if (id < qn + kn) {
+      const size_t j = id - qn;
+      const size_t t = j / NKV_;
+      const size_t h = j % NKV_;
+      const size_t base = h * HD_;
+      float ss = 0;
+      Kokkos::parallel_reduce(
+          Kokkos::TeamThreadRange(team, HD_),
+          KOKKOS_LAMBDA(size_t d, float& acc) {
+            const float v = static_cast<float>(kflat_(t, base + d));
+            acc += v * v;
+          },
+          ss);
+      const float inv =
+          1.0f / Kokkos::sqrtf(ss / static_cast<float>(HD_) + eps_);
+      Kokkos::parallel_for(
+          Kokkos::TeamThreadRange(team, HD_), KOKKOS_LAMBDA(size_t d) {
+            kout_(t, h, d) = static_cast<Scalar>(
+                static_cast<float>(kflat_(t, base + d)) * inv *
+                static_cast<float>(wk_(d)));
+          });
+      if (rope_) {
+        team.team_barrier();
+        const float p = static_cast<float>(pos_(t));
+        const size_t half = HD_ / 2;
+        Kokkos::parallel_for(
+            Kokkos::TeamThreadRange(team, half), KOKKOS_LAMBDA(size_t d) {
+              const float ang = p * static_cast<float>(inv_(d));
+              const float c = Kokkos::cosf(ang), s = Kokkos::sinf(ang);
+              const float a = static_cast<float>(kout_(t, h, d));
+              const float b = static_cast<float>(kout_(t, h, d + half));
+              kout_(t, h, d) = static_cast<Scalar>(a * c - b * s);
+              kout_(t, h, d + half) = static_cast<Scalar>(a * s + b * c);
+            });
+      }
+    } else {
+      const size_t j = id - qn - kn;
+      const size_t t = j / NKV_;
+      const size_t h = j % NKV_;
+      const size_t base = h * HD_;
+      Kokkos::parallel_for(
+          Kokkos::TeamThreadRange(team, HD_), KOKKOS_LAMBDA(size_t d) {
+            vout_(t, h, d) = vflat_(t, base + d);
+          });
+    }
+  }
+};
 // layout-agnostic (managed or unmanaged aliases alike; only extents and
 // operator() are used). In-place safe: the reduce completes before any
 // write.
@@ -969,6 +1094,58 @@ void qk_rmsnorm_qkv_fused(
   Impl::rmsnorm_team_launch<ExecSpace>(
       Impl::QkVRmsNormFusedTeam<ExecSpace, Scalar>{
           qflat, wq, qout, kflat, wk, kout, vflat, vout, NH, NKV, eps},
+      T * (NH + 2 * NKV), HD, label);
+}
+
+// Fused Q/K per-head RMSNorm + V reshape + conditional NeoX RoPE (see
+// Impl::QkVRmsNormFusedRopeTeam): bit-identical to qk_rmsnorm_qkv_fused
+// followed by rope_neoX_inplace(qout, kout, inv_freq, HD, positions) when
+// do_rope is true, and bit-identical to qk_rmsnorm_qkv_fused alone when
+// false (inv_freq may then be empty). q/k share one eps; inv_freq stays
+// FP32 and the rotation is computed in FP32. Scalar-agnostic;
+// backend-portable team-parallel kernel (one team per (token, head) row,
+// D-way parallel within the team). FView/PView are view-generic (managed
+// views or subviews alike); FView must hold HD/2 entries and PView T
+// entries when do_rope is true.
+template <class ExecSpace, class Scalar, class FView, class PView>
+void qk_rmsnorm_qkv_fused_rope(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& qflat,
+    const Kokkos::View<Scalar*, ExecSpace>& wq,
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& qout,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& kflat,
+    const Kokkos::View<Scalar*, ExecSpace>& wk,
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& kout,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& vflat,
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& vout,
+    float eps, const FView& inv_freq, const PView& positions, bool do_rope,
+    const std::string& label = "KokkosDNN::qk_rmsnorm_qkv_fused_rope") {
+  static_assert(FView::rank == 1, "qk_rmsnorm_qkv_fused_rope: inv_freq rank 1");
+  static_assert(PView::rank == 1, "qk_rmsnorm_qkv_fused_rope: positions rank 1");
+  const size_t T = qout.extent(0), NH = qout.extent(1), HD = qout.extent(2);
+  const size_t NKV = kout.extent(1);
+  if (qflat.extent(0) != T || qflat.extent(1) != NH * HD ||
+      wq.extent(0) != HD || kflat.extent(0) != T ||
+      kflat.extent(1) != NKV * HD || wk.extent(0) != HD ||
+      kout.extent(0) != T || kout.extent(2) != HD || vflat.extent(0) != T ||
+      vflat.extent(1) != NKV * HD || vout.extent(0) != T ||
+      vout.extent(1) != NKV || vout.extent(2) != HD)
+    throw std::invalid_argument(
+        "qk_rmsnorm_qkv_fused_rope: dimension mismatch");
+  if (do_rope) {
+    if (HD == 0 || HD % 2 != 0)
+      throw std::invalid_argument(
+          "qk_rmsnorm_qkv_fused_rope: head_dim must be positive and even");
+    if (inv_freq.extent(0) != HD / 2)
+      throw std::invalid_argument(
+          "qk_rmsnorm_qkv_fused_rope: inv_freq length must be head_dim/2");
+    if (positions.extent(0) != T)
+      throw std::invalid_argument(
+          "qk_rmsnorm_qkv_fused_rope: positions length must match T");
+  }
+  Impl::rmsnorm_team_launch<ExecSpace>(
+      Impl::QkVRmsNormFusedRopeTeam<ExecSpace, Scalar, FView, PView>{
+          qflat, wq, qout, kflat, wk, kout, vflat, vout, NH, NKV, eps,
+          inv_freq, positions, do_rope},
       T * (NH + 2 * NKV), HD, label);
 }
 
