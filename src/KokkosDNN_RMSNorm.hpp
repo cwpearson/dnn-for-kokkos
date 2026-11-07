@@ -9,6 +9,7 @@
 #include <string>
 
 #include "KokkosDNN_Occupancy.hpp"
+#include "KokkosDNN_RoPE.hpp"
 
 namespace KokkosDNN {
 namespace Impl {
@@ -628,12 +629,8 @@ struct QkVRmsNormFusedRopeTeam {
         const size_t half = HD_ / 2;
         Kokkos::parallel_for(
             Kokkos::TeamThreadRange(team, half), KOKKOS_LAMBDA(size_t d) {
-              const float ang = p * static_cast<float>(inv_(d));
-              const float c = Kokkos::cosf(ang), s = Kokkos::sinf(ang);
-              const float a = static_cast<float>(qout_(t, h, d));
-              const float b = static_cast<float>(qout_(t, h, d + half));
-              qout_(t, h, d) = static_cast<Scalar>(a * c - b * s);
-              qout_(t, h, d + half) = static_cast<Scalar>(a * s + b * c);
+              rope_neox_rotate_pair(qout_, t, h, d, half,
+                                    static_cast<float>(inv_(d)), p);
             });
       }
     } else if (id < qn + kn) {
@@ -663,12 +660,8 @@ struct QkVRmsNormFusedRopeTeam {
         const size_t half = HD_ / 2;
         Kokkos::parallel_for(
             Kokkos::TeamThreadRange(team, half), KOKKOS_LAMBDA(size_t d) {
-              const float ang = p * static_cast<float>(inv_(d));
-              const float c = Kokkos::cosf(ang), s = Kokkos::sinf(ang);
-              const float a = static_cast<float>(kout_(t, h, d));
-              const float b = static_cast<float>(kout_(t, h, d + half));
-              kout_(t, h, d) = static_cast<Scalar>(a * c - b * s);
-              kout_(t, h, d + half) = static_cast<Scalar>(a * s + b * c);
+              rope_neox_rotate_pair(kout_, t, h, d, half,
+                                    static_cast<float>(inv_(d)), p);
             });
       }
     } else {

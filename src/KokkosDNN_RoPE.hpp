@@ -125,6 +125,32 @@ Kokkos::View<float*, ExecSpace> rope_inv_freq_proportional(
   return f;
 }
 
+namespace Impl {
+
+// Shared GPT-NeoX pair rotation: rotates lanes (d, d+half) of row (t, h) of
+// a [T, H, D] view by angle pos*freq in FP32 (same FP32 cos/sin and same
+// multiply-add order as the formerly duplicated q/k bodies, so results are
+// bit-identical to the two-kernel sequence). View-generic/layout-agnostic
+// (only extents and operator()(t,h,d) are used); the Scalar type is deduced
+// from the view. freq/pos must already be FP32 (callers convert with
+// static_cast<float> so double-backed tables convert identically).
+template <class View>
+KOKKOS_INLINE_FUNCTION void rope_neox_rotate_pair(const View& v, size_t t,
+                                                  size_t h, size_t d,
+                                                  size_t half, float freq,
+                                                  float pos) {
+  using Scalar     = typename View::value_type;
+  const float ang  = pos * freq;
+  const float c    = Kokkos::cosf(ang);
+  const float s    = Kokkos::sinf(ang);
+  const float a    = static_cast<float>(v(t, h, d));
+  const float b    = static_cast<float>(v(t, h, d + half));
+  v(t, h, d)       = static_cast<Scalar>(a * c - b * s);
+  v(t, h, d + half) = static_cast<Scalar>(a * s + b * c);
+}
+
+}  // namespace Impl
+
 // GPT-NeoX-style rotary embedding applied to q and k in place:
 // for each head, pairs (d, d+half) rotate by angle = pos * inv_freq[d].
 // q, k: [tokens, n_heads, head_dim] (flattened last two dims as [T, H*D]).
@@ -132,6 +158,8 @@ Kokkos::View<float*, ExecSpace> rope_inv_freq_proportional(
 // Scalar-agnostic over q/k (float, bhalf_t); inv_freq stays FP32 and the
 // rotation is computed in FP32. Views are layout-agnostic (any Kokkos
 // layout); only extents and operator()(t/h/d) are used.
+// Pair rotation itself lives in Impl::rope_neox_rotate_pair above (shared
+// with the fused QK-norm+RoPE kernel in KokkosDNN_RMSNorm.hpp).
 template <class ExecSpace, class Scalar, class QView, class KView, class FView,
           class PView>
 void rope_neoX_inplace(
@@ -177,12 +205,8 @@ void rope_neoX_inplace(
       KOKKOS_LAMBDA(size_t t, size_t h) {
         float pos = (float)positions(t);
         for (size_t d = 0; d < Hd; ++d) {
-          float ang = pos * inv_freq(d);
-          float c = Kokkos::cosf(ang), s = Kokkos::sinf(ang);
-          float a = static_cast<float>(q(t, h, d)),
-                b = static_cast<float>(q(t, h, d + Hd));
-          q(t, h, d)      = static_cast<Scalar>(a * c - b * s);
-          q(t, h, d + Hd) = static_cast<Scalar>(a * s + b * c);
+          Impl::rope_neox_rotate_pair(q, t, h, d, Hd,
+                                      static_cast<float>(inv_freq(d)), pos);
         }
       });
   if (Hk == 0) return;
@@ -192,12 +216,8 @@ void rope_neoX_inplace(
       KOKKOS_LAMBDA(size_t t, size_t h) {
         float pos = (float)positions(t);
         for (size_t d = 0; d < Hd; ++d) {
-          float ang = pos * inv_freq(d);
-          float c = Kokkos::cosf(ang), s = Kokkos::sinf(ang);
-          float a = static_cast<float>(k(t, h, d)),
-                b = static_cast<float>(k(t, h, d + Hd));
-          k(t, h, d)      = static_cast<Scalar>(a * c - b * s);
-          k(t, h, d + Hd) = static_cast<Scalar>(a * s + b * c);
+          Impl::rope_neox_rotate_pair(k, t, h, d, Hd,
+                                      static_cast<float>(inv_freq(d)), pos);
         }
       });
 }
