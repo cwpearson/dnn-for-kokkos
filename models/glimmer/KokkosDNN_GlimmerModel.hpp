@@ -501,14 +501,22 @@ class Model {
           "pos_fill", Kokkos::RangePolicy<ExecSpace>(0, C),
           KOKKOS_LAMBDA(size_t t) { pos(t) = (int)(cpos + t); });
 
+      // Input norm for layer 0, hoisted before the loop: deeper layers arrive
+      // with it precomputed by the previous iteration's fused post-FFN tail
+      // (one launch per layer boundary instead of a resid-add launch plus a
+      // norm launch). tmp carries each layer's normed input.
+      rmsnorm_one_plus<ExecSpace, Scalar>(h, weights.blocks[0].input_norm, EPS,
+                                          tmp);
+
       for (int l = 0; l < NL; ++l) {
         auto& b = weights.blocks[(size_t)l];
         const bool full = cfg.is_full(l);
         const bool nope = cfg.layer_rope_theta[(size_t)l] <= 0.0;
-        // 1. Attention block: input norm, QK projs + per-head norms (the q
-        // pre-scale is fused into the q norm via the qk_qscale_ weight),
-        // (optional) RoPE, KV write + GQA.
-        rmsnorm_one_plus<ExecSpace, Scalar>(h, b.input_norm, EPS, tmp);
+        // 1. Attention block: the input norm for layer 0 was hoisted before
+        // the loop; deeper layers arrive with it precomputed by the previous
+        // iteration's fused post-FFN tail (see below), so no norm runs here.
+        // QK projs + per-head norms (the q pre-scale is fused into the q
+        // norm via the qk_qscale_ weight), (optional) RoPE, KV write + GQA.
         // Linear dispatch (see KokkosDNN_GlimmerQuantDispatch.hpp): decode
         // chunks (C == 1) run quant_gemv on packed weights, prefill chunks
         // dequantize-once into exact staging + dense gemm. Dense Weights
@@ -629,13 +637,12 @@ class Model {
                                                           attn_flat);
         Impl::linear_chunk<ExecSpace, Scalar>(handle, attn_flat, b.wo, deq_o_,
                                               proj, "wo", q8_act_buf_);
-        // Fused post-attention norm + residual add (one launch instead of
-        // norm + resid1; ~1 ulp reassociation, see KokkosDNN_RMSNorm.hpp):
-        // h += norm(proj) * (1 + w).
-        rmsnorm_one_plus_resid<ExecSpace, Scalar>(proj, b.post_attn_norm,
-                                                 POST_EPS, h);
-        // 2. SwiGLU MLP under the pre-FFN norm + post-FFN norm.
-        rmsnorm_one_plus<ExecSpace, Scalar>(h, b.pre_ffn_norm, EPS, tmp2);
+        // Fused post-attention norm + residual + pre-FFN norm (one launch
+        // instead of a resid-add launch plus a norm launch; same per-row
+        // math, see KokkosDNN_RMSNorm.hpp):
+        // h += norm(proj) * (1 + w); tmp2 = norm(h) * (1 + w).
+        rmsnorm_one_plus_resid_then_one_plus<ExecSpace, Scalar>(
+            proj, b.post_attn_norm, POST_EPS, h, b.pre_ffn_norm, EPS, tmp2);
         Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp2, b.wgate, deq_ffn_,
                                               gate, "wgate", q8_act_buf_);
         Impl::linear_chunk<ExecSpace, Scalar>(handle, tmp2, b.wup, deq_ffn_,
@@ -643,11 +650,22 @@ class Model {
         swiglu<ExecSpace, Scalar>(gate, up, act);
         Impl::linear_chunk<ExecSpace, Scalar>(handle, act, b.wdown, deq_down_,
                                               down, "wdown", q8_act_buf_);
-        // Fused post-FFN norm + residual add (one launch instead of
-        // norm + resid2; ~1 ulp reassociation, see KokkosDNN_RMSNorm.hpp):
+        // Fused post-FFN norm + residual + next layer's input norm (one
+        // launch instead of a resid-add launch plus a norm launch; same
+        // per-row math, see KokkosDNN_RMSNorm.hpp). tmp already carries this
+        // layer's normed input (last read by the gate_attn proj above), so
+        // overwriting it with the next layer's normed input is safe. The
+        // last layer keeps the standalone resid-add (the final norm runs
+        // after the loop).
         // h += norm(down) * (1 + w).
-        rmsnorm_one_plus_resid<ExecSpace, Scalar>(down, b.post_ffn_norm,
-                                                 POST_EPS, h);
+        if (l + 1 < NL) {
+          rmsnorm_one_plus_resid_then_one_plus<ExecSpace, Scalar>(
+              down, b.post_ffn_norm, POST_EPS, h,
+              weights.blocks[(size_t)(l + 1)].input_norm, EPS, tmp);
+        } else {
+          rmsnorm_one_plus_resid<ExecSpace, Scalar>(down, b.post_ffn_norm,
+                                                    POST_EPS, h);
+        }
       }
 
       // Only the last chunk produces logits (earlier chunks only fill KV).

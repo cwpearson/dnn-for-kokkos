@@ -277,6 +277,140 @@ TEST(RMSNormOnePlusResid, BHalf) {
   check_rmsnorm_one_plus_resid<Kokkos::Experimental::bhalf_t>(5e-2f, 5e-2f);
 }
 
+// Fused resid-add + following norm: matches the sequential
+// rmsnorm_one_plus_resid + rmsnorm_one_plus pair and the host serial
+// reference. Distinct eps1/eps2 mirror the Glimmer use (tight post-norm eps
+// into the regular eps).
+template <class Scalar>
+void check_rmsnorm_one_plus_resid_then_one_plus(float tol_host,
+                                                float tol_twopass) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  for (int T : {1, 3}) {
+    const int D = 8;
+    const float eps1 = 1e-8f, eps2 = 1e-5f;
+    Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> x("x", T, D),
+        hf("hfused", T, D), yf("yfused", T, D), hs("hseq", T, D),
+        ys("yseq", T, D);
+    Kokkos::View<Scalar*, Exec> w1("w1", D), w2("w2", D);
+    auto hx = Kokkos::create_mirror_view(x);
+    auto hh = Kokkos::create_mirror_view(hf);
+    auto hw1 = Kokkos::create_mirror_view(w1);
+    auto hw2 = Kokkos::create_mirror_view(w2);
+    for (int t = 0; t < T; ++t)
+      for (int d = 0; d < D; ++d) {
+        hx(t, d) = static_cast<Scalar>(0.5f * (t + 1) - 0.25f * d);
+        hh(t, d) = static_cast<Scalar>(0.1f * d - 0.3f * t);
+      }
+    for (int d = 0; d < D; ++d) {
+      hw1(d) = static_cast<Scalar>(0.05f * d - 0.1f);
+      hw2(d) = static_cast<Scalar>(-0.03f * d + 0.07f);
+    }
+    Kokkos::deep_copy(x, hx);
+    Kokkos::deep_copy(w1, hw1);
+    Kokkos::deep_copy(w2, hw2);
+    Kokkos::deep_copy(hf, hh);
+    Kokkos::deep_copy(hs, hh);
+    // Snapshots for the host reference: on host backends (Serial) mirrors
+    // may alias the device views, which the kernels below overwrite.
+    std::vector<float> xref((size_t)T * (size_t)D),
+        href((size_t)T * (size_t)D), w1ref((size_t)D), w2ref((size_t)D);
+    for (int t = 0; t < T; ++t)
+      for (int d = 0; d < D; ++d) {
+        xref[(size_t)t * (size_t)D + (size_t)d] =
+            static_cast<float>(hx(t, d));
+        href[(size_t)t * (size_t)D + (size_t)d] =
+            static_cast<float>(hh(t, d));
+      }
+    for (int d = 0; d < D; ++d) {
+      w1ref[(size_t)d] = static_cast<float>(hw1(d));
+      w2ref[(size_t)d] = static_cast<float>(hw2(d));
+    }
+    // Sequential device reference.
+    KokkosDNN::rmsnorm_one_plus_resid<Exec, Scalar>(x, w1, eps1, hs);
+    KokkosDNN::rmsnorm_one_plus<Exec, Scalar>(hs, w2, eps2, ys);
+    // Fused (distinct y).
+    KokkosDNN::rmsnorm_one_plus_resid_then_one_plus<Exec, Scalar>(x, w1, eps1,
+                                                                 hf, w2, eps2,
+                                                                 yf);
+    Kokkos::fence();
+    auto got_h = Kokkos::create_mirror_view(hf);
+    Kokkos::deep_copy(got_h, hf);
+    auto want_h = Kokkos::create_mirror_view(hs);
+    Kokkos::deep_copy(want_h, hs);
+    auto got_y = Kokkos::create_mirror_view(yf);
+    Kokkos::deep_copy(got_y, yf);
+    auto want_y = Kokkos::create_mirror_view(ys);
+    Kokkos::deep_copy(want_y, ys);
+    for (int t = 0; t < T; ++t)
+      for (int d = 0; d < D; ++d) {
+        EXPECT_NEAR(static_cast<double>(got_h(t, d)),
+                    static_cast<double>(want_h(t, d)), tol_twopass)
+            << "resid_then_norm h mismatch at T=" << T << " (" << t << ","
+            << d << ")";
+        EXPECT_NEAR(static_cast<double>(got_y(t, d)),
+                    static_cast<double>(want_y(t, d)), tol_twopass)
+            << "resid_then_norm y mismatch at T=" << T << " (" << t << ","
+            << d << ")";
+      }
+    // Host serial reference (functionality).
+    for (int t = 0; t < T; ++t) {
+      float ss1 = 0;
+      for (int d = 0; d < D; ++d) {
+        float v = xref[(size_t)t * (size_t)D + (size_t)d];
+        ss1 += v * v;
+      }
+      float inv1 = 1.0f / std::sqrt(ss1 / D + eps1);
+      std::vector<float> hnew((size_t)D);
+      for (int d = 0; d < D; ++d)
+        hnew[(size_t)d] = href[(size_t)t * (size_t)D + (size_t)d] +
+                          xref[(size_t)t * (size_t)D + (size_t)d] * inv1 *
+                              (1.0f + w1ref[(size_t)d]);
+      float ss2 = 0;
+      for (int d = 0; d < D; ++d) ss2 += hnew[(size_t)d] * hnew[(size_t)d];
+      float inv2 = 1.0f / std::sqrt(ss2 / D + eps2);
+      for (int d = 0; d < D; ++d) {
+        float want_h_host = hnew[(size_t)d];
+        float want_y_host = hnew[(size_t)d] * inv2 * (1.0f + w2ref[(size_t)d]);
+        EXPECT_NEAR(static_cast<double>(got_h(t, d)), want_h_host, tol_host)
+            << "host h mismatch at T=" << T << " (" << t << "," << d << ")";
+        EXPECT_NEAR(static_cast<double>(got_y(t, d)), want_y_host, tol_host)
+            << "host y mismatch at T=" << T << " (" << t << "," << d << ")";
+      }
+    }
+    // In-place y == h is supported (second-phase reduce completes before
+    // any write): rerun fused aliasing y onto h and compare.
+    Kokkos::deep_copy(hf, hh);
+    KokkosDNN::rmsnorm_one_plus_resid_then_one_plus<Exec, Scalar>(x, w1, eps1,
+                                                                 hf, w2, eps2,
+                                                                 hf);
+    Kokkos::fence();
+    auto got_ip = Kokkos::create_mirror_view(hf);
+    Kokkos::deep_copy(got_ip, hf);
+    for (int t = 0; t < T; ++t)
+      for (int d = 0; d < D; ++d)
+        EXPECT_NEAR(static_cast<double>(got_ip(t, d)),
+                    static_cast<double>(want_y(t, d)), tol_twopass)
+            << "in-place mismatch at T=" << T << " (" << t << "," << d << ")";
+  }
+  // Dimension mismatch throws.
+  const int D = 8;
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> x("x", 2, D), h("h", 2, D),
+      bad("bad", 2, D - 1);
+  Kokkos::View<Scalar*, Exec> w("w", D);
+  EXPECT_THROW((KokkosDNN::rmsnorm_one_plus_resid_then_one_plus<Exec, Scalar>(
+                   x, w, 1e-8f, h, w, 1e-5f, bad)),
+               std::invalid_argument);
+}
+
+TEST(RMSNormOnePlusResidThenOnePlus, Float) {
+  check_rmsnorm_one_plus_resid_then_one_plus<float>(1e-5f, 1e-6f);
+}
+
+TEST(RMSNormOnePlusResidThenOnePlus, BHalf) {
+  check_rmsnorm_one_plus_resid_then_one_plus<Kokkos::Experimental::bhalf_t>(
+      5e-2f, 5e-2f);
+}
+
 // Fused Q/K per-head norms + V reshape: bit-identical to separate
 // qk_rmsnorm calls plus a reshape copy.
 template <class Scalar>
