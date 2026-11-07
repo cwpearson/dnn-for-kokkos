@@ -924,19 +924,8 @@ void rmsnorm_one_plus(
   if (y.extent(0) != T || y.extent(1) != D || w.extent(0) != D)
     throw std::invalid_argument("rmsnorm_one_plus: dimension mismatch");
   if (T == 0 || D == 0) return;
-  // Team per row: the sum-of-squares is a team-parallel reduce, so decode
-  // (T=1) spreads the whole row over the team instead of one serial thread.
-  // The probe clamps the team size for backends that cannot field 256
-  // threads (Serial -> 1; strided TeamThreadRange stays correct).
-  Impl::RmsNormOnePlusTeam<ExecSpace, Scalar> f{
-      x, w, y, eps,
-  };
-  const int mx = Impl::cached_team_size_max<ExecSpace>(f);
-  int ts = static_cast<int>(D < 256 ? D : 256);
-  if (mx < ts) ts = mx;
-  if (ts < 1) ts = 1;
-  Kokkos::TeamPolicy<ExecSpace> policy(static_cast<int>(T), ts);
-  Kokkos::parallel_for(label, policy, f);
+  Impl::rmsnorm_team_launch<ExecSpace>(
+      Impl::RmsNormOnePlusTeam<ExecSpace, Scalar>{x, w, y, eps}, T, D, label);
 }
 
 // Fused Gemma2 (1+w)-RMSNorm + residual add:
@@ -958,15 +947,9 @@ void rmsnorm_one_plus_resid(
   if (h.extent(0) != T || h.extent(1) != D || w.extent(0) != D)
     throw std::invalid_argument("rmsnorm_one_plus_resid: dimension mismatch");
   if (T == 0 || D == 0) return;
-  Impl::RmsNormOnePlusResidTeam<ExecSpace, Scalar> f{
-      x, w, h, eps,
-  };
-  const int mx = Impl::cached_team_size_max<ExecSpace>(f);
-  int ts = static_cast<int>(D < 256 ? D : 256);
-  if (mx < ts) ts = mx;
-  if (ts < 1) ts = 1;
-  Kokkos::TeamPolicy<ExecSpace> policy(static_cast<int>(T), ts);
-  Kokkos::parallel_for(label, policy, f);
+  Impl::rmsnorm_team_launch<ExecSpace>(
+      Impl::RmsNormOnePlusResidTeam<ExecSpace, Scalar>{x, w, h, eps}, T, D,
+      label);
 }
 
 // Fused (1+w)-RMSNorm + residual add + following (1+w)-RMSNorm:
@@ -995,15 +978,10 @@ void rmsnorm_one_plus_resid_then_one_plus(
     throw std::invalid_argument(
         "rmsnorm_one_plus_resid_then_one_plus: dimension mismatch");
   if (T == 0 || D == 0) return;
-  Impl::RmsNormOnePlusResidNextNormTeam<ExecSpace, Scalar> f{
-      x, w1, h, w2, y, eps1, eps2,
-  };
-  const int mx = Impl::cached_team_size_max<ExecSpace>(f);
-  int ts = static_cast<int>(D < 256 ? D : 256);
-  if (mx < ts) ts = mx;
-  if (ts < 1) ts = 1;
-  Kokkos::TeamPolicy<ExecSpace> policy(static_cast<int>(T), ts);
-  Kokkos::parallel_for(label, policy, f);
+  Impl::rmsnorm_team_launch<ExecSpace>(
+      Impl::RmsNormOnePlusResidNextNormTeam<ExecSpace, Scalar>{x, w1, h, w2, y,
+                                                              eps1, eps2},
+      T, D, label);
 }
 
 // Single-row scaleless variant for decode.
