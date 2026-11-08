@@ -59,6 +59,15 @@ void run_load_u(const Kokkos::View<uint8_t*, Exec>& d,
   Kokkos::fence();
 }
 
+void run_load_u16(const Kokkos::View<uint8_t*, Exec>& d,
+                  const Kokkos::View<int32_t*, Exec>& out) {
+  using Dot = KokkosDNN::Impl::IntDot<Exec>;
+  Kokkos::parallel_for(
+      "intdot_load_u16", Kokkos::RangePolicy<Exec>(0, (int)out.extent(0)),
+      KOKKOS_LAMBDA(int i) { out(i) = Dot::load_u16(d.data() + 2 * i); });
+  Kokkos::fence();
+}
+
 TEST(IntDot, Dot4MatchesScalarReference) {
   constexpr int nwords = 4096;
   std::mt19937 rng(0x1D07u);
@@ -137,6 +146,24 @@ TEST(IntDot, LoadURoundTripsUnalignedBytes) {
     int32_t want;
     std::memcpy(&want, bytes + i, 4);
     EXPECT_EQ(h(i), want) << "offset " << i;
+  }
+}
+
+TEST(IntDot, LoadU16RoundTripsTwoByteAlignedWords) {
+  // `load_u16` requires only 2-byte alignment (Q6_K/Q8_0 block payloads).
+  const uint8_t bytes[8] = {0x00, 0xFF, 0x80, 0x7F,
+                            0x01, 0x80, 0xFF, 0x3C};
+  Kokkos::View<uint8_t*, Exec> d("d", 8);
+  auto mh = Kokkos::create_mirror_view(d);
+  for (int i = 0; i < 8; ++i) mh(i) = bytes[i];
+  Kokkos::deep_copy(d, mh);
+  Kokkos::View<int32_t*, Exec> out("out", 3);
+  run_load_u16(d, out);
+  auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), out);
+  for (int i = 0; i < 3; ++i) {
+    int32_t want;
+    std::memcpy(&want, bytes + 2 * i, 4);
+    EXPECT_EQ(h(i), want) << "offset " << 2 * i;
   }
 }
 

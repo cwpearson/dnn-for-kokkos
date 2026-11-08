@@ -261,6 +261,17 @@ struct Int8UnitWindow {
   int32_t sum0, sum1;
 };
 
+// One aligned 16-byte chunk (four int8 words). The activation staging buffer
+// and every Q4_K/Q5_K weight window are 16-byte aligned, so these become one
+// vector load instead of four scalar ones.
+struct alignas(16) Int8Words4 {
+  int32_t w[4];
+};
+
+KOKKOS_INLINE_FUNCTION Int8Words4 mvq_load_words4(const void* p) {
+  return *static_cast<const Int8Words4*>(p);
+}
+
 template <class ExecSpace, Wd DT>
 KOKKOS_INLINE_FUNCTION Int8UnitWindow mvq_load_unit_window(const int8_t* xq,
                                                            const ActQ8Hdr* xh,
@@ -273,10 +284,12 @@ KOKKOS_INLINE_FUNCTION Int8UnitWindow mvq_load_unit_window(const int8_t* xq,
     const int half = c & 1;
     const int k0   = (blk << 8) + (iter << 6) + (half << 4);
     const int b0   = k0 >> 5;
+    const Int8Words4 a = mvq_load_words4(xq + k0);
+    const Int8Words4 b = mvq_load_words4(xq + k0 + 32);
 KOKKOSDNN_PRAGMA_UNROLL()
     for (int i = 0; i < 4; ++i) {
-      x.w[i]     = Dot::load(xq + k0 + i * 4);
-      x.w[4 + i] = Dot::load(xq + k0 + 32 + i * 4);
+      x.w[i]     = a.w[i];
+      x.w[4 + i] = b.w[i];
     }
     x.d0   = xh[b0].d;
     x.d1   = xh[b0 + 1].d;
@@ -288,12 +301,17 @@ KOKKOSDNN_PRAGMA_UNROLL()
     const int iter = sub >> 1;
     const bool low = (sub & 1) == 0;
     const int k0   = (blk << 8) + (iter << 6) + (low ? 0 : 32);
+    const Int8Words4 a = mvq_load_words4(xq + k0);
+    const Int8Words4 b = mvq_load_words4(xq + k0 + 16);
 KOKKOSDNN_PRAGMA_UNROLL()
-    for (int i = 0; i < 8; ++i) x.w[i] = Dot::load(xq + k0 + i * 4);
-    const int b     = k0 >> 5;
-    x.d0            = xh[b].d;
+    for (int i = 0; i < 4; ++i) {
+      x.w[i]     = a.w[i];
+      x.w[4 + i] = b.w[i];
+    }
+    const int hb    = k0 >> 5;
+    x.d0            = xh[hb].d;
     x.d1            = x.d0;
-    x.sum0          = xh[b].sum_lo + xh[b].sum_hi;
+    x.sum0          = xh[hb].sum_lo + xh[hb].sum_hi;
     x.sum1          = x.sum0;
   } else if constexpr (DT == Wd::Q6K) {
     const int blk   = c >> 3;
@@ -302,10 +320,12 @@ KOKKOSDNN_PRAGMA_UNROLL()
     const int half  = c & 1;
     const int k0 = (blk << 8) + (chunk << 7) + (pair << 5) + (half << 4);
     const int b0 = k0 >> 5;
+    const Int8Words4 a = mvq_load_words4(xq + k0);
+    const Int8Words4 b = mvq_load_words4(xq + k0 + 64);
 KOKKOSDNN_PRAGMA_UNROLL()
     for (int i = 0; i < 4; ++i) {
-      x.w[i]     = Dot::load(xq + k0 + i * 4);
-      x.w[4 + i] = Dot::load(xq + k0 + 64 + i * 4);
+      x.w[i]     = a.w[i];
+      x.w[4 + i] = b.w[i];
     }
     x.d0   = xh[b0].d;
     x.d1   = xh[b0 + 2].d;
@@ -313,8 +333,13 @@ KOKKOSDNN_PRAGMA_UNROLL()
     x.sum1 = (half != 0) ? xh[b0 + 2].sum_hi : xh[b0 + 2].sum_lo;
   } else {  // Wd::Q80: one 32-element block, int8 payload.
     const int k0 = c << 5;
+    const Int8Words4 a = mvq_load_words4(xq + k0);
+    const Int8Words4 b = mvq_load_words4(xq + k0 + 16);
 KOKKOSDNN_PRAGMA_UNROLL()
-    for (int i = 0; i < 8; ++i) x.w[i] = Dot::load(xq + k0 + i * 4);
+    for (int i = 0; i < 4; ++i) {
+      x.w[i]     = a.w[i];
+      x.w[4 + i] = b.w[i];
+    }
     x.d0   = xh[c].d;
     x.d1   = x.d0;
     x.sum0 = 0;
@@ -348,9 +373,10 @@ KOKKOS_INLINE_FUNCTION float gemv_int8_unit_dot_win(
     const float fb = dw * (float)sc1 * x.d1;
     const float mb = dm * (float)mn1 * x.d1;
     int dotA = 0, dotB = 0;
+    const Int8Words4 q = mvq_load_words4(qw);
 KOKKOSDNN_PRAGMA_UNROLL()
     for (int i = 0; i < 4; ++i) {
-      const uint32_t w = (uint32_t)Dot::load(qw + i * 4);
+      const uint32_t w = (uint32_t)q.w[i];
       dotA = Dot::dot4((int32_t)(w & 0x0F0F0F0Fu), x.w[i], dotA);
       dotB = Dot::dot4((int32_t)((w >> 4) & 0x0F0F0F0Fu), x.w[4 + i], dotB);
     }
@@ -371,14 +397,23 @@ KOKKOSDNN_PRAGMA_UNROLL()
     const float dm = mvq_h2f(b->dmin) * (float)mn * x.d0;
     const uint32_t sh    = low ? 0u : 4u;
     const uint32_t bitsh = (uint32_t)(2 * iter + (low ? 0 : 1));
+    const Int8Words4 ql0 = mvq_load_words4(ql);
+    const Int8Words4 ql1 = mvq_load_words4(ql + 16);
+    const Int8Words4 qh0 = mvq_load_words4(qh);
+    const Int8Words4 qh1 = mvq_load_words4(qh + 16);
     int dot = 0;
 KOKKOSDNN_PRAGMA_UNROLL()
-    for (int i = 0; i < 8; ++i) {
-      const uint32_t qlw = (uint32_t)Dot::load(ql + i * 4);
-      const uint32_t qhw = (uint32_t)Dot::load(qh + i * 4);
-      const uint32_t w =
-          ((qlw >> sh) & 0x0F0F0F0Fu) | (((qhw >> bitsh) & 0x01010101u) << 4);
-      dot = Dot::dot4((int32_t)w, x.w[i], dot);
+    for (int i = 0; i < 4; ++i) {
+      const uint32_t qlw0 = (uint32_t)ql0.w[i];
+      const uint32_t qlw1 = (uint32_t)ql1.w[i];
+      const uint32_t qhw0 = (uint32_t)qh0.w[i];
+      const uint32_t qhw1 = (uint32_t)qh1.w[i];
+      const uint32_t w0 =
+          ((qlw0 >> sh) & 0x0F0F0F0Fu) | (((qhw0 >> bitsh) & 0x01010101u) << 4);
+      const uint32_t w1 =
+          ((qlw1 >> sh) & 0x0F0F0F0Fu) | (((qhw1 >> bitsh) & 0x01010101u) << 4);
+      dot = Dot::dot4((int32_t)w0, x.w[i], dot);
+      dot = Dot::dot4((int32_t)w1, x.w[4 + i], dot);
     }
     return dw * (float)dot - dm * (float)x.sum0;
   } else if constexpr (DT == Wd::Q6K) {
@@ -404,8 +439,8 @@ KOKKOSDNN_PRAGMA_UNROLL()
     int dotA = 0, dotB = 0;
 KOKKOSDNN_PRAGMA_UNROLL()
     for (int i = 0; i < 4; ++i) {
-      const uint32_t qlw = (uint32_t)Dot::load_u(ql + i * 4);
-      const uint32_t qhw = (uint32_t)Dot::load_u(qh + i * 4);
+      const uint32_t qlw = (uint32_t)Dot::load_u16(ql + i * 4);
+      const uint32_t qhw = (uint32_t)Dot::load_u16(qh + i * 4);
       const uint32_t wA =
           (qlw & 0x0F0F0F0Fu) | ((((qhw >> sh) & 0x03030303u)) << 4);
       const uint32_t wB = ((qlw >> 4) & 0x0F0F0F0Fu) |
@@ -421,7 +456,7 @@ KOKKOSDNN_PRAGMA_UNROLL()
     int dot           = 0;
 KOKKOSDNN_PRAGMA_UNROLL()
     for (int i = 0; i < 8; ++i)
-      dot = Dot::dot4(Dot::load_u(b->qs + i * 4), x.w[i], dot);
+      dot = Dot::dot4(Dot::load_u16(b->qs + i * 4), x.w[i], dot);
     return dw * (float)dot;
   }
 }

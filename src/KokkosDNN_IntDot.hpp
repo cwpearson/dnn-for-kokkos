@@ -84,6 +84,15 @@ KOKKOS_INLINE_FUNCTION int32_t load_unaligned32(const void* p) {
                    ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24));
 }
 
+// 4-byte load for 2-byte-aligned payloads: two natural 16-bit loads instead of
+// four byte loads, which is what the unaligned path costs. Used by the Q6_K /
+// Q8_0 weight windows (their block sizes are even, so every window is at
+// least 2-byte aligned).
+KOKKOS_INLINE_FUNCTION int32_t load_u16x2(const void* p) {
+  const uint16_t* q = static_cast<const uint16_t*>(p);
+  return (int32_t)((uint32_t)q[0] | ((uint32_t)q[1] << 16));
+}
+
 }  // namespace IntDotDetail
 
 // Primary template: portable, exact, deliberately dumb.
@@ -99,6 +108,10 @@ struct IntDot {
   // Unaligned-safe variant for 2-byte-aligned payloads (Q6_K/Q8_0 windows).
   KOKKOS_INLINE_FUNCTION static int32_t load_u(const void* p) {
     return IntDotDetail::load_unaligned32(p);
+  }
+  // 2-byte-aligned variant: two 16-bit loads (cheaper than load_u).
+  KOKKOS_INLINE_FUNCTION static int32_t load_u16(const void* p) {
+    return IntDotDetail::load_u16x2(p);
   }
 };
 
@@ -121,6 +134,10 @@ struct IntDot<Kokkos::Cuda> {
   // Unaligned-safe variant for 2-byte-aligned payloads (Q6_K/Q8_0 windows).
   KOKKOS_INLINE_FUNCTION static int32_t load_u(const void* p) {
     return IntDotDetail::load_unaligned32(p);
+  }
+  // 2-byte-aligned variant: two 16-bit loads (cheaper than load_u).
+  KOKKOS_INLINE_FUNCTION static int32_t load_u16(const void* p) {
+    return IntDotDetail::load_u16x2(p);
   }
 };
 #endif
