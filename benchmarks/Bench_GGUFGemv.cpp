@@ -5,9 +5,12 @@
 // KokkosDNN::Gguf::quant_gemv on each shape.
 //
 // usage: kokkosdnn_bench_gguf_gemv <gguf> [iters] [rows] [tpr] [groups] [shape]
+//        [--int8]
 //   rows != 0 bypasses quant_gemv and drives the row-blocked kernel directly
 //   with that layout (rows per thread group, threads per row, row groups per
-//   team). rows == -99 lists tensors of block 0 and exits.
+//   team). rows == -99 lists tensors of block 0 and exits. --int8 supplies the
+//   persistent activation staging buffer, which selects the int8-dot (MMVQ)
+//   decode path instead of the portable fp dot path (the model's decode path).
 //
 // How to read the output: shapes are timed round-robin, one launch each per
 // round, so every shape sees the same GPU clock state. `min` is the best case
@@ -77,6 +80,7 @@ struct Case {
   std::string name;
   Gguf::QuantWeight<Exec> w;
   Kokkos::View<Scalar*, Exec> x, y;
+  Kokkos::View<uint8_t*, Exec> act_scratch;  // empty => portable fp dot path
   int nlayers = 1;  // multiplicity in one decode step
 };
 
@@ -92,11 +96,35 @@ void launch_rows(const Case& c, int tpr, int groups) {
       c.x, c.w, c.y, tpr, groups, "bench_variant");
 }
 
+// Variant launch for the int8-dot path: same explicit layout knobs, driving
+// the row-blocked int8 kernel (with its activation quantize, as in decode).
+void launch_int8_variant(const Case& c, int rows, int tpr, int groups) {
+  using Wd = KokkosDNN::Impl::GgufMvq::Wd;
+  Wd dt{};
+  switch (c.w.dtype) {
+    case Gguf::GgmlType::Q4_K: dt = Wd::Q4K; break;
+    case Gguf::GgmlType::Q5_K: dt = Wd::Q5K; break;
+    case Gguf::GgmlType::Q6_K: dt = Wd::Q6K; break;
+    case Gguf::GgmlType::Q8_0: dt = Wd::Q80; break;
+    default: return;
+  }
+  KokkosDNN::Impl::GgufMvq::Int8Layout layout;
+  layout.rows_per_group  = rows;
+  layout.threads_per_row = tpr;
+  layout.groups          = groups;
+  KokkosDNN::Impl::GgufMvq::launch_quant_gemv_int8<Exec, Scalar>(
+      c.x, c.w.data.data(), dt, c.w.rows, c.w.cols, c.w.row_bytes(), c.y,
+      const_cast<uint8_t*>(c.act_scratch.data()), c.act_scratch.extent(0),
+      layout);
+}
+
 void launch_variant(const Case& c, int rows, int tpr, int groups) {
   using G = Gguf::GgmlType;
 #define KOKKOSDNN_BENCH_ROWS(DT)                                        \
   case DT:                                                              \
-    if (rows >= 4)                                                      \
+    if (rows >= 8)                                                      \
+      launch_rows<DT, 8>(c, tpr, groups);                               \
+    else if (rows >= 4)                                                 \
       launch_rows<DT, 4>(c, tpr, groups);                               \
     else if (rows == 2)                                                 \
       launch_rows<DT, 2>(c, tpr, groups);                               \
@@ -116,7 +144,14 @@ void launch_variant(const Case& c, int rows, int tpr, int groups) {
 // One timed launch (rows > 0 drives the variant path).
 void launch(const Case& c, int rows, int tpr, int groups) {
   if (rows > 0) {
-    launch_variant(c, rows, tpr, groups);
+    if (c.act_scratch.extent(0) != 0)
+      launch_int8_variant(c, rows, tpr, groups);
+    else
+      launch_variant(c, rows, tpr, groups);
+    return;
+  }
+  if (c.act_scratch.extent(0) != 0) {
+    Gguf::quant_gemv(Exec(), c.x, c.w, c.y, c.act_scratch);
     return;
   }
   Gguf::quant_gemv(Exec(), c.x, c.w, c.y);
@@ -135,17 +170,27 @@ double checksum(const Case& c) {
 
 int main(int argc, char** argv) {
   Kokkos::ScopeGuard guard(argc, argv);
-  if (argc < 2) {
-    std::fprintf(stderr, "usage: %s <gguf> [iters] [rows] [tpr] [grp] [shape]\n",
+  std::vector<std::string> pos;
+  bool use_int8 = false;
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--int8") == 0)
+      use_int8 = true;
+    else
+      pos.emplace_back(argv[i]);
+  }
+  if (pos.empty()) {
+    std::fprintf(stderr,
+                 "usage: %s <gguf> [iters] [rows] [tpr] [grp] [shape] "
+                 "[--int8]\n",
                  argv[0]);
     return 2;
   }
-  const std::string path = argv[1];
-  const int iters        = argc > 2 ? std::atoi(argv[2]) : 60;
-  const int rows         = argc > 3 ? std::atoi(argv[3]) : 0;
-  const int tpr          = argc > 4 ? std::atoi(argv[4]) : 32;
-  const int groups       = argc > 5 ? std::atoi(argv[5]) : 4;
-  const std::string only = argc > 6 ? argv[6] : "";
+  const std::string path = pos[0];
+  const int iters        = pos.size() > 1 ? std::atoi(pos[1].c_str()) : 60;
+  const int rows         = pos.size() > 2 ? std::atoi(pos[2].c_str()) : 0;
+  const int tpr          = pos.size() > 3 ? std::atoi(pos[3].c_str()) : 32;
+  const int groups       = pos.size() > 4 ? std::atoi(pos[4].c_str()) : 4;
+  const std::string only = pos.size() > 5 ? pos[5] : "";
 
   Gguf::GgufFile f(path);
   if (rows == -99) {
@@ -175,6 +220,12 @@ int main(int argc, char** argv) {
     c.x    = Kokkos::View<Scalar*, Exec>("x", c.w.cols);
     c.y    = Kokkos::View<Scalar*, Exec>("y", c.w.rows);
     Kokkos::deep_copy(c.x, Scalar(0.01f));
+    if (use_int8) {
+      const size_t need = Gguf::quant_gemv_int8_scratch_bytes(c.w.cols);
+      if (need != 0 && Gguf::quant_gemv_int8_supported<Exec, Scalar>(
+                           c.w.dtype, c.w.cols))
+        c.act_scratch = Kokkos::View<uint8_t*, Exec>("act_scratch", need);
+    }
     c.nlayers = std::string(name).rfind("blk.0.", 0) == 0 ? nlayers : 1;
     cases.push_back(std::move(c));
   }
