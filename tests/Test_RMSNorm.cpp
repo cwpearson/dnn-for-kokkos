@@ -311,6 +311,13 @@ void check_rmsnorm_one_plus_resid_then_one_plus(float tol_host,
     Kokkos::deep_copy(w2, hw2);
     Kokkos::deep_copy(hf, hh);
     Kokkos::deep_copy(hs, hh);
+    // Device-side backup of the init residual stream: on host backends
+    // (Serial/Threads) the hh mirror above may alias hf, so it no longer
+    // holds the init values after the fused kernel below overwrites hf.
+    // h_init is a distinct device allocation, so the in-place rerun can
+    // restore from it portably.
+    Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> h_init("h_init", T, D);
+    Kokkos::deep_copy(h_init, hf);
     // Snapshots for the host reference: on host backends (Serial) mirrors
     // may alias the device views, which the kernels below overwrite.
     std::vector<float> xref((size_t)T * (size_t)D),
@@ -379,8 +386,9 @@ void check_rmsnorm_one_plus_resid_then_one_plus(float tol_host,
       }
     }
     // In-place y == h is supported (second-phase reduce completes before
-    // any write): rerun fused aliasing y onto h and compare.
-    Kokkos::deep_copy(hf, hh);
+    // any write): rerun fused aliasing y onto h and compare. Restore hf
+    // from h_init (not the hh mirror, which may alias hf on host backends).
+    Kokkos::deep_copy(hf, h_init);
     KokkosDNN::rmsnorm_one_plus_resid_then_one_plus<Exec, Scalar>(x, w1, eps1,
                                                                  hf, w2, eps2,
                                                                  hf);
