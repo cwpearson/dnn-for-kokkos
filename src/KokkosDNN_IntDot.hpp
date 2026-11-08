@@ -15,8 +15,10 @@
 //
 // Usage: load 4-byte words and dot them. `load` needs a 4-byte-aligned
 // address (one load instruction); `load_u` is safe at any alignment for the
-// 2-byte-aligned Q6_K/Q8_0 payloads. The natural granularity is one 4-byte
-// word per dot, e.g. a serial unrolled loop over words inside one thread:
+// 2-byte-aligned Q6_K/Q8_0 payloads, and `load_u16` is the cheaper form for
+// the same payloads when only 2-byte alignment is known (two 16-bit loads
+// instead of four byte loads). The natural granularity is one 4-byte word
+// per dot, e.g. a serial unrolled loop over words inside one thread:
 //
 //   int dot = 0;
 //   for (int i = 0; i < 4; ++i)

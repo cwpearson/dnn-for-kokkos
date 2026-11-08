@@ -11,6 +11,10 @@
 //   team). rows == -99 lists tensors of block 0 and exits. --int8 supplies the
 //   persistent activation staging buffer, which selects the int8-dot (MMVQ)
 //   decode path instead of the portable fp dot path (the model's decode path).
+//   With --int8, rows is the row-group size (clamped to 1/2/4/8) and a layout
+//   that cannot be fielded falls back to the one-team-per-row kernel inside
+//   the launcher, so sweep values outside that set measure a different
+//   schedule than the label says.
 //
 // How to read the output: shapes are timed round-robin, one launch each per
 // round, so every shape sees the same GPU clock state. `min` is the best case
@@ -98,7 +102,7 @@ void launch_rows(const Case& c, int tpr, int groups) {
 
 // Variant launch for the int8-dot path: same explicit layout knobs, driving
 // the row-blocked int8 kernel (with its activation quantize, as in decode).
-void launch_int8_variant(const Case& c, int rows, int tpr, int groups) {
+bool launch_int8_variant(const Case& c, int rows, int tpr, int groups) {
   using Wd = KokkosDNN::Impl::GgufMvq::Wd;
   Wd dt{};
   switch (c.w.dtype) {
@@ -106,16 +110,15 @@ void launch_int8_variant(const Case& c, int rows, int tpr, int groups) {
     case Gguf::GgmlType::Q5_K: dt = Wd::Q5K; break;
     case Gguf::GgmlType::Q6_K: dt = Wd::Q6K; break;
     case Gguf::GgmlType::Q8_0: dt = Wd::Q80; break;
-    default: return;
+    default: return false;
   }
   KokkosDNN::Impl::GgufMvq::Int8Layout layout;
   layout.rows_per_group  = rows;
   layout.threads_per_row = tpr;
   layout.groups          = groups;
-  KokkosDNN::Impl::GgufMvq::launch_quant_gemv_int8<Exec, Scalar>(
+  return KokkosDNN::Impl::GgufMvq::launch_quant_gemv_int8<Exec, Scalar>(
       c.x, c.w.data.data(), dt, c.w.rows, c.w.cols, c.w.row_bytes(), c.y,
-      const_cast<uint8_t*>(c.act_scratch.data()), c.act_scratch.extent(0),
-      layout);
+      c.act_scratch.data(), c.act_scratch.extent(0), layout);
 }
 
 void launch_variant(const Case& c, int rows, int tpr, int groups) {
@@ -144,10 +147,19 @@ void launch_variant(const Case& c, int rows, int tpr, int groups) {
 // One timed launch (rows > 0 drives the variant path).
 void launch(const Case& c, int rows, int tpr, int groups) {
   if (rows > 0) {
-    if (c.act_scratch.extent(0) != 0)
-      launch_int8_variant(c, rows, tpr, groups);
-    else
+    if (c.act_scratch.extent(0) != 0) {
+      if (!launch_int8_variant(c, rows, tpr, groups)) {
+        // A declined int8 launch would leave y at its previous value and make
+        // the timing meaningless, so fail instead of reporting a fake number.
+        std::fprintf(stderr,
+                     "int8 variant declined for %s (dtype/layout not "
+                     "supported)\n",
+                     c.name.c_str());
+        std::abort();
+      }
+    } else {
       launch_variant(c, rows, tpr, groups);
+    }
     return;
   }
   if (c.act_scratch.extent(0) != 0) {

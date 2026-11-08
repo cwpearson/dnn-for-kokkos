@@ -847,7 +847,9 @@ void check_dequant_to_dense(GgmlType dtype, size_t K, float tol) {
 // exactly, never "close".
 // ---------------------------------------------------------------------------
 template <class Scalar>
-void check_quant_gemv_int8(GgmlType dtype, size_t K, float tol, size_t N = 5) {
+void check_quant_gemv_int8(
+    GgmlType dtype, size_t K, float tol, size_t N = 5,
+    const KokkosDNN::Impl::GgufMvq::Int8Layout* layout = nullptr) {
   std::vector<float> ref;
   std::vector<uint8_t> raw;
   build_case(dtype, N, K, ref, raw);
@@ -881,7 +883,27 @@ void check_quant_gemv_int8(GgmlType dtype, size_t K, float tol, size_t N = 5) {
   Kokkos::View<uint8_t*, Exec> scratch("scratch",
                                        quant_gemv_int8_scratch_bytes(K));
   const bool active = quant_gemv_int8_supported<Exec, Scalar>(dtype, K);
-  quant_gemv(h, x, w, y, scratch);
+  if (layout == nullptr) {
+    quant_gemv(h, x, w, y, scratch);
+  } else {
+    // Explicit layout: drive the row-blocked kernel directly so tail rows and
+    // ROWS >= 2 (which the default shape heuristic only picks for N >= 1024)
+    // are covered against the same int8-aware host reference.
+    using Wd = KokkosDNN::Impl::GgufMvq::Wd;
+    Wd mdt{};
+    switch (dtype) {
+      case GgmlType::Q4_K: mdt = Wd::Q4K; break;
+      case GgmlType::Q5_K: mdt = Wd::Q5K; break;
+      case GgmlType::Q6_K: mdt = Wd::Q6K; break;
+      case GgmlType::Q8_0: mdt = Wd::Q80; break;
+      default: FAIL() << "explicit layout needs an int8 dtype"; return;
+    }
+    const bool launched =
+        KokkosDNN::Impl::GgufMvq::launch_quant_gemv_int8<Exec, Scalar>(
+            x, w.data.data(), mdt, N, K, w.row_bytes(), y, scratch.data(),
+            scratch.extent(0), *layout);
+    ASSERT_TRUE(launched);
+  }
   Kokkos::fence();
   auto got = Kokkos::create_mirror_view(y);
   Kokkos::deep_copy(got, y);
@@ -1125,10 +1147,33 @@ TEST(GgufQuantGemm, GemvInt8Float) {
   check_quant_gemv_int8<float>(GgmlType::F32, 512, 1e-3f);
 }
 
-// Skinny decode shapes (attn_k/attn_v: N ~= 256, large K): these take the
-// split-K schedule (8 warps/row at K = 4096, 4 warps/row at K = 2048) while
-// the N = 5 cases above take the baseline, so both schedules are pinned
-// against the int8-aware host reference.
+// Wide-row default: N >= 1024 selects two rows per thread group, and N = 1025
+// pins the odd tail (the last team recomputes row N-1 and must drop it).
+TEST(GgufQuantGemm, GemvInt8DefaultWideRows) {
+  check_quant_gemv_int8<float>(GgmlType::Q4_K, 512, 1e-3f, 1024);
+  check_quant_gemv_int8<float>(GgmlType::Q4_K, 512, 1e-3f, 1025);
+  check_quant_gemv_int8<float>(GgmlType::Q6_K, 512, 1e-3f, 1025);
+}
+
+// Explicit blocked layouts: every ROWS template and both sides of the row
+// tail, including rows < ROWS (the clamped tail then computes copies of the
+// last real row and drops all but one result).
+TEST(GgufQuantGemm, GemvInt8BlockedLayouts) {
+  using L = KokkosDNN::Impl::GgufMvq::Int8Layout;
+  for (size_t N : {1u, 3u, 5u, 17u, 1025u}) {
+    for (int rows : {1, 2, 4, 8}) {
+      L layout;
+      layout.rows_per_group  = rows;
+      layout.threads_per_row = 64;
+      layout.groups          = 1;
+      check_quant_gemv_int8<float>(GgmlType::Q4_K, 512, 1e-3f, N, &layout);
+    }
+  }
+}
+
+// Skinny decode shapes (attn_k/attn_v: N ~= 256, large K). They keep one row
+// per group (team-count bound), and the N = 5 cases above cover the same
+// blocked kernel, so both are pinned against the int8-aware host reference.
 TEST(GgufQuantGemm, GemvInt8SkinnyRows) {
   check_quant_gemv_int8<float>(GgmlType::Q4_K, 4096, 1e-3f, 256);
   check_quant_gemv_int8<float>(GgmlType::Q6_K, 2048, 1e-3f, 256);
@@ -1140,7 +1185,7 @@ TEST(GgufQuantGemm, GemvInt8BHalf) {
   check_quant_gemv_int8<bhalf_t>(GgmlType::Q4_K, 512, 1e-2f);
   check_quant_gemv_int8<bhalf_t>(GgmlType::Q6_K, 512, 1e-2f);
   check_quant_gemv_int8<bhalf_t>(GgmlType::Q8_0, 512, 1e-2f);
-  // Skinny split-K schedule with bf16 activations (8 warps/row).
+  // Skinny-row int8 schedule with bf16 activations (K = 4096 -> 4 warps/row).
   check_quant_gemv_int8<bhalf_t>(GgmlType::Q4_K, 4096, 1e-2f, 256);
 }
 

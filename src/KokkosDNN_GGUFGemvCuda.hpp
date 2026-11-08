@@ -22,8 +22,8 @@
 //      q_i = rint(x_i/d) in [-127, 127], plus the sum of each 16-element half
 //      (the weight-side min / Q6_K -32 terms, so the dot never re-derives
 //      them). The row is quantized ONCE per GEMV and reused by all N rows.
-//   2. GemvInt8BlockedFunctor<DT, ROWS>: one team per ROWS-row group, 128
-//      threads per row, one row group per team. Each thread strides the
+//   2. GemvInt8BlockedFunctor<DT, ROWS>: one team per ROWS-row group with
+//      128 threads per group (64 per row at ROWS=2). Each thread strides the
 //      row's decode units, loads the unit's activation window once
 //      (Int8UnitWindow: 8 int8 words + the two block headers) and dots it
 //      against all ROWS packed weight rows, so the activation side is shared
@@ -276,7 +276,6 @@ template <class ExecSpace, Wd DT>
 KOKKOS_INLINE_FUNCTION Int8UnitWindow mvq_load_unit_window(const int8_t* xq,
                                                            const ActQ8Hdr* xh,
                                                            int c) {
-  using Dot = ::KokkosDNN::Impl::IntDot<ExecSpace>;
   Int8UnitWindow x;
   if constexpr (DT == Wd::Q4K) {
     const int blk  = c >> 3;
@@ -469,9 +468,10 @@ KOKKOS_INLINE_FUNCTION float gemv_int8_unit_dot(const uint8_t* row, int c,
       row, c, mvq_load_unit_window<ExecSpace, DT>(xq, xh, c));
 }
 
-// One team per output row; the row's decode units are reduced over the team's
-// threads (the portable spelling of one warp per row). No team scratch and no
-// barrier: Kokkos owns the reduction.
+// Fallback for layouts the blocked kernel cannot field (team-size cap below
+// ROWS, or a host backend with a 1-thread team and ROWS > 1): one team per
+// output row, decode units reduced over the team's threads. No team scratch
+// and no barrier: Kokkos owns the reduction.
 template <class ExecSpace, class Scalar, Wd DT>
 struct GemvInt8Functor {
   using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
@@ -608,6 +608,7 @@ inline void launch_gemv_int8_blocked(const uint8_t* wdata, size_t row_bytes,
                                      const ActQ8Hdr* xh, Scalar* y,
                                      int nunits, int threads_per_row,
                                      int groups) {
+  if (rows == 0) return;
   GemvInt8BlockedFunctor<ExecSpace, Scalar, DT, ROWS> f{
       wdata, row_bytes, xq, xh, y, nunits, rows, threads_per_row, groups};
   const std::size_t shmem = sizeof(float) * (std::size_t)threads_per_row *
@@ -621,8 +622,9 @@ inline void launch_gemv_int8_blocked(const uint8_t* wdata, size_t row_bytes,
   while (tpr > 1 && tpr * gs > tmax) tpr /= 2;
   if (tpr * gs > tmax) gs = (tmax / tpr > 0) ? (tmax / tpr) : 1;
   if (tmax < 1 || tpr < ROWS || tpr * gs > tmax) {
-    // No blocked team fits (single-thread backends): fall back to the
-    // one-team-per-row kernel, which runs correctly with team_size 1.
+    // No blocked team fits (team-size cap below ROWS, e.g. a 1-thread host
+    // backend with ROWS > 1): fall back to the one-team-per-row kernel, which
+    // runs correctly with team_size 1.
     launch_gemv_dt<ExecSpace, Scalar, DT>(wdata, row_bytes, rows, xq, xh, y,
                                           nunits);
     return;
@@ -649,10 +651,10 @@ inline int gemv_int8_rows_per_group(size_t rows) {
   return rows >= 1024 ? 2 : 1;
 }
 
-// One thread per decode unit, 128 threads per row (four warps), one row group
-// per team. The launcher shrinks threads_per_row for short rows and the
-// backend's team-size cap, so this is an upper bound rather than a hard
-// layout.
+// 128 threads per ROWS-row group (four warps, i.e. 64 threads per row at the
+// default ROWS=2), one row group per team. The launcher shrinks
+// threads_per_row for short rows and the backend's team-size cap, so this is
+// an upper bound rather than a hard layout.
 inline void gemv_int8_threads(size_t /*nunits*/, int& tpr, int& groups) {
   tpr    = 128;
   groups = 1;
@@ -668,7 +670,12 @@ inline void launch_gemv_int8_dispatch(const uint8_t* wdata, size_t row_bytes,
                       : gemv_int8_rows_per_group(rows);
   int tpr       = layout.threads_per_row;
   int groups    = layout.groups;
-  if (tpr <= 0 || groups <= 0) gemv_int8_threads((size_t)nunits, tpr, groups);
+  if (tpr <= 0 || groups <= 0) {
+    int default_tpr = 0, default_groups = 0;
+    gemv_int8_threads((size_t)nunits, default_tpr, default_groups);
+    if (tpr <= 0) tpr = default_tpr;
+    if (groups <= 0) groups = default_groups;
+  }
   if (rpg >= 8)
     launch_gemv_int8_blocked<ExecSpace, Scalar, DT, 8>(
         wdata, row_bytes, rows, xq, xh, y, nunits, tpr, groups);
@@ -707,15 +714,16 @@ bool launch_quant_gemv_int8(const Kokkos::View<Scalar*, ExecSpace>& x,
     if (scratch_bytes < act_q8_bytes(cols)) return false;
     // The kernels index the activation by element (contiguous row).
     if (x.stride(0) != 1 || y.stride(0) != 1) return false;
-    // IntDot::load needs aligned addresses: the staging base (16-multiple
-    // offsets into it) and, for Q4_K/Q5_K whose weight windows also use wide
-    // loads, 16-aligned packed rows (144/176-byte blocks keep every window
-    // 16-aligned). Q6_K/Q8_0 weight windows use the unaligned-safe loader,
-    // so only the staging base matters there. Decline instead of faulting
-    // when a caller hands us a misaligned buffer -- the portable fallback
-    // has no alignment requirements. In practice Kokkos allocations always
-    // satisfy this, so the check never fires.
+    // Alignment contract of the loaders below: the staging base and the
+    // Q4_K/Q5_K weight windows use 16-byte loads (144/176-byte blocks keep
+    // every window 16-aligned), so both need 16-byte alignment. Q6_K/Q8_0
+    // weight windows use load_u16 (two 16-bit loads) and only need their
+    // even block offsets plus an even wdata base. Decline instead of
+    // faulting when a caller hands us a misaligned buffer -- the portable
+    // fallback has no alignment requirements. In practice Kokkos allocations
+    // always satisfy this, so the check never fires.
     if ((reinterpret_cast<uintptr_t>(scratch) & 15u) != 0u) return false;
+    if ((reinterpret_cast<uintptr_t>(wdata) & 1u) != 0u) return false;
     if ((dt == Wd::Q4K || dt == Wd::Q5K) &&
         (reinterpret_cast<uintptr_t>(wdata) & 15u) != 0u)
       return false;
