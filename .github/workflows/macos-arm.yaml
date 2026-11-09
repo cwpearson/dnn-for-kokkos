@@ -12,10 +12,14 @@ on:
   push:
     paths-ignore:
       - "docs/**"
+      - "README.md"
+      - "AGENTS.md"
       - ".github/workflows/docs.yaml"
   pull_request:
     paths-ignore:
       - "docs/**"
+      - "README.md"
+      - "AGENTS.md"
       - ".github/workflows/docs.yaml"
 
 concurrency:
