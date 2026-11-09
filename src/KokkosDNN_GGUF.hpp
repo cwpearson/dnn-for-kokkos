@@ -53,7 +53,7 @@
 #include <utility>
 #include <vector>
 
-#include "KokkosDNN_GGUFGemvCuda.hpp"
+#include "KokkosDNN_GGUFGemvInt8.hpp"
 #include "KokkosDNN_Handle.hpp"
 #include "KokkosDNN_Macros.hpp"
 #include "KokkosDNN_Occupancy.hpp"
@@ -270,7 +270,7 @@ struct BlockQ5K {
 };
 static_assert(sizeof(BlockQ5K) == 176, "BlockQ5K must be 176 bytes");
 
-// The CUDA int8-dot GEMV (KokkosDNN_GGUFGemvCuda.hpp) walks these packed
+// The portable int8-dot GEMV (KokkosDNN_GGUFGemvInt8.hpp) walks these packed
 // layouts by byte offset; pin its copies so the two cannot drift.
 static_assert(sizeof(::KokkosDNN::Impl::GgufMvq::BlockQ4K) == sizeof(BlockQ4K),
               "int8 GEMV Q4_K block layout drift");
@@ -2473,7 +2473,7 @@ void quant_gemv(
 // ---------------------------------------------------------------------------
 // int8-dot decode GEMV (portable MMVQ): stage the activation row into int8
 // blocks once and run integer dots per 16/32-element window (see
-// KokkosDNN_GGUFGemvCuda.hpp for the design and the numerics note).
+// KokkosDNN_GGUFGemvInt8.hpp for the design and the numerics note).
 //
 // The staging buffer is caller-owned and reused across calls: decode runs
 // ~400 of these per token and must not allocate. Size it with

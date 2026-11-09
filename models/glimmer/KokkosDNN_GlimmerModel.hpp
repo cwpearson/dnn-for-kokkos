@@ -169,9 +169,9 @@ class Model {
   // Weights holds dense views (ensure_deq_staging keys off the block weight
   // type), so dense builds pay no extra memory.
   MatR deq_q_, deq_kv_, deq_o_, deq_ffn_, deq_down_;
-  // int8 activation staging for the CUDA decode GEMV (see
+  // int8 activation staging for the portable decode GEMV (see
   // Gguf::quant_gemv_int8_scratch_bytes and
-  // KokkosDNN_GGUFGemvCuda.hpp): one buffer sized for the widest GEMV K in
+  // KokkosDNN_GGUFGemvInt8.hpp): one buffer sized for the widest GEMV K in
   // the model, reused by every projection, so steady decode allocates
   // nothing. Empty for dense Weights (that path never stages activations).
   Kokkos::View<uint8_t*, ExecSpace> q8_act_buf_;

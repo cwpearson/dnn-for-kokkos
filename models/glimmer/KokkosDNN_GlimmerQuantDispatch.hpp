@@ -92,9 +92,10 @@ void linear_decode(
 // back to the native kernel. The Model rents one exact-size buffer per
 // distinct projection shape for this reason.
 //
-// `act_scratch` is the persistent int8 activation staging buffer of the CUDA
+// `act_scratch` is the persistent int8 activation staging buffer of the
+// portable
 // decode path (Gguf::quant_gemv_int8_scratch_bytes(K) bytes, see
-// KokkosDNN_GGUFGemvCuda.hpp). It is optional and trailing so the dense and
+// KokkosDNN_GGUFGemvInt8.hpp). It is optional and trailing so the dense and
 // exact-reference call sites stay unchanged: empty means "no staging" and
 // decode runs the portable unit-dot kernel (a different, ~1%-level arithmetic
 // only when the staging buffer is actually supplied).

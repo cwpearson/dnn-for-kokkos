@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 // SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
-#ifndef KOKKOSDNN_GGUFGEMVCUDA_HPP
-#define KOKKOSDNN_GGUFGEMVCUDA_HPP
+#ifndef KOKKOSDNN_GGUFGEMVINT8_HPP
+#define KOKKOSDNN_GGUFGEMVINT8_HPP
 
 // Portable int8-dot GEMV for packed GGUF weights at M == 1 (decode), MMVQ style.
 //

@@ -174,9 +174,9 @@ the same file, model and GPU.
 | server launch → listening (17GB GGUF) | 3.5–6 s | 6.7 s |
 
 Decode is GEMV-bound (the 17GB of packed weights are streamed once per
-token). On CUDA `quant_gemv` quantizes the activation row to int8 per
-32-element block and runs `dp4a` (`src/KokkosDNN_GGUFGemvCuda.hpp`); the
-portable bf16 path remains the fallback for other backends, other dtypes, or
+token). `quant_gemv` quantizes the activation row to int8 per
+32-element block and runs `dp4a`-class int8 dots (`src/KokkosDNN_GGUFGemvInt8.hpp`); the
+portable dequantize path remains the fallback for other dtypes, or
 callers that do not pass the staging buffer. Prefill stays on
 dequantize-once + cuBLAS (GEMM is compute-bound there; a fused packed GEMM
 would only remove the ~11% staging share). The remaining short-prompt prefill
