@@ -1,8 +1,8 @@
 # Commit guidelines
 
 LLM-authored commits must include a git `Co-authored-by` trailer naming the model.
-Example for Muse Spark 1.3:
-`Co-authored-by: Muse Spark 1.3 <noreply@carlpearson.net>`
+- Muse Spark 1.3: `Co-authored-by: Muse Spark 1.3 <noreply@carlpearson.net>`
+- DeepSeek V4.1 Flash: `Co-authored-by: DeepSeek V4.1 Flash <noreply@carlpearson.net>`
 
 # Project layout
 
