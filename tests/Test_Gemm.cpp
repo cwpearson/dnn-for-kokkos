@@ -67,19 +67,18 @@ TEST(Gemm, Float) { check_gemm<float>(1e-4f); }
 
 TEST(Gemm, BHalf) { check_gemm<Kokkos::Experimental::bhalf_t>(5e-2f); }
 
-// Tile-edge coverage for the tiled native kernel: exercises M/N/K tile
-// remainders, the vec/scalar load paths (K%4==0 vs odd K), and non-trivial
-// alpha/beta against a host reference. M=17 routes to the mid geometry
-// (TM=32/TN=64/TK=32: M edge + second/third N tiles, K edge over 3 slabs),
-// M=13 to thin-fine (TM=16/TN=32/TK=64: N edge + K edge).
+// Tile-edge coverage: exercises M/N/K tile remainders, the vec/scalar load
+// paths (K%4==0 vs odd K), and non-trivial alpha/beta against a host
+// reference. M=17 routes to the mid geometry (TM=32/TN=64/TK=32: M edge +
+// second/third N tiles, K edge over 3 slabs), M=13 to thin-fine
+// (TM=16/TN=32/TK=64: N edge + K edge). Runs through the default dispatch
+// (native kernel on TPL-off builds, Accelerate/cuBLAS where enabled) so the
+// dispatched path gets direct correctness coverage; the native tiling itself
+// is covered by the TPL-off legs of the build matrix (cmake-controlled).
 template <class Scalar>
 void check_gemm_edges(int M, int N, int K, float tol) {
   using Exec = Kokkos::DefaultExecutionSpace;
-  // Force the native kernel even when cuBLAS dispatch is available.
   KokkosDNN::DNNHandle<Exec> h;
-  h.use_cublas = false;
-  h.use_cudnn  = false;
-  h.use_accelerate = false;
   Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> X("X", M, K), W("W", N, K),
       Y("Y", M, N);
   auto hx = Kokkos::create_mirror_view(X);
@@ -133,9 +132,10 @@ TEST(GemmEdges, BHalfSkinny) {
 
 // Portability: the host execution space cannot always field a team
 // (DefaultHostExecutionSpace is Serial with max team size 1 on CUDA and
-// Serial-only builds), so gemm must take the naive fallback there -- same
-// result, verified against the host reference (team-capable backends run
-// the tiled kernel through the same gemm entry point).
+// Serial-only builds), so gemm takes the naive fallback there on TPL-off
+// builds (Accelerate sgemm where enabled) -- same result, verified against
+// the host reference (team-capable backends run the tiled kernel through
+// the same gemm entry point).
 TEST(GemmEdges, PortableHost) {
   using Exec = Kokkos::DefaultHostExecutionSpace;
   KokkosDNN::DNNHandle<Exec> h;

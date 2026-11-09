@@ -47,7 +47,7 @@ Options:
 | `KokkosDNN_ENABLE_CUDNN` | OFF | attention + convolutions via cuDNN (with automatic native fallback; needs `<cudnn.h>` + `cudnn-frontend`, fetched automatically) |
 | `KokkosDNN_ENABLE_HIPBLAS` | OFF | GEMM via hipBLAS on HIP spaces |
 | `KokkosDNN_ENABLE_MIOPEN` | OFF | convolutions via MIOpen on HIP spaces (attention path falls back to native; no fused SDPA in MIOpen) |
-| `KokkosDNN_ENABLE_ACCELERATE` | OFF | GEMM/GEMV via Apple Accelerate `cblas_sgemm` on host spaces (float only; native fallback otherwise) |
+| `KokkosDNN_ENABLE_ACCELERATE` | ON on Apple, OFF elsewhere | GEMM/GEMV via Apple Accelerate `cblas_sgemm` on host spaces (float only; native fallback otherwise) |
 | `KokkosDNN_ENABLE_TEST_DISCOVERY` | ON | register gtest tests via `gtest_discover_tests` (set OFF for GPU-less build-only CI, where test binaries cannot run at build time) |
 | `KokkosDNN_ENABLE_IMAGE` | ON | optional image component (`KokkosDNN::image`, stb-backed I/O + preprocessing, WebP via libwebp) |
 | `KokkosDNN_ENABLE_IMAGE_WEBP` | ON | WebP decode/encode in the image component (libwebp: system package, else fetched) |
