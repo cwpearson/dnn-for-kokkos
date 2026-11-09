@@ -68,6 +68,14 @@ usage, and finish reasons — no own buffering/truncation logic.
   `Common::TokenCallback` and `Common::normalize_stop_ids()`. Every
   decoder-only Model keeps only its `forward()` math; its `generate()`
   wrapper resolves its default stop set and delegates here.
+- `KokkosDNN_CliOptions.hpp` — `Common::Cli::TextGenOptions` plus
+  `Common::Cli::try_parse_shared()` and
+  `Common::Cli::resolve_random_seed()`. Shares the argv machinery (list
+  and scalar consumers plus the common text-generate flags:
+  tokenizer/prompt/max-new/stop/stop-string/prefill-chunk/config/
+  max-seq-len/fp32/sampling/seed/tiny/bos/weights) across the
+  `examples/*/*_generate` drivers; `--model` and other model-specific
+  flags stay per driver (selected via `Common::Cli::ParseAllow`).
 - `KokkosDNN_SessionTypes.hpp` — `Common::SessionOptions`,
   `Common::StepOutcome`, `Common::CachedPrefillOutcome`,
   `Common::ISession`. Per-arch Sessions alias these types and keep only

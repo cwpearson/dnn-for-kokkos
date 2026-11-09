@@ -4,10 +4,10 @@
 #include <cctype>
 #include <cstdio>
 #include <iostream>
-#include <random>
 #include <string>
 #include <vector>
 #include "KokkosDNN.hpp"
+#include "KokkosDNN_CliOptions.hpp"
 #include "KokkosDNN_GlimmerConfig.hpp"
 #include "KokkosDNN_GlimmerModel.hpp"
 #include "KokkosDNN_GlimmerTokenizer.hpp"
@@ -297,51 +297,20 @@ int run_model(KokkosDNN::Glimmer::Config cfg,
 int main(int argc, char** argv) {
   Kokkos::initialize(argc, argv);
   {
-    std::vector<std::string> wfiles, wpatterns;
-    std::string tok_path, prompt = "Hello, I am";
-    std::string config_path;
-    std::string model_name = "glimmer-30b";  // --model base (only model)
-    bool model_touched = false;  // explicit --model opts out of tiny default
-    bool tiny_explicit = false;  // explicit --tiny still forces tiny_test
-    int max_new = 16;
-    bool tiny = true;
-    bool fp32 = false;
-    bool list_tensors = false;
-    std::vector<int> extra_stops;
-    int prefill_chunk_override = -1;
-    int max_seq_len_override = -1;
-    int kv_quant_override = -1;  // -1 unset, 0 = dense FP, 1 = int8 KV
-    bool chat_mode = false;
-    std::string system_prompt;
-    std::string role = "user";
-    std::string reasoning_strength = "high";
-    bool want_bos = true;  // --add-bos default (matches TemplateProcessing)
-    std::vector<std::string> stop_strings;
+    KokkosDNN::Common::Cli::TextGenOptions o;
     // Upstream generation_config.json: do_sample=false (greedy), no
     // temperature/top_k/top_p. Sampling flags below opt into samplers.
-    KokkosDNN::SampleOptions samp_opt;
-    bool seed_given = false;
+    std::vector<std::string> wfiles;
+    std::string model_name = "glimmer-30b";  // --model base (only model)
+    bool model_touched = false;  // explicit --model opts out of tiny default
+    bool list_tensors = false;
+    int kv_quant_override = -1;  // -1 unset, 0 = dense FP, 1 = int8 KV
+    std::string reasoning_strength = "high";
 
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
-      if (a == "--weights" && i + 1 < argc) {
-        // comma/space separated list in one arg, or repeated flags; entries
-        // may be glob patterns (expanded after parsing).
-        while (i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0)
-          wpatterns.push_back(argv[++i]);
-        tiny = false;
-      } else if (a == "--tokenizer" && i + 1 < argc) {
-        tok_path = argv[++i];
-      } else if (a == "--prompt" && i + 1 < argc) {
-        prompt = argv[++i];
-      } else if (a == "--max-new" && i + 1 < argc) {
-        max_new = std::stoi(argv[++i]);
-      } else if (a == "--stop" && i + 1 < argc) {
-        while (i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0)
-          extra_stops.push_back(std::stoi(argv[++i]));
-      } else if (a == "--tiny") {
-        tiny = true;
-        tiny_explicit = true;
+      if (KokkosDNN::Common::Cli::try_parse_shared(a, argv, i, argc, o)) {
+        continue;
       } else if (a == "--model" && i + 1 < argc) {
         std::string m = argv[++i];
         for (auto& ch : m) ch = (char)std::tolower((unsigned char)ch);
@@ -366,31 +335,12 @@ int main(int argc, char** argv) {
           return 1;
         }
         model_touched = true;
-      } else if (a == "--chat") {
-        chat_mode = true;
-      } else if (a == "--system" && i + 1 < argc) {
-        system_prompt = argv[++i];
-      } else if (a == "--role" && i + 1 < argc) {
-        role = argv[++i];
       } else if (a == "--reasoning-strength" && i + 1 < argc) {
         reasoning_strength = argv[++i];
       } else if (a == "--reasoning" && i + 1 < argc) {
         reasoning_strength = argv[++i];
       } else if (a == "--reasoning-effort" && i + 1 < argc) {
         reasoning_strength = argv[++i];
-      } else if (a == "--messages" && i + 1 < argc) {
-        // Minimal alias: wrap the value as the user turn (implies chat).
-        prompt = argv[++i];
-        chat_mode = true;
-      } else if (a == "--add-bos") {
-        want_bos = true;
-      } else if (a == "--no-add-bos") {
-        want_bos = false;
-      } else if (a == "--stop-string" && i + 1 < argc) {
-        while (i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0)
-          stop_strings.push_back(argv[++i]);
-      } else if (a == "--prefill-chunk" && i + 1 < argc) {
-        prefill_chunk_override = std::stoi(argv[++i]);
       } else if (a == "--kv-int8") {
         kv_quant_override = 1;
       } else if (a == "--kv-fp") {
@@ -411,32 +361,10 @@ int main(int argc, char** argv) {
         }
       } else if (a == "--list-tensors") {
         list_tensors = true;
-      } else if (a == "--config" && i + 1 < argc) {
-        config_path = argv[++i];
-      } else if (a == "--max-seq-len" && i + 1 < argc) {
-        max_seq_len_override = std::stoi(argv[++i]);
-      } else if (a == "--fp32") {
-        fp32 = true;
-      } else if (a == "--temperature" && i + 1 < argc) {
-        samp_opt.temperature = std::stof(argv[++i]);
-      } else if (a == "--top-k" && i + 1 < argc) {
-        samp_opt.top_k = std::stoi(argv[++i]);
-      } else if (a == "--top-p" && i + 1 < argc) {
-        samp_opt.top_p = std::stof(argv[++i]);
-      } else if (a == "--min-p" && i + 1 < argc) {
-        samp_opt.min_p = std::stof(argv[++i]);
-      } else if (a == "--repetition-penalty" && i + 1 < argc) {
-        samp_opt.repetition_penalty = std::stof(argv[++i]);
-      } else if (a == "--seed" && i + 1 < argc) {
-        samp_opt.seed = (uint64_t)std::stoull(argv[++i]);
-        seed_given = true;
       }
     }
 
-    if (!seed_given) {
-      std::random_device rd;
-      samp_opt.seed = (uint64_t(rd()) << 32) | uint64_t(rd());
-    }
+    KokkosDNN::Common::Cli::resolve_random_seed(o);
 
     try {
       reasoning_strength =
@@ -447,7 +375,7 @@ int main(int argc, char** argv) {
       return 1;
     }
     KokkosDNN::print_configuration(std::cout);
-    wfiles = expand_weight_patterns(wpatterns);
+    wfiles = expand_weight_patterns(o.weights);
     // --list-tensors is a header-only inspection (no model build).
     if (list_tensors) {
       if (wfiles.empty()) {
@@ -474,32 +402,32 @@ int main(int argc, char** argv) {
     // Explicit --model opts out of the tiny default so
     // `--model glimmer-30b` alone runs the full-size model with random
     // weights; explicit --tiny still forces tiny_test dims below.
-    if (model_touched && !tiny_explicit) tiny = false;
+    if (model_touched && !o.tiny_explicit) o.tiny = false;
     KokkosDNN::Glimmer::Config cfg = KokkosDNN::Glimmer::Config::glimmer_30b();
     std::printf("[model %s]\n", model_name.c_str());
-    if (tiny) {
+    if (o.tiny) {
       cfg = KokkosDNN::Glimmer::Config::tiny_test();
       cfg.max_seq_len = 64;
     }
-    if (!config_path.empty()) {
+    if (!o.config_path.empty()) {
       try {
-        cfg = KokkosDNN::Glimmer::Config::from_json_file(config_path, cfg);
+        cfg = KokkosDNN::Glimmer::Config::from_json_file(o.config_path, cfg);
       } catch (const std::exception& e) {
         std::fprintf(stderr, "error: --config '%s': %s\n",
-                     config_path.c_str(), e.what());
+                     o.config_path.c_str(), e.what());
         Kokkos::finalize();
         return 1;
       }
       std::printf("[config %s] dim=%d layers=%d heads=%d kv=%d ffn=%d "
                   "vocab=%d hdim=%d eps=%g post_eps=%g s_theta=%g sw=%d "
                   "max_seq=%d tie=%d\n",
-                  config_path.c_str(), cfg.dim, cfg.n_layers, cfg.n_heads,
+                  o.config_path.c_str(), cfg.dim, cfg.n_layers, cfg.n_heads,
                   cfg.n_kv_heads, cfg.ffn_dim, cfg.vocab_size, cfg.head_dim,
                   (double)cfg.rms_norm_eps, (double)cfg.post_norm_eps,
                   (double)cfg.rope_theta, cfg.sliding_window,
                   cfg.max_seq_len, (int)cfg.tie_word_embeddings);
     }
-    if (max_seq_len_override > 0) cfg.max_seq_len = max_seq_len_override;
+    if (o.max_seq_len > 0) cfg.max_seq_len = o.max_seq_len;
     try {
       cfg.validate();
     } catch (const std::exception& e) {
@@ -508,19 +436,20 @@ int main(int argc, char** argv) {
       return 1;
     }
     int rc;
-    if (fp32) {
+    if (o.fp32) {
       std::printf("[dtype fp32]\n");
-      rc = run_model<float>(cfg, wfiles, tiny, tok_path, prompt, max_new,
-                            extra_stops, prefill_chunk_override,
-                            kv_quant_override, chat_mode, system_prompt, role,
-                            want_bos, stop_strings, reasoning_strength,
-                            samp_opt);
+      rc = run_model<float>(cfg, wfiles, o.tiny, o.tokenizer_path, o.prompt,
+                            o.max_new, o.extra_stops, o.prefill_chunk,
+                            kv_quant_override, o.chat_mode, o.system_prompt,
+                            o.role, o.want_bos, o.stop_strings,
+                            reasoning_strength, o.samp);
     } else {
       std::printf("[dtype bfloat16]\n");
       rc = run_model<KokkosDNN::Glimmer::DefaultScalar>(
-          cfg, wfiles, tiny, tok_path, prompt, max_new, extra_stops,
-          prefill_chunk_override, kv_quant_override, chat_mode, system_prompt,
-          role, want_bos, stop_strings, reasoning_strength, samp_opt);
+          cfg, wfiles, o.tiny, o.tokenizer_path, o.prompt, o.max_new,
+          o.extra_stops, o.prefill_chunk, kv_quant_override, o.chat_mode,
+          o.system_prompt, o.role, o.want_bos, o.stop_strings,
+          reasoning_strength, o.samp);
     }
     Kokkos::finalize();
     return rc;

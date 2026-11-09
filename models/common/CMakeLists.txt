@@ -20,7 +20,7 @@ kokkosdnn_add_header_only_model_library(kokkosdnn_common
 install(FILES KokkosDNN_Common.hpp KokkosDNN_Detokenizer.hpp KokkosDNN_Usage.hpp
   KokkosDNN_Generate.hpp KokkosDNN_SessionTypes.hpp KokkosDNN_PrefixCacheCore.hpp
   KokkosDNN_ModelConcepts.hpp KokkosDNN_JsonLite.hpp KokkosDNN_BpeCore.hpp
-  KokkosDNN_ChatStop.hpp
+  KokkosDNN_ChatStop.hpp KokkosDNN_CliOptions.hpp
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 if(KokkosDNN_ENABLE_TESTS)

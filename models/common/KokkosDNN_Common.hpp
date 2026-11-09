@@ -16,6 +16,7 @@
 
 #include "KokkosDNN_BpeCore.hpp"
 #include "KokkosDNN_ChatStop.hpp"
+#include "KokkosDNN_CliOptions.hpp"
 #include "KokkosDNN_Detokenizer.hpp"
 #include "KokkosDNN_Generate.hpp"
 #include "KokkosDNN_JsonLite.hpp"
@@ -51,6 +52,10 @@ namespace Common {
 // ChatStop (KokkosDNN_ChatStop.hpp): find_stop_string/
 // truncate_at_stop_strings/ensure_bos plus generic make_chat_messages/
 // encode_rendered_chat templates; per-namespace wrappers preserve API.
+// CliOptions (KokkosDNN_CliOptions.hpp): TextGenOptions +
+// try_parse_shared()/resolve_random_seed() sharing the argv machinery
+// (list/value consumers plus the common text-generate flags) across the
+// *_generate drivers; model-specific flags stay per driver.
 }  // namespace Common
 }  // namespace KokkosDNN
 

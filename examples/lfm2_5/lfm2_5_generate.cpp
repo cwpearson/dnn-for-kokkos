@@ -6,10 +6,10 @@
 #include <chrono>
 #include <cstdio>
 #include <iostream>
-#include <random>
 #include <string>
 #include <vector>
 #include "KokkosDNN.hpp"
+#include "KokkosDNN_CliOptions.hpp"
 #include "KokkosDNN_LFM25Config.hpp"
 #include "KokkosDNN_LFM25Model.hpp"
 #include "KokkosDNN_LFM25Tokenizer.hpp"
@@ -256,114 +256,57 @@ int run_model(KokkosDNN::LFM25::Config cfg, const std::string& wpath,
 int main(int argc, char** argv) {
   Kokkos::initialize(argc, argv);
   {
-    std::string wpath;
-    std::string tok_path, prompt = "Hello, I am";
-    std::string config_path;
-    int max_new = 16;
-    bool tiny   = true;
-    bool fp32   = false;
-    std::vector<int> extra_stops;
-    int prefill_chunk_override = -1;
-    int max_seq_len_override   = -1;
-    bool chat_mode             = false;
-    std::string system_prompt;
-    std::string role = "user";
-    bool want_bos    = true;
-    bool want_timings = false;
-    std::vector<std::string> stop_strings;
+    // LFM2.5 takes no --messages alias, so the shared parser runs with
+    // messages disabled (--chat/--system/--role still shared).
+    const KokkosDNN::Common::Cli::ParseAllow allow{true, false};
+    KokkosDNN::Common::Cli::TextGenOptions o;
     // LFM2.5 driver sampling defaults.
-    KokkosDNN::SampleOptions samp_opt;
-    samp_opt.temperature         = 0.1f;
-    samp_opt.top_k               = 50;
-    samp_opt.repetition_penalty  = 1.05f;
-    bool seed_given = false;
+    o.samp.temperature = 0.1f;
+    o.samp.top_k = 50;
+    o.samp.repetition_penalty = 1.05f;
+    bool want_timings = false;
 
     for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
-      if (a == "--weights" && i + 1 < argc) {
-        wpath = argv[++i];
-        tiny  = false;
-      } else if (a == "--tokenizer" && i + 1 < argc) {
-        tok_path = argv[++i];
-      } else if (a == "--prompt" && i + 1 < argc) {
-        prompt = argv[++i];
-      } else if (a == "--max-new" && i + 1 < argc) {
-        max_new = std::stoi(argv[++i]);
-      } else if (a == "--stop" && i + 1 < argc) {
-        while (i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0)
-          extra_stops.push_back(std::stoi(argv[++i]));
-      } else if (a == "--tiny") {
-        tiny = true;
-      } else if (a == "--chat") {
-        chat_mode = true;
-      } else if (a == "--system" && i + 1 < argc) {
-        system_prompt = argv[++i];
-      } else if (a == "--role" && i + 1 < argc) {
-        role = argv[++i];
-      } else if (a == "--add-bos") {
-        want_bos = true;
-      } else if (a == "--no-add-bos") {
-        want_bos = false;
-      } else if (a == "--stop-string" && i + 1 < argc) {
-        while (i + 1 < argc && std::string(argv[i + 1]).rfind("--", 0) != 0)
-          stop_strings.push_back(argv[++i]);
-      } else if (a == "--prefill-chunk" && i + 1 < argc) {
-        prefill_chunk_override = std::stoi(argv[++i]);
-      } else if (a == "--config" && i + 1 < argc) {
-        config_path = argv[++i];
-      } else if (a == "--max-seq-len" && i + 1 < argc) {
-        max_seq_len_override = std::stoi(argv[++i]);
-      } else if (a == "--fp32") {
-        fp32 = true;
+      if (KokkosDNN::Common::Cli::try_parse_shared(a, argv, i, argc, o,
+                                                   allow)) {
+        continue;
       } else if (a == "--timings") {
         want_timings = true;
-      } else if (a == "--temperature" && i + 1 < argc) {
-        samp_opt.temperature = std::stof(argv[++i]);
-      } else if (a == "--top-k" && i + 1 < argc) {
-        samp_opt.top_k = std::stoi(argv[++i]);
-      } else if (a == "--top-p" && i + 1 < argc) {
-        samp_opt.top_p = std::stof(argv[++i]);
-      } else if (a == "--min-p" && i + 1 < argc) {
-        samp_opt.min_p = std::stof(argv[++i]);
-      } else if (a == "--repetition-penalty" && i + 1 < argc) {
-        samp_opt.repetition_penalty = std::stof(argv[++i]);
-      } else if (a == "--seed" && i + 1 < argc) {
-        samp_opt.seed = (uint64_t)std::stoull(argv[++i]);
-        seed_given = true;
       }
     }
 
-    if (!seed_given) {
-      std::random_device rd;
-      samp_opt.seed = (uint64_t(rd()) << 32) | uint64_t(rd());
-    }
+    KokkosDNN::Common::Cli::resolve_random_seed(o);
+    // Single-file GGUF weights: the shared parser collects --weights into
+    // a list; the first entry wins (extra tokens were ignored before too).
+    const std::string wpath = o.weights.empty() ? "" : o.weights.front();
 
     KokkosDNN::print_configuration(std::cout);
     KokkosDNN::LFM25::Config cfg = KokkosDNN::LFM25::Config::lfm2_5_24b_a2b();
     std::printf("[model lfm2.5-24b-a2b]\n");
-    if (tiny) {
+    if (o.tiny) {
       cfg               = KokkosDNN::LFM25::Config::tiny_test();
       cfg.max_seq_len   = 64;
     }
-    if (!config_path.empty()) {
+    if (!o.config_path.empty()) {
       try {
-        cfg = KokkosDNN::LFM25::Config::from_json_file(config_path, cfg);
+        cfg = KokkosDNN::LFM25::Config::from_json_file(o.config_path, cfg);
       } catch (const std::exception& e) {
         std::fprintf(stderr, "error: --config '%s': %s\n",
-                     config_path.c_str(), e.what());
+                     o.config_path.c_str(), e.what());
         Kokkos::finalize();
         return 1;
       }
       std::printf("[config %s] dim=%d layers=%d heads=%d kv=%d ffn=%d "
                   "moe_inter=%d experts=%d top_k=%d dense=%d vocab=%d eps=%g "
                   "theta=%g max_seq=%d tie=%d\n",
-                  config_path.c_str(), cfg.dim, cfg.n_layers, cfg.n_heads,
+                  o.config_path.c_str(), cfg.dim, cfg.n_layers, cfg.n_heads,
                   cfg.n_kv_heads, cfg.ffn_dim, cfg.moe_intermediate,
                   cfg.n_experts, cfg.top_k, cfg.n_dense_layers, cfg.vocab_size,
                   (double)cfg.rms_norm_eps, (double)cfg.rope_theta,
                   cfg.max_seq_len, (int)cfg.tie_word_embeddings);
     }
-    if (max_seq_len_override > 0) cfg.max_seq_len = max_seq_len_override;
+    if (o.max_seq_len > 0) cfg.max_seq_len = o.max_seq_len;
     try {
       cfg.validate();
     } catch (const std::exception& e) {
@@ -372,18 +315,18 @@ int main(int argc, char** argv) {
       return 1;
     }
     int rc;
-    if (fp32) {
+    if (o.fp32) {
       std::printf("[dtype fp32]\n");
-      rc = run_model<float>(cfg, wpath, tiny, tok_path, prompt, max_new,
-                            extra_stops, prefill_chunk_override, chat_mode,
-                            system_prompt, role, want_bos, stop_strings,
-                            samp_opt, want_timings);
+      rc = run_model<float>(cfg, wpath, o.tiny, o.tokenizer_path, o.prompt,
+                            o.max_new, o.extra_stops, o.prefill_chunk,
+                            o.chat_mode, o.system_prompt, o.role, o.want_bos,
+                            o.stop_strings, o.samp, want_timings);
     } else {
       std::printf("[dtype bfloat16]\n");
       rc = run_model<KokkosDNN::LFM25::DefaultScalar>(
-          cfg, wpath, tiny, tok_path, prompt, max_new, extra_stops,
-          prefill_chunk_override, chat_mode, system_prompt, role, want_bos,
-          stop_strings, samp_opt, want_timings);
+          cfg, wpath, o.tiny, o.tokenizer_path, o.prompt, o.max_new,
+          o.extra_stops, o.prefill_chunk, o.chat_mode, o.system_prompt,
+          o.role, o.want_bos, o.stop_strings, o.samp, want_timings);
     }
     Kokkos::finalize();
     return rc;

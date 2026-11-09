@@ -13,3 +13,5 @@ kokkosdnn_add_test(test_common_generate Test_Generate.cpp
   LINK_LIBRARIES KokkosDNN::common)
 kokkosdnn_add_test(test_common_session_types Test_SessionTypes.cpp
   LINK_LIBRARIES KokkosDNN::common)
+kokkosdnn_add_test(test_common_cli_options Test_CliOptions.cpp
+  LINK_LIBRARIES KokkosDNN::common)
