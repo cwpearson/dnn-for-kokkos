@@ -32,7 +32,9 @@
 //      integer math through Impl::IntDot (one dp4a-class dot per 4-byte word
 //      where the backend provides it, exact scalar arithmetic elsewhere).
 //      GemvInt8Functor (one team per row, TeamThreadRange reduction) stays as
-//      the short-row / backend-cap fallback.
+//      the short-row / backend-cap fallback, and fields every ROWS=1 launch
+//      (no cross-row reuse exists there, so the blocked kernel's scratch,
+//      barrier and reduction epilogue would be pure overhead).
 // The unit mapping is EXACTLY the portable one (Impl::quant_unit_count /
 // quant_unit_dot: Q4_K unit = block c/8, iter (c%8)/2, half c%2; Q6_K unit =
 // block c/8, chunk (c%8)/4, pair (c%4)/2, half c%2; Q5_K/Q8_0 unit = one
@@ -202,10 +204,14 @@ struct QuantizeActQ8Functor {
 
   KOKKOS_INLINE_FUNCTION void operator()(int b) const {
     const size_t base = (size_t)b * 32;
-    float amax        = 0.0f;
+    // Single pass: stage the row's 32 values in registers while finding the
+    // block max, so the activation row is read once, not twice (amax pass +
+    // quant pass). Bit-identical math to the two-pass form.
+    float v[32];
+    float amax = 0.0f;
     for (int i = 0; i < 32; ++i) {
-      const float v = static_cast<float>(x[base + (size_t)i]);
-      const float a = v >= 0.0f ? v : -v;
+      v[i]            = static_cast<float>(x[base + (size_t)i]);
+      const float a   = v[i] >= 0.0f ? v[i] : -v[i];
       if (a > amax) amax = a;
     }
     // d = amax/127 keeps every |q| <= 127; an all-zero block quantizes to
@@ -214,10 +220,9 @@ struct QuantizeActQ8Functor {
     const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
     int sum_lo = 0, sum_hi = 0;
     for (int i = 0; i < 32; ++i) {
-      const float v = static_cast<float>(x[base + (size_t)i]);
       // rint: round-to-nearest-even, matching __float2int_rn and the host
       // nearbyint reference bit for bit.
-      int q = (int)Kokkos::rint(v * inv);
+      int q = (int)Kokkos::rint(v[i] * inv);
       if (q > 127) q = 127;
       if (q < -127) q = -127;
       xq[base + (size_t)i] = (int8_t)q;
@@ -609,6 +614,15 @@ inline void launch_gemv_int8_blocked(const uint8_t* wdata, size_t row_bytes,
                                      int nunits, int threads_per_row,
                                      int groups) {
   if (rows == 0) return;
+  if constexpr (ROWS == 1) {
+    // One row per group buys no cross-row activation reuse, so the blocked
+    // kernel's scratch, barrier and strided reduction epilogue are pure
+    // overhead: run the one-team-per-row kernel (TeamThreadRange reduction,
+    // no scratch, no barrier) instead.
+    launch_gemv_dt<ExecSpace, Scalar, DT>(wdata, row_bytes, rows, xq, xh, y,
+                                          nunits);
+    return;
+  }
   GemvInt8BlockedFunctor<ExecSpace, Scalar, DT, ROWS> f{
       wdata, row_bytes, xq, xh, y, nunits, rows, threads_per_row, groups};
   const std::size_t shmem = sizeof(float) * (std::size_t)threads_per_row *
