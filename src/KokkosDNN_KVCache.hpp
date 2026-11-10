@@ -354,7 +354,8 @@ void attention_streaming_loader(const QView& q, size_t q_off, const OView& out,
 // with the same scratch layout (scaled Q rows + normalized running means
 // [NG x SS] plus this tile's per-head weights [NG x ktile]), the same
 // per-tile score/max/weight/accumulate phases, and the same partial-record
-// + GqaDecodeCombineFunctor merge. The only difference is the KV source:
+// + GqaDecodeCombineFunctor merge for multi-split calls (single-split calls
+// write O directly, like the dense path). The only difference is the KV source:
 // K/V rows are int8 (kq/vq [Ktot, Hkv, D]) dequantized on the fly with
 // their per-token per-head FP32 scales (ks/vs [Ktot, Hkv]). Per-key scales
 // are hoisted out of the D loops (one scale load per key, reused across
@@ -367,7 +368,7 @@ void attention_streaming_loader(const QView& q, size_t q_off, const OView& out,
 // reassociation, matching the streaming core above to ~1e-6.
 // ---------------------------------------------------------------------------
 template <class ExecSpace, class Scalar, class QView, class KQView, class KSView,
-          class VQView, class VSView, class PView, int NG>
+          class VQView, class VSView, class PView, class OView, int NG>
 struct GqaDecodeSplitQuantFunctor {
   using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
   using ScratchView =
@@ -382,6 +383,8 @@ struct GqaDecodeSplitQuantFunctor {
   size_t Hq, D, Hkv, klo, khi, nsplit, ksplit;
   int ktile;  // keys per tile
   float scale;
+  OView out;    // only written when direct (single-split fast path)
+  bool direct;  // nsplit == 1: write O in the epilogue, skip the combine
 
   KOKKOS_INLINE_FUNCTION
   void operator()(const Member& member) const {
@@ -393,6 +396,7 @@ struct GqaDecodeSplitQuantFunctor {
     const auto VQ = vq;
     const auto VS = vs;
     const auto P = partial;
+    const auto O = out;
     const size_t Dloc = D;
     const size_t Hqloc = Hq;
     const size_t Kvloc = Hkv;
@@ -601,6 +605,20 @@ struct GqaDecodeSplitQuantFunctor {
     // normalized mean per dim). A block with no key writes the -1e30 / 0
     // sentinel pair, which the combine weights to zero.
     const size_t rec = Dloc + 2;
+    if (direct) {
+      // Single-split fast path: this block owns the head's whole key window,
+      // so the normalized running mean already is the answer (empty windows
+      // keep the stored zeros) and the combine launch is skipped.
+      for (size_t u = 0; u < dpt; ++u) {
+        const size_t d =
+            static_cast<size_t>(rank) + u * static_cast<size_t>(team_n);
+        if (d >= Dloc) break;
+        for (int h = 0; h < NG; ++h)
+          O(0, hbase + static_cast<size_t>(h), d) =
+              static_cast<Scalar>(base[ao + static_cast<size_t>(h) * SS + d]);
+      }
+      return;
+    }
     if (rank == 0) {
       for (int h = 0; h < NG; ++h) {
         float* pr =
@@ -634,13 +652,19 @@ void launch_gqa_decode_quant_split(
     const OView& out, float scale, const std::string& label) {
   const size_t Hq = q.extent(1), D = q.extent(2);
   const size_t ngroups = Hq / static_cast<size_t>(NG);
-  Kokkos::View<float*, ExecSpace> partial = handle.attn_decode_scratch(
-      gqa_decode_partial_floats(Hq, nsplit, D));
+  // Single-split calls skip the partial roundtrip: the split kernel writes
+  // the output rows directly (GqaDecodeSplitQuantFunctor::direct), so there
+  // is no workspace to rent and no combine launch.
+  const bool direct = (nsplit == 1);
+  Kokkos::View<float*, ExecSpace> partial;
+  if (!direct)
+    partial = handle.attn_decode_scratch(
+        gqa_decode_partial_floats(Hq, nsplit, D));
 
   GqaDecodeSplitQuantFunctor<ExecSpace, Scalar, QView, KQView, KSView, VQView,
-                             VSView, Kokkos::View<float*, ExecSpace>, NG>
+                             VSView, Kokkos::View<float*, ExecSpace>, OView, NG>
       f{q, kq, ks, vq, vs, partial, Hq, D, kq.extent(1), klo, khi, nsplit,
-        ksplit, ktile, scale};
+        ksplit, ktile, scale, out, direct};
   Kokkos::TeamPolicy<ExecSpace> policy(static_cast<int>(ngroups * nsplit),
                                        team_size, 1);
   policy.set_scratch_size(
@@ -648,6 +672,7 @@ void launch_gqa_decode_quant_split(
                          sizeof(float)));
   Kokkos::parallel_for(label, policy, f);
 
+  if (direct) return;
   GqaDecodeCombineFunctor<ExecSpace, Scalar, OView,
                           Kokkos::View<float*, ExecSpace>>
       cf{out, partial, D, nsplit, team_size};
@@ -721,6 +746,12 @@ void launch_gqa_decode_quant(
   const size_t nsplit = static_cast<size_t>(nsplit_i);
   const size_t ksplit = (len + nsplit - 1) / nsplit;  // ceil, >= 1 when len > 0
 
+  // Single-split short windows run one head per block (same occupancy
+  // argument as the dense launch_gqa_decode: a lone key range leaves the grid
+  // at ngroups blocks, and the KV re-read per head is negligible over the
+  // short windows that yield a single split).
+  if (nsplit == 1) ng = 1;
+
   // Team size: a requested warp count clamped to what the backend and the
   // kernel's scratch allow (Serial -> 1). Probe with the largest tile so the
   // answer is conservative for whatever tile width is chosen below.
@@ -733,9 +764,9 @@ void launch_gqa_decode_quant(
     Kokkos::View<float*, ExecSpace> probe_ws =
         handle.attn_decode_scratch(gqa_decode_partial_floats(Hq, nsplit, D));
     GqaDecodeSplitQuantFunctor<ExecSpace, Scalar, QView, KQView, KSView, VQView,
-                               VSView, Kokkos::View<float*, ExecSpace>, 1>
+                               VSView, Kokkos::View<float*, ExecSpace>, OView, 1>
         probe_f{q, kq,      ks,     vq,    vs, probe_ws, Hq, D, Hkv,
-                klo, khi,  nsplit, ksplit, 512, scale};
+                klo, khi,  nsplit, ksplit, 512, scale, out, nsplit == 1};
     Kokkos::TeamPolicy<ExecSpace> probe(1, 1);
     const size_t req = scratch_bytes(512);
     probe.set_scratch_size(0, Kokkos::PerTeam(req < budget ? req : budget));

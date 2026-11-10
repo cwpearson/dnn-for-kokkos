@@ -235,8 +235,11 @@ TEST(Attention, FloatLongKeys) {
 // (the LFM2.5 shape, where one block covers all query heads of a KV head),
 // MHA (no sharing), MQA (group of 8), a geometry whose Hq % Hkv != 0 (group
 // width 1 fallback), an odd head dim, and a sliding-window decode. The
-// kernel is reached through the public entry point, so the test also covers
-// the launcher's split/tile/team choice and the combine pass.
+// Glimmer-like group-of-16 cases run short windows, so they also cover the
+// launcher's single-split fast path (one head per block, output written
+// directly with no combine pass). The kernel is reached through the public
+// entry point, so the test also covers the launcher's split/tile/team choice
+// and the combine pass.
 template <class Scalar>
 void check_decode_split_reference(float tol, int Hq, int Hkv, int D, int Ktot,
                                   size_t window) {
@@ -322,6 +325,12 @@ TEST(Attention, SplitKVDecodeReference) {
   check_decode_split_reference<float>(1e-5f, 4, 2, 7, 256, 0);    // odd D
   check_decode_split_reference<float>(1e-5f, 32, 8, 64, 512, 256);   // window
   check_decode_split_reference<float>(1e-5f, 3, 2, 8, 33, 0);     // ragged
+  check_decode_split_reference<float>(1e-5f, 32, 2, 128, 128, 0);  // GQA-16,
+                                                                  // 1 split
+  check_decode_split_reference<Kokkos::Experimental::bhalf_t>(
+      5e-2f, 32, 2, 128, 128, 0);                                 // same, bf16
+  check_decode_split_reference<float>(1e-5f, 32, 2, 128, 300, 64);  // windowed,
+                                                                   // 1 split
 }
 
 // Causal GQA with tanh logit softcapping and a per-key validity mask vs a
