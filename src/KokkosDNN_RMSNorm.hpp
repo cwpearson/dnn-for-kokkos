@@ -100,6 +100,44 @@ struct RmsNormNoScaleTeam {
   }
 };
 
+// Single-row RMSNorm worker for decode heads: norms row `row` of h [C, D]
+// into y [D] (one team; the league has a single team). Same team-parallel
+// reduce-then-scale structure as RmsNormTeam with the same team-size
+// selection at the call site, so the result matches rmsnorm(h, w, eps, hn)
+// followed by y(d) = hn(row, d) while writing only the consumed row: the
+// other C-1 rows are never materialized. h and y must not alias (the model
+// passes the [C, D] residual stream vs its [D] staging vector).
+template <class ExecSpace, class Scalar>
+struct RmsNormLastRowTeam {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  using View2 = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
+  using View1 = Kokkos::View<Scalar*, ExecSpace>;
+  View2 h;
+  View1 w;
+  View1 y;
+  size_t row;
+  float eps;
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& team) const {
+    // Locals: the lambdas below capture by value, so bind members to
+    // locals to avoid an implicit `this` capture (deprecated in C++20).
+    const View2 h_ = h;
+    const View1 w_ = w, y_ = y;
+    const float eps_ = eps;
+    const size_t t = row;
+    const size_t D = h_.extent(1);
+    // In-place safe within the row: the reduce completes before any write.
+    const float inv = rms_row_inv(team, D, eps_, KOKKOS_LAMBDA(size_t d) {
+      return static_cast<float>(h_(t, d));
+    });
+    Kokkos::parallel_for(
+        Kokkos::TeamThreadRange(team, D), KOKKOS_LAMBDA(size_t d) {
+          y_(d) = static_cast<Scalar>(static_cast<float>(h_(t, d)) * inv *
+                                     static_cast<float>(w_(d)));
+        });
+  }
+};
+
 // Launcher shared by rmsnorm and the per-head qk variants below: one team
 // per row, team size min(D, 256) clamped to team_size_max.
 template <class ExecSpace, class Functor>
@@ -260,6 +298,27 @@ void rmsnorm(
           y(b, t, d) = static_cast<Scalar>(
               static_cast<float>(x(b, t, d)) * inv * static_cast<float>(w(d)));
       });
+}
+
+// Last-row RMSNorm for decode heads: y[d] = h[C-1,d]/rms(h[C-1,:]) * w[d].
+// Replaces rmsnorm(h, w, eps, hn) plus a gather of the last row into y (two
+// launches and a full [C, D] hn round-trip) with one launch that reads only
+// the consumed row. Same per-row math as rmsnorm (same team-parallel FP32
+// reduction tree at the same team size), so results match the two-pass form.
+// h and y must not alias.
+template <class ExecSpace, class Scalar>
+void rmsnorm_last_row(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& h,
+    const Kokkos::View<Scalar*, ExecSpace>& w, float eps,
+    const Kokkos::View<Scalar*, ExecSpace>& y,
+    const std::string& label = "KokkosDNN::rmsnorm_last_row") {
+  const size_t C = h.extent(0), D = h.extent(1);
+  if (w.extent(0) != D || y.extent(0) != D)
+    throw std::invalid_argument("rmsnorm_last_row: dimension mismatch");
+  if (C == 0 || D == 0) return;
+  Impl::rmsnorm_team_launch<ExecSpace>(
+      Impl::RmsNormLastRowTeam<ExecSpace, Scalar>{h, w, y, C - 1, eps}, 1, D,
+      label);
 }
 
 // Single-row variant for decode.
@@ -551,11 +610,23 @@ struct QkVRmsNormFusedRopeTeam {
   FView inv_freq;    // [HD/2] FP32 table; ignored (may be empty) when !do_rope
   PView positions;   // [T] absolute positions; ignored when !do_rope
   bool do_rope;
+  // Dense KV-cache write-through (empty views disable): k/v teams also store
+  // their rows at [cpos+t, h, d]. Lets a caller fold the contiguous KV-cache
+  // write into this launch instead of running a separate copy kernel over
+  // k3/v3 afterwards. The cached values are the post-RoPE rows (the copy
+  // runs after the rotation barrier), matching a post-kernel copy exactly.
+  View3 kcache;
+  View3 vcache;
+  size_t cpos;
   KOKKOS_INLINE_FUNCTION
   void operator()(const Member& team) const {
     const View2 qflat_ = qflat, kflat_ = kflat, vflat_ = vflat;
     const View1 wq_ = wq, wk_ = wk;
     const View3 qout_ = qout, kout_ = kout, vout_ = vout;
+    const View3 kcache_ = kcache, vcache_ = vcache;
+    const size_t cpos_ = cpos;
+    const bool cache_ =
+        kcache_.extent(0) > cpos_ && vcache_.extent(0) > cpos_;
     const float eps_ = eps;
     const size_t NH_ = NH, NKV_ = NKV;
     const size_t HD_ = wq_.extent(0);
@@ -615,6 +686,15 @@ struct QkVRmsNormFusedRopeTeam {
                                     static_cast<float>(inv_(d)), p);
             });
       }
+      if (cache_) {
+        // Post-rotation rows (or the plain norms when !rope_): the barrier
+        // publishes every lane before the copy reads them back.
+        team.team_barrier();
+        Kokkos::parallel_for(
+            Kokkos::TeamThreadRange(team, HD_), KOKKOS_LAMBDA(size_t d) {
+              kcache_(cpos_ + t, h, d) = kout_(t, h, d);
+            });
+      }
     } else {
       const size_t j = id - qn - kn;
       const size_t t = j / NKV_;
@@ -622,7 +702,9 @@ struct QkVRmsNormFusedRopeTeam {
       const size_t base = h * HD_;
       Kokkos::parallel_for(
           Kokkos::TeamThreadRange(team, HD_), KOKKOS_LAMBDA(size_t d) {
-            vout_(t, h, d) = vflat_(t, base + d);
+            const Scalar vv = vflat_(t, base + d);
+            vout_(t, h, d)  = vv;
+            if (cache_) vcache_(cpos_ + t, h, d) = vv;
           });
     }
   }
@@ -1040,7 +1122,70 @@ void qk_rmsnorm_qkv_fused_rope(
   Impl::rmsnorm_team_launch<ExecSpace>(
       Impl::QkVRmsNormFusedRopeTeam<ExecSpace, Scalar, FView, PView>{
           qflat, wq, qout, kflat, wk, kout, vflat, vout, NH, NKV, eps,
-          inv_freq, positions, do_rope},
+          inv_freq, positions, do_rope, Kokkos::View<Scalar***,
+                                                     Kokkos::LayoutRight,
+                                                     ExecSpace>(),
+          Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>(), 0},
+      T * (NH + 2 * NKV), HD, label);
+}
+
+// Dense-KV variant of qk_rmsnorm_qkv_fused_rope with cache write-through:
+// identical q/k/v outputs plus kcache[cpos+t,h,d]/vcache[cpos+t,h,d] rows,
+// so a decode caller skips the separate k3/v3 -> cache copy launch. The
+// cached rows are exactly what a post-kernel copy would store (post-RoPE),
+// verified bit-identical by tests. kcache/vcache are [Ktot, NKV, HD] dense
+// pools with Ktot >= cpos + T. Scalar-agnostic; backend-portable.
+template <class ExecSpace, class Scalar, class FView, class PView>
+void qk_rmsnorm_qkv_fused_rope_cached(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& qflat,
+    const Kokkos::View<Scalar*, ExecSpace>& wq,
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& qout,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& kflat,
+    const Kokkos::View<Scalar*, ExecSpace>& wk,
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& kout,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& vflat,
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& vout,
+    float eps, const FView& inv_freq, const PView& positions, bool do_rope,
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& kcache,
+    const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& vcache,
+    size_t cpos,
+    const std::string& label = "KokkosDNN::qk_rmsnorm_qkv_fused_rope") {
+  static_assert(FView::rank == 1,
+                "qk_rmsnorm_qkv_fused_rope_cached: inv_freq rank 1");
+  static_assert(PView::rank == 1,
+                "qk_rmsnorm_qkv_fused_rope_cached: positions rank 1");
+  const size_t T = qout.extent(0), NH = qout.extent(1), HD = qout.extent(2);
+  const size_t NKV = kout.extent(1);
+  if (qflat.extent(0) != T || qflat.extent(1) != NH * HD ||
+      wq.extent(0) != HD || kflat.extent(0) != T ||
+      kflat.extent(1) != NKV * HD || wk.extent(0) != HD ||
+      kout.extent(0) != T || kout.extent(2) != HD || vflat.extent(0) != T ||
+      vflat.extent(1) != NKV * HD || vout.extent(0) != T ||
+      vout.extent(1) != NKV || vout.extent(2) != HD)
+    throw std::invalid_argument(
+        "qk_rmsnorm_qkv_fused_rope_cached: dimension mismatch");
+  if (do_rope) {
+    if (HD == 0 || HD % 2 != 0)
+      throw std::invalid_argument(
+          "qk_rmsnorm_qkv_fused_rope_cached: head_dim must be positive and "
+          "even");
+    if (inv_freq.extent(0) != HD / 2)
+      throw std::invalid_argument(
+          "qk_rmsnorm_qkv_fused_rope_cached: inv_freq length must be "
+          "head_dim/2");
+    if (positions.extent(0) != T)
+      throw std::invalid_argument(
+          "qk_rmsnorm_qkv_fused_rope_cached: positions length must match T");
+  }
+  if (kcache.extent(0) < cpos + T || kcache.extent(1) != NKV ||
+      kcache.extent(2) != HD || vcache.extent(0) < cpos + T ||
+      vcache.extent(1) != NKV || vcache.extent(2) != HD)
+    throw std::invalid_argument(
+        "qk_rmsnorm_qkv_fused_rope_cached: cache dimension mismatch");
+  Impl::rmsnorm_team_launch<ExecSpace>(
+      Impl::QkVRmsNormFusedRopeTeam<ExecSpace, Scalar, FView, PView>{
+          qflat, wq, qout, kflat, wk, kout, vflat, vout, NH, NKV, eps,
+          inv_freq, positions, do_rope, kcache, vcache, cpos},
       T * (NH + 2 * NKV), HD, label);
 }
 

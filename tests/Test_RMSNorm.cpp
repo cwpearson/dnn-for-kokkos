@@ -653,6 +653,187 @@ TEST(QkRmsNormQkvFusedRope, BHalf) {
   check_qk_rmsnorm_qkv_fused_rope<Kokkos::Experimental::bhalf_t>();
 }
 
+// Last-row RMSNorm vs rmsnorm + last-row gather (float + bfloat16).
+// Same team-parallel reduction at the same team size, so EXPECT_EQ.
+template <class Scalar>
+void check_rmsnorm_last_row() {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  const float eps = 1e-5f;
+  for (int C : {1, 3}) {
+    const int D = 16;
+    Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> h("h", C, D),
+        hn("hn", C, D);
+    Kokkos::View<Scalar*, Exec> w("w", D), last("last", D), ref("ref", D);
+    auto hh = Kokkos::create_mirror_view(h);
+    auto hw = Kokkos::create_mirror_view(w);
+    for (int t = 0; t < C; ++t)
+      for (int d = 0; d < D; ++d)
+        hh(t, d) = static_cast<Scalar>(0.4f * (t + 1) - 0.13f * d);
+    for (int d = 0; d < D; ++d) hw(d) = static_cast<Scalar>(1.0f + 0.07f * d);
+    Kokkos::deep_copy(h, hh);
+    Kokkos::deep_copy(w, hw);
+    // Reference: full norm plus a last-row gather.
+    KokkosDNN::rmsnorm<Exec, Scalar>(h, w, eps, hn);
+    Kokkos::parallel_for(
+        "gather_ref", Kokkos::RangePolicy<Exec>(0, (size_t)D),
+        KOKKOS_LAMBDA(size_t d) { ref(d) = hn((size_t)C - 1, d); });
+    KokkosDNN::rmsnorm_last_row<Exec, Scalar>(h, w, eps, last);
+    Kokkos::fence();
+    auto got = Kokkos::create_mirror_view(last);
+    auto want = Kokkos::create_mirror_view(ref);
+    Kokkos::deep_copy(got, last);
+    Kokkos::deep_copy(want, ref);
+    for (int d = 0; d < D; ++d)
+      EXPECT_EQ(got(d), want(d)) << "last_row mismatch at C=" << C;
+  }
+  // Dimension mismatch throws; empty inputs are a no-op.
+  const int D = 8;
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> h("h", 2, D);
+  Kokkos::View<Scalar*, Exec> w("w", D), bad("bad", D + 1), y("y", D);
+  EXPECT_THROW((KokkosDNN::rmsnorm_last_row<Exec, Scalar>(h, w, 1e-5f, bad)),
+               std::invalid_argument);
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> he("he", 0, D);
+  EXPECT_NO_THROW((KokkosDNN::rmsnorm_last_row<Exec, Scalar>(he, w, 1e-5f, y)));
+}
+
+TEST(RMSNormLastRow, Float) { check_rmsnorm_last_row<float>(); }
+
+TEST(RMSNormLastRow, BHalf) {
+  check_rmsnorm_last_row<Kokkos::Experimental::bhalf_t>();
+}
+
+// Cached QK-norm+RoPE vs the plain fused kernel plus a manual cache copy
+// (float + bfloat16). Bit-identical, so EXPECT_EQ; covers a nonzero cpos and
+// both RoPE/NoPE paths.
+template <class Scalar>
+void check_qk_rmsnorm_qkv_fused_rope_cached() {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  for (int T : {1, 3}) {
+    const int NH = 4, NKV = 2, HD = 8, KTOT = 9;
+    const size_t cpos = 5;  // nonzero write offset into the pools
+    const float eps = 1e-6f;
+    Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> q2("q2", T, NH * HD),
+        k2("k2", T, NKV * HD), v2("v2", T, NKV * HD);
+    Kokkos::View<Scalar*, Exec> wq("wq", HD), wk("wk", HD);
+    Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec> q3("q3", T, NH, HD),
+        k3("k3", T, NKV, HD), v3("v3", T, NKV, HD), q3r("q3r", T, NH, HD),
+        k3r("k3r", T, NKV, HD), v3r("v3r", T, NKV, HD);
+    Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec> kc("kc", KTOT, NKV, HD),
+        vc("vc", KTOT, NKV, HD), kcr("kcr", KTOT, NKV, HD),
+        vcr("vcr", KTOT, NKV, HD);
+    auto hq = Kokkos::create_mirror_view(q2);
+    auto hk = Kokkos::create_mirror_view(k2);
+    auto hv = Kokkos::create_mirror_view(v2);
+    auto hwq = Kokkos::create_mirror_view(wq);
+    auto hwk = Kokkos::create_mirror_view(wk);
+    for (int t = 0; t < T; ++t) {
+      for (int i = 0; i < NH * HD; ++i)
+        hq(t, i) = static_cast<Scalar>(0.25f * ((t + 1) * (i % 7 + 1)) - 3.0f);
+      for (int i = 0; i < NKV * HD; ++i) {
+        hk(t, i) = static_cast<Scalar>(0.2f * ((t + 2) * (i % 5 + 1)) - 2.0f);
+        hv(t, i) = static_cast<Scalar>(0.3f * (i - t) + 0.5f);
+      }
+    }
+    for (int d = 0; d < HD; ++d) {
+      hwq(d) = static_cast<Scalar>(1.0f + 0.05f * d);
+      hwk(d) = static_cast<Scalar>(1.0f);
+    }
+    Kokkos::deep_copy(q2, hq);
+    Kokkos::deep_copy(k2, hk);
+    Kokkos::deep_copy(v2, hv);
+    Kokkos::deep_copy(wq, hwq);
+    Kokkos::deep_copy(wk, hwk);
+    auto inv = KokkosDNN::rope_inv_freq<Exec>(HD, 500000.0f);
+    Kokkos::View<int*, Exec> pos("pos", T);
+    {
+      auto hp = Kokkos::create_mirror_view(pos);
+      for (int t = 0; t < T; ++t) hp(t) = 3 + 5 * t;
+      Kokkos::deep_copy(pos, hp);
+    }
+    for (bool do_rope : {true, false}) {
+      // Reference: plain fused kernel, then a manual copy into the pools.
+      KokkosDNN::qk_rmsnorm_qkv_fused_rope<Exec, Scalar>(
+          q2, wq, q3r, k2, wk, k3r, v2, v3r, eps, inv, pos, do_rope);
+      Kokkos::parallel_for(
+          "cache_ref",
+          Kokkos::MDRangePolicy<Exec, Kokkos::Rank<3>>(
+              {0, 0, 0}, {(size_t)T, (size_t)NKV, (size_t)HD}),
+          KOKKOS_LAMBDA(size_t t, size_t hh, size_t d) {
+            kcr(cpos + t, hh, d) = k3r(t, hh, d);
+            vcr(cpos + t, hh, d) = v3r(t, hh, d);
+          });
+      // Cached variant under test.
+      KokkosDNN::qk_rmsnorm_qkv_fused_rope_cached<Exec, Scalar>(
+          q2, wq, q3, k2, wk, k3, v2, v3, eps, inv, pos, do_rope, kc, vc,
+          cpos);
+      Kokkos::fence();
+      auto gq = Kokkos::create_mirror_view(q3);
+      auto gqr = Kokkos::create_mirror_view(q3r);
+      auto gk = Kokkos::create_mirror_view(k3);
+      auto gkr = Kokkos::create_mirror_view(k3r);
+      auto gv = Kokkos::create_mirror_view(v3);
+      auto gvr = Kokkos::create_mirror_view(v3r);
+      auto gkc = Kokkos::create_mirror_view(kc);
+      auto gkcr = Kokkos::create_mirror_view(kcr);
+      auto gvc = Kokkos::create_mirror_view(vc);
+      auto gvcr = Kokkos::create_mirror_view(vcr);
+      Kokkos::deep_copy(gq, q3);
+      Kokkos::deep_copy(gqr, q3r);
+      Kokkos::deep_copy(gk, k3);
+      Kokkos::deep_copy(gkr, k3r);
+      Kokkos::deep_copy(gv, v3);
+      Kokkos::deep_copy(gvr, v3r);
+      Kokkos::deep_copy(gkc, kc);
+      Kokkos::deep_copy(gkcr, kcr);
+      Kokkos::deep_copy(gvc, vc);
+      Kokkos::deep_copy(gvcr, vcr);
+      for (int t = 0; t < T; ++t)
+        for (int h = 0; h < NH; ++h)
+          for (int d = 0; d < HD; ++d)
+            EXPECT_EQ(gq(t, h, d), gqr(t, h, d))
+                << "cached q mismatch at T=" << T << " rope=" << do_rope;
+      for (int t = 0; t < T; ++t)
+        for (int h = 0; h < NKV; ++h)
+          for (int d = 0; d < HD; ++d) {
+            EXPECT_EQ(gk(t, h, d), gkr(t, h, d))
+                << "cached k mismatch at T=" << T << " rope=" << do_rope;
+            EXPECT_EQ(gv(t, h, d), gvr(t, h, d))
+                << "cached v mismatch at T=" << T << " rope=" << do_rope;
+            EXPECT_EQ(gkc(cpos + (size_t)t, h, d), gkcr(cpos + (size_t)t, h, d))
+                << "cache k mismatch at T=" << T << " rope=" << do_rope;
+            EXPECT_EQ(gvc(cpos + (size_t)t, h, d), gvcr(cpos + (size_t)t, h, d))
+                << "cache v mismatch at T=" << T << " rope=" << do_rope;
+          }
+    }
+  }
+  // Undersized pools throw.
+  const int HD = 8;
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> q2("q2", 2, 4 * HD),
+      k2("k2", 2, 2 * HD), v2("v2", 2, 2 * HD);
+  Kokkos::View<Scalar*, Exec> wq("wq", HD), wk("wk", HD);
+  Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec> q3("q3", 2, 4, HD),
+      k3("k3", 2, 2, HD), v3("v3", 2, 2, HD);
+  Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec> kc("kc", 2, 2, HD),
+      vc("vc", 2, 2, HD);
+  Kokkos::View<float*, Exec> empty_inv("empty_inv", 0);
+  Kokkos::View<int*, Exec> pos("pos", 2);
+  EXPECT_THROW((KokkosDNN::qk_rmsnorm_qkv_fused_rope_cached<Exec, Scalar>(
+                   q2, wq, q3, k2, wk, k3, v2, v3, 1e-6f, empty_inv, pos,
+                   false, kc, vc, 1)),
+               std::invalid_argument);
+  EXPECT_NO_THROW((KokkosDNN::qk_rmsnorm_qkv_fused_rope_cached<Exec, Scalar>(
+      q2, wq, q3, k2, wk, k3, v2, v3, 1e-6f, empty_inv, pos, false, kc, vc,
+      0)));
+}
+
+TEST(QkRmsNormQkvFusedRopeCached, Float) {
+  check_qk_rmsnorm_qkv_fused_rope_cached<float>();
+}
+
+TEST(QkRmsNormQkvFusedRopeCached, BHalf) {
+  check_qk_rmsnorm_qkv_fused_rope_cached<Kokkos::Experimental::bhalf_t>();
+}
+
 
 // Fused RMSNorm + AdaLN-zero modulation (rank-2 and rank-3) vs host
 // reference (float + bfloat16). Rank-2 conditions on [D], rank-3 on

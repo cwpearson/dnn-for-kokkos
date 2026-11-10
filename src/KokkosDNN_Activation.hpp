@@ -189,6 +189,33 @@ void logit_softcap_forward(
       });
 }
 
+// Fused output-multiplier + softcap head (rank-1, e.g. single-row decode):
+//   y[i] = cap * tanh(Scalar(mult * x[i]) / cap), computed in FP32.
+// Bit-identical to scale_by_scalar(x, mult, tmp) followed by
+// logit_softcap_forward(tmp, cap, y): the intermediate Scalar rounding is
+// reproduced explicitly, so in-place use (x aliases y) matches the two-pass
+// sequence elementwise. One launch over [vocab] instead of two. Throws for
+// cap <= 0.
+template <class ExecSpace, class Scalar>
+void scale_softcap_forward(
+    const Kokkos::View<Scalar*, ExecSpace>& x, float mult, float cap,
+    const Kokkos::View<Scalar*, ExecSpace>& y,
+    const std::string& label = "KokkosDNN::scale_softcap") {
+  if (cap <= 0.0f)
+    throw std::invalid_argument("scale_softcap_forward: cap must be > 0");
+  if (x.extent(0) != y.extent(0))
+    throw std::invalid_argument("scale_softcap_forward: dimension mismatch");
+  const size_t N = x.extent(0);
+  if (N == 0) return;
+  Kokkos::parallel_for(
+      label, Kokkos::RangePolicy<ExecSpace>(0, N), KOKKOS_LAMBDA(size_t i) {
+        const Scalar s =
+            static_cast<Scalar>(mult * static_cast<float>(x(i)));
+        y(i) = static_cast<Scalar>(cap * Kokkos::tanhf(static_cast<float>(s) /
+                                                      cap));
+      });
+}
+
 // Elementwise activations for small training MLPs (e.g. the XOR example).
 // All ops are out-of-place-capable and in-place safe (x and y may alias;
 // each output element depends only on the same-index input). Computed in

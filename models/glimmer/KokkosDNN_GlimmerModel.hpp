@@ -155,7 +155,7 @@ class Model {
   // demand in ensure_scratch() and are never shrunk, so the steady decode
   // state (T=1 after prefill) performs zero View allocations.
   // Fixed-size state (last/logits) is allocated once in the constructor.
-  MatR h_buf_, tmp_buf_, tmp2_buf_, proj_buf_, down_buf_, hn_buf_;
+  MatR h_buf_, tmp_buf_, tmp2_buf_, proj_buf_, down_buf_;
   MatR q2_buf_, k2_buf_, v2_buf_, attn_flat_buf_, gate_attn_buf_;
   MatR gate_buf_, up_buf_, act_buf_;
   // Dequantized-weight staging for the packed-quant path (see
@@ -290,7 +290,7 @@ class Model {
     if (C <= scratch_cap_ && h_buf_.extent(0) >= C &&
         h_buf_.extent(1) == DIM && tmp_buf_.extent(1) == DIM &&
         tmp2_buf_.extent(1) == DIM && proj_buf_.extent(1) == DIM &&
-        down_buf_.extent(1) == DIM && hn_buf_.extent(1) == DIM &&
+        down_buf_.extent(1) == DIM &&
         q2_buf_.extent(1) == HqD && attn_flat_buf_.extent(1) == HqD &&
         gate_attn_buf_.extent(1) == HqD && k2_buf_.extent(1) == HkvD &&
         v2_buf_.extent(1) == HkvD && gate_buf_.extent(1) == FFN &&
@@ -306,7 +306,6 @@ class Model {
     tmp2_buf_ = MatR("tmp2", C, DIM);
     proj_buf_ = MatR("proj", C, DIM);
     down_buf_ = MatR("down", C, DIM);
-    hn_buf_ = MatR("hn", C, DIM);
     q2_buf_ = MatR("q2", C, HqD);
     k2_buf_ = MatR("k2", C, HkvD);
     v2_buf_ = MatR("v2", C, HkvD);
@@ -398,8 +397,8 @@ class Model {
     if (pos0 + T > (size_t)cfg.max_seq_len)
       throw std::runtime_error("Model::forward: sequence exceeds max_seq_len");
     // Hoisted (device lambdas must not capture `this`/`cfg`).
-    const int DIM = cfg.dim, HD = cfg.head_dim, NKV = cfg.n_kv_heads,
-              VS = cfg.vocab_size, NL = cfg.n_layers;
+    const int DIM = cfg.dim, HD = cfg.head_dim, VS = cfg.vocab_size,
+              NL = cfg.n_layers;
     const float EPS = cfg.rms_norm_eps, POST_EPS = cfg.post_norm_eps;
     const float QK_SCALE = cfg.qk_scale_factor;
     const float ATTN_SCALE = 1.0f / std::sqrt((float)HD);
@@ -486,8 +485,6 @@ class Model {
                                   Kokkos::ALL);
       auto down = Kokkos::subview(down_buf_, std::make_pair(size_t(0), C),
                                   Kokkos::ALL);
-      auto hn = Kokkos::subview(hn_buf_, std::make_pair(size_t(0), C),
-                                Kokkos::ALL);
       auto toks =
           Kokkos::subview(tokens, std::make_pair(off, off + C));
 
@@ -530,16 +527,29 @@ class Model {
         // Fused Q/K per-head norms + V reshape with a conditional RoPE
         // epilogue (one launch instead of norm + rope-q + rope-k; bit-identical,
         // see KokkosDNN_RMSNorm.hpp). rope_inv_ is empty on NoPE layers, where
-        // do_rope=false skips the rotation.
+        // do_rope=false skips the rotation. On the dense KV path the cache
+        // write rides along (write-through into k/v_cache), folding the
+        // post-kernel copy into the same launch; the int8 path keeps the
+        // plain kernel (its quantizing write runs below, and the dense pools
+        // stay empty).
         {
           auto inv = rope_inv_[(size_t)l];
-          qk_rmsnorm_qkv_fused_rope<ExecSpace, Scalar>(
-              q2, qscale, q3, k2, ones, k3, v2, v3, EPS, inv, pos, !nope);
+          if (!kvq) {
+            auto kc = k_cache[(size_t)l];
+            auto vc = v_cache[(size_t)l];
+            qk_rmsnorm_qkv_fused_rope_cached<ExecSpace, Scalar>(
+                q2, qscale, q3, k2, ones, k3, v2, v3, EPS, inv, pos, !nope,
+                kc, vc, cpos);
+          } else {
+            qk_rmsnorm_qkv_fused_rope<ExecSpace, Scalar>(
+                q2, qscale, q3, k2, ones, k3, v2, v3, EPS, inv, pos, !nope);
+          }
         }
         // KV write + attention, branched once per layer on the
         // construction-time mode (views hoisted to locals above: indexing
         // the member vectors inside a device lambda would capture `this`).
-        //   dense FP: legacy contiguous write + prefix-subview attention.
+        //   dense FP: write-through inside the fused QK-norm kernel above,
+        //     then prefix-subview attention.
         //   int8: quantizing write always (decode and future turns must see
         //     the quantized pools), then prefill chunks (C > 1) dequantize
         //     the [0, cpos+C) prefix into the shared dense scratch and run
@@ -555,16 +565,10 @@ class Model {
         if (!kvq) {
           auto kc = k_cache[(size_t)l];
           auto vc = v_cache[(size_t)l];
-          Kokkos::parallel_for(
-              "kcache_write",
-              Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<3>>(
-                  {0, 0, 0}, {C, (size_t)NKV, (size_t)HD}),
-              KOKKOS_LAMBDA(size_t t, size_t hh, size_t d) {
-                kc(cpos + t, hh, d) = k3(t, hh, d);
-                vc(cpos + t, hh, d) = v3(t, hh, d);
-              });
-          // Pass the valid KV prefix as subviews: no repack/copy, and no extra
-          // [K, Hkv, D] temporaries per layer. The attention kernel is
+          // The KV rows were already written through by the fused QK-norm
+          // kernel above: pass the valid prefix straight to attention (no
+          // repack/copy, and no extra [K, Hkv, D] temporaries per layer). The
+          // attention kernel is
           // layout-agnostic and streams over keys, so long prefixes stay O(1)
           // in extra memory here too. q_off is the chunk start so causal
           // masking (query t attends to keys [0, cpos + t]) matches
@@ -670,18 +674,19 @@ class Model {
 
       // Only the last chunk produces logits (earlier chunks only fill KV).
       if (off + C < T) continue;
-      rmsnorm<ExecSpace, Scalar>(h, weights.final_norm, EPS, hn);
-      Kokkos::parallel_for(
-          "gather_last", Kokkos::RangePolicy<ExecSpace>(0, (size_t)DIM),
-          KOKKOS_LAMBDA(size_t d) { last(d) = hn(C - 1, d); });
+      // Final norm of the last row straight into the logit staging vector
+      // (one launch instead of a full [C, D] norm plus a gather).
+      rmsnorm_last_row<ExecSpace, Scalar>(h, weights.final_norm, EPS, last);
       // Untied lm_head through the shared head dispatch (dense gemv /
       // packed quant_gemv), then the output-multiplier + tanh softcap head:
       // logits = cap * tanh((lm_head(h) * mult) / cap).
       Impl::lm_head_forward<ExecSpace, Scalar>(handle, last, weights.lm_head,
                                                logits, "lm_head",
                                                q8_act_buf_);
-      scale_by_scalar<ExecSpace, Scalar>(logits, OUT_MULT, logits);
-      logit_softcap_forward<ExecSpace, Scalar>(logits, SOFTCAP, logits);
+      // Output-multiplier + tanh softcap in one pass (bit-identical to the
+      // two-pass sequence, see scale_softcap_forward).
+      scale_softcap_forward<ExecSpace, Scalar>(logits, OUT_MULT, SOFTCAP,
+                                              logits);
     }
     seq_len += T;
     return logits;

@@ -253,6 +253,44 @@ void check_logit_softcap(double tol) {
                std::invalid_argument);
 }
 
+// Fused output-multiplier + softcap head vs the two-pass sequence (float +
+// bfloat16). Bit-identical (the intermediate Scalar rounding is reproduced),
+// so EXPECT_EQ, out-of-place and in-place.
+template <class Scalar>
+void check_scale_softcap() {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  const float mult = 1.5f;  // Glimmer-style output multiplier
+  const float cap = 20.0f;  // Glimmer-style final_logit_softcap
+  const size_t N = 11;
+  Kokkos::View<Scalar*, Exec> x("x", N), y2("y2", N), yf("yf", N);
+  Kokkos::View<Scalar*, HostSpace> hx("hx", N);
+  const float vals[11] = {0.0f,  1.0f,   -1.0f, 15.0f,  -45.0f, 300.0f,
+                          -300.0f, 7.5f,  -0.25f, 0.5f,  -2.0f};
+  for (size_t i = 0; i < N; ++i) hx(i) = static_cast<Scalar>(vals[i]);
+  Kokkos::deep_copy(x, hx);
+  // Reference: scale then softcap.
+  KokkosDNN::scale_by_scalar<Exec, Scalar>(x, mult, y2);
+  KokkosDNN::logit_softcap_forward<Exec, Scalar>(y2, cap, y2);
+  // Fused, out-of-place and in-place.
+  KokkosDNN::scale_softcap_forward<Exec, Scalar>(x, mult, cap, yf);
+  KokkosDNN::scale_softcap_forward<Exec, Scalar>(x, mult, cap, x);
+  Kokkos::fence();
+  auto got2 = Kokkos::create_mirror_view_and_copy(HostSpace{}, y2);
+  auto gotf = Kokkos::create_mirror_view_and_copy(HostSpace{}, yf);
+  auto gotip = Kokkos::create_mirror_view_and_copy(HostSpace{}, x);
+  for (size_t i = 0; i < N; ++i) {
+    EXPECT_EQ(gotf(i), got2(i)) << "scale_softcap mismatch at x=" << vals[i];
+    EXPECT_EQ(gotip(i), got2(i))
+        << "scale_softcap in-place mismatch at x=" << vals[i];
+  }
+  EXPECT_THROW(
+      (KokkosDNN::scale_softcap_forward<Exec, Scalar>(x, mult, 0.0f, yf)),
+      std::invalid_argument);
+  EXPECT_THROW(
+      (KokkosDNN::scale_softcap_forward<Exec, Scalar>(x, mult, -1.0f, yf)),
+      std::invalid_argument);
+}
+
 }  // namespace
 
 TEST(GemmaOps, EmbedScaledFloat) { check_embed_scaled<float>(1e-4f); }
@@ -274,6 +312,10 @@ TEST(GemmaOps, ScaleByScalarBHalf) { check_scale_by_scalar<bhalf>(5e-2f); }
 TEST(GemmaOps, LogitSoftcapFloat) { check_logit_softcap<float>(1e-5); }
 
 TEST(GemmaOps, LogitSoftcapBHalf) { check_logit_softcap<bhalf>(5e-2); }
+
+TEST(GemmaOps, ScaleSoftcapFloat) { check_scale_softcap<float>(); }
+
+TEST(GemmaOps, ScaleSoftcapBHalf) { check_scale_softcap<bhalf>(); }
 
 // Proportional partial-RoPE table: values + zero tail + arg validation.
 TEST(GemmaOps, ProportionalRopeTable) {
