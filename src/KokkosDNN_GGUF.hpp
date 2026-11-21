@@ -80,6 +80,7 @@ enum class GgmlType : uint32_t {
   Q5_K = 13,
   Q6_K = 14,
   Q8_K = 15,
+  IQ4_NL = 20,
   I8   = 24,
   I16  = 25,
   I32  = 26,
@@ -101,6 +102,7 @@ inline constexpr uint32_t ggml_block_len(GgmlType t) {
     case GgmlType::Q5_1:
     case GgmlType::Q8_0:
     case GgmlType::Q8_1: return 32;
+    case GgmlType::IQ4_NL: return 32;
     case GgmlType::Q2_K:
     case GgmlType::Q3_K:
     case GgmlType::Q4_K:
@@ -127,6 +129,7 @@ inline constexpr size_t ggml_type_size(GgmlType t) {
     case GgmlType::Q5_1: return 24;
     case GgmlType::Q8_0: return 34;
     case GgmlType::Q8_1: return 36;
+    case GgmlType::IQ4_NL: return 18;
     case GgmlType::Q2_K: return 84;
     case GgmlType::Q3_K: return 110;
     case GgmlType::Q4_K: return 144;
@@ -156,7 +159,7 @@ inline constexpr bool ggml_is_k_quant(GgmlType t) {
 inline constexpr bool gguf_can_compute(GgmlType t) {
   return t == GgmlType::F32 || t == GgmlType::F16 || t == GgmlType::BF16 ||
          t == GgmlType::Q8_0 || t == GgmlType::Q4_K || t == GgmlType::Q5_K ||
-         t == GgmlType::Q6_K;
+         t == GgmlType::Q6_K || t == GgmlType::IQ4_NL;
 }
 
 inline std::string ggml_type_name(GgmlType t) {
@@ -175,6 +178,7 @@ inline std::string ggml_type_name(GgmlType t) {
     case GgmlType::Q5_K: return "Q5_K";
     case GgmlType::Q6_K: return "Q6_K";
     case GgmlType::Q8_K: return "Q8_K";
+    case GgmlType::IQ4_NL: return "IQ4_NL";
     case GgmlType::I8: return "I8";
     case GgmlType::I16: return "I16";
     case GgmlType::I32: return "I32";
@@ -253,6 +257,16 @@ struct BlockQ80 {
 };
 static_assert(sizeof(BlockQ80) == 34, "BlockQ80 must be 34 bytes");
 
+// IQ4_NL: 32 elements, one fp16 scale, 4-bit nonlinear codes (ggml
+// block_iq4_nl). Low nibble of qs[j] is element j, high nibble element
+// j+16 (verbatim dequantize_row_iq4_nl); the table below is ggml's
+// kvalues_iq4nl. 18 bytes total: same footprint as Q4_0, different dequant.
+struct BlockIQ4NL {
+  uint16_t d;     // block scale (fp16)
+  uint8_t qs[16]; // 32x 4-bit codes, low nibble first per pair
+};
+static_assert(sizeof(BlockIQ4NL) == 18, "BlockIQ4NL must be 18 bytes");
+
 struct BlockQ6K {
   uint8_t ql[128];    // low 4 bits of each 6-bit quant
   uint8_t qh[64];     // high 2 bits, packed 4 per byte
@@ -324,6 +338,25 @@ KOKKOS_INLINE_FUNCTION void dequant_q4k_block(const BlockQ4K* b, float* out) {
 KOKKOS_INLINE_FUNCTION void dequant_q80_block(const BlockQ80* b, float* out) {
   const float d = fp16_to_float(b->d);
   for (int i = 0; i < 32; ++i) out[i] = d * (float)b->qs[i];
+}
+
+// IQ4_NL codebook (ggml kvalues_iq4nl): int8 values used directly, no
+// min/offset term. Device-callable lookup keeps every IQ4_NL kernel in one
+// place instead of spreading the table across call sites.
+KOKKOS_INLINE_FUNCTION int8_t iq4nl_value(uint8_t nib) {
+  constexpr int8_t kIq4NlValues[16] = {-127, -104, -83, -65, -49, -35, -22,
+                                       -10,  1,    13,  25,  38,  53,  69,
+                                       89,   113};
+  return kIq4NlValues[nib & 0xF];
+}
+
+KOKKOS_INLINE_FUNCTION void dequant_iq4nl_block(const BlockIQ4NL* b,
+                                               float* out) {
+  const float d = fp16_to_float(b->d);
+  for (int j = 0; j < 16; ++j) {
+    out[j]      = d * (float)iq4nl_value(b->qs[j] & 0xF);
+    out[j + 16] = d * (float)iq4nl_value(b->qs[j] >> 4);
+  }
 }
 
 KOKKOS_INLINE_FUNCTION void dequant_q6k_block(const BlockQ6K* b, float* out) {
@@ -809,6 +842,16 @@ inline void dequant_tensor_to_float(const GgufFile& file,
       }
       return;
     }
+    case GgmlType::IQ4_NL: {
+      float tmp[32];
+      for (uint64_t b = 0, n = info.numel / 32; b < n; ++b) {
+        BlockIQ4NL blk;
+        std::memcpy(&blk, src + b * sizeof(blk), sizeof(blk));
+        dequant_iq4nl_block(&blk, tmp);
+        std::memcpy(dst + b * 32, tmp, sizeof(tmp));
+      }
+      return;
+    }
     case GgmlType::Q4_K: {
       float tmp[256];
       for (uint64_t b = 0, n = info.numel / 256; b < n; ++b) {
@@ -902,6 +945,15 @@ KOKKOS_INLINE_FUNCTION float quant_elem(GgmlType dtype, const uint8_t* row,
           reinterpret_cast<const BlockQ80*>(row + (k / 32) * sizeof(BlockQ80));
       return fp16_to_float(b->d) * (float)b->qs[k % 32];
     }
+    case GgmlType::IQ4_NL: {
+      const BlockIQ4NL* b = reinterpret_cast<const BlockIQ4NL*>(
+          row + (k / 32) * sizeof(BlockIQ4NL));
+      const size_t l  = k % 32;
+      const uint8_t q = b->qs[l & 15];
+      const uint8_t nib =
+          (l < 16) ? (uint8_t)(q & 0xF) : (uint8_t)(q >> 4);
+      return fp16_to_float(b->d) * (float)iq4nl_value(nib);
+    }
     case GgmlType::Q4_K: {
       const BlockQ4K* b =
           reinterpret_cast<const BlockQ4K*>(row + (k / 256) * sizeof(BlockQ4K));
@@ -976,7 +1028,7 @@ KOKKOS_INLINE_FUNCTION float quant_elem(GgmlType dtype, const uint8_t* row,
 // quant_elem() repeats per element (32x/16x fewer), leaving one nibble
 // extract + FMA per element. Same values up to FP32 reassociation (the
 // callers reduce over groups instead of elements). xd/xs cover strided
-// activation rows: element k reads xd[k * xs]. Q4_K/Q5_K/Q6_K/Q8_0 only;
+// activation rows: element k reads xd[k * xs]. Q4_K/Q5_K/Q6_K/Q8_0/IQ4_NL only;
 // other dtypes stay on quant_elem().
 template <class Scalar>
 KOKKOS_INLINE_FUNCTION float quant_group_dot(GgmlType dtype,
@@ -1089,7 +1141,21 @@ KOKKOS_INLINE_FUNCTION float quant_group_dot(GgmlType dtype,
         s += d * (float)b->qs[l] * static_cast<float>(xd[(k0 + l) * xs]);
       return s;
     }
-    default: return 0.0f;  // unreachable: grouped path is Q4_K/Q5_K/Q6_K/Q8_0 only
+    case GgmlType::IQ4_NL: {
+      const BlockIQ4NL* b = reinterpret_cast<const BlockIQ4NL*>(
+          row + (k0 / 32) * sizeof(BlockIQ4NL));
+      const float d = fp16_to_float(b->d);
+      float s       = 0;
+      for (size_t l = 0; l < 16; ++l) {
+        const uint8_t q = b->qs[l];
+        s += d * (float)iq4nl_value(q & 0xF) *
+             static_cast<float>(xd[(k0 + l) * xs]);
+        s += d * (float)iq4nl_value(q >> 4) *
+             static_cast<float>(xd[(k0 + l + 16) * xs]);
+      }
+      return s;
+    }
+    default: return 0.0f;  // unreachable: grouped path is Q4_K/Q5_K/Q6_K/Q8_0/IQ4_NL only
   }
 }
 
@@ -1102,6 +1168,7 @@ inline bool quant_can_group(GgmlType dtype, size_t K, size_t& gs) {
     case GgmlType::Q5_K: gs = 32; return K % 32 == 0;
     case GgmlType::Q6_K: gs = 16; return K % 16 == 0;
     case GgmlType::Q8_0: gs = 32; return K % 32 == 0;
+    case GgmlType::IQ4_NL: gs = 32; return K % 32 == 0;
     default: return false;
   }
 }
@@ -1155,7 +1222,8 @@ inline size_t quant_unit_count(GgmlType dtype, size_t cols) {
     case GgmlType::Q4_K:
     case GgmlType::Q5_K:
     case GgmlType::Q6_K:
-    case GgmlType::Q8_0: return cols / 32;
+    case GgmlType::Q8_0:
+    case GgmlType::IQ4_NL: return cols / 32;
     default: return cols;
   }
 }
@@ -1226,9 +1294,9 @@ KOKKOS_INLINE_FUNCTION QuantUnitX quant_unit_load_x(const Scalar* xd,
     k1 = k + 8;
     k2 = k + 64;
     k3 = k + 72;
-  } else {  // Q5_K, Q8_0: 32 contiguous elements
+  } else {  // Q5_K, Q8_0, IQ4_NL: 32 contiguous elements
     const size_t k =
-        (Dt == GgmlType::Q8_0)
+        (Dt == GgmlType::Q8_0 || Dt == GgmlType::IQ4_NL)
             ? c * 32
             : (c / 8) * 256 + ((c % 8) / 2) * 64 + (((c % 8) % 2) ? 32 : 0);
     k0 = k;
@@ -1552,6 +1620,76 @@ KOKKOSDNN_PRAGMA_UNROLL()
   return s;
 }
 
+// One IQ4_NL unit: a whole 18-byte block (32 elements, one scale). The 16 qs
+// bytes hold two 16-element halves (low/high nibbles); like Q8_0 they are
+// fetched as 2-byte loads (an 18-byte block is only 2-byte aligned, so
+// 128-bit loads on the weight row are unsafe). Four independent FMA chains.
+KOKKOS_INLINE_FUNCTION float quant_iq4nl_dot_x(const uint8_t* row, size_t c,
+                                               const QuantUnitX& x) {
+  const BlockIQ4NL* b = reinterpret_cast<const BlockIQ4NL*>(
+      row + c * sizeof(BlockIQ4NL));
+  const float d = fp16_to_float(b->d);
+  // 16 qs bytes as two 8-byte halves (4x 2-byte loads each): an 18-byte
+  // block is only 2-byte aligned and a 16-byte load of the second half
+  // would overread into the next block.
+  const uint16_t* p = reinterpret_cast<const uint16_t*>(b->qs);
+  QuantU16x8 lo, hi;
+KOKKOSDNN_PRAGMA_UNROLL()
+  for (int i = 0; i < 4; ++i) {
+    lo.w[i] = p[i];
+    hi.w[i] = p[i + 4];
+  }
+  float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+KOKKOSDNN_PRAGMA_UNROLL()
+  for (int i = 0; i < 8; ++i) {
+    const float q0 =
+        static_cast<float>(iq4nl_value(quant_u16x8_byte(lo, i)));
+    const float q1 =
+        static_cast<float>(iq4nl_value(quant_u16x8_byte(hi, i)));
+    const float q2 = static_cast<float>(
+        iq4nl_value(quant_u16x8_byte(lo, i) >> 4));
+    const float q3 = static_cast<float>(
+        iq4nl_value(quant_u16x8_byte(hi, i) >> 4));
+    s0 = fmaf(d * q0, x.v[0][i], s0);
+    s1 = fmaf(d * q1, x.v[1][i], s1);
+    s2 = fmaf(d * q2, x.v[2][i], s2);
+    s3 = fmaf(d * q3, x.v[3][i], s3);
+  }
+  return (s0 + s1) + (s2 + s3);
+}
+
+template <class Scalar>
+KOKKOS_INLINE_FUNCTION float quant_iq4nl_chunk_dot(const uint8_t* row,
+                                                   const Scalar* xd,
+                                                   size_t xs, size_t c,
+                                                   bool xvec) {
+  if (xvec)
+    return quant_iq4nl_dot_x(row, c,
+                             quant_unit_load_x<GgmlType::IQ4_NL, Scalar>(xd, c));
+  const BlockIQ4NL* b = reinterpret_cast<const BlockIQ4NL*>(
+      row + c * sizeof(BlockIQ4NL));
+  const size_t k0 = c * 32;
+  const float d   = fp16_to_float(b->d);
+  const uint16_t* p = reinterpret_cast<const uint16_t*>(b->qs);
+  QuantU16x8 lo, hi;
+KOKKOSDNN_PRAGMA_UNROLL()
+  for (int i = 0; i < 4; ++i) {
+    lo.w[i] = p[i];
+    hi.w[i] = p[i + 4];
+  }
+  float s = 0;
+KOKKOSDNN_PRAGMA_UNROLL()
+  for (int i = 0; i < 16; ++i) {
+    const uint8_t byte = i < 8 ? quant_u16x8_byte(lo, i)
+                               : quant_u16x8_byte(hi, i - 8);
+    s = fmaf(d * static_cast<float>(iq4nl_value(byte & 0xF)),
+             static_cast<float>(xd[(k0 + i) * xs]), s);
+    s = fmaf(d * static_cast<float>(iq4nl_value(byte >> 4)),
+             static_cast<float>(xd[(k0 + 16 + i) * xs]), s);
+  }
+  return s;
+}
+
 // One decode unit of a packed row (see quant_unit_count above).
 template <class Scalar>
 KOKKOS_INLINE_FUNCTION float quant_unit_dot(GgmlType dtype,
@@ -1563,6 +1701,8 @@ KOKKOS_INLINE_FUNCTION float quant_unit_dot(GgmlType dtype,
     case GgmlType::Q5_K: return quant_q5k_chunk_dot(row, xd, xs, c, xvec);
     case GgmlType::Q6_K: return quant_q6k_chunk_dot(row, xd, xs, c, xvec);
     case GgmlType::Q8_0: return quant_q80_chunk_dot(row, xd, xs, c, xvec);
+    case GgmlType::IQ4_NL:
+      return quant_iq4nl_chunk_dot(row, xd, xs, c, xvec);
     default:
       return quant_elem(dtype, row, c) * static_cast<float>(xd[c * xs]);
   }
@@ -1579,6 +1719,8 @@ KOKKOS_INLINE_FUNCTION float quant_unit_dot_x(const uint8_t* row, size_t c,
     return quant_q5k_dot_x(row, c, x);
   else if constexpr (Dt == GgmlType::Q6_K)
     return quant_q6k_dot_x(row, c, x);
+  else if constexpr (Dt == GgmlType::IQ4_NL)
+    return quant_iq4nl_dot_x(row, c, x);
   else
     return quant_q80_dot_x(row, c, x);
 }
@@ -1887,6 +2029,7 @@ inline void quant_gemv_unit_dispatch(const Kokkos::View<Scalar*, ExecSpace>& x,
     KOKKOSDNN_IMPL_GGUF_UNIT_CASE(GgmlType::Q5_K);
     KOKKOSDNN_IMPL_GGUF_UNIT_CASE(GgmlType::Q6_K);
     KOKKOSDNN_IMPL_GGUF_UNIT_CASE(GgmlType::Q8_0);
+    KOKKOSDNN_IMPL_GGUF_UNIT_CASE(GgmlType::IQ4_NL);
     default: return;
   }
 #undef KOKKOSDNN_IMPL_GGUF_UNIT_CASE
@@ -1901,7 +2044,8 @@ inline bool quant_can_unit(GgmlType dtype, size_t K) {
     case GgmlType::Q4_K:
     case GgmlType::Q5_K:
     case GgmlType::Q6_K: return K % 256 == 0;
-    case GgmlType::Q8_0: return K % 32 == 0;
+    case GgmlType::Q8_0:
+    case GgmlType::IQ4_NL: return K % 32 == 0;
     default: return false;
   }
 }
@@ -1995,7 +2139,7 @@ inline void quant_check(GgmlType dtype, size_t rows, size_t cols,
   if (!gguf_can_compute(dtype))
     throw std::invalid_argument(
         std::string(what) + ": unsupported dtype " + ggml_type_name(dtype) +
-        " (supported: F32/F16/BF16/Q8_0/Q4_K/Q5_K/Q6_K)");
+        " (supported: F32/F16/BF16/Q8_0/Q4_K/Q5_K/Q6_K/IQ4_NL)");
   const size_t want = rows * ggml_row_bytes(dtype, cols);  // validates cols
   if (have_bytes != want)
     throw std::invalid_argument(std::string(what) + ": payload size " +
@@ -2372,6 +2516,9 @@ void quant_moe_decode(
       case GgmlType::Q5_K:
       case GgmlType::Q6_K:
       case GgmlType::Q8_0: return n % 256 == 0;
+      // IQ4_NL blocks are independent 32-wide units (one scale, no cross-block
+      // pairing), so 32-alignment suffices for the unit path.
+      case GgmlType::IQ4_NL: return n % 32 == 0;
       default: return true;
     }
   };
@@ -2787,6 +2934,33 @@ void dequant_rows_q80(const uint8_t* wdata, size_t R, size_t C, size_t rb,
       });
 }
 
+// IQ4_NL: one fp16 block scale per 32 columns, 4-bit nonlinear codes.
+template <class ExecSpace, class Scalar, int VEC, bool VSTORE>
+void dequant_rows_iq4nl(const uint8_t* wdata, size_t R, size_t C, size_t rb,
+                        Scalar* dptr, size_t pitch, const std::string& label) {
+  const size_t CG = C / (size_t)VEC;
+  Kokkos::parallel_for(
+      label, Kokkos::RangePolicy<ExecSpace>(0, R * CG),
+      KOKKOS_LAMBDA(size_t k) {
+        const size_t r    = k / CG;
+        const size_t c0   = (k - r * CG) * (size_t)VEC;
+        Scalar* out       = dptr + r * pitch + c0;
+        const BlockIQ4NL* b = reinterpret_cast<const BlockIQ4NL*>(
+            wdata + r * rb + (c0 >> 5) * sizeof(BlockIQ4NL));
+        const float d   = fp16_to_float(b->d);
+        const size_t l0 = c0 & 31;  // position in the 32-block
+        Scalar tmp[VEC];
+        for (int i = 0; i < VEC; ++i) {
+          const size_t l  = l0 + (size_t)i;
+          const uint8_t q = b->qs[(l & 15)];
+          const uint8_t nib =
+              (l < 16) ? (uint8_t)(q & 0xF) : (uint8_t)(q >> 4);
+          tmp[i] = static_cast<Scalar>(d * (float)iq4nl_value(nib));
+        }
+        dequant_store<VSTORE, Scalar, VEC>(out, tmp);
+      });
+}
+
 // Cast-copy dtypes (F32/F16/BF16): contiguous and already dense, so the same
 // grouped/vector-store shape applies (no column-multiple requirement).
 template <class ExecSpace, class Scalar, int VEC, bool VSTORE, class Src,
@@ -2817,7 +2991,7 @@ void dequant_rows_cast(const uint8_t* wdata, size_t R, size_t C,
 }  // namespace Impl
 
 // Dequantize a packed weight to a dense row-major matrix: Y[r,c] = w[r,c].
-// Covers the gguf_can_compute() dtype set (Q4_K/Q5_K/Q6_K/Q8_0 plus
+// Covers the gguf_can_compute() dtype set (Q4_K/Q5_K/Q6_K/Q8_0/IQ4_NL plus
 // F32/F16/BF16 cast-copy). Portable Kokkos kernels, no backend ifdefs.
 // Throws on dimension mismatch, unsupported dtype, or a column count that is
 // not a multiple of the block size.
@@ -2901,6 +3075,17 @@ void dequant_to_dense(
             wdata, R, C, rb, dptr, pitch, label);
       else
         Impl::dequant_rows_q80<ExecSpace, Scalar, 1, false>(
+            wdata, R, C, rb, dptr, pitch, label);
+      return;
+    case GgmlType::IQ4_NL:
+      if (C % 32 != 0)
+        throw std::invalid_argument(
+            "dequant_to_dense: IQ4_NL cols must be a multiple of 32");
+      if (vec)
+        Impl::dequant_rows_iq4nl<ExecSpace, Scalar, VEL, true>(
+            wdata, R, C, rb, dptr, pitch, label);
+      else
+        Impl::dequant_rows_iq4nl<ExecSpace, Scalar, 1, false>(
             wdata, R, C, rb, dptr, pitch, label);
       return;
     case GgmlType::F32:

@@ -38,6 +38,11 @@
 #include "KokkosDNN_AdaptiveNorm.hpp"
 #include "KokkosDNN_AudioDSP.hpp"
 #include "KokkosDNN_GroupNorm.hpp"
+#include "KokkosDNN_InklingNorm.hpp"
+#include "KokkosDNN_InklingConv.hpp"
+#include "KokkosDNN_InklingRelBias.hpp"
+#include "KokkosDNN_InklingGates.hpp"
+#include "KokkosDNN_InklingResidual.hpp"
 
 // NOTE: model-specific pipelines live outside src/. The MOSS-Image/Qwen
 // headers moved to models/moss_image/

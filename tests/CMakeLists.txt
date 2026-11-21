@@ -32,6 +32,7 @@ kokkosdnn_add_test(test_conv1dgeneral Test_Conv1DGeneral.cpp)
 kokkosdnn_add_test(test_lstm Test_LSTM.cpp)
 kokkosdnn_add_test(test_adaptivenorm Test_AdaptiveNorm.cpp)
 kokkosdnn_add_test(test_audiodsp Test_AudioDSP.cpp)
+kokkosdnn_add_test(test_inklingops Test_InklingOps.cpp)
 # MOSS-Image unit tests build only when the MOSS model component is enabled,
 # mirroring models/CMakeLists.txt and examples/CMakeLists.txt (both guard
 # their MOSS subdirectories on KokkosDNN_ENABLE_MODEL_MOSS).

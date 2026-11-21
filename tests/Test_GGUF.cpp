@@ -163,6 +163,12 @@ void host_dequant(GgmlType dt, const uint8_t* raw, size_t numel,
         dequant_q5k_block(reinterpret_cast<const BlockQ5K*>(raw + b * 176),
                           out.data() + b * 256);
       return;
+    case GgmlType::IQ4_NL:
+      for (size_t b = 0; b < numel / 32; ++b)
+        dequant_iq4nl_block(
+            reinterpret_cast<const BlockIQ4NL*>(raw + b * 18),
+            out.data() + b * 32);
+      return;
     default: throw std::runtime_error("host_dequant: unsupported dtype");
   }
 }
@@ -243,6 +249,29 @@ TEST(GgufDequant, Q80Spot) {
   dequant_q80_block(&b, out);
   for (int i = 0; i < 32; ++i)
     EXPECT_FLOAT_EQ(out[i], 0.5f * (float)(i * 3 - 20)) << "i=" << i;
+}
+
+TEST(GgufDequant, IQ4NLHandComputed) {
+  // ggml kvalues_iq4nl codebook, d = 1.0: low nibble -> out[j],
+  // high nibble -> out[j+16] (verbatim dequantize_row_iq4_nl).
+  BlockIQ4NL b{};
+  b.d = 0x3C00;  // 1.0
+  for (int j = 0; j < 16; ++j) b.qs[j] = (uint8_t)((j << 4) | j);
+  float out[32];
+  dequant_iq4nl_block(&b, out);
+  const float want[16] = {-127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f,
+                          -22.0f,  -10.0f,  1.0f,   13.0f,  25.0f,  38.0f,
+                          53.0f,   69.0f,   89.0f,  113.0f};
+  for (int j = 0; j < 16; ++j) {
+    EXPECT_FLOAT_EQ(out[j], want[j]) << "j=" << j;
+    EXPECT_FLOAT_EQ(out[j + 16], want[j]) << "j=" << j;
+  }
+  // quant_elem agrees with the block dequantizer lane by lane.
+  const uint8_t* row = reinterpret_cast<const uint8_t*>(&b);
+  for (int k = 0; k < 32; ++k)
+    EXPECT_FLOAT_EQ(Impl::quant_elem(GgmlType::IQ4_NL, row, (size_t)k),
+                    out[k])
+        << "k=" << k;
 }
 
 TEST(GgufDequant, Q6KSpot) {
@@ -707,6 +736,26 @@ void build_case(GgmlType dtype, size_t N, size_t K, std::vector<float>& ref,
         quant_q80_block(ref.data() + i * K + blk * 32, &b);
         std::memcpy(raw.data() + (i * (K / 32) + blk) * 34, &b, 34);
       }
+  } else if (dtype == GgmlType::IQ4_NL) {
+    // Crafted exact codes: ref values ARE the codebook entries (d = 1.0),
+    // so ref == dequantized exactly and the kernel tolerance stays tight.
+    for (size_t i = 0; i < N; ++i)
+      for (size_t k = 0; k < K; ++k)
+        ref[i * K + k] = (float)iq4nl_value((uint8_t)((i * K + k) % 16));
+    raw.resize(N * (K / 32) * 18);
+    for (size_t i = 0; i < N; ++i)
+      for (size_t blk = 0; blk < K / 32; ++blk) {
+        BlockIQ4NL b{};
+        b.d = 0x3C00;  // 1.0
+        for (int l = 0; l < 16; ++l) {
+          const uint8_t lo =
+              (uint8_t)(((i * K + blk * 32 + l) % 16) & 0xF);
+          const uint8_t hi =
+              (uint8_t)(((i * K + blk * 32 + 16 + l) % 16) & 0xF);
+          b.qs[l] = (uint8_t)(lo | (hi << 4));
+        }
+        std::memcpy(raw.data() + (i * (K / 32) + blk) * 18, &b, 18);
+      }
   } else {
     throw std::runtime_error("build_case: unsupported dtype");
   }
@@ -757,7 +806,8 @@ void check_quant_gemv_rows(GgmlType dtype, size_t N, size_t K, float tol,
       acc0 += (double)ref[j * K + k] * (double)xf[k];
     const float loose =
         (dtype == GgmlType::F32 || dtype == GgmlType::Q4_K ||
-         dtype == GgmlType::Q5_K || dtype == GgmlType::Q6_K)
+         dtype == GgmlType::Q5_K || dtype == GgmlType::Q6_K ||
+         dtype == GgmlType::IQ4_NL)
             ? tol
             : 5e-2f;
     EXPECT_NEAR((float)got(j), (float)acc0, loose)
@@ -1057,6 +1107,7 @@ TEST(GgufQuantGemm, GemvFloat) {  check_quant_gemv<float>(GgmlType::F32, 64, 1e-
   check_quant_gemv<float>(GgmlType::F16, 64, 1e-4f);
   check_quant_gemv<float>(GgmlType::BF16, 64, 1e-4f);
   check_quant_gemv<float>(GgmlType::Q8_0, 64, 1e-4f);
+  check_quant_gemv<float>(GgmlType::IQ4_NL, 64, 1e-4f);
   check_quant_gemv<float>(GgmlType::Q4_K, 256, 1e-4f);
   check_quant_gemv<float>(GgmlType::Q5_K, 256, 1e-4f);
   check_quant_gemv<float>(GgmlType::Q6_K, 256, 1e-4f);
@@ -1068,6 +1119,7 @@ TEST(GgufQuantGemm, GemvBHalf) {
   check_quant_gemv<bhalf_t>(GgmlType::F16, 64, 5e-2f);
   check_quant_gemv<bhalf_t>(GgmlType::BF16, 64, 5e-2f);
   check_quant_gemv<bhalf_t>(GgmlType::Q8_0, 64, 5e-2f);
+  check_quant_gemv<bhalf_t>(GgmlType::IQ4_NL, 64, 5e-2f);
 }
 
 // The K-quant dtypes with bf16 activations are what the decode path actually
@@ -1098,6 +1150,7 @@ TEST(GgufQuantGemm, GemmFloat) {
   check_quant_gemm<float>(GgmlType::F16, 64, 1e-4f);
   check_quant_gemm<float>(GgmlType::BF16, 64, 1e-4f);
   check_quant_gemm<float>(GgmlType::Q8_0, 64, 1e-4f);
+  check_quant_gemm<float>(GgmlType::IQ4_NL, 64, 1e-4f);
   check_quant_gemm<float>(GgmlType::Q4_K, 256, 1e-4f);
   check_quant_gemm<float>(GgmlType::Q5_K, 256, 1e-4f);
   check_quant_gemm<float>(GgmlType::Q6_K, 256, 1e-4f);
@@ -1108,6 +1161,7 @@ TEST(GgufDequantToDense, Float) {
   check_dequant_to_dense<float>(GgmlType::F16, 64, 1e-4f);
   check_dequant_to_dense<float>(GgmlType::BF16, 64, 1e-4f);
   check_dequant_to_dense<float>(GgmlType::Q8_0, 64, 1e-4f);
+  check_dequant_to_dense<float>(GgmlType::IQ4_NL, 64, 1e-4f);
   check_dequant_to_dense<float>(GgmlType::Q4_K, 256, 1e-4f);
   check_dequant_to_dense<float>(GgmlType::Q5_K, 256, 1e-4f);
   check_dequant_to_dense<float>(GgmlType::Q6_K, 256, 1e-4f);
