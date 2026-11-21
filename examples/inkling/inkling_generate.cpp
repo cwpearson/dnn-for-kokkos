@@ -1,0 +1,444 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright Contributors to the KokkosDNN project
+#include <Kokkos_Core.hpp>
+#include <cctype>
+#include <cstdio>
+#include <iostream>
+#include <string>
+#include <vector>
+#include "KokkosDNN.hpp"
+#include "KokkosDNN_CliOptions.hpp"
+// TODO(models/inkling): these headers come from the models/inkling component
+// (KokkosDNN::inkling target). The Inkling:: names below mirror the
+// models/glimmer API surface (Config::inkling_2_mini/tiny_test/from_json_file,
+// random_init, load_gguf/load_safetensors, list_*_tensors, Tokenizer,
+// make_chat_messages, render_inkling_chatml_with_tools,
+// encode_rendered_chat, ensure_bos, normalize_reasoning_effort,
+// default_stop_strings, truncate_at_stop_strings, find_stop_string,
+// Model::generate, DefaultScalar); adjust when the component lands.
+#include "KokkosDNN_InklingConfig.hpp"
+#include "KokkosDNN_InklingModel.hpp"
+#include "KokkosDNN_InklingTokenizer.hpp"
+#include "KokkosDNN_InklingWeights.hpp"
+
+// POSIX glob for --weights patterns (multi-file sharded checkpoints).
+#if defined(__unix__) || defined(__unix) || defined(__APPLE__) || \
+    defined(__linux__)
+#include <glob.h>
+#define KOKKOSDNN_INKLING_HAS_GLOB 1
+#else
+#define KOKKOSDNN_INKLING_HAS_GLOB 0
+#endif
+
+namespace {
+// Expand shell-style --weights patterns (e.g. "model-*.safetensors").
+// Patterns matching nothing are kept literally so the loader reports the
+// missing file by name. Results are sorted and deduplicated.
+std::vector<std::string> expand_weight_patterns(
+    const std::vector<std::string>& pats) {
+  std::vector<std::string> out;
+#if KOKKOSDNN_INKLING_HAS_GLOB
+  for (auto& p : pats) {
+    glob_t g;
+    int rc = ::glob(p.c_str(), 0, nullptr, &g);
+    if (rc != 0 || g.gl_pathc == 0) {
+      out.push_back(p);
+    } else {
+      for (size_t i = 0; i < g.gl_pathc; ++i) out.emplace_back(g.gl_pathv[i]);
+    }
+    ::globfree(&g);
+  }
+#else
+  out = pats;
+#endif
+  std::sort(out.begin(), out.end());
+  out.erase(std::unique(out.begin(), out.end()), out.end());
+  return out;
+}
+
+// A single .gguf file (case-insensitive suffix) selects the GGUF loading
+// path (llama.cpp tensor naming + dequantization); anything else is a
+// safetensors shard (possibly a glob pattern, expanded above).
+bool is_gguf_path(const std::string& p) {
+  if (p.size() < 5) return false;
+  std::string ext = p.substr(p.size() - 5);
+  for (auto& ch : ext) ch = (char)std::tolower((unsigned char)ch);
+  return ext == ".gguf";
+}
+}  // namespace
+
+// PoC driver: tiny random model by default; real weights via flags.
+//   inkling_generate [--tiny] [--model inkling-2-mini]
+//                    [--weights model.safetensors (globs accepted) |
+//                               model.gguf (single file, llama.cpp naming)]
+//                    [--tokenizer tokenizer.json] [--prompt "text"]
+//                    [--max-new N] [--stop <id> ...] [--fp32]
+//                    [--prefill-chunk N] [--config config.json]
+//                    [--max-seq-len N] [--kv-int8 | --kv-fp | --kv-quant MODE]
+//                    [--list-tensors]
+//                    [--chat] [--system "text"] [--role user]
+//                    [--reasoning-effort none|minimal|low|medium|high|xhigh|max]
+//                    [--add-bos | --no-add-bos] [--stop-string "str" ...]
+//                    [--temperature T] [--top-k K] [--top-p P] [--min-p P]
+//                    [--repetition-penalty R] [--seed S]
+//
+// --model selects the base Config (only inkling-2-mini; aliases inkling,
+// 2-mini; case-insensitive). Passing --model explicitly opts out of the tiny
+// default, so `--model inkling-2-mini` alone runs the full-size model with
+// random weights (no downloads); --tiny still forces tiny_test dims.
+// --config overlays on top of the selected base (present keys win, missing
+// keys keep hardcoded defaults).
+//
+// Sampling defaults to greedy (the upstream generation_config.json sets
+// do_sample=false, no temperature/top_k/top_p); any sampling flag opts into
+// that sampler. Seed is random unless --seed is given.
+//
+// Default compute/storage is bfloat16; --fp32 opts into FP32 for comparison.
+// --prefill-chunk N caps prefill activations to O(N·dim) (0 = single-shot);
+// default is Config::prefill_chunk_size.
+//
+// --config overlays a config JSON onto the selected base config (present
+// keys win, missing keys keep hardcoded defaults); --max-seq-len caps the
+// KV-cache context (validated by Config::validate; the arch max is 1048576
+// per tokenizer_config.json model_max_length).
+// --kv-int8 selects the symmetric-int8 KV cache; --kv-fp restores dense FP;
+// --kv-quant takes "int8"/"none" explicitly; the last explicit source on
+// the command line wins over the file.
+// --list-tensors prints the tensor names stored in --weights files
+// (useful to inspect partial/sharded downloads) and exits. A single
+// --weights entry ending in .gguf (case-insensitive) instead loads a
+// llama.cpp GGUF checkpoint; mixing .gguf with safetensors shards is an
+// error.
+//
+// BOS: --add-bos (default) ensures exactly one leading BOS id;
+// --no-add-bos strips it.
+//
+// Chat: --chat wraps --prompt as one `role` (default "user") turn via the
+// upstream chat template (thinking-effort system message + optional tool
+// catalogue, then the user turn); --system prepends a system turn (implies
+// chat); --messages is a minimal alias wrapping its value as the user turn
+// (implies chat). --reasoning-effort selects the effort cue
+// (none|minimal|low|medium|high|xhigh|max or a float in [0.0, 0.99],
+// default high; --reasoning-strength and --reasoning are aliases).
+// Raw mode (default) encodes --prompt directly.
+//
+// Stopping: by default the generation_config stop set {eos 200006}; --stop
+// appends extra ids. --stop-string appends decoded-text stop strings
+// (repeatable); generation is truncated before the earliest match.
+template <class Scalar>
+int run_model(KokkosDNN::Inkling::Config cfg,
+              const std::vector<std::string>& wfiles, bool tiny,
+              const std::string& tok_path, const std::string& prompt,
+              int max_new, const std::vector<int>& extra_stops,
+              int prefill_chunk_override, int kv_quant_override, bool chat_mode,
+              const std::string& system_prompt, const std::string& role,
+              bool want_bos, const std::vector<std::string>& stop_strings,
+              const std::string& reasoning_effort,
+              KokkosDNN::SampleOptions samp_opt) {
+  using Exec = Kokkos::DefaultExecutionSpace;
+  KokkosDNN::Inkling::Weights<Exec, Scalar> w;
+  if (tiny || wfiles.empty()) {
+    KokkosDNN::Inkling::random_init(cfg, w);
+    std::printf("[%srandom weights] dim=%d layers=%d\n", tiny ? "tiny " : "",
+                cfg.dim, cfg.n_layers);
+  } else if (wfiles.size() == 1 && is_gguf_path(wfiles[0])) {
+    KokkosDNN::Inkling::load_gguf(cfg, wfiles[0], w);
+    std::printf("[loaded %s]\n", wfiles[0].c_str());
+  } else {
+    for (auto& fp : wfiles)
+      if (is_gguf_path(fp))
+        throw std::runtime_error(
+            "GGUF loading takes a single .gguf file: got '" + fp +
+            "' among " + std::to_string(wfiles.size()) +
+            " --weights entries (mixing .gguf with safetensors shards is "
+            "unsupported)");
+    KokkosDNN::Inkling::load_safetensors(cfg, wfiles, w);
+    std::printf("[loaded %zu shard(s)]\n", wfiles.size());
+  }
+
+  std::vector<int> prompt_ids;
+  std::vector<int> stops;
+  const bool use_chat = chat_mode || !system_prompt.empty();
+  if (!tok_path.empty()) {
+    KokkosDNN::Inkling::Tokenizer tok(tok_path);
+    if (use_chat) {
+      auto msgs = KokkosDNN::Inkling::make_chat_messages(
+          prompt, system_prompt, role.empty() ? "user" : role);
+      std::string rendered =
+          KokkosDNN::Inkling::render_inkling_chatml_with_tools(
+              msgs, "", "", true, "", reasoning_effort);
+      std::printf("[chat reasoning-effort=%s] %s\n",
+                  KokkosDNN::Inkling::normalize_reasoning_effort(
+                      reasoning_effort)
+                      .c_str(),
+                  rendered.c_str());
+      prompt_ids =
+          KokkosDNN::Inkling::encode_rendered_chat(tok, rendered, want_bos);
+    } else {
+      prompt_ids = KokkosDNN::Inkling::ensure_bos(tok.encode(prompt, want_bos),
+                                                 tok.bos(), want_bos);
+    }
+    std::printf("prompt tokens: %zu\n", prompt_ids.size());
+    // generation_config.json eos_token_id 200006.
+    stops = {tok.eos()};
+  } else {
+    // byte-fallback prompt (no tokenizer file): deterministic ids.
+    // Chat mode renders the template first so the byte stream matches;
+    // BOS wiring mirrors the tokenizer path (exactly one or zero).
+    std::string text = prompt;
+    if (use_chat) {
+      auto msgs = KokkosDNN::Inkling::make_chat_messages(
+          prompt, system_prompt, role.empty() ? "user" : role);
+      text = KokkosDNN::Inkling::render_inkling_chatml_with_tools(
+          msgs, "", "", true, "", reasoning_effort);
+      std::printf("[chat, no tokenizer] %s\n", text.c_str());
+    }
+    if (want_bos) prompt_ids.push_back(cfg.bos_token % cfg.vocab_size);
+    for (unsigned char c : text) prompt_ids.push_back(c % cfg.vocab_size);
+    std::printf("[no tokenizer] byte-fallback prompt tokens: %zu\n",
+                prompt_ids.size());
+    stops = {cfg.eos_token};  // generation_config eos id
+  }
+  stops.insert(stops.end(), extra_stops.begin(), extra_stops.end());
+  std::printf("stop ids:");
+  for (auto id : stops) std::printf(" %d", id);
+  std::printf("\n");
+  if (prefill_chunk_override >= 0)
+    cfg.prefill_chunk_size = prefill_chunk_override;
+  std::printf("prefill chunk: %d\n", cfg.prefill_chunk_size);
+  if (kv_quant_override >= 0) cfg.kv_int8 = (kv_quant_override != 0);
+  try {
+    cfg.validate();
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "error: invalid model config: %s\n", e.what());
+    return 1;
+  }
+  {
+    const double mib =
+        (double)cfg.kv_cache_bytes(sizeof(Scalar)) / (1024.0 * 1024.0);
+    std::printf("kv cache: %s, full-window %.1f MiB\n",
+                cfg.kv_int8 ? "int8" : "dense", mib);
+  }
+  if (prompt_ids.size() > (size_t)cfg.max_seq_len) {
+    std::fprintf(stderr,
+                 "error: prompt is %zu tokens but max_seq_len is %d "
+                 "(raise --max-seq-len or pass --tokenizer)\n",
+                 prompt_ids.size(), cfg.max_seq_len);
+    return 1;
+  }
+
+  KokkosDNN::Inkling::Model<Exec, Scalar> model(cfg, w);
+  std::printf("sampling: temp=%g top_k=%d top_p=%g min_p=%g rep_pen=%g seed=%llu%s\n",
+              (double)samp_opt.temperature, samp_opt.top_k,
+              (double)samp_opt.top_p, (double)samp_opt.min_p,
+              (double)samp_opt.repetition_penalty,
+              (unsigned long long)samp_opt.seed,
+              samp_opt.is_greedy() ? " [greedy]" : "");
+  KokkosDNN::HostRNG rng(samp_opt.seed);
+  std::vector<int> out;
+  if (!tok_path.empty()) {
+    // Tokenizer for streaming decode: constructed once, reused per token.
+    KokkosDNN::Inkling::Tokenizer stok(tok_path);
+    std::printf("decoded (streaming): ");
+    std::fflush(stdout);
+    auto on_token = [&](int id) {
+      std::string piece = stok.decode(std::vector<int>{id});
+      std::fputs(piece.c_str(), stdout);
+      std::fflush(stdout);
+    };
+    out = model.generate(prompt_ids, max_new, stops, samp_opt, &rng, on_token);
+    std::printf("\n");
+    std::fflush(stdout);
+  } else {
+    std::printf("generated (streaming):");
+    std::fflush(stdout);
+    auto on_token = [&](int id) {
+      std::printf(" %d", id);
+      std::fflush(stdout);
+    };
+    out = model.generate(prompt_ids, max_new, stops, samp_opt, &rng, on_token);
+    std::printf("\n");
+  }
+  std::printf("generated %zu ids:", out.size());
+  for (auto id : out) std::printf(" %d", id);
+  std::printf("\n");
+  if (!tok_path.empty()) {
+    KokkosDNN::Inkling::Tokenizer tok(tok_path);
+    std::printf("decoded: %s\n", tok.decode(out).c_str());
+    if (!stop_strings.empty()) {
+      // Stop-strings are checked on decoded generated text (prompt
+      // excluded so prompt content cannot false-trigger): truncate the
+      // generation before the earliest match.
+      std::vector<int> gen_ids(out.begin() + (long)prompt_ids.size(),
+                               out.end());
+      std::string gen_text = tok.decode(gen_ids);
+      std::string cut =
+          KokkosDNN::Inkling::truncate_at_stop_strings(gen_text, stop_strings);
+      if (cut.size() != gen_text.size()) {
+        std::string hit;
+        KokkosDNN::Inkling::find_stop_string(gen_text, stop_strings, &hit);
+        std::printf("stop-string hit: '%s'\n", hit.c_str());
+      }
+      std::printf("decoded (stop-strings applied): %s\n", cut.c_str());
+    }
+  } else if (!stop_strings.empty()) {
+    std::fprintf(stderr,
+                 "warning: --stop-string needs --tokenizer (decoded-text "
+                 "check); ignoring %zu stop-string(s)\n",
+                 stop_strings.size());
+  }
+  Kokkos::fence();
+  return 0;
+}
+
+int main(int argc, char** argv) {
+  Kokkos::initialize(argc, argv);
+  {
+    KokkosDNN::Common::Cli::TextGenOptions o;
+    // Upstream generation_config.json: do_sample=false (greedy), no
+    // temperature/top_k/top_p. Sampling flags below opt into samplers.
+    std::vector<std::string> wfiles;
+    std::string model_name = "inkling-2-mini";  // --model base (only model)
+    bool model_touched = false;  // explicit --model opts out of tiny default
+    bool list_tensors = false;
+    int kv_quant_override = -1;  // -1 unset, 0 = dense FP, 1 = int8 KV
+    std::string reasoning_effort = "high";
+
+    for (int i = 1; i < argc; ++i) {
+      std::string a = argv[i];
+      if (KokkosDNN::Common::Cli::try_parse_shared(a, argv, i, argc, o)) {
+        continue;
+      } else if (a == "--model" && i + 1 < argc) {
+        std::string m = argv[++i];
+        for (auto& ch : m) ch = (char)std::tolower((unsigned char)ch);
+        if (m == "inkling-2-mini" || m == "inkling" || m == "2-mini") {
+          model_name = "inkling-2-mini";
+        } else {
+          std::fprintf(stderr,
+                       "error: --model '%s': expected "
+                       "inkling-2-mini "
+                       "(aliases inkling, 2-mini, case-insensitive)\n",
+                       argv[i]);
+          Kokkos::finalize();
+          return 1;
+        }
+        model_touched = true;
+      } else if (a == "--reasoning-effort" && i + 1 < argc) {
+        reasoning_effort = argv[++i];
+      } else if (a == "--reasoning-strength" && i + 1 < argc) {
+        reasoning_effort = argv[++i];
+      } else if (a == "--reasoning" && i + 1 < argc) {
+        reasoning_effort = argv[++i];
+      } else if (a == "--kv-int8") {
+        kv_quant_override = 1;
+      } else if (a == "--kv-fp") {
+        kv_quant_override = 0;
+      } else if (a == "--kv-quant" && i + 1 < argc) {
+        std::string m = argv[++i];
+        for (auto& ch : m) ch = (char)std::tolower((unsigned char)ch);
+        if (m == "int8" || m == "kv_int8" || m == "true" || m == "1")
+          kv_quant_override = 1;
+        else if (m == "none" || m == "fp" || m == "false" || m == "0")
+          kv_quant_override = 0;
+        else {
+          std::fprintf(stderr,
+                       "error: --kv-quant '%s': expected \"int8\" or \"none\"\n",
+                       argv[i]);
+          Kokkos::finalize();
+          return 1;
+        }
+      } else if (a == "--list-tensors") {
+        list_tensors = true;
+      }
+    }
+
+    KokkosDNN::Common::Cli::resolve_random_seed(o);
+
+    try {
+      reasoning_effort =
+          KokkosDNN::Inkling::normalize_reasoning_effort(reasoning_effort);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "error: --reasoning-effort: %s\n", e.what());
+      Kokkos::finalize();
+      return 1;
+    }
+    KokkosDNN::print_configuration(std::cout);
+    wfiles = expand_weight_patterns(o.weights);
+    // --list-tensors is a header-only inspection (no model build).
+    if (list_tensors) {
+      if (wfiles.empty()) {
+        std::fprintf(stderr, "error: --list-tensors needs --weights <files>\n");
+        Kokkos::finalize();
+        return 1;
+      }
+      try {
+        std::vector<std::string> names;
+        if (wfiles.size() == 1 && is_gguf_path(wfiles[0]))
+          names = KokkosDNN::Inkling::list_gguf_tensors(wfiles[0]);
+        else
+          names = KokkosDNN::Inkling::list_checkpoint_tensors(wfiles);
+        std::printf("%zu tensor(s):\n", names.size());
+        for (auto& n : names) std::printf("  %s\n", n.c_str());
+      } catch (const std::exception& e) {
+        std::fprintf(stderr, "error: --list-tensors: %s\n", e.what());
+        Kokkos::finalize();
+        return 1;
+      }
+      Kokkos::finalize();
+      return 0;
+    }
+    // Explicit --model opts out of the tiny default so
+    // `--model inkling-2-mini` alone runs the full-size model with random
+    // weights; explicit --tiny still forces tiny_test dims below.
+    if (model_touched && !o.tiny_explicit) o.tiny = false;
+    KokkosDNN::Inkling::Config cfg =
+        KokkosDNN::Inkling::Config::inkling_2_mini();
+    std::printf("[model %s]\n", model_name.c_str());
+    if (o.tiny) {
+      cfg = KokkosDNN::Inkling::Config::tiny_test();
+      cfg.max_seq_len = 64;
+    }
+    if (!o.config_path.empty()) {
+      try {
+        cfg = KokkosDNN::Inkling::Config::from_json_file(o.config_path, cfg);
+      } catch (const std::exception& e) {
+        std::fprintf(stderr, "error: --config '%s': %s\n",
+                     o.config_path.c_str(), e.what());
+        Kokkos::finalize();
+        return 1;
+      }
+      std::printf("[config %s] dim=%d layers=%d heads=%d kv=%d ffn=%d "
+                  "vocab=%d hdim=%d eps=%g max_seq=%d tie=%d\n",
+                  o.config_path.c_str(), cfg.dim, cfg.n_layers, cfg.n_heads,
+                  cfg.n_kv_heads, cfg.ffn_dim, cfg.vocab_size, cfg.head_dim,
+                  (double)cfg.rms_norm_eps, cfg.max_seq_len,
+                  (int)cfg.tie_word_embeddings);
+    }
+    if (o.max_seq_len > 0) cfg.max_seq_len = o.max_seq_len;
+    try {
+      cfg.validate();
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "error: invalid model config: %s\n", e.what());
+      Kokkos::finalize();
+      return 1;
+    }
+    int rc;
+    if (o.fp32) {
+      std::printf("[dtype fp32]\n");
+      rc = run_model<float>(cfg, wfiles, o.tiny, o.tokenizer_path, o.prompt,
+                            o.max_new, o.extra_stops, o.prefill_chunk,
+                            kv_quant_override, o.chat_mode, o.system_prompt,
+                            o.role, o.want_bos, o.stop_strings,
+                            reasoning_effort, o.samp);
+    } else {
+      std::printf("[dtype bfloat16]\n");
+      rc = run_model<KokkosDNN::Inkling::DefaultScalar>(
+          cfg, wfiles, o.tiny, o.tokenizer_path, o.prompt, o.max_new,
+          o.extra_stops, o.prefill_chunk, kv_quant_override, o.chat_mode,
+          o.system_prompt, o.role, o.want_bos, o.stop_strings,
+          reasoning_effort, o.samp);
+    }
+    Kokkos::finalize();
+    return rc;
+  }
+}

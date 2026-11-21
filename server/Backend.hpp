@@ -5,7 +5,8 @@
 // The HTTP layer (server_main.cpp) talks to models only through
 // KokkosDNN::Server::ChatBackend. Architecture specifics — chat template,
 // stop defaults, tool-call grammar, weight formats, session mechanics —
-// live in per-arch translation units (BackendLFM25.cpp, BackendGlimmer.cpp)
+// live in per-arch translation units (BackendLFM25.cpp, BackendGlimmer.cpp,
+// BackendInkling.cpp)
 // that register themselves by name. Adding a third architecture is a new
 // .cpp implementing ChatBackend plus a static register_backend() call (see
 // the recipe in server/README.md); no handler or CLI edits are needed.
@@ -33,6 +34,7 @@ namespace Server {
 // Canonical architecture names served by the registry.
 inline constexpr const char* kArchLFM25 = "lfm2.5";
 inline constexpr const char* kArchGlimmer = "glimmer";
+inline constexpr const char* kArchInkling = "inkling";
 
 // ---------------------------------------------------------------------------
 // Neutral request/session vocabulary (no per-arch types leak into handlers)
@@ -106,11 +108,12 @@ class StreamParser {
 };
 
 // Everything load() needs: resolved arch + model id, optional config
-// overlay, one (LFM25 GGUF) or more (Glimmer sharded safetensors / globs)
-// weight paths, tokenizer path or directory, context override, Glimmer KV
-// precision + prefill-chunk overrides (-1 = keep the config file / preset
-// value, matching the glimmer_generate driver), and the prefix-cache
-// placement flag (device vs host entry storage; both arches honor it).
+// overlay, one (LFM25 GGUF) or more (Glimmer/Inkling sharded safetensors /
+// globs) weight paths, tokenizer path or directory, context override,
+// Glimmer/Inkling KV precision + prefill-chunk overrides (-1 = keep the
+// config file / preset value, matching the *_generate drivers), and the
+// prefix-cache placement flag (device vs host entry storage; all arches
+// honor it).
 struct LoadOptions {
   std::string arch = kArchLFM25;
   std::string model_id;
@@ -132,7 +135,7 @@ class ChatBackend {
  public:
   virtual ~ChatBackend() = default;
 
-  // Registry name ("lfm2.5" | "glimmer").
+  // Registry name ("lfm2.5" | "glimmer" | "inkling").
   virtual const std::string& arch() const = 0;
   // Served model id when --model is absent (e.g. "lfm2_5", "glimmer-30b").
   virtual std::string default_model_id() const = 0;
@@ -159,8 +162,10 @@ class ChatBackend {
   // none); `system_suffix` carries tool_choice/response_format directives.
   // add_generation_prompt=false encodes the cacheable history prefix (same
   // encoding without the trailing generation prompt). `reasoning_strength`
-  // is the Glimmer RLed cue ("low"|"medium"|"high"|"xhigh", default "high");
-  // non-Glimmer backends ignore it.
+  // is the Glimmer RLed cue ("low"|"medium"|"high"|"xhigh", default "high")
+  // or the Inkling thinking-effort cue ("none"|"minimal"|"low"|"medium"|
+  // "high"|"xhigh"|"max" or a float in [0.0, 0.99], default "high");
+  // other backends ignore it.
   virtual std::vector<int> encode(const std::vector<ServerChatMessage>& messages,
                                   const std::string& tools_json,
                                   const std::string& system_suffix,
@@ -235,15 +240,21 @@ inline std::string normalize_arch_name(std::string name) {
   if (name == kArchGlimmer || name == "glimmer-30b" || name == "glimmer30b" ||
       name == "glimmer-30b-heretic")
     return kArchGlimmer;
+  if (name == kArchInkling || name == "inkling-2-mini" ||
+      name == "inkling2mini" || name == "inkling-2mini")
+    return kArchInkling;
   return "";
 }
 
 // Best-effort arch sniff of a model config file. Returns "lfm2.5",
-// "glimmer", or "" when the file carries no discriminating marker (e.g. a
-// minimal {"max_seq_len": ...} overlay) or cannot be read. Markers:
+// "glimmer", "inkling", or "" when the file carries no discriminating
+// marker (e.g. a minimal {"max_seq_len": ...} overlay) or cannot be read.
+// Markers:
 //   glimmer: "text_config" (full HF config), "layer_rope_theta",
 //            "qk_scale_factor", "muse_glimmer".
 //   lfm2.5:  "lfm2_moe" (model_type), "num_experts", "hidden_act".
+//   inkling: "inkling" anywhere (model_type / arch strings; the component
+//            schema is still landing, so this stays a substring check).
 inline std::string detect_config_arch(const std::string& path) {
   if (path.empty()) return "";
   std::string text;
@@ -263,8 +274,11 @@ inline std::string detect_config_arch(const std::string& path) {
   const bool lfm25 = text.find("lfm2_moe") != std::string::npos ||
                      text.find("\"num_experts\"") != std::string::npos ||
                      text.find("\"hidden_act\"") != std::string::npos;
+  const bool inkling = text.find("inkling") != std::string::npos ||
+                       text.find("Inkling") != std::string::npos;
   if (glimmer && !lfm25) return kArchGlimmer;
   if (lfm25 && !glimmer) return kArchLFM25;
+  if (inkling && !glimmer && !lfm25) return kArchInkling;
   return "";
 }
 

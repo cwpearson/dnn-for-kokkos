@@ -3,18 +3,19 @@
 # kokkosdnn_server: OpenAI-compatible HTTP front-end.
 # Thin binary: owns Kokkos::initialize/finalize, parses CLI flags, loads one
 # model backend (KokkosDNN::Server::ChatBackend; per-arch code in
-# BackendLFM25.cpp / BackendGlimmer.cpp), and serves OpenAI routes via
-# cpp-httplib. All inference, sampling, and chat logic belongs in
-# models/* — the server only translates HTTP <-> backend calls.
+# BackendLFM25.cpp / BackendGlimmer.cpp / BackendInkling.cpp), and serves
+# OpenAI routes via cpp-httplib. All inference, sampling, and chat logic
+# belongs in models/* — the server only translates HTTP <-> backend calls.
 # Requires at least one model component. The Glimmer backend additionally
 # needs the models/glimmer component (KokkosDNN::glimmer target); without it
 # BackendGlimmer.cpp compiles to a stub whose load() reports the missing
-# component.
+# component. Same for the Inkling backend (models/inkling component,
+# KokkosDNN::inkling target, BackendInkling.cpp).
 
-if(NOT KokkosDNN_ENABLE_MODEL_LFM25 AND NOT KokkosDNN_ENABLE_MODEL_GLIMMER)
+if(NOT KokkosDNN_ENABLE_MODEL_LFM25 AND NOT KokkosDNN_ENABLE_MODEL_GLIMMER AND NOT KokkosDNN_ENABLE_MODEL_INKLING)
   message(FATAL_ERROR
     "KokkosDNN_ENABLE_SERVER requires at least one model component "
-    "(KokkosDNN_ENABLE_MODEL_LFM25=ON and/or KokkosDNN_ENABLE_MODEL_GLIMMER=ON).")
+    "(KokkosDNN_ENABLE_MODEL_LFM25=ON, KokkosDNN_ENABLE_MODEL_GLIMMER=ON and/or KokkosDNN_ENABLE_MODEL_INKLING=ON).")
 endif()
 if(KokkosDNN_ENABLE_MODEL_GLIMMER AND NOT TARGET KokkosDNN::glimmer)
   message(FATAL_ERROR
@@ -46,8 +47,11 @@ kokkosdnn_suppress_third_party_warnings(httplib)
 kokkosdnn_suppress_third_party_warnings(nlohmann_json)
 
 # Backend availability: per-arch compile definitions select the real
-# implementation in Backend{ LFM25,Glimmer}.cpp; without them the TU
+# implementation in Backend{ LFM25,Glimmer,Inkling}.cpp; without them the TU
 # compiles to a load()-time stub so the arch name still resolves.
+# NOTE: the inkling key is TARGET-based (not option-based like LFM25) so a
+# configure with -DKokkosDNN_ENABLE_MODEL_INKLING=ON stays green until the
+# models/inkling component lands; the backend then builds as the stub.
 set(KOKKOSDNN_SERVER_BACKEND_DEFS "")
 set(KOKKOSDNN_SERVER_BACKEND_LIBS "")
 if(KokkosDNN_ENABLE_MODEL_LFM25)
@@ -58,8 +62,12 @@ if(TARGET KokkosDNN::glimmer)
   list(APPEND KOKKOSDNN_SERVER_BACKEND_DEFS KOKKOSDNN_SERVER_HAVE_GLIMMER)
   list(APPEND KOKKOSDNN_SERVER_BACKEND_LIBS KokkosDNN::glimmer)
 endif()
+if(TARGET KokkosDNN::inkling)
+  list(APPEND KOKKOSDNN_SERVER_BACKEND_DEFS KOKKOSDNN_SERVER_HAVE_INKLING)
+  list(APPEND KOKKOSDNN_SERVER_BACKEND_LIBS KokkosDNN::inkling)
+endif()
 
-set(KOKKOSDNN_SERVER_BACKEND_SOURCES BackendLFM25.cpp BackendGlimmer.cpp)
+set(KOKKOSDNN_SERVER_BACKEND_SOURCES BackendLFM25.cpp BackendGlimmer.cpp BackendInkling.cpp)
 
 # Both binaries share the backend TUs, definitions, and links; the parsing
 # test only swaps the main TU (it #includes server_main.cpp with NO_MAIN).

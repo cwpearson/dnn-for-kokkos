@@ -12,6 +12,13 @@ endif()
 if(KokkosDNN_ENABLE_MODEL_GLIMMER)
   add_subdirectory(glimmer)
 endif()
+# The inkling component lands separately (sibling workstream): the EXISTS
+# guard keeps configure green with -DKokkosDNN_ENABLE_MODEL_INKLING=ON
+# until models/inkling/CMakeLists.txt exists. Downstream (server, examples)
+# key off TARGET KokkosDNN::inkling so they stub out meanwhile.
+if(KokkosDNN_ENABLE_MODEL_INKLING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/inkling/CMakeLists.txt")
+  add_subdirectory(inkling)
+endif()
 if(KokkosDNN_ENABLE_MODEL_MOSS)
   add_subdirectory(moss_image)
 endif()

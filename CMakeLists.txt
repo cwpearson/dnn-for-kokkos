@@ -31,12 +31,14 @@ option(KokkosDNN_ENABLE_IMAGE "Build optional image I/O component (stb-based JPE
 option(KokkosDNN_ENABLE_IMAGE_WEBP "Enable WebP decode/encode in the image component (libwebp, system or fetched)" ON)
 option(KokkosDNN_ENABLE_MODEL_LFM25 "Build LFM2.5 model component (KokkosDNN::lfm25)" ON)
 option(KokkosDNN_ENABLE_MODEL_GLIMMER "Build Muse Glimmer 30B text model component (KokkosDNN::glimmer)" ON)
+option(KokkosDNN_ENABLE_MODEL_INKLING "Build Thinking Machines Inkling 2 Mini text model component (KokkosDNN::inkling)" ON)
 option(KokkosDNN_ENABLE_MODEL_MOSS "Build MOSS-Image model component (KokkosDNN::moss)" ON)
 option(KokkosDNN_ENABLE_MODEL_QWEN_IMAGE_21 "Build Qwen-Image-2.1 model component (KokkosDNN::qwen_image_21)" ON)
 # Server is OFF by default to keep existing CI builds unaffected (its
 # FetchContent deps touch the network at configure time).
 # -DKokkosDNN_ENABLE_SERVER=ON to build kokkosdnn_server
-# (requires KokkosDNN_ENABLE_MODEL_LFM25=ON).
+# (requires at least one of KokkosDNN_ENABLE_MODEL_LFM25=ON,
+# KokkosDNN_ENABLE_MODEL_GLIMMER=ON, KokkosDNN_ENABLE_MODEL_INKLING=ON).
 option(KokkosDNN_ENABLE_SERVER "Build OpenAI-compatible HTTP server" OFF)
 option(KokkosDNN_ENABLE_COMPILER_WARNINGS "Enable compiler warnings (as errors, mirroring Kokkos_ENABLE_COMPILER_WARNINGS)" OFF)
 option(BUILD_SHARED_LIBS "Build shared libraries" OFF)
