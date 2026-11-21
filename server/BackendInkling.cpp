@@ -47,15 +47,21 @@
 // are rejected with 400 in server_main.cpp parse_messages (arch-agnostic,
 // same as the other backends) — no backend change needed.
 //
-// Session mechanics: TODO — no models/inkling component exists yet. All
-// `Inkling::` names below (Config, Weights, Tokenizer, Session,
-// SessionOptions, ISession, make_chat_messages, encode_chatml_with_tools,
-// default_stop_strings, CachedPrefillOutcome, StepOutcome) are PLACEHOLDERS
-// mirroring the models/glimmer API surface (Glimmer::Session behind
-// Glimmer::ISession); adjust to the real component API when it lands. This
-// file only translates the neutral server vocabulary to/from it, mirroring
+// Session mechanics: all inference, sampling, and chat logic runs through
+// models/inkling (Inkling::Session behind Inkling::ISession); this file
+// only translates the neutral server vocabulary to/from it, mirroring
 // BackendGlimmer.cpp (long-lived session, device/host cache placement from
 // --prefix-cache-host).
+//
+// Assumed models/inkling API surface (Glimmer parity; TODO(models/inkling):
+// confirm each name in KokkosDNN_Inkling{Config,Session,Tokenizer,Weights}.hpp
+// when the component lands — Inkling::DefaultScalar, Config::inkling_2_mini(),
+// Config::from_json_file(path), Config::{max_seq_len,prefill_chunk_size,
+// kv_int8,eos_token,validate,kv_cache_bytes}, Weights<Exec,Scalar>{allocate},
+// load_gguf/load_safetensors(cfg,...), Tokenizer(path)/decode,
+// ChatMessage/ToolCall/make_chat_messages/encode_chatml_with_tools/
+// default_stop_strings, SessionOptions/ISession/CachedPrefillOutcome/
+// StepOutcome, Session<Exec,Scalar[,HostSpace]>).
 //
 // Without KOKKOSDNN_SERVER_HAVE_INKLING this TU compiles to a stub backend
 // whose load() fails with a clear message, so "inkling" still resolves in
@@ -64,11 +70,8 @@
 
 #ifdef KOKKOSDNN_SERVER_HAVE_INKLING
 
-// TODO(models/inkling): these headers do not exist yet. Create
-// models/inkling with KokkosDNN_Inkling{Config,Session,Tokenizer,Weights}.hpp
-// exposing the placeholder API used below, then wire the
-// KokkosDNN::inkling target + KOKKOSDNN_SERVER_HAVE_INKLING define in
-// server/CMakeLists.txt (see the wiring patch in this file's report).
+// Models/inkling component headers (KokkosDNN::inkling target,
+// models/inkling/KokkosDNN_Inkling{Config,Session,Tokenizer,Weights}.hpp).
 #include <KokkosDNN_InklingConfig.hpp>
 #include <KokkosDNN_InklingSession.hpp>
 #include <KokkosDNN_InklingTokenizer.hpp>
@@ -168,10 +171,10 @@ std::string normalize_inkling_reasoning_effort(const std::string& v) {
 // Pass-through channel splitter: no tool grammar is wired yet (the upstream
 // <|content_invoke_tool_json|> invoke blocks are NOT parsed here), so every
 // raw piece streams as display text and finish() returns it verbatim with
-// no reasoning trace and no tool calls. TODO: replace with a real
-// <|content_thinking|> / <|content_invoke_tool_json|> channel parser (plus
-// supports_tools()=true) once the invoke-JSON grammar is confirmed against
-// the real tokenizer/component.
+// no reasoning trace and no tool calls. TODO(models/inkling): replace with
+// a real <|content_thinking|> / <|content_invoke_tool_json|> channel parser
+// in KokkosDNN_InklingTokenizer.hpp (plus supports_tools()=true) once the
+// invoke-JSON grammar is confirmed against the real tokenizer/component.
 class InklingStreamParser final : public StreamParser {
  public:
   explicit InklingStreamParser(const std::vector<std::string>& /*stops*/) {}
@@ -193,9 +196,7 @@ class InklingStreamParser final : public StreamParser {
 class InklingBackend final : public ChatBackend {
  public:
   const std::string& arch() const override {
-    // TODO: return kArchInkling once Backend.hpp declares it (wiring patch
-    // below). Literal keeps this TU compilable without that header edit.
-    static const std::string a = "inkling";
+    static const std::string a = kArchInkling;
     return a;
   }
   std::string default_model_id() const override { return "inkling-2-mini"; }
@@ -214,8 +215,9 @@ class InklingBackend final : public ChatBackend {
     try {
       model_id_ = opts.model_id;
       // TODO(models/inkling): confirm the preset constructor name and the
-      // config-file schema (expect max_seq_len up to 1048576 per
-      // tokenizer_config.json model_max_length).
+      // config-file schema in KokkosDNN_InklingConfig.hpp (expect
+      // max_seq_len up to 1048576 per tokenizer_config.json
+      // model_max_length).
       cfg_ = opts.config_path.empty() ? Inkling::Config::inkling_2_mini()
                                       : Inkling::Config::from_json_file(
                                             opts.config_path);
@@ -287,9 +289,9 @@ class InklingBackend final : public ChatBackend {
     return s;
   }
   std::vector<std::string> default_stop_strings() const override {
-    // TODO(models/inkling): confirm against the real component. Terminator
-    // text as a belt-and-braces backup for the eos id, mirroring Glimmer's
-    // {"<|eot|>"}; <|end_message|> must NOT be added (structural).
+    // TODO(models/inkling): confirm against KokkosDNN_InklingTokenizer.hpp.
+    // Terminator text as a belt-and-braces backup for the eos id, mirroring
+    // Glimmer's {"<|eot|>"}; <|end_message|> must NOT be added (structural).
     return Inkling::default_stop_strings();
   }
   // TODO: flip to true with the invoke-JSON tool grammar (template declares
@@ -316,12 +318,13 @@ class InklingBackend final : public ChatBackend {
                           bool add_generation_prompt,
                           const std::string& reasoning_strength = "high") const override {
     // Validate the effort cue here so unknown values are a 400 even before
-    // the models/inkling component lands (mirrors Glimmer's
-    // reasoning_strength handling; the component's own encode must also
-    // raise on unknown values per the template's raise_exception).
+    // the models/inkling component encodes (mirrors Glimmer's
+    // reasoning_strength handling; the component's own encode in
+    // KokkosDNN_InklingTokenizer.hpp must also raise on unknown values per
+    // the template's raise_exception).
     (void)normalize_inkling_reasoning_effort(reasoning_strength);
-    // TODO(models/inkling): confirm the encode entry point. Upstream effort
-    // keys (none/minimal/low/medium/high/xhigh/max) already cover the
+    // TODO(models/inkling): confirm the encode entry point in
+    // KokkosDNN_InklingTokenizer.hpp. Upstream effort keys (none/minimal/low/medium/high/xhigh/max) already cover the
     // server's reasoning_strength vocabulary (default "high"), so the value
     // forwards verbatim like Glimmer's RLed cue; the component renders the
     // numeric 'Thinking effort level: N' message and the tool_declare /
@@ -453,8 +456,7 @@ class InklingBackend final : public ChatBackend {
 namespace {
 struct InklingRegistrar {
   InklingRegistrar() {
-    // TODO: register under kArchInkling once Backend.hpp declares it.
-    register_backend("inkling",
+    register_backend(kArchInkling,
                      []() { return std::make_unique<InklingBackend>(); });
   }
 };
@@ -474,8 +476,7 @@ namespace Impl {
 class InklingUnavailable final : public ChatBackend {
  public:
   const std::string& arch() const override {
-    // TODO: return kArchInkling once Backend.hpp declares it.
-    static const std::string a = "inkling";
+    static const std::string a = kArchInkling;
     return a;
   }
   std::string default_model_id() const override { return "inkling-2-mini"; }
@@ -528,8 +529,7 @@ class InklingUnavailable final : public ChatBackend {
 namespace {
 struct InklingRegistrar {
   InklingRegistrar() {
-    // TODO: register under kArchInkling once Backend.hpp declares it.
-    register_backend("inkling",
+    register_backend(kArchInkling,
                      []() { return std::make_unique<InklingUnavailable>(); });
   }
 };

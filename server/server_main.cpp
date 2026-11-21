@@ -282,8 +282,10 @@ struct CliOptions {
         "OpenAI-compatible inference server for KokkosDNN (multi-architecture).\n"
         "\n"
         "Options:\n"
-        "  --arch ARCH     model architecture to serve: 'lfm2.5' or 'glimmer'\n"
-        "                    (aliases: lfm2_5/lfm25, glimmer-30b/muse-glimmer).\n"
+        "  --arch ARCH     model architecture to serve: 'lfm2.5', 'glimmer',\n"
+        "                    or 'inkling'\n"
+        "                    (aliases: lfm2_5/lfm25, glimmer-30b/muse-glimmer,\n"
+        "                    inkling-2-mini).\n"
         "                    Default: auto-detect from --config, else lfm2.5.\n",
         argv[0]);
     std::printf(
@@ -291,9 +293,9 @@ struct CliOptions {
         "  --model ID        model identifier to serve (default: arch default\n"
         "                    'lfm2_5' / 'glimmer-30b')\n"
         "  --weights PATH    checkpoint to load (repeatable; globs allowed).\n"
-        "                    lfm2.5: exactly one GGUF file. glimmer: one .gguf\n"
-        "                    file or one or more safetensors shards (globs\n"
-        "                    like 'model-*.safetensors' are expanded).\n"
+        "                    lfm2.5: exactly one GGUF file. glimmer/inkling:\n"
+        "                    one .gguf file or one or more safetensors shards\n"
+        "                    (globs like 'model-*.safetensors' are expanded).\n"
         "  --tokenizer PATH  tokenizer.json path or directory (required)\n"
         "  --config PATH     optional model config JSON overlay (base: arch\n"
         "                    preset). Also used to auto-detect --arch when it\n"
@@ -349,7 +351,7 @@ struct CliOptions {
       if (!need_value("--arch", v)) return 1;
       const std::string canon = Server::normalize_arch_name(v);
       if (canon.empty()) {
-        std::printf("Unknown --arch '%s' (expected 'lfm2.5' or 'glimmer')\n",
+        std::printf("Unknown --arch '%s' (expected 'lfm2.5', 'glimmer', or 'inkling')\n",
                     v.c_str());
         return 1;
       }
@@ -701,10 +703,11 @@ bool parse_common(const json& body, const std::vector<int>& default_stop_ids,
     }
     out.parallel_tool_calls = body["parallel_tool_calls"].get<bool>();
   }
-  // reasoning_effort: OpenAI reasoning cue ("low"|"medium"|"high"|"xhigh",
-  // default "high"). Type-checked here for every arch; the Glimmer backend
-  // validates the value at encode time (400 on unknown), other backends
-  // ignore it.
+  // reasoning_effort: OpenAI reasoning cue ("low"|"medium"|"high"|"xhigh"
+  // for Glimmer; "none"|"minimal"|"low"|"medium"|"high"|"xhigh"|"max" or a
+  // float in [0.0, 0.99] for Inkling; default "high"). Type-checked here
+  // for every arch; the Glimmer/Inkling backends validate the value at
+  // encode time (400 on unknown), other backends ignore it.
   if (body.contains("reasoning_effort") &&
       !body["reasoning_effort"].is_null()) {
     if (!body["reasoning_effort"].is_string()) {
