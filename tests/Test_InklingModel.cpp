@@ -1339,5 +1339,65 @@ TEST(InklingModel, RawResidualNoGateBias) {
       << "maxdiff=" << max_abs_diff(got, want);
 }
 
+// Team-parallel attention must reproduce the legacy kernel bit-for-bit
+// (same per-element op order; scores staged in team scratch instead of
+// recomputed). Direct kernel-vs-kernel check across decode/prefill shapes,
+// sliding + full windows, and an empty-row edge.
+template <class Scalar>
+void check_attention_team_matches_legacy(size_t C, size_t H, size_t N,
+                                         size_t HD, size_t R, size_t E,
+                                         size_t q_off, size_t window,
+                                         unsigned seed) {
+  using V3 = Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec>;
+  using V2 = Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec>;
+  using VF = Kokkos::View<float**, Kokkos::LayoutRight, Exec>;
+  Kokkos::Random_XorShift64_Pool<Exec> pool(seed);
+  V3 q("q", C, H, HD), k("k", N, H > 0 ? 2 : 1, HD), v("v", N, 2, HD);
+  // H must be a multiple of Hkv = 2 here.
+  V3 rel("rel", C, H, R), out_t("out_t", C, H, HD),
+      out_l("out_l", C, H, HD);
+  V2 sink("sink", C, H);
+  VF proj("proj", R, E);
+  Kokkos::fill_random(q, pool, (Scalar)-1, (Scalar)1);
+  Kokkos::fill_random(k, pool, (Scalar)-1, (Scalar)1);
+  Kokkos::fill_random(v, pool, (Scalar)-1, (Scalar)1);
+  Kokkos::fill_random(rel, pool, (Scalar)-1, (Scalar)1);
+  Kokkos::fill_random(sink, pool, (Scalar)-1, (Scalar)1);
+  Kokkos::fill_random(proj, pool, -1.0f, 1.0f);
+  const float scale = 1.0f / std::sqrt((float)HD);
+  KokkosDNN::Inkling::Impl::inkling_attention_forward<Exec, Scalar>(
+      q, k, v, q_off, window, rel, proj, sink, scale, E, out_t);
+  KokkosDNN::Inkling::Impl::inkling_attention_forward_legacy<Exec, Scalar>(
+      q, k, v, q_off, window, rel, proj, sink, scale, E, out_l);
+  Kokkos::fence();
+  auto ht = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), out_t);
+  auto hl = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), out_l);
+  ASSERT_EQ(ht.size(), hl.size());
+  for (size_t i = 0; i < ht.size(); ++i)
+    EXPECT_FLOAT_EQ(static_cast<float>(ht.data()[i]),
+                    static_cast<float>(hl.data()[i]))
+        << "team vs legacy mismatch at " << i << " (C=" << C << " H=" << H
+        << " N=" << N << " window=" << window << " q_off=" << q_off << ")";
+}
+
+TEST(InklingModel, AttentionTeamMatchesLegacy) {
+  // Decode-like: single row, few keys, sliding + full.
+  check_attention_team_matches_legacy<float>(1, 4, 5, 8, 4, 32, 4, 1024, 7);
+  check_attention_team_matches_legacy<float>(1, 4, 5, 8, 4, 32, 4, 0, 8);
+  // Prefill-like: multiple rows, sliding window narrower than context.
+  check_attention_team_matches_legacy<float>(3, 4, 9, 8, 4, 32, 6, 4, 9);
+  check_attention_team_matches_legacy<float>(3, 4, 9, 8, 4, 32, 0, 0, 10);
+  // Empty rows: window excludes every key (khi < klo zeroes the row).
+  check_attention_team_matches_legacy<float>(1, 4, 2, 8, 4, 32, 9, 2, 11);
+  // Real head width.
+  check_attention_team_matches_legacy<float>(1, 8, 11, 128, 16, 128, 10, 1024,
+                                            12);
+  // bhalf (the deployed scalar): same op order, so bitwise too.
+  using bhalf_t = Kokkos::Experimental::bhalf_t;
+  check_attention_team_matches_legacy<bhalf_t>(1, 4, 5, 8, 4, 32, 4, 1024, 13);
+  check_attention_team_matches_legacy<bhalf_t>(1, 8, 11, 128, 16, 128, 10,
+                                              1024, 14);
+}
+
 }  // namespace
 

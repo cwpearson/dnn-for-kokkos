@@ -441,8 +441,12 @@ void check_inkling_gates(float tol) {
     Kokkos::deep_copy(gain, c);
   }
   Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> mout("mout", T, D);
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> rms_x("rms_x", T, D),
+      rms_m("rms_m", T, D);
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> mh("mh", T, R);
   KokkosDNN::inkling_message_gate<Exec, Scalar>(x, msg, down, forget, gain,
-                                               1e-6f, mout);
+                                               1e-6f, mout, rms_x, rms_m,
+                                               mh);
   Kokkos::fence();
   auto hx = to_host2(x);
   auto hmsg = to_host2(msg);

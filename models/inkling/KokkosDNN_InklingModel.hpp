@@ -147,20 +147,121 @@ bool is_full_layer(const Ids& local_ids, int n_layers, int l) {
   return !contains;
 }
 
-// Causal GQA with hidden-conditioned relative bias and attention sinks.
-// q [C,H,D], k/v [N,Hkv,D] (N = valid prefix length), rel [C,H,R]
-// post-norm relative states, proj [R,E] bias bank, sink [C,H] sink logits,
-// out [C,H,D]. Query t sits at absolute position q_off+t and attends keys
-// [0, q_off+t] (full, window==0) or [max(0,q_off+t+1-window), q_off+t]
-// (sliding). Score = scale*q.k + bias(d) with d=(q_off+t)-k and
-// bias(d)=(0<=d<E) ? rel.proj[:,d] : 0; softmax runs over [keys..., sink]
-// and the sink mass is dropped (it has a zero value). Matches
-// eager_attention_forward with position_bias + sinks + sliding mask.
-// FP32 accumulation, two passes over keys (max/sum, then weighted sum) so
-// no [D]-sized stack array is needed; backend-portable MDRange kernel.
+// Team-parallel causal GQA worker: one team per (token, head), threads split
+// the head dim. Scores are computed once per (t, h, key) by the team leader
+// into team scratch and shared across the d-split weighted sum, instead of
+// being recomputed per (t, h, d, key) as in the legacy MDRange kernel below.
+// At decode (C == 1) the legacy form leaves one thread grinding ~200k FLOP
+// through dependent scalar chains (~4 ms/launch on RTX 3090); the team form
+// is bit-identical (same per-element op order) at ~1/30th the time.
+template <class ExecSpace, class QView, class KView, class VView, class RView,
+          class PView, class SView, class OView>
+struct InklingAttentionTeam {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  QView q;
+  KView k;
+  VView v;
+  size_t q_off;
+  size_t window;
+  RView rel;
+  PView proj;
+  SView sink;
+  float scale;
+  size_t rel_extent;
+  OView out;
+  size_t C, H, D, N, Hkv, R, E, grp;
+  size_t Kmax;  // team-scratch floats per team (>= max keys per (t,h) row)
+
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& team) const {
+    // Bind members to locals: device lambdas must not capture `this`
+    // (deprecated in C++20, and the build treats warnings as errors).
+    const QView q_ = q;
+    const KView k_ = k;
+    const VView v_ = v;
+    const RView rel_ = rel;
+    const PView proj_ = proj;
+    const SView sink_ = sink;
+    const OView out_ = out;
+    const size_t H_ = H, D_ = D, N_ = N;
+    const size_t R_ = R, E_ = E, grp_ = grp, Kmax_ = Kmax;
+    const size_t q_off_ = q_off, window_ = window;
+    const float scale_ = scale;
+    const size_t th = static_cast<size_t>(team.league_rank());
+    const size_t t = th / H_, h = th % H_;
+    const size_t hkv = h / grp_;
+    const size_t qt = q_off_ + t;
+    size_t klo = 0;
+    if (window_ > 0 && qt + 1 > window_) klo = qt + 1 - window_;
+    size_t khi = qt;
+    if (khi >= N_) khi = N_ - 1;
+    if (khi < klo) {
+      Kokkos::parallel_for(
+          Kokkos::TeamThreadRange(team, D_), KOKKOS_LAMBDA(size_t d) {
+            out_(t, h, d) = static_cast<typename OView::value_type>(0);
+          });
+      return;
+    }
+    // m/denom are rank-0 values consumed by every thread: they live in
+    // scratch (a per-thread stack copy would leave other threads dividing
+    // by their own zero). Layout: scores[Kmax], rden[1].
+    float* sc = static_cast<float*>(
+        team.team_scratch(1).get_shmem(sizeof(float) * (Kmax_ + 1)));
+    float* sc_rden = sc + Kmax_;
+    // Passes 1-2 (leader): identical op order to the legacy kernel; scores
+    // land in scratch for the d-split pass 3 instead of being recomputed.
+    if (team.team_rank() == 0) {
+      float m = 0, denom = 0;
+      const float sk = static_cast<float>(sink_(t, h));
+      m = sk;
+      for (size_t kk = klo; kk <= khi; ++kk) {
+        float dot = 0;
+        for (size_t d = 0; d < D_; ++d)
+          dot += static_cast<float>(q_(t, h, d)) *
+                 static_cast<float>(k_(kk, hkv, d));
+        float s = dot * scale_;
+        const long dist = static_cast<long>(qt) - static_cast<long>(kk);
+        if (dist >= 0 && static_cast<size_t>(dist) < E_) {
+          float b = 0;
+          for (size_t r = 0; r < R_; ++r)
+            b += static_cast<float>(rel_(t, h, r)) *
+                 proj_(r, static_cast<size_t>(dist));
+          s += b;
+        }
+        sc[kk - klo] = s;
+        if (s > m) m = s;
+      }
+      denom = Kokkos::expf(sk - m);
+      for (size_t kk = klo; kk <= khi; ++kk) {
+        const float e = Kokkos::expf(sc[kk - klo] - m);
+        sc[kk - klo] = e;
+        denom += e;
+      }
+      sc_rden[0] = 1.0f / denom;
+    }
+    team.team_barrier();
+    const float rden = sc_rden[0];
+    // Pass 3: threads split d; each (t,h,d) accumulates keys in kk order
+    // over the staged scores, exactly like the legacy kernel.
+    Kokkos::parallel_for(
+        Kokkos::TeamThreadRange(team, D_), KOKKOS_LAMBDA(size_t d) {
+          float acc = 0;
+          for (size_t kk = klo; kk <= khi; ++kk)
+            acc += sc[kk - klo] * static_cast<float>(v_(kk, hkv, d));
+          out_(t, h, d) = acc * rden;
+        });
+  }
+};
+
+// Legacy single-thread-per-(t,h) form: kept as the fallback when the key
+// count exceeds the team-scratch budget (long-context full attention).
+// Matches eager_attention_forward with position_bias + sinks + sliding
+// mask. FP32 accumulation, two passes over keys (max/sum, then weighted
+// sum) so no [D]-sized stack array is needed; backend-portable MDRange
+// kernel.
 template <class ExecSpace, class Scalar, class QView, class KView, class VView,
           class RView, class PView, class SView, class OView>
-void inkling_attention_forward(
+void inkling_attention_forward_legacy(
     const QView& q, const KView& k, const VView& v, size_t q_off,
     size_t window, const RView& rel, const PView& proj, const SView& sink,
     float scale, size_t rel_extent, const OView& out,
@@ -248,6 +349,64 @@ void inkling_attention_forward(
           out(t, h, d) = static_cast<Scalar>(acc * rden);
         }
       });
+}
+
+// Team-parallel entry point (same contract as the legacy kernel above).
+// Scores for the widest (t,h) row need Kmax team-scratch floats; beyond
+// kTeamScratchKeys keys the launch would exceed portable scratch budgets,
+// so those long-context full-attention rows keep the legacy kernel.
+// Everything else (decode, sliding prefill, short-context full) takes the
+// team path. Math is bit-identical to the legacy kernel on the team path.
+inline constexpr size_t kInklingAttnTeamScratchKeys = 8192;
+
+template <class ExecSpace, class Scalar, class QView, class KView, class VView,
+          class RView, class PView, class SView, class OView>
+void inkling_attention_forward(
+    const QView& q, const KView& k, const VView& v, size_t q_off,
+    size_t window, const RView& rel, const PView& proj, const SView& sink,
+    float scale, size_t rel_extent, const OView& out,
+    const std::string& label = "KokkosDNN::Inkling::attention") {
+  const size_t C = q.extent(0), H = q.extent(1), D = q.extent(2);
+  const size_t N = k.extent(0), Hkv = k.extent(1);
+  const size_t R = rel.extent(2), E = proj.extent(1);
+  if (v.extent(0) != N || v.extent(1) != Hkv || v.extent(2) != D ||
+      k.extent(2) != D || rel.extent(0) != C || rel.extent(1) != H ||
+      proj.extent(0) != R || sink.extent(0) != C || sink.extent(1) != H ||
+      out.extent(0) != C || out.extent(1) != H || out.extent(2) != D ||
+      Hkv == 0 || H % Hkv != 0 || rel_extent != E)
+    throw std::invalid_argument("inkling_attention_forward: dim mismatch");
+  if (C == 0 || H == 0 || D == 0 || N == 0) return;
+  const size_t grp = H / Hkv;
+  // Widest key row in this launch (closed form of the khi/klo logic in the
+  // worker): full rows span [0, q_off+C), sliding rows the last `window`.
+  const size_t nrows = q_off + C;
+  const size_t Kmax =
+      (window > 0) ? std::min(window, std::min(nrows, N)) : std::min(nrows, N);
+  if (Kmax == 0) {
+    Kokkos::deep_copy(out, typename OView::value_type());
+    return;
+  }
+  if (Kmax > kInklingAttnTeamScratchKeys) {
+    inkling_attention_forward_legacy<ExecSpace, Scalar>(
+        q, k, v, q_off, window, rel, proj, sink, scale, rel_extent, out,
+        label);
+    return;
+  }
+  int team_size = 128;
+  if ((int)D < team_size) {
+    team_size = 1;
+    while (team_size < (int)D) team_size *= 2;
+  }
+  using Policy = Kokkos::TeamPolicy<ExecSpace>;
+  Policy policy((int)(C * H), team_size);
+  // Scores plus the shared reciprocal denominator.
+  policy.set_scratch_size(
+      1, Kokkos::PerTeam(sizeof(float) * (Kmax + 1)));
+  InklingAttentionTeam<ExecSpace, QView, KView, VView, RView, PView, SView,
+                       OView>
+      f{q, k, v, q_off,    window, rel, proj, sink, scale,
+        rel_extent, out, C, H,     D,   N,    Hkv, R, E, grp, Kmax};
+  Kokkos::parallel_for(label, policy, f);
 }
 
 // True when the layer type carries packed (QuantWeight) MoE experts
@@ -350,6 +509,10 @@ class Model {
   MatR msg_buf_, tmpc_buf_, tmpc_out_buf_, tmpdyn_buf_;
   MatR tmpk_buf_, tmpk_out_buf_;
   MatR blkpack_buf_, prevpack_buf_;
+  // Message-gate scratch: pre-normed streams + hidden state (caller-owned
+  // so the gate performs no per-call device allocation).
+  MatR msg_rmsx_buf_, msg_rmsm_buf_;
+  Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace> msg_h_buf_;
   View3 retr_buf_, retr1_buf_, msg_out_buf_;
   View3 blk_buf_, pre_blk_buf_;
   View3 attn_out_buf_;
@@ -477,6 +640,7 @@ class Model {
     const size_t NKV = (size_t)cfg.n_kv_heads;
     const size_t E = (size_t)cfg.n_experts, TK = (size_t)cfg.top_k;
     const size_t II = (size_t)cfg.intermediate_size;
+    const size_t GR = (size_t)cfg.gate_rank;
     const size_t Bmax = (size_t)cfg.n_layers / (size_t)cfg.attn_res_block + 2;
     const size_t K = (size_t)cfg.sconv_kernel;
     if (C <= scratch_cap_ && h_buf_.extent(0) >= C &&
@@ -509,6 +673,10 @@ class Model {
     down_buf_ = MatR("down", C, D);
     moe_out_buf_ = MatR("moe_out", C, D);
     msg_buf_ = MatR("msg", C, D);
+    msg_rmsx_buf_ = MatR("msg_rmsx", C, D);
+    msg_rmsm_buf_ = MatR("msg_rmsm", C, D);
+    msg_h_buf_ = Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>(
+        "msg_h", C, GR);
     tmpc_buf_ = MatR("tmpc", C + K, D);
     tmpc_out_buf_ = MatR("tmpc_out", C + K, D);
     tmpk_buf_ = MatR("tmpk", C + K, HkvD);
@@ -908,6 +1076,14 @@ class Model {
     auto o2 = Kokkos::subview(o2_buf_, std::make_pair(size_t(0), C),
                               Kokkos::ALL);
     auto pos = Kokkos::subview(pos_buf_, std::make_pair(size_t(0), C));
+    // Message-gate scratch (shared across the sequential gate calls below;
+    // gate outputs never alias these buffers).
+    auto msg_rmsx = Kokkos::subview(msg_rmsx_buf_,
+                                    std::make_pair(size_t(0), C), Kokkos::ALL);
+    auto msg_rmsm = Kokkos::subview(msg_rmsm_buf_,
+                                    std::make_pair(size_t(0), C), Kokkos::ALL);
+    auto msg_h = Kokkos::subview(msg_h_buf_, std::make_pair(size_t(0), C),
+                                 Kokkos::ALL);
     Kokkos::parallel_for(
         "Inkling::pos", Kokkos::RangePolicy<ExecSpace>(0, C),
         KOKKOS_LAMBDA(size_t t) { pos(t) = (int)(cpos + t); });
@@ -970,13 +1146,14 @@ class Model {
           Kokkos::deep_copy(msgt, mk);
           Kokkos::deep_copy(moe_in, mv);
           inkling_message_gate<ExecSpace, Scalar>(
-              o2, hn, b.loop_q_down, b.loop_q_forget, b.loop_q_gain, eps, qh);
+              o2, hn, b.loop_q_down, b.loop_q_forget, b.loop_q_gain, eps, qh,
+              msg_rmsx, msg_rmsm, msg_h);
           inkling_message_gate<ExecSpace, Scalar>(
               o2, msgt, b.loop_k_down, b.loop_k_forget, b.loop_k_gain, eps,
-              kh);
+              kh, msg_rmsx, msg_rmsm, msg_h);
           inkling_message_gate<ExecSpace, Scalar>(
               o2, moe_in, b.loop_v_down, b.loop_v_forget, b.loop_v_gain, eps,
-              vh);
+              vh, msg_rmsx, msg_rmsm, msg_h);
         } else {
           Kokkos::deep_copy(qh, rq0);
           Kokkos::deep_copy(kh, qh);
@@ -1020,17 +1197,17 @@ class Model {
           Kokkos::deep_copy(hn, mq);
           inkling_message_gate<ExecSpace, Scalar>(
               qh, hn, b.loop_q_down, b.loop_q_forget, b.loop_q_gain, eps,
-              msgt);
+              msgt, msg_rmsx, msg_rmsm, msg_h);
           Kokkos::deep_copy(qh, msgt);
           Kokkos::deep_copy(hn, mk);
           inkling_message_gate<ExecSpace, Scalar>(
               kh, hn, b.loop_k_down, b.loop_k_forget, b.loop_k_gain, eps,
-              msgt);
+              msgt, msg_rmsx, msg_rmsm, msg_h);
           Kokkos::deep_copy(kh, msgt);
           Kokkos::deep_copy(hn, mv);
           inkling_message_gate<ExecSpace, Scalar>(
               vh, hn, b.loop_v_down, b.loop_v_forget, b.loop_v_gain, eps,
-              msgt);
+              msgt, msg_rmsx, msg_rmsm, msg_h);
           Kokkos::deep_copy(vh, msgt);
         }
       }
@@ -1191,7 +1368,7 @@ class Model {
         Kokkos::deep_copy(moe_in, mm);
         inkling_message_gate<ExecSpace, Scalar>(
             msgt, moe_in, b.loop_mlp_down, b.loop_mlp_forget,
-            b.loop_mlp_gain, eps, hn);
+            b.loop_mlp_gain, eps, hn, msg_rmsx, msg_rmsm, msg_h);
         rmsnorm<ExecSpace, Scalar>(hn, b.post_attn_norm, eps, moe_in);
       } else {
         rmsnorm<ExecSpace, Scalar>(msgt, b.post_attn_norm, eps, moe_in);

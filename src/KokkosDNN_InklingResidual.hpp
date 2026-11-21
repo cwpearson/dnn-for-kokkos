@@ -22,12 +22,16 @@ namespace Impl {
 
 // One (token, query) worker: norms the S+1 stacked rows (block history +
 // partial), attends with the Q-th query row, writes one [D] output row.
-// Serial inner loops: D is the model hidden size and Q <= 4, so a team
-// decomposition buys nothing here; the (T, Q) MDRange exposes the outer
-// parallelism on every backend.
+// Team-parallel over the model dim: one team per (t, q), threads split D,
+// with the S+1 norms/scores in team scratch. The legacy serial form left a
+// decode row to one thread grinding ~200KB through dependent chains
+// (~0.7 ms/launch on RTX 3090); the team form is ~50x faster. Reduction
+// order across the team's threads differs from the serial loop, so results
+// agree to FP reassociation (~1e-7 relative), not bit-for-bit.
 template <class ExecSpace, class Scalar, class BView, class PView, class QView,
           class OView>
 struct InklingAttnResidualWorker {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
   BView blocks;  // [T, S, D]
   PView partial;  // [T, D]
   QView query;    // [Q, D] FP32
@@ -37,50 +41,77 @@ struct InklingAttnResidualWorker {
   size_t D;
   float eps;
   KOKKOS_INLINE_FUNCTION
-  void operator()(size_t t, size_t q) const {
+  void operator()(const Member& team) const {
+    // Cap from the callers (S <= 64); scratch holds one norm + one score
+    // per stacked row.
+    constexpr size_t kCap = 65;
     const size_t S_ = S, Q_ = Q, D_ = D;
+    const float eps_ = eps;
+    const BView blocks_ = blocks;
+    const PView partial_ = partial;
+    const QView query_ = query;
+    const OView out_ = out;
+    const size_t t = static_cast<size_t>(team.league_rank()) / Q_;
+    const size_t q = static_cast<size_t>(team.league_rank()) % Q_;
     const float scale = 1.0f / Kokkos::sqrtf(static_cast<float>(D_));
-    // Norms of the stacked rows; S is the block count (n_blocks <= 6), so
-    // a small stack buffer keeps this register-friendly. Cap: callers pass
-    // S <= 64.
-    float inv[65];
+    float* buf = static_cast<float*>(
+        team.team_scratch(0).get_shmem(sizeof(float) * (2 * kCap + 2)));
+    float* inv = buf;
+    float* scr = buf + kCap;
+    float* m_den = buf + 2 * kCap;  // [0] = max, [1] = denom (scratch so
+                                    // [=]-captured singles can update them)
+    // Norms of the stacked rows (one TeamThreadRange reduce per row).
     for (size_t s = 0; s <= S_; ++s) {
       float ss = 0;
-      for (size_t d = 0; d < D_; ++d) {
-        const float v = (s < S_) ? static_cast<float>(blocks(t, s, d))
-                                 : static_cast<float>(partial(t, d));
-        ss += v * v;
-      }
-      inv[s] = 1.0f / Kokkos::sqrtf(ss / static_cast<float>(D_) + eps);
+      Kokkos::parallel_reduce(
+          Kokkos::TeamThreadRange(team, D_),
+          KOKKOS_LAMBDA(size_t d, float& a) {
+            const float v = (s < S_) ? static_cast<float>(blocks_(t, s, d))
+                                     : static_cast<float>(partial_(t, d));
+            a += v * v;
+          },
+          ss);
+      Kokkos::single(
+          Kokkos::PerTeam(team), KOKKOS_LAMBDA() {
+            inv[s] = 1.0f / Kokkos::sqrtf(ss / static_cast<float>(D_) + eps_);
+          });
     }
-    // Scores + softmax over the stacked rows.
-    float m = -1e30f;
-    float scr[65];
-    for (size_t s = 0; s <= S_; ++s) {
-      float a = 0;
-      for (size_t d = 0; d < D_; ++d) {
-        const float v = (s < S_) ? static_cast<float>(blocks(t, s, d))
-                                 : static_cast<float>(partial(t, d));
-        a += static_cast<float>(query(q, d)) * v * inv[s];
-      }
-      scr[s] = a * scale;
-      m = (scr[s] > m) ? scr[s] : m;
-    }
-    float denom = 0;
-    for (size_t s = 0; s <= S_; ++s) {
-      scr[s] = Kokkos::expf(scr[s] - m);
-      denom += scr[s];
-    }
-    const float rden = 1.0f / denom;
-    for (size_t d = 0; d < D_; ++d) {
-      float acc = 0;
-      for (size_t s = 0; s <= S_; ++s) {
-        const float v = (s < S_) ? static_cast<float>(blocks(t, s, d))
-                                 : static_cast<float>(partial(t, d));
-        acc += scr[s] * rden * v * inv[s];
-      }
-      out(t, q, d) = static_cast<Scalar>(acc);
-    }
+    team.team_barrier();
+    // Scores + softmax over the stacked rows (serial over S+1 <= 65 rows).
+    Kokkos::single(
+        Kokkos::PerTeam(team), KOKKOS_LAMBDA() {
+          float m = -1e30f;
+          for (size_t s = 0; s <= S_; ++s) {
+            float a = 0;
+            for (size_t d = 0; d < D_; ++d) {
+              const float v = (s < S_) ? static_cast<float>(blocks_(t, s, d))
+                                       : static_cast<float>(partial_(t, d));
+              a += static_cast<float>(query_(q, d)) * v * inv[s];
+            }
+            scr[s] = a * scale;
+            m = (scr[s] > m) ? scr[s] : m;
+          }
+          float denom = 0;
+          for (size_t s = 0; s <= S_; ++s) {
+            scr[s] = Kokkos::expf(scr[s] - m);
+            denom += scr[s];
+          }
+          m_den[0] = m;
+          m_den[1] = denom;
+        });
+    team.team_barrier();
+    const float rden = 1.0f / m_den[1];
+    // Weighted sum, threads split d, rows ascending like the serial form.
+    Kokkos::parallel_for(
+        Kokkos::TeamThreadRange(team, D_), KOKKOS_LAMBDA(size_t d) {
+          float acc = 0;
+          for (size_t s = 0; s <= S_; ++s) {
+            const float v = (s < S_) ? static_cast<float>(blocks_(t, s, d))
+                                     : static_cast<float>(partial_(t, d));
+            acc += scr[s] * rden * v * inv[s];
+          }
+          out_(t, q, d) = static_cast<Scalar>(acc);
+        });
     (void)Q_;
   }
 };
@@ -120,9 +151,17 @@ void inkling_block_attention_residual(
       Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>, QView,
       Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>>
       w{block_states, partial, query, out, S, Q, D, eps};
-  Kokkos::parallel_for(
-      label, Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {T, Q}),
-      w);
+  // One team per (t, q); threads split D (see the worker). Scratch holds
+  // 2*65 norms/scores plus max/denom.
+  int team_size = 128;
+  if ((int)D < team_size) {
+    team_size = 1;
+    while (team_size < (int)D) team_size *= 2;
+  }
+  using Policy = Kokkos::TeamPolicy<ExecSpace>;
+  Policy policy((int)(T * Q), team_size);
+  policy.set_scratch_size(0, Kokkos::PerTeam(sizeof(float) * (2 * 65 + 2)));
+  Kokkos::parallel_for(label, policy, w);
 }
 
 // MessageAttentionResidual: per-loop-layer query table [L, 4, D] (FP32)
@@ -165,11 +204,17 @@ void inkling_message_attention_residual(
       Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>, QV,
       Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>>
       w{block_states, partial, query, out, S, 4, D, eps};
-  Kokkos::parallel_for(
-      label,
-      Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({size_t(0), size_t(0)},
-                                                       {T, size_t(4)}),
-      w);
+  // One team per (t, q); threads split D (see the worker). Scratch holds
+  // 2*65 norms/scores plus max/denom.
+  int team_size = 128;
+  if ((int)D < team_size) {
+    team_size = 1;
+    while (team_size < (int)D) team_size *= 2;
+  }
+  using Policy = Kokkos::TeamPolicy<ExecSpace>;
+  Policy policy((int)(T * 4), team_size);
+  policy.set_scratch_size(0, Kokkos::PerTeam(sizeof(float) * (2 * 65 + 2)));
+  Kokkos::parallel_for(label, policy, w);
 }
 
 }  // namespace KokkosDNN
