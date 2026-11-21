@@ -7,9 +7,8 @@ Scope: add GGUF `IQ4_NL` decode/compute coverage to
 can run on a 24 GB RTX 3090, where BF16 (52 GB) and Q8_0
 (27.8 GB) do not fit.
 
-Status: **design only — zero code edits applied**
-(shared headers are under parallel-agent edit; this doc is the
-new analysis file so nothing conflicts).
+Status: **implemented** (batch 1 commit `321e013` + batch 4 view-portability
+fixes; this doc is retained as the verification record).
 
 ## 1. Verified ggml spec (upstream llama.cpp, master)
 
