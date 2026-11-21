@@ -77,20 +77,28 @@ struct InklingAttnResidualWorker {
           });
     }
     team.team_barrier();
-    // Scores + softmax over the stacked rows (serial over S+1 <= 65 rows).
+    // Scores in parallel over rows (one TeamThreadRange reduce per row;
+    // the legacy kernel ran this serially, ~35k FLOP on one thread), then
+    // a trivial serial max/softmax over the S+1 <= 65 scores.
+    for (size_t s = 0; s <= S_; ++s) {
+      float a = 0;
+      Kokkos::parallel_reduce(
+          Kokkos::TeamThreadRange(team, D_),
+          KOKKOS_LAMBDA(size_t d, float& asum) {
+            const float v = (s < S_) ? static_cast<float>(blocks_(t, s, d))
+                                     : static_cast<float>(partial_(t, d));
+            asum += static_cast<float>(query_(q, d)) * v;
+          },
+          a);
+      Kokkos::single(Kokkos::PerTeam(team), KOKKOS_LAMBDA() {
+        scr[s] = a * inv[s] * scale;
+      });
+    }
+    team.team_barrier();
     Kokkos::single(
         Kokkos::PerTeam(team), KOKKOS_LAMBDA() {
           float m = -1e30f;
-          for (size_t s = 0; s <= S_; ++s) {
-            float a = 0;
-            for (size_t d = 0; d < D_; ++d) {
-              const float v = (s < S_) ? static_cast<float>(blocks_(t, s, d))
-                                       : static_cast<float>(partial_(t, d));
-              a += static_cast<float>(query_(q, d)) * v * inv[s];
-            }
-            scr[s] = a * scale;
-            m = (scr[s] > m) ? scr[s] : m;
-          }
+          for (size_t s = 0; s <= S_; ++s) m = (scr[s] > m) ? scr[s] : m;
           float denom = 0;
           for (size_t s = 0; s <= S_; ++s) {
             scr[s] = Kokkos::expf(scr[s] - m);
