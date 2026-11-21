@@ -92,6 +92,25 @@ prompts because every chunk re-dequantizes all weights; use 512 only when the
 KV cache plus scratch must fit a tighter device-memory budget (see the 24GB
 recipe below).
 
+### Inkling 2 Mini (IQ4_NL, ~17.6 GB)
+
+Measured end-to-end over HTTP with `Inkling-2-Mini-IQ4_NL.gguf` on an RTX
+3090 24GB, `--max-seq-len 8192`, greedy (`temperature 0`), cold prefix
+cache, against llama.cpp built from source on the same GPU/file:
+
+| workload | kokkosdnn_server | llama-server |
+|---|---|---|
+| decode, 128 generated tokens (short prompt) | 24.1 tok/s | 47.7 tok/s |
+| decode, 64 generated tokens (1457-token prompt) | 19.9 tok/s | 44.4 tok/s |
+| prefill 27 tokens | 0.42 s | 0.18 s (14 tok) |
+| prefill 1457 tokens | 3.99 s (365 tok/s) | 3.19 s (456 tok/s) |
+
+Prefill is within ~1.25x (cuBLAS GEMM + dequant-once MoE); decode is ~2x
+off, dominated by per-launch overhead rather than bytes (the MoE streams
+only ~2.5 GB/token after top-8 routing): ~5000 small launches/token at
+~21 us mean launch cost. The remaining path is CUDA-graph capture of the
+fixed-shape decode step, tracked as follow-up work.
+
 ## Docker
 
 One image serves EITHER LFM2.5 OR Glimmer — the builder compiles both
