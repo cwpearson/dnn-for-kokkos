@@ -103,6 +103,7 @@
 #include "KokkosDNN_Handle.hpp"
 #include "KokkosDNN_InklingConv.hpp"
 #include "KokkosDNN_InklingGates.hpp"
+#include "KokkosDNN_InklingMoeDecode.hpp"
 #include "KokkosDNN_InklingNorm.hpp"
 #include "KokkosDNN_InklingRelBias.hpp"
 #include "KokkosDNN_InklingResidual.hpp"
@@ -559,6 +560,11 @@ class Model {
   MatR deq_qkv_, deq_kv_, deq_o_, deq_rel_, deq_sink_, deq_router_, deq_dyn_;
   MatR deq_moe_gu_, deq_moe_d_;
   Kokkos::View<uint8_t*, ExecSpace> q8_act_buf_;
+  // Fused MoE decode scratch: one activation row per routed slot.
+  MatR moe_fused_act_buf_;
+  // Device expert-table cache for the fused MoE decode path (rebuilt only
+  // when the source weight vectors change).
+  Impl::InklingMoeTableCache<ExecSpace> moe_tables_;
   View1 last_buf_, logits_buf_;
   size_t scratch_cap_ = 0;
 
@@ -697,6 +703,7 @@ class Model {
     gu_buf_ = MatR("gu", C, 2 * II);
     act_buf_ = MatR("act", C, II);
     moe_gate_buf_ = MatR("moe_gate", C, II);
+    moe_fused_act_buf_ = MatR("moe_fused_act", TK, II);
     moe_up_buf_ = MatR("moe_up", C, II);
     down_buf_ = MatR("down", C, D);
     moe_out_buf_ = MatR("moe_out", C, D);
@@ -987,6 +994,26 @@ class Model {
       Kokkos::View<Scalar*, ExecSpace> empty("empty", 0);
       moe_route_sigmoid<ExecSpace, Scalar>(logits, empty, (int)TK, true,
                                            cfg.route_scale, idx, w);
+    }
+    // Fused decode fast path: one token, packed experts with grouped-dot
+    // eligible dtypes. Two launches, zero host fences (idx/wts stay on
+    // device); the host-grouped loop below is the fallback for C > 1,
+    // dense experts, or exotic packed dtypes.
+    if constexpr (Impl::HasPackedExperts<std::decay_t<decltype(b)>>) {
+      if (C == 1 && !b.gate_up_exps_q.empty() &&
+          !b.down_exps_q.empty() &&
+          Impl::moe_decode_fused_supported(
+              b.gate_up_exps_q[0].dtype, (size_t)cfg.d_model,
+              b.down_exps_q[0].dtype, (size_t)cfg.intermediate_size)) {
+        moe_tables_.ensure(b.gate_up_exps_q, b.down_exps_q);
+        auto act_f = Kokkos::subview(moe_fused_act_buf_,
+                                     std::make_pair(size_t(0), TK),
+                                     Kokkos::ALL);
+        Impl::inkling_moe_decode_fused<ExecSpace, Scalar>(
+            mn, moe_tables_.gu, moe_tables_.down, idx, w, act_f, out,
+            cfg.gate_softcap, cfg.up_softcap);
+        return;
+      }
     }
     auto idx_h = Kokkos::subview(moe_idx_host_, std::make_pair(size_t(0), C),
                                  Kokkos::ALL);

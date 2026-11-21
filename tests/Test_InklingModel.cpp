@@ -14,6 +14,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -132,9 +134,12 @@ inline std::vector<std::string> default_stop_strings() {
 }  // namespace KokkosDNN
 
 #include "KokkosDNN_InklingModel.hpp"
+#include "KokkosDNN_InklingMoeDecode.hpp"
 #include "KokkosDNN_InklingSession.hpp"
 
 namespace {
+
+namespace Gguf = KokkosDNN::Gguf;
 
 using Exec = Kokkos::DefaultExecutionSpace;
 using Scalar = float;
@@ -1397,6 +1402,234 @@ TEST(InklingModel, AttentionTeamMatchesLegacy) {
   check_attention_team_matches_legacy<bhalf_t>(1, 4, 5, 8, 4, 32, 4, 1024, 13);
   check_attention_team_matches_legacy<bhalf_t>(1, 8, 11, 128, 16, 128, 10,
                                               1024, 14);
+}
+
+// Fused MoE decode vs a host reference computed from the dequantized packed
+// bytes (exact weights, serial FP32 dots). Covers the real recipe (IQ4_NL
+// gate_up + Q8_0 down) and all-Q8_0, with an unrouted expert present.
+template <class Scalar>
+void check_moe_decode_fused(Gguf::GgmlType gu_dt, Gguf::GgmlType down_dt,
+                            unsigned seed) {
+  using Gguf::GgmlType;
+  const size_t E = 3, S = 2, K = 64, I = 32, D = 64;
+  const float gs = 4.0f, us = 25.0f;
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+  // Random float weights, packed per dtype.
+  std::vector<std::vector<float>> gu_f(E, std::vector<float>(2 * I * K));
+  std::vector<std::vector<float>> down_f(E, std::vector<float>(D * I));
+  for (size_t e = 0; e < E; ++e) {
+    for (auto& v : gu_f[e]) v = uni(rng);
+    for (auto& v : down_f[e]) v = uni(rng);
+  }
+  auto pack_q80 = [&](const std::vector<float>& f, size_t rows, size_t cols,
+                      std::vector<uint8_t>& raw) {
+    raw.assign(rows * (cols / 32) * 34, 0);
+    for (size_t r = 0; r < rows; ++r)
+      for (size_t b = 0; b < cols / 32; ++b) {
+        float amax = 0;
+        for (size_t i = 0; i < 32; ++i)
+          amax = std::max(amax, std::fabs(f[r * cols + b * 32 + i]));
+        const float d = amax > 0 ? amax / 127.0f : 1.0f;
+        // Manual fp32->fp16 for the test packer.
+        uint32_t bits;
+        std::memcpy(&bits, &d, 4);
+        const uint32_t sign = (bits >> 16) & 0x8000u;
+        uint16_t dh;
+        int exp = (int)((bits >> 23) & 0xFFu) - 127 + 15;
+        uint32_t mant = (bits >> 13) & 0x3FFu;
+        if (exp <= 0) {
+          dh = (uint16_t)sign;
+        } else if (exp >= 31) {
+          dh = (uint16_t)(sign | 0x7BFFu);
+        } else {
+          dh = (uint16_t)(sign | ((uint32_t)exp << 10) | mant);
+        }
+        Gguf::BlockQ80 blk{};
+        blk.d = dh;
+        for (size_t i = 0; i < 32; ++i) {
+          const float v = f[r * cols + b * 32 + i];
+          int q = (int)std::nearbyint(v / (amax > 0 ? d : 1.0f));
+          blk.qs[i] = (int8_t)std::max(-127, std::min(127, q));
+        }
+        std::memcpy(raw.data() + (r * (cols / 32) + b) * 34, &blk, 34);
+      }
+  };
+  auto pack_iq4nl = [&](const std::vector<float>& f, size_t rows, size_t cols,
+                        std::vector<uint8_t>& raw) {
+    raw.assign(rows * (cols / 32) * 18, 0);
+    for (size_t r = 0; r < rows; ++r)
+      for (size_t b = 0; b < cols / 32; ++b) {
+        float amax = 0;
+        for (size_t i = 0; i < 32; ++i)
+          amax = std::max(amax, std::fabs(f[r * cols + b * 32 + i]));
+        const float d = amax > 0 ? amax / 127.0f : 1.0f;
+        uint32_t bits;
+        std::memcpy(&bits, &d, 4);
+        const uint32_t sign = (bits >> 16) & 0x8000u;
+        int exp = (int)((bits >> 23) & 0xFFu) - 127 + 15;
+        uint32_t mant = (bits >> 13) & 0x3FFu;
+        uint16_t dh;
+        if (exp <= 0) {
+          dh = (uint16_t)sign;
+        } else if (exp >= 31) {
+          dh = (uint16_t)(sign | 0x7BFFu);
+        } else {
+          dh = (uint16_t)(sign | ((uint32_t)exp << 10) | mant);
+        }
+        Gguf::BlockIQ4NL blk{};
+        blk.d = dh;
+        for (size_t i = 0; i < 16; ++i) {
+          int best_lo = 0, best_hi = 0;
+          float best_lo_d = 1e30f, best_hi_d = 1e30f;
+          for (int c = 0; c < 16; ++c) {
+            const float lv = (float)Gguf::iq4nl_value((uint8_t)c);
+            const float dl = std::fabs(f[r * cols + b * 32 + i] / d - lv);
+            const float dhh =
+                std::fabs(f[r * cols + b * 32 + 16 + i] / d - lv);
+            if (dl < best_lo_d) {
+              best_lo_d = dl;
+              best_lo = c;
+            }
+            if (dhh < best_hi_d) {
+              best_hi_d = dhh;
+              best_hi = c;
+            }
+          }
+          blk.qs[i] = (uint8_t)(best_lo | (best_hi << 4));
+        }
+        std::memcpy(raw.data() + (r * (cols / 32) + b) * 18, &blk, 18);
+      }
+  };
+  // Host reference from the dequantized packed bytes.
+  auto dequant_row = [&](GgmlType dt, const uint8_t* raw, size_t row,
+                         size_t cols, std::vector<float>& out) {
+    out.assign(cols, 0);
+    const size_t rb = (dt == GgmlType::Q8_0) ? cols / 32 * 34 : cols / 32 * 18;
+    for (size_t b = 0; b < cols / 32; ++b) {
+      float tmp[32];
+      if (dt == GgmlType::Q8_0) {
+        Gguf::dequant_q80_block(
+            reinterpret_cast<const Gguf::BlockQ80*>(raw + row * rb + b * 34),
+            tmp);
+      } else {
+        Gguf::dequant_iq4nl_block(
+            reinterpret_cast<const Gguf::BlockIQ4NL*>(raw + row * rb + b * 18),
+            tmp);
+      }
+      for (size_t i = 0; i < 32; ++i) out[b * 32 + i] = tmp[i];
+    }
+  };
+  std::vector<float> x(K);
+  for (auto& v : x) v = uni(rng);
+  const std::vector<int> idx = {0, 2};  // expert 1 unrouted
+  const std::vector<float> wts = {0.7f, 0.3f};
+  std::vector<float> want(D, 0);
+  {
+    std::vector<float> xv = x;
+    for (size_t s = 0; s < S; ++s) {
+      const size_t e = (size_t)idx[s];
+      std::vector<uint8_t> gu_raw, down_raw;
+      if (gu_dt == GgmlType::Q8_0) {
+        pack_q80(gu_f[e], 2 * I, K, gu_raw);
+      } else {
+        pack_iq4nl(gu_f[e], 2 * I, K, gu_raw);
+      }
+      if (down_dt == GgmlType::Q8_0) {
+        pack_q80(down_f[e], D, I, down_raw);
+      } else {
+        pack_iq4nl(down_f[e], D, I, down_raw);
+      }
+      // Reference dots from the packed bytes (exact weights).
+      std::vector<float> act(I, 0);
+      for (size_t j = 0; j < I; ++j) {
+        std::vector<float> gr, ur;
+        dequant_row(gu_dt, gu_raw.data(), j, K, gr);
+        dequant_row(gu_dt, gu_raw.data(), j + I, K, ur);
+        double dg = 0, du = 0;
+        for (size_t k = 0; k < K; ++k) {
+          dg += (double)gr[k] * (double)xv[k];
+          du += (double)ur[k] * (double)xv[k];
+        }
+        const float gcap = std::tanh((float)dg / gs) * gs;
+        const float sig = 1.0f / (1.0f + std::exp(-(float)dg));
+        const float ucap = std::tanh((float)du / us) * us;
+        act[j] = gcap * sig * ucap;
+      }
+      for (size_t d = 0; d < D; ++d) {
+        std::vector<float> dr;
+        dequant_row(down_dt, down_raw.data(), d, I, dr);
+        double dd = 0;
+        for (size_t i = 0; i < I; ++i) dd += (double)dr[i] * (double)act[i];
+        want[d] += wts[s] * (float)dd;
+      }
+    }
+  }
+  // Device fused path.
+  std::vector<Gguf::QuantWeight<Exec>> gu_ws(E), down_ws(E);
+  for (size_t e = 0; e < E; ++e) {
+    std::vector<uint8_t> gu_raw, down_raw;
+    if (gu_dt == GgmlType::Q8_0) {
+      pack_q80(gu_f[e], 2 * I, K, gu_raw);
+    } else {
+      pack_iq4nl(gu_f[e], 2 * I, K, gu_raw);
+    }
+    if (down_dt == GgmlType::Q8_0) {
+      pack_q80(down_f[e], D, I, down_raw);
+    } else {
+      pack_iq4nl(down_f[e], D, I, down_raw);
+    }
+    gu_ws[e].dtype = gu_dt;
+    gu_ws[e].rows = 2 * I;
+    gu_ws[e].cols = K;
+    gu_ws[e].data = Kokkos::View<uint8_t*, Exec>("gu", gu_raw.size());
+    down_ws[e].dtype = down_dt;
+    down_ws[e].rows = D;
+    down_ws[e].cols = I;
+    down_ws[e].data = Kokkos::View<uint8_t*, Exec>("down", down_raw.size());
+    auto gu_h = Kokkos::create_mirror_view(gu_ws[e].data);
+    auto down_h = Kokkos::create_mirror_view(down_ws[e].data);
+    std::memcpy(gu_h.data(), gu_raw.data(), gu_raw.size());
+    std::memcpy(down_h.data(), down_raw.data(), down_raw.size());
+    Kokkos::deep_copy(gu_ws[e].data, gu_h);
+    Kokkos::deep_copy(down_ws[e].data, down_h);
+  }
+  auto gu_tab = Gguf::make_quant_weight_table<Exec>(gu_ws, "t");
+  auto down_tab = Gguf::make_quant_weight_table<Exec>(down_ws, "t");
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> xd("x", 1, K);
+  Kokkos::View<int**, Kokkos::LayoutRight, Exec> xidx("idx", 1, S);
+  Kokkos::View<float**, Kokkos::LayoutRight, Exec> xwts("wts", 1, S);
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> xact("act", S, I);
+  Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> xout("out", 1, D);
+  {
+    auto hx = Kokkos::create_mirror_view(xd);
+    auto hi = Kokkos::create_mirror_view(xidx);
+    auto hw = Kokkos::create_mirror_view(xwts);
+    for (size_t k = 0; k < K; ++k) hx(0, k) = static_cast<Scalar>(x[k]);
+    for (size_t s = 0; s < S; ++s) {
+      hi(0, s) = idx[s];
+      hw(0, s) = wts[s];
+    }
+    Kokkos::deep_copy(xd, hx);
+    Kokkos::deep_copy(xidx, hi);
+    Kokkos::deep_copy(xwts, hw);
+  }
+  ASSERT_TRUE(KokkosDNN::Inkling::Impl::moe_decode_fused_supported(
+      gu_dt, K, down_dt, I));
+  KokkosDNN::Inkling::Impl::inkling_moe_decode_fused<Exec, Scalar>(
+      xd, gu_tab, down_tab, xidx, xwts, xact, xout, gs, us);
+  Kokkos::fence();
+  auto hout = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), xout);
+  ASSERT_EQ(hout.size(), want.size());
+  for (size_t d = 0; d < D; ++d)
+    EXPECT_NEAR(static_cast<float>(hout(0, d)), want[d], 1e-4f)
+        << "fused MoE decode mismatch at " << d;
+}
+
+TEST(InklingModel, MoeDecodeFusedMatchesReference) {
+  check_moe_decode_fused<float>(Gguf::GgmlType::Q8_0, Gguf::GgmlType::Q8_0, 3);
+  check_moe_decode_fused<float>(Gguf::GgmlType::IQ4_NL, Gguf::GgmlType::Q8_0,
+                                4);
 }
 
 }  // namespace
