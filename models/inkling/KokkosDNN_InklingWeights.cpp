@@ -432,6 +432,25 @@ void transpose_into(
   Kokkos::deep_copy(dst, hd);
 }
 
+// Drop padded LM-head rows: the checkpoint stores the full vocab
+// (vocab_size rows) but the Model consumes unpadded_vocab rows (matching
+// HF, which slices logits to unpadded). Rows are independent packed units,
+// so a byte-prefix slice is exact.
+template <class ExecSpace>
+void drop_padded_vocab_rows(const Config& cfg,
+                            Gguf::QuantWeight<ExecSpace>& qw) {
+  const size_t want = (size_t)cfg.unpadded_vocab;
+  if (qw.rows == want) return;
+  if (qw.rows != (size_t)cfg.vocab_size || want > qw.rows)
+    throw std::runtime_error("drop_padded_vocab_rows: head rows " +
+                             std::to_string(qw.rows) +
+                             " match neither vocab_size nor unpadded_vocab");
+  const size_t rb = qw.row_bytes();
+  qw.data =
+      Kokkos::View<uint8_t*, ExecSpace>(Kokkos::subview(qw.data, std::make_pair(size_t(0), want * rb)));
+  qw.rows = want;
+}
+
 // Split one folded expert-major packed weight ([experts*per, cols]) into
 // per-expert QuantWeight views sharing the same device payload. Slice
 // starts are row-aligned (expert boundaries are multiples of whole rows),
@@ -665,6 +684,7 @@ void load_safetensors(const Config& cfg,
   load_mat(id, rows, cols, w.tok_emb);
   load_vec({Tensor::TokenEmbdNorm, -1}, w.tok_norm);
   load_mat({Tensor::Output, -1}, rows, cols, w.out_w);
+  drop_padded_vocab_rows(cfg, w.out_w);
   load_vec({Tensor::OutputNorm, -1}, w.out_norm);
   load_dense({Tensor::OutputResQuery, -1}, w.out_res_q);
   for (int l = 0; l < cfg.n_layers; ++l) {
@@ -1187,6 +1207,7 @@ void load_gguf(const Config& cfg, const std::string& path,
   gguf_load_dense_vec<ExecSpace, Scalar>(file, {Tensor::TokenEmbdNorm, -1},
                                          w.tok_norm);
   gguf_load_mat<ExecSpace>(file, {Tensor::Output, -1}, rows, cols, w.out_w);
+  drop_padded_vocab_rows(cfg, w.out_w);
   gguf_load_dense_vec<ExecSpace, Scalar>(file, {Tensor::OutputNorm, -1},
                                          w.out_norm);
   gguf_load_dense_mat<ExecSpace, Scalar>(file, {Tensor::OutputResQuery, -1},

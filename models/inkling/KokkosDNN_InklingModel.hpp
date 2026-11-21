@@ -402,6 +402,11 @@ class Model {
   }
 
  private:
+  // NOTE (CUDA): the helpers below launch extended __host__ __device__
+  // lambdas, which NVCC only accepts inside public member functions, so
+  // they live in a public section. They are still implementation detail:
+  // entry points are the constructor, reset(), forward(), and generate().
+ public:
   size_t n_passes(size_t l) const {
     return is_loop_layer((int)l) ? (size_t)cfg.loop_passes : 1;
   }
