@@ -33,6 +33,7 @@ kokkosdnn_add_test(test_lstm Test_LSTM.cpp)
 kokkosdnn_add_test(test_adaptivenorm Test_AdaptiveNorm.cpp)
 kokkosdnn_add_test(test_audiodsp Test_AudioDSP.cpp)
 kokkosdnn_add_test(test_inklingops Test_InklingOps.cpp)
+kokkosdnn_add_test(test_inklingmodel Test_InklingModel.cpp INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/../models/inkling LINK_LIBRARIES KokkosDNN::common)
 # MOSS-Image unit tests build only when the MOSS model component is enabled,
 # mirroring models/CMakeLists.txt and examples/CMakeLists.txt (both guard
 # their MOSS subdirectories on KokkosDNN_ENABLE_MODEL_MOSS).
