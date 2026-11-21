@@ -276,9 +276,12 @@ inline std::string detect_config_arch(const std::string& path) {
                      text.find("\"hidden_act\"") != std::string::npos;
   const bool inkling = text.find("inkling") != std::string::npos ||
                        text.find("Inkling") != std::string::npos;
+  // Inkling is checked first: its HF-style config.json wraps the text block
+  // in a "text_config" object, which would otherwise match the glimmer
+  // markers below. Glimmer/LFM2.5 configs never mention inkling.
+  if (inkling && !lfm25) return kArchInkling;
   if (glimmer && !lfm25) return kArchGlimmer;
   if (lfm25 && !glimmer) return kArchLFM25;
-  if (inkling && !glimmer && !lfm25) return kArchInkling;
   return "";
 }
 

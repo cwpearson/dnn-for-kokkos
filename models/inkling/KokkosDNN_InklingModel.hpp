@@ -280,7 +280,9 @@ void moe_expert_linears(
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& up,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& act,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& dn,
-    float gate_softcap, float up_softcap) {
+    float gate_softcap, float up_softcap,
+    const Kokkos::View<uint8_t*, ExecSpace>& act_scratch =
+        Kokkos::View<uint8_t*, ExecSpace>()) {
   const size_t n = gathered.extent(0);
   const size_t E2I = gu.extent(1);
   if (E2I % 2 != 0 || gu.extent(0) != n || gate.extent(0) != n ||
@@ -290,7 +292,7 @@ void moe_expert_linears(
     throw std::invalid_argument("moe_expert_linears: dimension mismatch");
   const size_t I = E2I / 2;
   linear_chunk<ExecSpace, Scalar>(handle, gathered, wgu_e, staging_gu, gu,
-                                  "Inkling::moe_gate_up");
+                                  "Inkling::moe_gate_up", act_scratch);
   auto gu_lo = Kokkos::subview(gu, Kokkos::ALL, std::make_pair(size_t(0), I));
   auto gu_hi =
       Kokkos::subview(gu, Kokkos::ALL, std::make_pair(I, size_t(2) * I));
@@ -299,7 +301,7 @@ void moe_expert_linears(
   inkling_softcapped_swiglu<ExecSpace, Scalar>(gate, up, gate_softcap,
                                                up_softcap, act);
   linear_chunk<ExecSpace, Scalar>(handle, act, wd_e, staging_d, dn,
-                                  "Inkling::moe_down");
+                                  "Inkling::moe_down", act_scratch);
 }
 
 }  // namespace Impl
@@ -846,12 +848,12 @@ class Model {
         Impl::moe_expert_linears<ExecSpace, Scalar>(
             handle, g_n, b.gate_up_exps_q[e], b.down_exps_q[e], deq_moe_gu_,
             deq_moe_d_, gu_e, gate_e, up_e, act_e, dn_e, cfg.gate_softcap,
-            cfg.up_softcap);
+            cfg.up_softcap, q8_act_buf_);
       } else {
         Impl::moe_expert_linears<ExecSpace, Scalar>(
             handle, g_n, b.gate_up_exps[e], b.down_exps[e], deq_moe_gu_,
             deq_moe_d_, gu_e, gate_e, up_e, act_e, dn_e, cfg.gate_softcap,
-            cfg.up_softcap);
+            cfg.up_softcap, q8_act_buf_);
       }
       moe_scatter_add_weighted<ExecSpace, Scalar>(dn_e, rows_n, wstage_n, out);
     }

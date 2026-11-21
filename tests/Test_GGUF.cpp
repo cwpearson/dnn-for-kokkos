@@ -946,6 +946,7 @@ void check_quant_gemv_int8(
       case GgmlType::Q5_K: mdt = Wd::Q5K; break;
       case GgmlType::Q6_K: mdt = Wd::Q6K; break;
       case GgmlType::Q8_0: mdt = Wd::Q80; break;
+      case GgmlType::IQ4_NL: mdt = Wd::IQ4NL; break;
       default: FAIL() << "explicit layout needs an int8 dtype"; return;
     }
     const bool launched =
@@ -1002,6 +1003,7 @@ void check_quant_gemv_int8_random(GgmlType dtype, size_t K) {
     case GgmlType::Q5_K: block_bytes.push_back(176); break;
     case GgmlType::Q6_K: block_bytes.push_back(210); break;
     case GgmlType::Q8_0: block_bytes.push_back(34); break;
+    case GgmlType::IQ4_NL: block_bytes.push_back(18); break;
     default: throw std::runtime_error("random int8 case: bad dtype");
   }
   const uint16_t small = 0x2400u;  // fp16 2^-7
@@ -1012,7 +1014,7 @@ void check_quant_gemv_int8_random(GgmlType dtype, size_t K) {
         std::memcpy(blk + 208, &small, 2);
         // 6-bit quant scales are int8 here (any value is valid).
         for (int s = 0; s < 16; ++s) blk[192 + (size_t)s] = (int8_t)(s * 9 - 70);
-      } else if (dtype == GgmlType::Q8_0) {
+      } else if (dtype == GgmlType::Q8_0 || dtype == GgmlType::IQ4_NL) {
         std::memcpy(blk, &small, 2);
       } else {
         std::memcpy(blk, &small, 2);
@@ -1174,7 +1176,7 @@ TEST(GgufQuantGemm, GemvInt8Float) {
   using KokkosDNN::Gguf::quant_gemv_int8_supported;
   EXPECT_GT(quant_gemv_int8_scratch_bytes(512), 512u);
   EXPECT_EQ(quant_gemv_int8_scratch_bytes(500), 0u);
-  // Supported set: block-aligned K-quants and Q8_0 only.
+  // Supported set: block-aligned K-quants, Q8_0, and IQ4_NL.
   const bool f32_supported =
       quant_gemv_int8_supported<Exec, float>(GgmlType::F32, 512);
   const bool unaligned_supported =
@@ -1189,6 +1191,8 @@ TEST(GgufQuantGemm, GemvInt8Float) {
             mmvq_live);
   EXPECT_EQ((quant_gemv_int8_supported<Exec, float>(GgmlType::Q6_K, 6656)),
             mmvq_live);
+  EXPECT_EQ((quant_gemv_int8_supported<Exec, float>(GgmlType::IQ4_NL, 512)),
+            mmvq_live);
   check_quant_gemv_int8<float>(GgmlType::Q4_K, 512, 1e-3f);
   check_quant_gemv_int8<float>(GgmlType::Q4_K, 1024, 1e-3f);
   check_quant_gemv_int8<float>(GgmlType::Q4_K, 4096, 1e-3f);
@@ -1197,6 +1201,8 @@ TEST(GgufQuantGemm, GemvInt8Float) {
   check_quant_gemv_int8<float>(GgmlType::Q6_K, 1024, 1e-3f);
   check_quant_gemv_int8<float>(GgmlType::Q6_K, 4096, 1e-3f);
   check_quant_gemv_int8<float>(GgmlType::Q8_0, 512, 1e-3f);
+  check_quant_gemv_int8<float>(GgmlType::IQ4_NL, 512, 1e-3f);
+  check_quant_gemv_int8<float>(GgmlType::IQ4_NL, 2304, 1e-3f);
   // Dtypes the fast path does not implement keep the portable kernel.
   check_quant_gemv_int8<float>(GgmlType::F32, 512, 1e-3f);
 }
@@ -1221,6 +1227,7 @@ TEST(GgufQuantGemm, GemvInt8BlockedLayouts) {
       layout.threads_per_row = 64;
       layout.groups          = 1;
       check_quant_gemv_int8<float>(GgmlType::Q4_K, 512, 1e-3f, N, &layout);
+      check_quant_gemv_int8<float>(GgmlType::IQ4_NL, 512, 1e-3f, N, &layout);
     }
   }
 }
@@ -1232,6 +1239,9 @@ TEST(GgufQuantGemm, GemvInt8SkinnyRows) {
   check_quant_gemv_int8<float>(GgmlType::Q4_K, 4096, 1e-3f, 256);
   check_quant_gemv_int8<float>(GgmlType::Q6_K, 2048, 1e-3f, 256);
   check_quant_gemv_int8<float>(GgmlType::Q8_0, 4096, 1e-3f, 256);
+  check_quant_gemv_int8<float>(GgmlType::IQ4_NL, 4096, 1e-3f, 256);
+  // Inkling MoE down-projection width (K = 1152, N = 2304).
+  check_quant_gemv_int8<float>(GgmlType::IQ4_NL, 1152, 1e-3f, 2304);
 }
 
 TEST(GgufQuantGemm, GemvInt8BHalf) {
@@ -1239,6 +1249,11 @@ TEST(GgufQuantGemm, GemvInt8BHalf) {
   check_quant_gemv_int8<bhalf_t>(GgmlType::Q4_K, 512, 1e-2f);
   check_quant_gemv_int8<bhalf_t>(GgmlType::Q6_K, 512, 1e-2f);
   check_quant_gemv_int8<bhalf_t>(GgmlType::Q8_0, 512, 1e-2f);
+  // IQ4_NL crafted codes span the full codebook (d = 1.0, |w| <= 127), so
+  // outputs reach ~10 where the bhalf store itself rounds by up to half a
+  // ulp (0.031); the kernel int math is exact, so the tolerance covers the
+  // output rounding, not the dot. A wrong LUT/nibble would miss by >> 1.
+  check_quant_gemv_int8<bhalf_t>(GgmlType::IQ4_NL, 512, 5e-2f);
   // Skinny-row int8 schedule with bf16 activations (K = 4096 -> 4 warps/row).
   check_quant_gemv_int8<bhalf_t>(GgmlType::Q4_K, 4096, 1e-2f, 256);
 }
@@ -1250,6 +1265,7 @@ TEST(GgufQuantGemm, GemvInt8RandomPayload) {
   check_quant_gemv_int8_random<float>(GgmlType::Q5_K, 2048);
   check_quant_gemv_int8_random<float>(GgmlType::Q6_K, 2048);
   check_quant_gemv_int8_random<float>(GgmlType::Q8_0, 2048);
+  check_quant_gemv_int8_random<float>(GgmlType::IQ4_NL, 2048);
   check_quant_gemv_int8_random<float>(GgmlType::Q6_K, 6656);
   check_quant_gemv_int8_random<float>(GgmlType::Q4_K, 6656);
 }

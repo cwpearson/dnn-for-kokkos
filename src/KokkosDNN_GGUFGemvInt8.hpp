@@ -76,7 +76,7 @@ namespace GgufMvq {
 // Packed weight dtypes this path implements. Anything else declines (the
 // caller keeps the portable kernel), so adding a tag here is the only way to
 // opt a format in.
-enum class Wd : int { Q4K = 0, Q5K = 1, Q6K = 2, Q80 = 3 };
+enum class Wd : int { Q4K = 0, Q5K = 1, Q6K = 2, Q80 = 3, IQ4NL = 4 };
 
 // ggml block layouts (ggml-common.h field order). GGUF.hpp asserts these
 // sizes against its own Gguf::BlockXXX definitions, so the two cannot drift.
@@ -102,6 +102,14 @@ struct BlockQ6K {
 struct BlockQ80 {
   uint16_t d;
   int8_t qs[32];
+};
+// IQ4_NL: 32 elements, one fp16 scale, 4-bit nonlinear codes (ggml
+// block_iq4_nl field order). Size pinned against Gguf::BlockIQ4NL in
+// KokkosDNN_GGUF.hpp; the LUT lives in mvq_iq4nl_value below (local copy
+// so this header stays standalone, like mvq_h2f).
+struct BlockIQ4NL {
+  uint16_t d;
+  uint8_t qs[16];
 };
 
 // ---------------------------------------------------------------------------
@@ -144,7 +152,8 @@ constexpr bool dtype_ok(Wd dt, std::size_t K) {
     case Wd::Q4K:
     case Wd::Q5K:
     case Wd::Q6K: return K % 256 == 0;
-    case Wd::Q80: return true;
+    case Wd::Q80:
+    case Wd::IQ4NL: return true;
   }
   return false;
 }
@@ -176,6 +185,15 @@ KOKKOS_INLINE_FUNCTION float mvq_h2f(uint16_t h) {
   float out;
   std::memcpy(&out, &f, 4);
   return out;
+}
+
+// Portable copy of Gguf::Impl::iq4nl_value (ggml kvalues_iq4nl); kept local
+// so this header stays standalone. int8 codes used directly, no min/offset
+// term (unlike Q4_K/Q5_K/Q6_K): the LUT asymmetry is the whole value.
+KOKKOS_INLINE_FUNCTION int8_t mvq_iq4nl_value(uint8_t nib) {
+  constexpr int8_t kValues[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
+                                  1,    13,   25,  38,  53,  69,  89,  113};
+  return kValues[nib & 0xFu];
 }
 
 // Portable copy of Gguf::Impl::get_scale_min_k4 (ggml-quants.c). One call per
@@ -335,7 +353,11 @@ KOKKOSDNN_PRAGMA_UNROLL()
     x.d1   = xh[b0 + 2].d;
     x.sum0 = (half != 0) ? xh[b0].sum_hi : xh[b0].sum_lo;
     x.sum1 = (half != 0) ? xh[b0 + 2].sum_hi : xh[b0 + 2].sum_lo;
-  } else {  // Wd::Q80: one 32-element block, int8 payload.
+  } else {
+    // Wd::Q80 or Wd::IQ4NL: one 32-element block, int8 payload (Q8_0) or
+    // 16-byte nibble payload decoded to int8 in the dot (IQ4_NL): either
+    // way one contiguous 32-element activation window with a single block
+    // scale. Final else keeps the constexpr chain exhaustive.
     const int k0 = c << 5;
     const Int8Words4 a = mvq_load_words4(xq + k0);
     const Int8Words4 b = mvq_load_words4(xq + k0 + 16);
@@ -454,13 +476,55 @@ KOKKOSDNN_PRAGMA_UNROLL()
     }
     return s0 * (float)(dotA - (x.sum0 << 5)) +
            s1 * (float)(dotB - (x.sum1 << 5));
-  } else {  // Wd::Q80: one 32-element block, one scale, int8 payload.
+  } else if constexpr (DT == Wd::Q80) {
+    // One 32-element block, one scale, int8 payload.
     const BlockQ80* b = reinterpret_cast<const BlockQ80*>(row) + c;
     const float dw    = mvq_h2f(b->d) * x.d0;
     int dot           = 0;
 KOKKOSDNN_PRAGMA_UNROLL()
     for (int i = 0; i < 8; ++i)
       dot = Dot::dot4(Dot::load_u16(b->qs + i * 4), x.w[i], dot);
+    return dw * (float)dot;
+  } else {  // Wd::IQ4NL: one 18-byte block (fp16 scale + 16 nibble bytes),
+            // 32 elements, no min/offset term (ggml kvalues_iq4nl used
+            // directly). Same activation window as Q8_0 above; each group
+            // of 4 qs bytes decodes to 4 low-nibble + 4 high-nibble int8
+            // lanes dotted against the matching activation halves.
+    const BlockIQ4NL* b = reinterpret_cast<const BlockIQ4NL*>(row) + c;
+    const float dw      = mvq_h2f(b->d) * x.d0;
+    const uint8_t* qs   = b->qs;
+    int dot             = 0;
+KOKKOSDNN_PRAGMA_UNROLL()
+    for (int i = 0; i < 4; ++i) {
+      const uint8_t q0 = qs[4 * i];
+      const uint8_t q1 = qs[4 * i + 1];
+      const uint8_t q2 = qs[4 * i + 2];
+      const uint8_t q3 = qs[4 * i + 3];
+      const int32_t wlo = (int32_t)((uint32_t)(uint8_t)mvq_iq4nl_value(
+                                        (uint8_t)(q0 & 0xFu)) |
+                                    ((uint32_t)(uint8_t)mvq_iq4nl_value(
+                                         (uint8_t)(q1 & 0xFu))
+                                     << 8) |
+                                    ((uint32_t)(uint8_t)mvq_iq4nl_value(
+                                         (uint8_t)(q2 & 0xFu))
+                                     << 16) |
+                                    ((uint32_t)(uint8_t)mvq_iq4nl_value(
+                                         (uint8_t)(q3 & 0xFu))
+                                     << 24));
+      const int32_t whi = (int32_t)((uint32_t)(uint8_t)mvq_iq4nl_value(
+                                        (uint8_t)(q0 >> 4)) |
+                                    ((uint32_t)(uint8_t)mvq_iq4nl_value(
+                                         (uint8_t)(q1 >> 4))
+                                     << 8) |
+                                    ((uint32_t)(uint8_t)mvq_iq4nl_value(
+                                         (uint8_t)(q2 >> 4))
+                                     << 16) |
+                                    ((uint32_t)(uint8_t)mvq_iq4nl_value(
+                                         (uint8_t)(q3 >> 4))
+                                     << 24));
+      dot = Dot::dot4(wlo, x.w[i], dot);
+      dot = Dot::dot4(whi, x.w[4 + i], dot);
+    }
     return dw * (float)dot;
   }
 }
@@ -732,10 +796,12 @@ bool launch_quant_gemv_int8(const Kokkos::View<Scalar*, ExecSpace>& x,
     // Q4_K/Q5_K weight windows use 16-byte loads (144/176-byte blocks keep
     // every window 16-aligned), so both need 16-byte alignment. Q6_K/Q8_0
     // weight windows use load_u16 (two 16-bit loads) and only need their
-    // even block offsets plus an even wdata base. Decline instead of
-    // faulting when a caller hands us a misaligned buffer -- the portable
-    // fallback has no alignment requirements. In practice Kokkos allocations
-    // always satisfy this, so the check never fires.
+    // even block offsets plus an even wdata base; IQ4_NL uses byte loads
+    // (18-byte blocks are 2-aligned) with the same even-base rule.
+    // Decline instead of faulting when a caller hands us a misaligned
+    // buffer -- the portable fallback has no alignment requirements. In
+    // practice Kokkos allocations always satisfy this, so the check never
+    // fires.
     if ((reinterpret_cast<uintptr_t>(scratch) & 15u) != 0u) return false;
     if ((reinterpret_cast<uintptr_t>(wdata) & 1u) != 0u) return false;
     if ((dt == Wd::Q4K || dt == Wd::Q5K) &&
@@ -769,6 +835,10 @@ bool launch_quant_gemv_int8(const Kokkos::View<Scalar*, ExecSpace>& x,
         break;
       case Wd::Q80:
         launch_gemv_int8_dispatch<ExecSpace, Scalar, Wd::Q80>(
+            wdata, row_bytes, rows, xq, xh, y.data(), nu, layout);
+        break;
+      case Wd::IQ4NL:
+        launch_gemv_int8_dispatch<ExecSpace, Scalar, Wd::IQ4NL>(
             wdata, row_bytes, rows, xq, xh, y.data(), nu, layout);
         break;
     }

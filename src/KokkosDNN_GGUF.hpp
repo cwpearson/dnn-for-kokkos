@@ -294,6 +294,9 @@ static_assert(sizeof(::KokkosDNN::Impl::GgufMvq::BlockQ6K) == sizeof(BlockQ6K),
               "int8 GEMV Q6_K block layout drift");
 static_assert(sizeof(::KokkosDNN::Impl::GgufMvq::BlockQ80) == sizeof(BlockQ80),
               "int8 GEMV Q8_0 block layout drift");
+static_assert(sizeof(::KokkosDNN::Impl::GgufMvq::BlockIQ4NL) ==
+                  sizeof(BlockIQ4NL),
+              "int8 GEMV IQ4_NL block layout drift");
 
 // Scale/min unpacking for Q4_K (and Q5_K): 8 sub-blocks of 32 elements share
 // 12 bytes. j<4: 6-bit values straight out of bytes j/j+4; j>=4: 4-bit nibble
@@ -2656,6 +2659,7 @@ inline bool quant_int8_dtype(GgmlType dt,
     case GgmlType::Q5_K: out = Wd::Q5K; return true;
     case GgmlType::Q6_K: out = Wd::Q6K; return true;
     case GgmlType::Q8_0: out = Wd::Q80; return true;
+    case GgmlType::IQ4_NL: out = Wd::IQ4NL; return true;
     default: return false;
   }
 }
