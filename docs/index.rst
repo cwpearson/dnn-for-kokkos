@@ -10,5 +10,6 @@ DNN for Kokkos
 
    getting_started
    api
+   inkling-iq4nl-design
 
 * :ref:`genindex` | :ref:`search`

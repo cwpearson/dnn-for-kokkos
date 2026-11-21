@@ -13,6 +13,7 @@ kokkosdnn_add_compiled_model_library(kokkosdnn_moss
   EXPORT_NAME moss
   SOURCES
     KokkosDNN_MossWeights.cpp
+    KokkosDNN_MossImageConfig.cpp
   LINK_LIBRARIES KokkosDNN::kokkosdnn KokkosDNN::common
   WITH_IMAGE
 )

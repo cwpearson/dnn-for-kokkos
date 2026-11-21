@@ -65,6 +65,19 @@ namespace MossImage {
 
 // Model / sampler constants for OpenMOSS-Team/MOSS-Image-SFT.
 struct Config {
+  // Copy/move are declared here and defaulted out of line (see
+  // KokkosDNN_MossImageConfig.cpp): the std::vector member copy must never
+  // be inlined into callers, where GCC 15's -Warray-bounds otherwise
+  // false-positives on the inlined memmove once it proves skip_layers has
+  // one element (promoted to a hard error by -Werror). Callers only see a
+  // call to an opaque function, so no optimization level or inlining
+  // depth can resurrect the false positive.
+  Config();
+  Config(const Config&);
+  Config& operator=(const Config&);
+  Config(Config&&) noexcept;
+  Config& operator=(Config&&) noexcept;
+
   int dim = 3072;            // transformer width
   int ffn_dim = 8192;        // FFN intermediate dim
   int num_heads = 24;        // joint-attention heads (head_dim = 128)

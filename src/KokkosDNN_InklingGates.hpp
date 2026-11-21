@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "KokkosDNN_Occupancy.hpp"
 #include "KokkosDNN_RMSNorm.hpp"
 
 namespace KokkosDNN {
@@ -158,10 +159,16 @@ void inkling_message_gate_hidden(
     team_size = 1;
     while (team_size < (int)(2 * D)) team_size *= 2;
   }
-  using Policy = Kokkos::TeamPolicy<ExecSpace>;
-  Policy policy((int)(T * R), team_size);
   MsgGateHiddenTeam<ExecSpace, Scalar, DView> w{rms_x, rms_m, down, h, T, D,
                                                 R};
+  // Clamp to the backend maximum (Serial -> 1); the strided TeamThreadRange
+  // stays correct at any team size (see Impl::cached_team_size_max).
+  const int team_max =
+      ::KokkosDNN::Impl::cached_team_size_max<ExecSpace>(w);
+  if (team_max < team_size) team_size = team_max;
+  if (team_size < 1) team_size = 1;
+  using Policy = Kokkos::TeamPolicy<ExecSpace>;
+  Policy policy((int)(T * R), team_size);
   Kokkos::parallel_for(label, policy, w);
 }
 }  // namespace Impl

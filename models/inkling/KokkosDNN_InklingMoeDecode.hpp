@@ -33,6 +33,7 @@
 #include "KokkosDNN_GGUF.hpp"
 #include "KokkosDNN_GGUFGemvInt8.hpp"
 #include "KokkosDNN_Handle.hpp"
+#include "KokkosDNN_Occupancy.hpp"
 
 namespace KokkosDNN {
 namespace Inkling {
@@ -109,6 +110,8 @@ struct InklingMoeGateUpFunctor {
   KOKKOS_INLINE_FUNCTION void operator()(const Member& team) const {
     const ActView act_ = act;
     const IdxView idx_ = idx;
+    const int8_t* xq_ = xq;
+    const Mvq::ActQ8Hdr* xh_ = xh;
     const size_t I_ = I, nu_ = nunits;
     const float gsc_ = gate_softcap, usc_ = up_softcap;
     const size_t rb_ = gu_row_bytes;
@@ -124,7 +127,7 @@ struct InklingMoeGateUpFunctor {
         Kokkos::TeamThreadRange(team, nu_),
         KOKKOS_LAMBDA(size_t c, float& acc) {
           const Mvq::Int8UnitWindow xw =
-              Mvq::mvq_load_unit_window<ExecSpace, DT>(xq, xh, (int)c);
+              Mvq::mvq_load_unit_window<ExecSpace, DT>(xq_, xh_, (int)c);
           acc += Mvq::gemv_int8_unit_dot_win<ExecSpace, DT>(rg, (int)c, xw);
         },
         g);
@@ -133,7 +136,7 @@ struct InklingMoeGateUpFunctor {
         Kokkos::TeamThreadRange(team, nu_),
         KOKKOS_LAMBDA(size_t c, float& acc) {
           const Mvq::Int8UnitWindow xw =
-              Mvq::mvq_load_unit_window<ExecSpace, DT>(xq, xh, (int)c);
+              Mvq::mvq_load_unit_window<ExecSpace, DT>(xq_, xh_, (int)c);
           acc += Mvq::gemv_int8_unit_dot_win<ExecSpace, DT>(ru, (int)c, xw);
         },
         u);
@@ -172,6 +175,8 @@ struct InklingMoeDownFunctor {
     const IdxView idx_ = idx;
     const WtsView wts_ = wts;
     const OutView out_ = out;
+    const int8_t* aq_ = aq;
+    const Mvq::ActQ8Hdr* ah_ = ah;
     const size_t I_ = I, S_ = S, nu_ = nunits;
     const size_t rb_ = down_row_bytes;
     const size_t d = static_cast<size_t>(team.league_rank());
@@ -187,7 +192,7 @@ struct InklingMoeDownFunctor {
           KOKKOS_LAMBDA(size_t c, float& sum) {
             const Mvq::Int8UnitWindow aw =
                 Mvq::mvq_load_unit_window<ExecSpace, DT>(
-                    aq + s * I_, ah + s * (I_ / 32), (int)c);
+                    aq_ + s * I_, ah_ + s * (I_ / 32), (int)c);
             sum += Mvq::gemv_int8_unit_dot_win<ExecSpace, DT>(row, (int)c, aw);
           },
           r);
@@ -263,7 +268,13 @@ void inkling_moe_decode_fused(
                                                Mvq::act_q8_hdr_offset(K)),
         gu.base, gu.dtype, gu.row_bytes, idx, act, I, K / 32,
         gate_softcap, up_softcap};
-    Kokkos::TeamPolicy<ExecSpace> policy((int)(S * I), 128);
+    // Clamp to the backend maximum (Serial -> 1); the strided
+    // TeamThreadRange stays correct at any team size.
+    int gate_up_ts =
+        ::KokkosDNN::Impl::cached_team_size_max<ExecSpace>(f);
+    if (gate_up_ts > 128) gate_up_ts = 128;
+    if (gate_up_ts < 1) gate_up_ts = 1;
+    Kokkos::TeamPolicy<ExecSpace> policy((int)(S * I), gate_up_ts);
     Kokkos::parallel_for(label + "::gate_up", policy, f);
   };
   switch (gu_wd) {
@@ -297,7 +308,12 @@ void inkling_moe_decode_fused(
         reinterpret_cast<const Mvq::ActQ8Hdr*>(qa_scratch.data() +
                                                Mvq::act_q8_hdr_offset(S * I)),
         down.base, down.dtype, down.row_bytes, idx, wts, out, I, S, I / 32};
-    Kokkos::TeamPolicy<ExecSpace> policy((int)D, 128);
+    // Clamp to the backend maximum (Serial -> 1); the strided
+    // TeamThreadRange stays correct at any team size.
+    int down_ts = ::KokkosDNN::Impl::cached_team_size_max<ExecSpace>(f);
+    if (down_ts > 128) down_ts = 128;
+    if (down_ts < 1) down_ts = 1;
+    Kokkos::TeamPolicy<ExecSpace> policy((int)D, down_ts);
     Kokkos::parallel_for(label + "::down", policy, f);
   };
   switch (down_wd) {

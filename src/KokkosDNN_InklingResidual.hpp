@@ -17,6 +17,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "KokkosDNN_Occupancy.hpp"
+
 namespace KokkosDNN {
 namespace Impl {
 
@@ -166,6 +168,12 @@ void inkling_block_attention_residual(
     team_size = 1;
     while (team_size < (int)D) team_size *= 2;
   }
+  // Clamp to the backend maximum (Serial -> 1); the strided TeamThreadRange
+  // stays correct at any team size (see Impl::cached_team_size_max).
+  const int team_max = ::KokkosDNN::Impl::cached_team_size_max<ExecSpace>(
+      w, sizeof(float) * (2 * 65 + 2));
+  if (team_max < team_size) team_size = team_max;
+  if (team_size < 1) team_size = 1;
   using Policy = Kokkos::TeamPolicy<ExecSpace>;
   Policy policy((int)(T * Q), team_size);
   policy.set_scratch_size(0, Kokkos::PerTeam(sizeof(float) * (2 * 65 + 2)));
@@ -219,6 +227,12 @@ void inkling_message_attention_residual(
     team_size = 1;
     while (team_size < (int)D) team_size *= 2;
   }
+  // Clamp to the backend maximum (Serial -> 1); the strided TeamThreadRange
+  // stays correct at any team size (see Impl::cached_team_size_max).
+  const int team_max = ::KokkosDNN::Impl::cached_team_size_max<ExecSpace>(
+      w, sizeof(float) * (2 * 65 + 2));
+  if (team_max < team_size) team_size = team_max;
+  if (team_size < 1) team_size = 1;
   using Policy = Kokkos::TeamPolicy<ExecSpace>;
   Policy policy((int)(T * 4), team_size);
   policy.set_scratch_size(0, Kokkos::PerTeam(sizeof(float) * (2 * 65 + 2)));

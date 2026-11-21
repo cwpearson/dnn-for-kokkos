@@ -108,6 +108,7 @@
 #include "KokkosDNN_InklingRelBias.hpp"
 #include "KokkosDNN_InklingResidual.hpp"
 #include "KokkosDNN_MoE.hpp"
+#include "KokkosDNN_Occupancy.hpp"
 #include "KokkosDNN_RMSNorm.hpp"
 #include "KokkosDNN_Sampler.hpp"
 #include "KokkosDNN_Generate.hpp"
@@ -426,15 +427,21 @@ void inkling_attention_forward(
     team_size = 1;
     while (team_size < (int)D) team_size *= 2;
   }
+  InklingAttentionTeam<ExecSpace, QView, KView, VView, RView, PView, SView,
+                       OView>
+      f{q, k, v, q_off,    window, rel, proj, sink, scale,
+        rel_extent, out, C, H,     D,   N,    Hkv, R, E, grp, Kmax};
+  // Clamp to the backend maximum (Serial -> 1); the strided TeamThreadRange
+  // stays correct at any team size (see Impl::cached_team_size_max).
+  const int team_max = ::KokkosDNN::Impl::cached_team_size_max<ExecSpace>(
+      f, sizeof(float) * (Kmax + 1));
+  if (team_max < team_size) team_size = team_max;
+  if (team_size < 1) team_size = 1;
   using Policy = Kokkos::TeamPolicy<ExecSpace>;
   Policy policy((int)(C * H), team_size);
   // Scores plus the shared reciprocal denominator.
   policy.set_scratch_size(
       1, Kokkos::PerTeam(sizeof(float) * (Kmax + 1)));
-  InklingAttentionTeam<ExecSpace, QView, KView, VView, RView, PView, SView,
-                       OView>
-      f{q, k, v, q_off,    window, rel, proj, sink, scale,
-        rel_extent, out, C, H,     D,   N,    Hkv, R, E, grp, Kmax};
   Kokkos::parallel_for(label, policy, f);
 }
 
