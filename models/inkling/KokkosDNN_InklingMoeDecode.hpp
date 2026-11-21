@@ -5,19 +5,20 @@
 
 // Fused MoE decode for the Inkling 2 Mini text decoder (one token).
 //
-// The legacy path (Model::moe_forward) routes on the host: per token it
-// deep_copies idx/wts to host, loops 128 experts, and launches gather +
-// gate_up GEMV + 2 split copies + swiglu + down GEMV + scatter per routed
-// expert (~8 launches + 2 fences per expert, ~350us/visit on RTX 3090).
-// This path does it in two launches per layer visit with zero host fences:
+// The legacy path (Model::moe_forward) routes on the host: per token, per
+// layer visit, 2 D2H fences + a 128-expert host scan + 2 H2D fences per
+// routed expert, then gather + gate_up GEMV + 2 split copies + swiglu + down
+// GEMV + scatter per expert (~8 launches + fences per expert). The fused
+// path does it in three launches per visit with zero host fences:
 //
-//   1. gate_up fused dots + softcapped SwiGLU -> act [S, I]
-//   2. down fused dots + weighted slot combine  -> out [1, D] (written)
+//   0. quantize the shared input row (and the S slot rows for stage 2)
+//   1. gate_up int8 dots + softcapped SwiGLU -> act [S, I]
+//   2. down int8 dots + weighted slot combine  -> out [1, D] (written)
 //
 // Routing idx/wts are consumed on device (moe_route_sigmoid already leaves
-// them there); at C == 1 every slot is its own row, so no host-side bucket
-// grouping is needed at all. Dots reuse the tested grouped primitives
-// (Gguf::quant_group_dot, same values as quant_gemm's grouped path up to FP
+// them there); at C == 1 every slot is its own row, so no bucketing is
+// needed. Dots reuse the portable int8 machinery (GgufMvq unit windows and
+// integer dots: same values as quant_gemv's int8 path up to FP
 // reassociation). Weights stay packed: no dequant staging, no dense traffic.
 
 #include <Kokkos_Core.hpp>
@@ -26,9 +27,11 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "KokkosDNN_GGUF.hpp"
+#include "KokkosDNN_GGUFGemvInt8.hpp"
 #include "KokkosDNN_Handle.hpp"
 
 namespace KokkosDNN {
@@ -71,69 +74,72 @@ struct InklingMoeTableCache {
   }
 };
 
-// True when the fused decode path can serve these packed expert shapes:
-// both projections must take the grouped dot path (one scale set per 32
-// elements). IQ4_NL and Q8_0 qualify at the Inkling widths (K = 2304,
-// I = 1152); K-quants do not divide evenly and keep the legacy path.
+namespace Mvq = ::KokkosDNN::Impl::GgufMvq;
+
+// True when the fused decode path can serve these packed expert shapes: the
+// int8-dot path must cover the dtype (IQ4_NL, Q8_0) at these widths.
 inline bool moe_decode_fused_supported(Gguf::GgmlType gu_dtype, size_t K,
                                        Gguf::GgmlType down_dtype, size_t I) {
-  size_t gs = 0;
-  if (!Gguf::Impl::quant_can_group(gu_dtype, K, gs)) return false;
-  if (!Gguf::Impl::quant_can_group(down_dtype, I, gs)) return false;
-  return true;
+  Mvq::Wd gu_wd{}, down_wd{};
+  if (!Gguf::Impl::quant_int8_dtype(gu_dtype, gu_wd)) return false;
+  if (!Gguf::Impl::quant_int8_dtype(down_dtype, down_wd)) return false;
+  return Mvq::dtype_ok(gu_wd, K) && Mvq::dtype_ok(down_wd, I);
 }
 
 // Stage 1: act[s, j] = softcap(g_e.j . x) * sigmoid(g_e.j . x) *
 // softcap(u_e.j . x) with the fused gate_up rows (gate j, up j+I) of expert
 // e = idx[s]. One team per (slot, output): threads reduce over the K/32
-// groups, gate then up, then a single thread applies the activation.
-template <class ExecSpace, class Scalar>
+// int8 units with integer dots against the shared quantized input window,
+// then a single thread applies the activation.
+template <class ExecSpace, class Scalar, Mvq::Wd DT>
 struct InklingMoeGateUpFunctor {
   using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
-  using XView = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
   using ActView = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
   using IdxView = Kokkos::View<int**, Kokkos::LayoutRight, ExecSpace>;
-  XView x;  // [1, K], single token row
+  const int8_t* xq;
+  const Mvq::ActQ8Hdr* xh;
   Kokkos::View<uintptr_t*, ExecSpace> gu_base;
   Gguf::GgmlType gu_dtype;
   size_t gu_row_bytes;
   IdxView idx;  // [1, S] expert per slot
   ActView act;  // [S, I]
-  size_t I, ngroups, gs;
+  size_t I, nunits;
   float gate_softcap, up_softcap;
 
   KOKKOS_INLINE_FUNCTION void operator()(const Member& team) const {
-    const XView x_ = x;
     const ActView act_ = act;
     const IdxView idx_ = idx;
-    const auto gu_base_ = gu_base;
-    const size_t I_ = I, ng_ = ngroups, gs_ = gs;
+    const size_t I_ = I, nu_ = nunits;
     const float gsc_ = gate_softcap, usc_ = up_softcap;
-    const Gguf::GgmlType dt_ = gu_dtype;
     const size_t rb_ = gu_row_bytes;
     const size_t s = static_cast<size_t>(team.league_rank()) / I_;
     const size_t j = static_cast<size_t>(team.league_rank()) % I_;
     const size_t e = static_cast<size_t>(idx_(0, s));
     const uint8_t* payload =
-        reinterpret_cast<const uint8_t*>(gu_base_(e));
+        reinterpret_cast<const uint8_t*>(gu_base(e));
     const uint8_t* rg = payload + j * rb_;
     const uint8_t* ru = payload + (j + I_) * rb_;
-    const Scalar* xd = x_.data();
-    const size_t xs = x_.stride(1);
     float g = 0;
     Kokkos::parallel_reduce(
-        Kokkos::TeamThreadRange(team, ng_),
-        KOKKOS_LAMBDA(size_t gg, float& acc) {
-          acc += Gguf::Impl::quant_group_dot(dt_, rg, xd, xs, gg * gs_);
+        Kokkos::TeamThreadRange(team, nu_),
+        KOKKOS_LAMBDA(size_t c, float& acc) {
+          const Mvq::Int8UnitWindow xw =
+              Mvq::mvq_load_unit_window<ExecSpace, DT>(xq, xh, (int)c);
+          acc += Mvq::gemv_int8_unit_dot_win<ExecSpace, DT>(rg, (int)c, xw);
         },
         g);
     float u = 0;
     Kokkos::parallel_reduce(
-        Kokkos::TeamThreadRange(team, ng_),
-        KOKKOS_LAMBDA(size_t gg, float& acc) {
-          acc += Gguf::Impl::quant_group_dot(dt_, ru, xd, xs, gg * gs_);
+        Kokkos::TeamThreadRange(team, nu_),
+        KOKKOS_LAMBDA(size_t c, float& acc) {
+          const Mvq::Int8UnitWindow xw =
+              Mvq::mvq_load_unit_window<ExecSpace, DT>(xq, xh, (int)c);
+          acc += Mvq::gemv_int8_unit_dot_win<ExecSpace, DT>(ru, (int)c, xw);
         },
         u);
+    // Integer dots land fully scaled (weight_scale x act_scale fold into
+    // the unit dot, as in quant_gemv's int8 path); the single thread only
+    // applies the softcapped activation.
     Kokkos::single(Kokkos::PerTeam(team), KOKKOS_LAMBDA() {
       const float gs = Kokkos::tanhf(g / gsc_) * gsc_;
       const float sig = 1.0f / (1.0f + Kokkos::expf(-g));
@@ -143,31 +149,30 @@ struct InklingMoeGateUpFunctor {
   }
 };
 
-// Stage 2: out[d] = sum_s wts[s] * (down_e[s][d, :] . act[s, :]). One team
-// per output dim; slots accumulate serially (S <= 8), groups in parallel.
-template <class ExecSpace, class Scalar>
+// Stage 2: out[d] = sum_s wts[s] * (down_e[s][d, :] . act[s, :]) with int8
+// dots against the per-slot quantized activation rows. One team per output
+// dim; slots accumulate serially (S <= 8), units in parallel.
+template <class ExecSpace, class Scalar, Mvq::Wd DT>
 struct InklingMoeDownFunctor {
   using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
-  using ActView = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
+  using OutView = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
   using IdxView = Kokkos::View<int**, Kokkos::LayoutRight, ExecSpace>;
   using WtsView = Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>;
-  using OutView = Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>;
-  ActView act;  // [S, I]
+  const int8_t* aq;
+  const Mvq::ActQ8Hdr* ah;
   Kokkos::View<uintptr_t*, ExecSpace> down_base;
   Gguf::GgmlType down_dtype;
   size_t down_row_bytes;
   IdxView idx;  // [1, S]
   WtsView wts;  // [1, S]
   OutView out;  // [1, D], written
-  size_t I, S, ngroups, gs;
+  size_t I, S, nunits;
 
   KOKKOS_INLINE_FUNCTION void operator()(const Member& team) const {
-    const ActView act_ = act;
     const IdxView idx_ = idx;
     const WtsView wts_ = wts;
     const OutView out_ = out;
-    const size_t I_ = I, S_ = S, ng_ = ngroups, gs_ = gs;
-    const Gguf::GgmlType dt_ = down_dtype;
+    const size_t I_ = I, S_ = S, nu_ = nunits;
     const size_t rb_ = down_row_bytes;
     const size_t d = static_cast<size_t>(team.league_rank());
     float acc = 0;
@@ -176,13 +181,14 @@ struct InklingMoeDownFunctor {
       const float w = wts_(0, s);
       const uint8_t* row =
           reinterpret_cast<const uint8_t*>(down_base(e)) + d * rb_;
-      const Scalar* ad = act_.data() + s * act_.stride(0);
-      const size_t axs = act_.stride(1);
       float r = 0;
       Kokkos::parallel_reduce(
-          Kokkos::TeamThreadRange(team, ng_),
-          KOKKOS_LAMBDA(size_t gg, float& sum) {
-            sum += Gguf::Impl::quant_group_dot(dt_, row, ad, axs, gg * gs_);
+          Kokkos::TeamThreadRange(team, nu_),
+          KOKKOS_LAMBDA(size_t c, float& sum) {
+            const Mvq::Int8UnitWindow aw =
+                Mvq::mvq_load_unit_window<ExecSpace, DT>(
+                    aq + s * I_, ah + s * (I_ / 32), (int)c);
+            sum += Mvq::gemv_int8_unit_dot_win<ExecSpace, DT>(row, (int)c, aw);
           },
           r);
       acc += w * r;
@@ -193,7 +199,7 @@ struct InklingMoeDownFunctor {
   }
 };
 
-// Two-launch fused MoE decode for one token. See the header docs for the
+// Three-launch fused MoE decode for one token. See the header docs for the
 // contract. Throws on shape/dtype misuse; the caller checks
 // moe_decode_fused_supported() first to choose this path vs the legacy
 // host-grouped one.
@@ -205,6 +211,8 @@ void inkling_moe_decode_fused(
     const Kokkos::View<int**, Kokkos::LayoutRight, ExecSpace>& idx,
     const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& wts,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& act,
+    const Kokkos::View<uint8_t*, ExecSpace>& qx_scratch,
+    const Kokkos::View<uint8_t*, ExecSpace>& qa_scratch,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& out,
     float gate_softcap, float up_softcap,
     const std::string& label = "KokkosDNN::Inkling::moe_decode_fused") {
@@ -222,24 +230,86 @@ void inkling_moe_decode_fused(
     throw std::invalid_argument(
         "inkling_moe_decode_fused: dimension mismatch");
   if (S == 0 || K == 0 || D == 0 || I == 0) return;
-  size_t gs_gu = 0, gs_d = 0;
-  if (!Gguf::Impl::quant_can_group(gu.dtype, K, gs_gu) ||
-      !Gguf::Impl::quant_can_group(down.dtype, I, gs_d))
+  Mvq::Wd gu_wd{}, down_wd{};
+  if (!Gguf::Impl::quant_int8_dtype(gu.dtype, gu_wd) ||
+      !Gguf::Impl::quant_int8_dtype(down.dtype, down_wd))
     throw std::invalid_argument(
-        "inkling_moe_decode_fused: expert dtype not grouped-dot eligible");
+        "inkling_moe_decode_fused: expert dtype lacks an int8 path");
+  if (!Mvq::dtype_ok(gu_wd, K) || !Mvq::dtype_ok(down_wd, I))
+    throw std::invalid_argument(
+        "inkling_moe_decode_fused: expert width not int8 aligned");
+  const size_t xneed = Mvq::act_q8_bytes(K);
+  const size_t aneed = Mvq::act_q8_bytes(S * I);
+  if (qx_scratch.extent(0) < xneed || qa_scratch.extent(0) < aneed)
+    throw std::invalid_argument(
+        "inkling_moe_decode_fused: activation scratch too small");
+  // Stage 0: quantize the shared input row.
   {
-    InklingMoeGateUpFunctor<ExecSpace, Scalar> f{
-        x,          gu.base, gu.dtype, gu.row_bytes, idx, act,
-        I,          K / gs_gu, gs_gu, gate_softcap, up_softcap};
+    uint8_t* const sbase = qx_scratch.data();
+    int8_t* const xq = reinterpret_cast<int8_t*>(sbase);
+    Mvq::ActQ8Hdr* const xh = reinterpret_cast<Mvq::ActQ8Hdr*>(
+        sbase + Mvq::act_q8_hdr_offset(K));
+    const int nblk = (int)Mvq::act_q8_blocks(K);
+    Mvq::QuantizeActQ8Functor<ExecSpace, Scalar> qf{x.data(), xq, xh, nblk};
+    Kokkos::parallel_for(label + "::quant_x",
+                          Kokkos::RangePolicy<ExecSpace>(0, nblk), qf);
+  }
+  // Stage 1: gate_up int8 dots + swiglu.
+  const auto launch_gate_up = [&](auto wd_tag) {
+    constexpr Mvq::Wd DT = decltype(wd_tag)::value;
+    InklingMoeGateUpFunctor<ExecSpace, Scalar, DT> f{
+        reinterpret_cast<const int8_t*>(qx_scratch.data()),
+        reinterpret_cast<const Mvq::ActQ8Hdr*>(qx_scratch.data() +
+                                               Mvq::act_q8_hdr_offset(K)),
+        gu.base, gu.dtype, gu.row_bytes, idx, act, I, K / 32,
+        gate_softcap, up_softcap};
     Kokkos::TeamPolicy<ExecSpace> policy((int)(S * I), 128);
     Kokkos::parallel_for(label + "::gate_up", policy, f);
+  };
+  switch (gu_wd) {
+    case Mvq::Wd::IQ4NL:
+      launch_gate_up(std::integral_constant<Mvq::Wd, Mvq::Wd::IQ4NL>{});
+      break;
+    case Mvq::Wd::Q80:
+      launch_gate_up(std::integral_constant<Mvq::Wd, Mvq::Wd::Q80>{});
+      break;
+    default:
+      throw std::invalid_argument(
+          "inkling_moe_decode_fused: unsupported gate_up dtype");
   }
+  // Stage 0b: quantize the slot rows (flattened [S*I]). Same-stream
+  // ordering covers the stage-1 -> quantize dependency (no fence).
   {
-    InklingMoeDownFunctor<ExecSpace, Scalar> f{
-        act, down.base, down.dtype, down.row_bytes, idx, wts,
-        out, I, S, I / gs_d, gs_d};
+    uint8_t* const sbase = qa_scratch.data();
+    int8_t* const aq = reinterpret_cast<int8_t*>(sbase);
+    Mvq::ActQ8Hdr* const ah = reinterpret_cast<Mvq::ActQ8Hdr*>(
+        sbase + Mvq::act_q8_hdr_offset(S * I));
+    const int nblk = (int)Mvq::act_q8_blocks(S * I);
+    Mvq::QuantizeActQ8Functor<ExecSpace, Scalar> qf{act.data(), aq, ah, nblk};
+    Kokkos::parallel_for(label + "::quant_a",
+                          Kokkos::RangePolicy<ExecSpace>(0, nblk), qf);
+  }
+  // Stage 2: down int8 dots + weighted combine.
+  const auto launch_down = [&](auto wd_tag) {
+    constexpr Mvq::Wd DT = decltype(wd_tag)::value;
+    InklingMoeDownFunctor<ExecSpace, Scalar, DT> f{
+        reinterpret_cast<const int8_t*>(qa_scratch.data()),
+        reinterpret_cast<const Mvq::ActQ8Hdr*>(qa_scratch.data() +
+                                               Mvq::act_q8_hdr_offset(S * I)),
+        down.base, down.dtype, down.row_bytes, idx, wts, out, I, S, I / 32};
     Kokkos::TeamPolicy<ExecSpace> policy((int)D, 128);
     Kokkos::parallel_for(label + "::down", policy, f);
+  };
+  switch (down_wd) {
+    case Mvq::Wd::IQ4NL:
+      launch_down(std::integral_constant<Mvq::Wd, Mvq::Wd::IQ4NL>{});
+      break;
+    case Mvq::Wd::Q80:
+      launch_down(std::integral_constant<Mvq::Wd, Mvq::Wd::Q80>{});
+      break;
+    default:
+      throw std::invalid_argument(
+          "inkling_moe_decode_fused: unsupported down dtype");
   }
 }
 

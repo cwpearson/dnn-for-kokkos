@@ -562,6 +562,7 @@ class Model {
   Kokkos::View<uint8_t*, ExecSpace> q8_act_buf_;
   // Fused MoE decode scratch: one activation row per routed slot.
   MatR moe_fused_act_buf_;
+  Kokkos::View<uint8_t*, ExecSpace> moe_fused_q8_buf_;
   // Device expert-table cache for the fused MoE decode path (rebuilt only
   // when the source weight vectors change).
   Impl::InklingMoeTableCache<ExecSpace> moe_tables_;
@@ -704,6 +705,9 @@ class Model {
     act_buf_ = MatR("act", C, II);
     moe_gate_buf_ = MatR("moe_gate", C, II);
     moe_fused_act_buf_ = MatR("moe_fused_act", TK, II);
+    moe_fused_q8_buf_ = Kokkos::View<uint8_t*, ExecSpace>(
+        "moe_fused_q8",
+        Gguf::quant_gemv_int8_scratch_bytes(TK * II));
     moe_up_buf_ = MatR("moe_up", C, II);
     down_buf_ = MatR("down", C, D);
     moe_out_buf_ = MatR("moe_out", C, D);
@@ -1010,7 +1014,8 @@ class Model {
                                      std::make_pair(size_t(0), TK),
                                      Kokkos::ALL);
         Impl::inkling_moe_decode_fused<ExecSpace, Scalar>(
-            mn, moe_tables_.gu, moe_tables_.down, idx, w, act_f, out,
+            mn, moe_tables_.gu, moe_tables_.down, idx, w, act_f,
+            moe_fused_q8_buf_, moe_fused_q8_buf_, out,
             cfg.gate_softcap, cfg.up_softcap);
         return;
       }

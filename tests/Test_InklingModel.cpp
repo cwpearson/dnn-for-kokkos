@@ -1524,43 +1524,72 @@ void check_moe_decode_fused(Gguf::GgmlType gu_dt, Gguf::GgmlType down_dt,
   for (auto& v : x) v = uni(rng);
   const std::vector<int> idx = {0, 2};  // expert 1 unrouted
   const std::vector<float> wts = {0.7f, 0.3f};
+  // Host reference from the dequantized packed bytes, replaying the int8
+  // stage-1 quantizer exactly (same formula as QuantizeActQ8Functor), so the
+  // tolerance only covers kernel FP reassociation, not quantizer noise.
+  auto quant_row = [&](const std::vector<float>& f, std::vector<float>& dq) {
+    dq.assign(f.size(), 0);
+    for (size_t b = 0; b < f.size() / 32; ++b) {
+      float amax = 0;
+      for (size_t i = 0; i < 32; ++i)
+        amax = std::max(amax, std::fabs(f[b * 32 + i]));
+      const float d = amax / 127.0f;
+      const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+      for (size_t i = 0; i < 32; ++i) {
+        int q = (int)std::nearbyint(f[b * 32 + i] * inv);
+        q = std::max(-127, std::min(127, q));
+        dq[b * 32 + i] = d * (float)q;
+      }
+    }
+  };
+  std::vector<float> qx;
+  quant_row(x, qx);
   std::vector<float> want(D, 0);
   {
-    std::vector<float> xv = x;
+    std::vector<float> act(S * I, 0);
     for (size_t s = 0; s < S; ++s) {
       const size_t e = (size_t)idx[s];
-      std::vector<uint8_t> gu_raw, down_raw;
+      std::vector<uint8_t> gu_raw;
       if (gu_dt == GgmlType::Q8_0) {
         pack_q80(gu_f[e], 2 * I, K, gu_raw);
       } else {
         pack_iq4nl(gu_f[e], 2 * I, K, gu_raw);
       }
-      if (down_dt == GgmlType::Q8_0) {
-        pack_q80(down_f[e], D, I, down_raw);
-      } else {
-        pack_iq4nl(down_f[e], D, I, down_raw);
-      }
-      // Reference dots from the packed bytes (exact weights).
-      std::vector<float> act(I, 0);
+      // Reference gate/up dots from the packed bytes and quantized input.
+      std::vector<float> act_s(I, 0);
       for (size_t j = 0; j < I; ++j) {
         std::vector<float> gr, ur;
         dequant_row(gu_dt, gu_raw.data(), j, K, gr);
         dequant_row(gu_dt, gu_raw.data(), j + I, K, ur);
         double dg = 0, du = 0;
         for (size_t k = 0; k < K; ++k) {
-          dg += (double)gr[k] * (double)xv[k];
-          du += (double)ur[k] * (double)xv[k];
+          dg += (double)gr[k] * (double)qx[k];
+          du += (double)ur[k] * (double)qx[k];
         }
         const float gcap = std::tanh((float)dg / gs) * gs;
         const float sig = 1.0f / (1.0f + std::exp(-(float)dg));
         const float ucap = std::tanh((float)du / us) * us;
-        act[j] = gcap * sig * ucap;
+        act_s[j] = gcap * sig * ucap;
+        act[s * I + j] = act_s[j];
       }
+    }
+    // Reference down dots from the packed bytes and quantized slot rows.
+    for (size_t s = 0; s < S; ++s) {
+      const size_t e = (size_t)idx[s];
+      std::vector<uint8_t> down_raw;
+      if (down_dt == GgmlType::Q8_0) {
+        pack_q80(down_f[e], D, I, down_raw);
+      } else {
+        pack_iq4nl(down_f[e], D, I, down_raw);
+      }
+      std::vector<float> slot(act.begin() + s * I, act.begin() + (s + 1) * I);
+      std::vector<float> qslot;
+      quant_row(slot, qslot);
       for (size_t d = 0; d < D; ++d) {
         std::vector<float> dr;
         dequant_row(down_dt, down_raw.data(), d, I, dr);
         double dd = 0;
-        for (size_t i = 0; i < I; ++i) dd += (double)dr[i] * (double)act[i];
+        for (size_t i = 0; i < I; ++i) dd += (double)dr[i] * (double)qslot[i];
         want[d] += wts[s] * (float)dd;
       }
     }
@@ -1616,13 +1645,20 @@ void check_moe_decode_fused(Gguf::GgmlType gu_dt, Gguf::GgmlType down_dt,
   }
   ASSERT_TRUE(KokkosDNN::Inkling::Impl::moe_decode_fused_supported(
       gu_dt, K, down_dt, I));
+  Kokkos::View<uint8_t*, Exec> qx_scratch(
+      "qx", KokkosDNN::Gguf::quant_gemv_int8_scratch_bytes(K));
+  Kokkos::View<uint8_t*, Exec> qa_scratch(
+      "qa", KokkosDNN::Gguf::quant_gemv_int8_scratch_bytes(S * I));
   KokkosDNN::Inkling::Impl::inkling_moe_decode_fused<Exec, Scalar>(
-      xd, gu_tab, down_tab, xidx, xwts, xact, xout, gs, us);
+      xd, gu_tab, down_tab, xidx, xwts, xact, qx_scratch, qa_scratch, xout,
+      gs, us);
   Kokkos::fence();
   auto hout = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), xout);
   ASSERT_EQ(hout.size(), want.size());
+  // Quantizer noise is replayed in the reference, so the envelope only
+  // covers kernel FP reassociation; nibble/LUT bugs miss by O(1).
   for (size_t d = 0; d < D; ++d)
-    EXPECT_NEAR(static_cast<float>(hout(0, d)), want[d], 1e-4f)
+    EXPECT_NEAR(static_cast<float>(hout(0, d)), want[d], 1e-3f)
         << "fused MoE decode mismatch at " << d;
 }
 
