@@ -800,6 +800,16 @@ class Model {
       inkling_short_conv_forward<ExecSpace, Scalar>(x, w, out);
       return;
     }
+    if (C == 1) {
+      // Single-token stateful path: one launch instead of five.
+      using Unm1 = Kokkos::View<Scalar*, Kokkos::LayoutRight, ExecSpace,
+                                Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+      // x is only read (state/out are written); the allocation is ours.
+      Unm1 x1(const_cast<Scalar*>(x.data()), Ch);
+      Unm1 y1(out.data(), Ch);
+      inkling_short_conv_update_state<ExecSpace, Scalar>(x1, state, w, y1);
+      return;
+    }
     const size_t Km1 = K - 1;
     auto tin = Kokkos::subview(tmp, std::make_pair(size_t(0), Km1 + C),
                                Kokkos::ALL);
@@ -842,6 +852,18 @@ class Model {
     if (K == 1) {
       inkling_dynamic_short_conv_forward<ExecSpace, Scalar>(
           x, static_w, dyn, nheads, head_dim, out);
+      return;
+    }
+    if (C == 1) {
+      // Single-token stateful path: one launch instead of six.
+      using Unm1 = Kokkos::View<Scalar*, Kokkos::LayoutRight, ExecSpace,
+                                Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+      // x/dyn are only read; the allocations are ours.
+      Unm1 x1(const_cast<Scalar*>(x.data()), Ch);
+      Unm1 dyn1(const_cast<Scalar*>(dyn.data()), nheads * K);
+      Unm1 y1(out.data(), Ch);
+      inkling_dynamic_short_conv_update_state<ExecSpace, Scalar>(
+          x1, state, static_w, dyn1, nheads, head_dim, y1);
       return;
     }
     const size_t Km1 = K - 1;

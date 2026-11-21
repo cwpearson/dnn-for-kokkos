@@ -246,6 +246,43 @@ void check_inkling_conv(float tol) {
   auto hyd = to_host1(yd);
   for (size_t d = 0; d < D; ++d)
     EXPECT_NEAR(hyd[d], hy[T - 1][d], tol) << d;
+  // In-place decode (x aliases y, as the Model calls it): the state append
+  // must observe the input, not the just-written output. Re-run from the
+  // same pre-state with aliased views and compare against the out-of-place
+  // result above.
+  {
+    Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> state_pre("state_pre",
+                                                                D, K - 1);
+    {
+      auto ms = Kokkos::create_mirror_view(state_pre);
+      for (size_t d = 0; d < D; ++d)
+        for (size_t k = 0; k < K - 1; ++k) {
+          const int s = (int)(T - 1) - (int)(K - 1) + (int)k;
+          ms(d, k) = (s < 0) ? (Scalar)0 : (Scalar)hx[s][d];
+        }
+      Kokkos::deep_copy(state_pre, ms);
+    }
+    Kokkos::View<Scalar*, Exec> xio("xio", D);
+    Kokkos::deep_copy(xio, xn);
+    Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> state_io("state_io", D,
+                                                               K - 1);
+    Kokkos::deep_copy(state_io, state_pre);
+    KokkosDNN::inkling_short_conv_update_state<Exec, Scalar>(xio, state_io,
+                                                             w, xio);
+    Kokkos::fence();
+    auto hio = to_host1(xio);
+    auto ms = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(),
+                                                  state_io);
+    auto ms_ref =
+        Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), state);
+    for (size_t d = 0; d < D; ++d) {
+      EXPECT_NEAR(hio[d], hyd[d], tol) << "in-place " << d;
+      for (size_t k = 0; k < K - 1; ++k)
+        EXPECT_FLOAT_EQ(static_cast<float>(ms(d, k)),
+                        static_cast<float>(ms_ref(d, k)))
+            << "in-place state " << d << " " << k;
+    }
+  }
   // State now holds the last K-1 inputs.
   {
     auto ms = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), state);
@@ -310,6 +347,37 @@ void check_inkling_conv(float tol) {
   auto hydd = to_host1(ydd);
   for (size_t d = 0; d < D; ++d)
     EXPECT_NEAR(hydd[d], hydyn[T - 1][d], tol) << d;
+  // In-place dynamic decode (x aliases y): same transition must result.
+  {
+    Kokkos::View<Scalar*, Exec> xio("xio", D);
+    Kokkos::deep_copy(xio, xn);
+    Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> state_io("state_io", D,
+                                                               K - 1);
+    {
+      auto ms = Kokkos::create_mirror_view(state_io);
+      for (size_t d = 0; d < D; ++d)
+        for (size_t k = 0; k < K - 1; ++k) {
+          const int s = (int)(T - 1) - (int)(K - 1) + (int)k;
+          ms(d, k) = (s < 0) ? (Scalar)0 : (Scalar)hx[s][d];
+        }
+      Kokkos::deep_copy(state_io, ms);
+    }
+    KokkosDNN::inkling_dynamic_short_conv_update_state<Exec, Scalar>(
+        xio, state_io, sw, dyn_row, H, Dh, xio);
+    Kokkos::fence();
+    auto hio = to_host1(xio);
+    auto ms = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(),
+                                                  state_io);
+    auto ms_ref =
+        Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), state2);
+    for (size_t d = 0; d < D; ++d) {
+      EXPECT_NEAR(hio[d], hydd[d], tol) << "in-place dyn " << d;
+      for (size_t k = 0; k < K - 1; ++k)
+        EXPECT_FLOAT_EQ(static_cast<float>(ms(d, k)),
+                        static_cast<float>(ms_ref(d, k)))
+            << "in-place dyn state " << d << " " << k;
+    }
+  }
 }
 
 TEST(InklingConv, Float) { check_inkling_conv<float>(1e-5f); }

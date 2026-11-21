@@ -92,7 +92,9 @@ void inkling_short_conv_update_state(
         acc += static_cast<float>(weight(d, K - 1)) * xn;
         y(d) = static_cast<Scalar>((acc + xn) * inv);
         for (size_t k = 0; k + 1 < K - 1; ++k) state(d, k) = state(d, k + 1);
-        if (K > 1) state(d, K - 2) = x_new(d);
+        // Append the snapshot, not a re-read: x_new may alias y (the Model
+        // calls these in place), and y(d) is already overwritten here.
+        if (K > 1) state(d, K - 2) = static_cast<Scalar>(xn);
       });
 }
 
@@ -151,11 +153,11 @@ void inkling_dynamic_short_conv_forward(
 // dyn_row[h*K+k], y[c] = (sum_k tap*window[k] + x_new[c]) / sqrt(2K+1);
 // state shifts left and appends x_new. Layouts mirror the full-sequence
 // overload with T = 1.
-template <class ExecSpace, class Scalar>
+template <class ExecSpace, class Scalar, class SWView>
 void inkling_dynamic_short_conv_update_state(
     const Kokkos::View<Scalar*, ExecSpace>& x_new,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& state,
-    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& static_w,
+    const SWView& static_w,
     const Kokkos::View<Scalar*, ExecSpace>& dyn_row, size_t nheads,
     size_t head_dim, const Kokkos::View<Scalar*, ExecSpace>& y,
     const std::string& label =
@@ -187,7 +189,8 @@ void inkling_dynamic_short_conv_update_state(
         acc += tap_last * xn;
         y(c) = static_cast<Scalar>((acc + xn) * inv);
         for (size_t k = 0; k + 1 < K - 1; ++k) state(c, k) = state(c, k + 1);
-        if (K > 1) state(c, K - 2) = x_new(c);
+        // Append the snapshot (x_new may alias y; see above).
+        if (K > 1) state(c, K - 2) = static_cast<Scalar>(xn);
       });
 }
 
