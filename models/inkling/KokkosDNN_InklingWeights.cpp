@@ -516,16 +516,20 @@ void random_init(const Config& cfg, Weights<ExecSpace, Scalar>& w,
     Kokkos::deep_copy(qw.data, h);
   };
   auto fill_vec = [&](auto& v) {
+    using ElemT = typename std::decay_t<decltype(
+        Kokkos::create_mirror_view(v))>::value_type;
     auto h = Kokkos::create_mirror_view(v);
     for (size_t i = 0; i < h.extent(0); ++i)
-      h(i) = static_cast<Scalar>(dist(rng));
+      h(i) = static_cast<ElemT>(dist(rng));
     Kokkos::deep_copy(v, h);
   };
   auto fill_mat = [&](auto& v) {
+    using ElemT = typename std::decay_t<decltype(
+        Kokkos::create_mirror_view(v))>::value_type;
     auto h = Kokkos::create_mirror_view(v);
     for (size_t i = 0; i < h.extent(0); ++i)
       for (size_t j = 0; j < h.extent(1); ++j)
-        h(i, j) = static_cast<Scalar>(dist(rng));
+        h(i, j) = static_cast<ElemT>(dist(rng));
     Kokkos::deep_copy(v, h);
   };
   const size_t D = (size_t)cfg.d_model, V = (size_t)cfg.vocab_size;
@@ -669,6 +673,14 @@ void load_safetensors(const Config& cfg,
     Loc l = locate(name);
     stream_to_mat<ExecSpace, Scalar>(shards[l.shard], name, *l.meta, dst);
   };
+  auto load_dense_f = [&](const TensorId& id,
+                          const Kokkos::View<float**, Kokkos::LayoutRight,
+                                             ExecSpace>& dst) {
+    if (dst.size() == 0) return;
+    const std::string name = hf_name(id);
+    Loc l = locate(name);
+    stream_to_mat<ExecSpace, float>(shards[l.shard], name, *l.meta, dst);
+  };
   auto load_dense_T = [&](const TensorId& id,
                           const Kokkos::View<Scalar**, Kokkos::LayoutRight,
                                              ExecSpace>& dst) {
@@ -756,7 +768,7 @@ void load_safetensors(const Config& cfg,
       load_dense_T({Tensor::LoopFfnCtrlDown, l}, b.loop_mlp_down);
       load_dense_T({Tensor::LoopFfnCtrlForget, l}, b.loop_mlp_forget);
       load_dense_T({Tensor::LoopFfnCtrlGain, l}, b.loop_mlp_gain);
-      load_dense({Tensor::LoopMsgQuery, l}, b.msg_query);
+      load_dense_f({Tensor::LoopMsgQuery, l}, b.msg_query);
     }
   }
   Kokkos::fence();
@@ -1317,7 +1329,7 @@ void load_gguf(const Config& cfg, const std::string& path,
           file, {Tensor::LoopFfnCtrlForget, l}, b.loop_mlp_forget);
       gguf_load_dense_mat_T<ExecSpace, Scalar>(
           file, {Tensor::LoopFfnCtrlGain, l}, b.loop_mlp_gain);
-      gguf_load_dense_mat<ExecSpace, Scalar>(file, {Tensor::LoopMsgQuery, l},
+      gguf_load_dense_mat<ExecSpace, float>(file, {Tensor::LoopMsgQuery, l},
                                              b.msg_query);
     }
     // Keep host RAM bounded: at most one tensor payload is referenced at a
