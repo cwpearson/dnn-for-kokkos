@@ -1339,10 +1339,10 @@ TEST(InklingModel, RawResidualNoGateBias) {
       << "maxdiff=" << max_abs_diff(got, want);
 }
 
-// Team-parallel attention must reproduce the legacy kernel bit-for-bit
-// (same per-element op order; scores staged in team scratch instead of
-// recomputed). Direct kernel-vs-kernel check across decode/prefill shapes,
-// sliding + full windows, and an empty-row edge.
+// Team-parallel attention must reproduce the legacy kernel to FP
+// reassociation (the max/sum reductions reorder vs the legacy serial loop).
+// Direct kernel-vs-kernel check across decode/prefill shapes, sliding +
+// full windows, and an empty-row edge.
 template <class Scalar>
 void check_attention_team_matches_legacy(size_t C, size_t H, size_t N,
                                          size_t HD, size_t R, size_t E,
@@ -1374,8 +1374,8 @@ void check_attention_team_matches_legacy(size_t C, size_t H, size_t N,
   auto hl = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), out_l);
   ASSERT_EQ(ht.size(), hl.size());
   for (size_t i = 0; i < ht.size(); ++i)
-    EXPECT_FLOAT_EQ(static_cast<float>(ht.data()[i]),
-                    static_cast<float>(hl.data()[i]))
+    EXPECT_NEAR(static_cast<float>(ht.data()[i]),
+                static_cast<float>(hl.data()[i]), 1e-5f)
         << "team vs legacy mismatch at " << i << " (C=" << C << " H=" << H
         << " N=" << N << " window=" << window << " q_off=" << q_off << ")";
 }
@@ -1392,7 +1392,7 @@ TEST(InklingModel, AttentionTeamMatchesLegacy) {
   // Real head width.
   check_attention_team_matches_legacy<float>(1, 8, 11, 128, 16, 128, 10, 1024,
                                             12);
-  // bhalf (the deployed scalar): same op order, so bitwise too.
+  // bhalf (the deployed scalar): same tolerance bar.
   using bhalf_t = Kokkos::Experimental::bhalf_t;
   check_attention_team_matches_legacy<bhalf_t>(1, 4, 5, 8, 4, 32, 4, 1024, 13);
   check_attention_team_matches_legacy<bhalf_t>(1, 8, 11, 128, 16, 128, 10,

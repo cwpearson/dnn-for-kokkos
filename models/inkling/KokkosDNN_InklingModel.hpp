@@ -148,12 +148,14 @@ bool is_full_layer(const Ids& local_ids, int n_layers, int l) {
 }
 
 // Team-parallel causal GQA worker: one team per (token, head), threads split
-// the head dim. Scores are computed once per (t, h, key) by the team leader
-// into team scratch and shared across the d-split weighted sum, instead of
-// being recomputed per (t, h, d, key) as in the legacy MDRange kernel below.
-// At decode (C == 1) the legacy form leaves one thread grinding ~200k FLOP
-// through dependent scalar chains (~4 ms/launch on RTX 3090); the team form
-// is bit-identical (same per-element op order) at ~1/30th the time.
+// the head dim. Scores are computed once per (t, h, key) into team scratch
+// and shared across the d-split weighted sum, instead of being recomputed
+// per (t, h, d, key) as in the legacy MDRange kernel below. At decode
+// (C == 1) the legacy form leaves one thread grinding ~200k FLOP through
+// dependent scalar chains (~4 ms/launch on RTX 3090); the team form is
+// ~1/30th the time. The max/sum reductions reassociate vs the legacy serial
+// loop, so results agree to FP reassociation (~1e-6), not bit-for-bit
+// (pinned by AttentionTeamMatchesLegacy at 1e-5).
 template <class ExecSpace, class QView, class KView, class VView, class RView,
           class PView, class SView, class OView>
 struct InklingAttentionTeam {
@@ -202,53 +204,78 @@ struct InklingAttentionTeam {
           });
       return;
     }
-    // m/denom are rank-0 values consumed by every thread: they live in
-    // scratch (a per-thread stack copy would leave other threads dividing
-    // by their own zero). Layout: scores[Kmax], rden[1].
+    const size_t nkeys = khi - klo + 1;
+    const float sk = static_cast<float>(sink_(t, h));
+    // Shared max (rank-0 value consumed by every thread): scratch-resident
+    // so no thread divides by its own uninitialized copy. Layout:
+    // scores[Kmax], max[1]. Scores are normalized in place in pass 2, so
+    // pass 3 needs no extra reciprocal.
     float* sc = static_cast<float*>(
         team.team_scratch(1).get_shmem(sizeof(float) * (Kmax_ + 1)));
-    float* sc_rden = sc + Kmax_;
-    // Passes 1-2 (leader): identical op order to the legacy kernel; scores
-    // land in scratch for the d-split pass 3 instead of being recomputed.
-    if (team.team_rank() == 0) {
-      float m = 0, denom = 0;
-      const float sk = static_cast<float>(sink_(t, h));
-      m = sk;
-      for (size_t kk = klo; kk <= khi; ++kk) {
-        float dot = 0;
-        for (size_t d = 0; d < D_; ++d)
-          dot += static_cast<float>(q_(t, h, d)) *
-                 static_cast<float>(k_(kk, hkv, d));
-        float s = dot * scale_;
-        const long dist = static_cast<long>(qt) - static_cast<long>(kk);
-        if (dist >= 0 && static_cast<size_t>(dist) < E_) {
-          float b = 0;
-          for (size_t r = 0; r < R_; ++r)
-            b += static_cast<float>(rel_(t, h, r)) *
-                 proj_(r, static_cast<size_t>(dist));
-          s += b;
-        }
-        sc[kk - klo] = s;
-        if (s > m) m = s;
-      }
-      denom = Kokkos::expf(sk - m);
-      for (size_t kk = klo; kk <= khi; ++kk) {
-        const float e = Kokkos::expf(sc[kk - klo] - m);
-        sc[kk - klo] = e;
-        denom += e;
-      }
-      sc_rden[0] = 1.0f / denom;
+    float* sc_max = sc + Kmax_;
+    // Pass 1: scores in parallel over keys (each key by exactly one
+    // thread, same formula as the legacy kernel), then a max-reduction.
+    // The legacy kernel ran this serially, which is fine for ~11 decode
+    // keys but strands 127/128 threads on thousand-key prefill rows.
+    Kokkos::parallel_for(
+        Kokkos::TeamThreadRange(team, nkeys), KOKKOS_LAMBDA(size_t i) {
+          const size_t kk = klo + i;
+          float dot = 0;
+          for (size_t d = 0; d < D_; ++d)
+            dot += static_cast<float>(q_(t, h, d)) *
+                   static_cast<float>(k_(kk, hkv, d));
+          float s = dot * scale_;
+          const long dist = static_cast<long>(qt) - static_cast<long>(kk);
+          if (dist >= 0 && static_cast<size_t>(dist) < E_) {
+            float b = 0;
+            for (size_t r = 0; r < R_; ++r)
+              b += static_cast<float>(rel_(t, h, r)) *
+                   proj_(r, static_cast<size_t>(dist));
+            s += b;
+          }
+          sc[i] = s;
+        });
+    {
+      float m = -1e30f;
+      Kokkos::parallel_reduce(
+          Kokkos::TeamThreadRange(team, nkeys),
+          KOKKOS_LAMBDA(size_t i, float& mloc) {
+            if (sc[i] > mloc) mloc = sc[i];
+          },
+          Kokkos::Max<float>(m));
+      Kokkos::single(Kokkos::PerTeam(team), KOKKOS_LAMBDA() {
+        sc_max[0] = (m > sk) ? m : sk;
+        // Fold the sink logit into the max (legacy pass 1 seeds m = sk).
+      });
     }
     team.team_barrier();
-    const float rden = sc_rden[0];
+    const float m = sc_max[0];
+    // Pass 2: exp/sum reduction, then normalize in place.
+    {
+      float denom = 0;
+      Kokkos::parallel_reduce(
+          Kokkos::TeamThreadRange(team, nkeys),
+          KOKKOS_LAMBDA(size_t i, float& dloc) {
+            const float e = Kokkos::expf(sc[i] - m);
+            sc[i] = e;
+            dloc += e;
+          },
+          denom);
+      Kokkos::single(Kokkos::PerTeam(team), KOKKOS_LAMBDA() {
+        const float rden = 1.0f / (Kokkos::expf(sk - m) + denom);
+        for (size_t i = 0; i < nkeys; ++i) sc[i] *= rden;
+      });
+    }
+    team.team_barrier();
     // Pass 3: threads split d; each (t,h,d) accumulates keys in kk order
-    // over the staged scores, exactly like the legacy kernel.
+    // over the normalized staged scores (legacy pass-3 order, with the
+    // 1/denom fold already applied above).
     Kokkos::parallel_for(
         Kokkos::TeamThreadRange(team, D_), KOKKOS_LAMBDA(size_t d) {
           float acc = 0;
           for (size_t kk = klo; kk <= khi; ++kk)
             acc += sc[kk - klo] * static_cast<float>(v_(kk, hkv, d));
-          out_(t, h, d) = acc * rden;
+          out_(t, h, d) = acc;
         });
   }
 };
@@ -356,7 +383,8 @@ void inkling_attention_forward_legacy(
 // kTeamScratchKeys keys the launch would exceed portable scratch budgets,
 // so those long-context full-attention rows keep the legacy kernel.
 // Everything else (decode, sliding prefill, short-context full) takes the
-// team path. Math is bit-identical to the legacy kernel on the team path.
+// team path. Max/sum reductions reassociate vs the legacy serial loop
+// (~1e-6 agreement; the legacy kernel is still used past the key budget).
 inline constexpr size_t kInklingAttnTeamScratchKeys = 8192;
 
 template <class ExecSpace, class Scalar, class QView, class KView, class VView,
