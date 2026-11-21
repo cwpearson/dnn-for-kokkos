@@ -116,7 +116,12 @@ void linear_prefill(
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& Y,
     const std::string& label = "Inkling::linear_prefill") {
   if (staging.extent(0) != W.rows || staging.extent(1) != W.cols)
-    throw std::invalid_argument("linear_prefill: staging shape mismatch");
+    throw std::invalid_argument("linear_prefill: staging shape mismatch in " +
+                                label + " (staging [" +
+                                std::to_string(staging.extent(0)) + "x" +
+                                std::to_string(staging.extent(1)) +
+                                "] vs weight [" + std::to_string(W.rows) +
+                                "x" + std::to_string(W.cols) + "])");
   Gguf::dequant_to_dense<ExecSpace, Scalar>(W, staging);
   gemm<ExecSpace, Scalar>(handle, static_cast<Scalar>(1), X, staging,
                           static_cast<Scalar>(0), Y, label);

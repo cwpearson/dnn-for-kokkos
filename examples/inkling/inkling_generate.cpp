@@ -16,6 +16,8 @@
 // encode_rendered_chat, ensure_bos, normalize_reasoning_effort,
 // default_stop_strings, truncate_at_stop_strings, find_stop_string,
 // Model::generate, DefaultScalar); adjust when the component lands.
+#include "KokkosDNN_ChatStop.hpp"
+#include "KokkosDNN_InklingChat.hpp"
 #include "KokkosDNN_InklingConfig.hpp"
 #include "KokkosDNN_InklingModel.hpp"
 #include "KokkosDNN_InklingTokenizer.hpp"
@@ -140,7 +142,7 @@ int run_model(KokkosDNN::Inkling::Config cfg,
   if (tiny || wfiles.empty()) {
     KokkosDNN::Inkling::random_init(cfg, w);
     std::printf("[%srandom weights] dim=%d layers=%d\n", tiny ? "tiny " : "",
-                cfg.dim, cfg.n_layers);
+                cfg.d_model, cfg.n_layers);
   } else if (wfiles.size() == 1 && is_gguf_path(wfiles[0])) {
     KokkosDNN::Inkling::load_gguf(cfg, wfiles[0], w);
     std::printf("[loaded %s]\n", wfiles[0].c_str());
@@ -166,16 +168,16 @@ int run_model(KokkosDNN::Inkling::Config cfg,
           prompt, system_prompt, role.empty() ? "user" : role);
       std::string rendered =
           KokkosDNN::Inkling::render_inkling_chatml_with_tools(
-              msgs, "", "", true, "", reasoning_effort);
+              msgs, "", "", true, true, reasoning_effort);
       std::printf("[chat reasoning-effort=%s] %s\n",
-                  KokkosDNN::Inkling::normalize_reasoning_effort(
+                  KokkosDNN::Inkling::resolve_reasoning_effort(
                       reasoning_effort)
                       .c_str(),
                   rendered.c_str());
       prompt_ids =
-          KokkosDNN::Inkling::encode_rendered_chat(tok, rendered, want_bos);
+          KokkosDNN::Common::Chat::encode_rendered_chat(tok, rendered, want_bos);
     } else {
-      prompt_ids = KokkosDNN::Inkling::ensure_bos(tok.encode(prompt, want_bos),
+      prompt_ids = KokkosDNN::Common::Chat::ensure_bos(tok.encode(prompt, want_bos),
                                                  tok.bos(), want_bos);
     }
     std::printf("prompt tokens: %zu\n", prompt_ids.size());
@@ -190,10 +192,10 @@ int run_model(KokkosDNN::Inkling::Config cfg,
       auto msgs = KokkosDNN::Inkling::make_chat_messages(
           prompt, system_prompt, role.empty() ? "user" : role);
       text = KokkosDNN::Inkling::render_inkling_chatml_with_tools(
-          msgs, "", "", true, "", reasoning_effort);
+          msgs, "", "", true, true, reasoning_effort);
       std::printf("[chat, no tokenizer] %s\n", text.c_str());
     }
-    if (want_bos) prompt_ids.push_back(cfg.bos_token % cfg.vocab_size);
+    (void)want_bos;  // upstream carries no BOS; byte-fallback emits none
     for (unsigned char c : text) prompt_ids.push_back(c % cfg.vocab_size);
     std::printf("[no tokenizer] byte-fallback prompt tokens: %zu\n",
                 prompt_ids.size());
@@ -273,10 +275,10 @@ int run_model(KokkosDNN::Inkling::Config cfg,
                                out.end());
       std::string gen_text = tok.decode(gen_ids);
       std::string cut =
-          KokkosDNN::Inkling::truncate_at_stop_strings(gen_text, stop_strings);
+          KokkosDNN::Common::Chat::truncate_at_stop_strings(gen_text, stop_strings);
       if (cut.size() != gen_text.size()) {
         std::string hit;
-        KokkosDNN::Inkling::find_stop_string(gen_text, stop_strings, &hit);
+        KokkosDNN::Common::Chat::find_stop_string(gen_text, stop_strings, &hit);
         std::printf("stop-string hit: '%s'\n", hit.c_str());
       }
       std::printf("decoded (stop-strings applied): %s\n", cut.c_str());
@@ -356,7 +358,7 @@ int main(int argc, char** argv) {
 
     try {
       reasoning_effort =
-          KokkosDNN::Inkling::normalize_reasoning_effort(reasoning_effort);
+          KokkosDNN::Inkling::resolve_reasoning_effort(reasoning_effort);
     } catch (const std::exception& e) {
       std::fprintf(stderr, "error: --reasoning-effort: %s\n", e.what());
       Kokkos::finalize();
@@ -395,12 +397,31 @@ int main(int argc, char** argv) {
         KokkosDNN::Inkling::Config::inkling_2_mini();
     std::printf("[model %s]\n", model_name.c_str());
     if (o.tiny) {
-      cfg = KokkosDNN::Inkling::Config::tiny_test();
-      cfg.max_seq_len = 64;
+      // Smoke-test dims (all-sliding layers, no loop layers): must satisfy
+      // Config::validate (n_layers % attn_res_block == 0, loop range in
+      // bounds, non-empty strictly-increasing local_layer_ids).
+      cfg.n_layers          = 6;
+      cfg.d_model           = 64;
+      cfg.n_heads           = 4;
+      cfg.n_kv_heads        = 2;
+      cfg.head_dim          = 16;
+      cfg.n_experts         = 4;
+      cfg.top_k             = 2;
+      cfg.intermediate_size = 32;
+      cfg.vocab_size        = 512;
+      cfg.unpadded_vocab    = 512;
+      cfg.swa_window        = 32;
+      cfg.loop_start        = 1;
+      cfg.loop_end          = 3;
+      // Mirror the real topology: res-block boundary layers are
+      // full-attention (dynamic conv, 3 res queries); the rest slide.
+      cfg.local_layer_ids   = {0, 1, 2, 3, 4};
+      cfg.max_seq_len       = 64;
+      cfg.prefill_chunk_size = 64;
     }
     if (!o.config_path.empty()) {
       try {
-        cfg = KokkosDNN::Inkling::Config::from_json_file(o.config_path, cfg);
+        cfg = KokkosDNN::Inkling::Config::from_json_file(o.config_path);
       } catch (const std::exception& e) {
         std::fprintf(stderr, "error: --config '%s': %s\n",
                      o.config_path.c_str(), e.what());
@@ -409,10 +430,10 @@ int main(int argc, char** argv) {
       }
       std::printf("[config %s] dim=%d layers=%d heads=%d kv=%d ffn=%d "
                   "vocab=%d hdim=%d eps=%g max_seq=%d tie=%d\n",
-                  o.config_path.c_str(), cfg.dim, cfg.n_layers, cfg.n_heads,
-                  cfg.n_kv_heads, cfg.ffn_dim, cfg.vocab_size, cfg.head_dim,
-                  (double)cfg.rms_norm_eps, cfg.max_seq_len,
-                  (int)cfg.tie_word_embeddings);
+                  o.config_path.c_str(), cfg.d_model, cfg.n_layers, cfg.n_heads,
+                  cfg.n_kv_heads, cfg.intermediate_size, cfg.vocab_size, cfg.head_dim,
+                  (double)cfg.eps, cfg.max_seq_len,
+                  0);
     }
     if (o.max_seq_len > 0) cfg.max_seq_len = o.max_seq_len;
     try {

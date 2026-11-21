@@ -72,6 +72,7 @@
 
 // Models/inkling component headers (KokkosDNN::inkling target,
 // models/inkling/KokkosDNN_Inkling{Config,Session,Tokenizer,Weights}.hpp).
+#include <KokkosDNN_InklingChat.hpp>
 #include <KokkosDNN_InklingConfig.hpp>
 #include <KokkosDNN_InklingSession.hpp>
 #include <KokkosDNN_InklingTokenizer.hpp>

@@ -391,7 +391,67 @@ void stream_to_mat(
   }
 }
 
+// Transposed dense load: the checkpoint holds [rows, cols] (torch order)
+// but the Model math wants [cols, rows] (loop control downs/forget/gain,
+// rel_proj — see the GGUF transpose loader). Small tensors: materialize
+// the whole tensor on the host once, then write transposed.
+template <class ExecSpace, class Scalar>
+void stream_to_mat_T(
+    const ShardFile& sh, const std::string& name, const TensorMeta& m,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& dst) {
+  const size_t rows = dst.extent(0), cols = dst.extent(1);
+  if (rows == 0 || cols == 0) return;
+  // Checkpoint shape is the transpose of dst.
+  const size_t es = check_tensor(sh, name, m, {cols, rows});
+  Kokkos::View<Scalar*, Kokkos::HostSpace> stage("safetensors_chunk",
+                                                 rows * cols);
+  convert_block<Scalar>(sh.data_ptr(m.begin), m.dtype, stage.data(),
+                        rows * cols);
+  (void)es;
+  auto h = Kokkos::create_mirror_view(dst);
+  for (size_t i = 0; i < rows; ++i)
+    for (size_t j = 0; j < cols; ++j) h(i, j) = stage[j * rows + i];
+  Kokkos::deep_copy(dst, h);
+}
+
 }  // namespace
+
+// Device transpose via host mirrors (loader-time only; the transposed
+// tensors are KBs). dst must be [src.cols, src.rows].
+template <class ExecSpace, class Scalar>
+void transpose_into(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& src,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& dst) {
+  if (dst.extent(0) != src.extent(1) || dst.extent(1) != src.extent(0))
+    throw std::runtime_error("transpose_into: shape mismatch");
+  if (src.size() == 0) return;
+  auto hs = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), src);
+  auto hd = Kokkos::create_mirror_view(dst);
+  for (size_t i = 0; i < src.extent(0); ++i)
+    for (size_t j = 0; j < src.extent(1); ++j) hd(j, i) = hs(i, j);
+  Kokkos::deep_copy(dst, hd);
+}
+
+// Split one folded expert-major packed weight ([experts*per, cols]) into
+// per-expert QuantWeight views sharing the same device payload. Slice
+// starts are row-aligned (expert boundaries are multiples of whole rows),
+// so every slice keeps the dtype's row-packing alignment.
+template <class ExecSpace>
+void slice_experts(const Gguf::QuantWeight<ExecSpace>& folded, size_t experts,
+                   std::vector<Gguf::QuantWeight<ExecSpace>>& per) {
+  if (experts == 0 || folded.rows % experts != 0)
+    throw std::runtime_error("slice_experts: bad expert folding");
+  const size_t per_rows = folded.rows / experts;
+  const size_t rb       = folded.row_bytes();
+  per.resize(experts);
+  for (size_t e = 0; e < experts; ++e) {
+    per[e].dtype = folded.dtype;
+    per[e].rows  = per_rows;
+    per[e].cols  = folded.cols;
+    per[e].data  = Kokkos::View<uint8_t*, ExecSpace>(Kokkos::subview(
+        folded.data, std::make_pair(e * per_rows * rb, (e + 1) * per_rows * rb)));
+  }
+}
 
 template <class ExecSpace, class Scalar>
 void copy_host_to_device(
@@ -452,60 +512,67 @@ void random_init(const Config& cfg, Weights<ExecSpace, Scalar>& w,
   const size_t D = (size_t)cfg.d_model, V = (size_t)cfg.vocab_size;
   const size_t hq = (size_t)cfg.n_heads * (size_t)cfg.head_dim;
   const size_t hkv = (size_t)cfg.n_kv_heads * (size_t)cfg.head_dim;
-  fill_packed(w.embed, V, D);
-  fill_packed(w.lm_head, V, D);
-  fill_vec(w.token_embd_norm);
-  fill_vec(w.output_norm);
-  fill_vec(w.output_res_query);
+  fill_packed(w.tok_emb, V, D);
+  fill_packed(w.out_w, V, D);
+  fill_vec(w.tok_norm);
+  fill_vec(w.out_norm);
+  fill_mat(w.out_res_q);
   for (auto& b : w.blocks) {
-    fill_packed(b.attn_gate, hq, D);
-    fill_packed(b.attn_q, hq, D);
-    fill_packed(b.attn_k, hkv, D);
-    fill_packed(b.attn_v, hkv, D);
-    fill_packed(b.attn_output, D, hq);
-    fill_packed(b.attn_rel, (size_t)cfg.n_heads * (size_t)cfg.d_rel, D);
-    fill_packed(b.attn_sink_proj, (size_t)cfg.n_heads, D);
+    fill_packed(b.wgate_attn, hq, D);
+    fill_packed(b.wq, hq, D);
+    fill_packed(b.wk, hkv, D);
+    fill_packed(b.wv, hkv, D);
+    fill_packed(b.wo, D, hq);
+    fill_packed(b.wrel, (size_t)cfg.n_heads * (size_t)cfg.d_rel, D);
+    fill_packed(b.wsink, (size_t)cfg.n_heads, D);
     if (is_dyn_conv_layer(cfg, (int)(&b - w.blocks.data()))) {
-      fill_packed(b.attn_k_conv_proj, (size_t)cfg.gate_rank / 2, D);
-      fill_packed(b.attn_v_conv_proj, (size_t)cfg.gate_rank / 2, D);
+      const size_t dk = (size_t)cfg.n_kv_heads * (size_t)cfg.sconv_kernel;
+      fill_packed(b.k_conv_proj, dk, D);
+      fill_packed(b.v_conv_proj, dk, D);
     }
     size_t erows = 0, ecols = 0;
     {
       TensorId id{Tensor::FfnGateUpExps, 0};
       expected_shape(id, cfg, erows, ecols);
-      fill_packed(b.ffn_gate_up_exps, erows, ecols);
+      const size_t per_gu = erows / (size_t)cfg.n_experts;
+      b.gate_up_exps_q.resize((size_t)cfg.n_experts);
+      for (auto& q : b.gate_up_exps_q) fill_packed(q, per_gu, ecols);
       expected_shape(TensorId{Tensor::FfnDownExps, 0}, cfg, erows, ecols);
-      fill_packed(b.ffn_down_exps, erows, ecols);
+      const size_t per_d = erows / (size_t)cfg.n_experts;
+      b.down_exps_q.resize((size_t)cfg.n_experts);
+      for (auto& q : b.down_exps_q) fill_packed(q, per_d, ecols);
     }
     fill_vec(b.attn_norm);
-    fill_vec(b.attn_q_inp_norm);
-    fill_vec(b.attn_k_inp_norm);
-    fill_vec(b.attn_v_inp_norm);
-    fill_vec(b.ffn_norm);
-    fill_vec(b.ffn_res_query);
-    fill_vec(b.exp_probs_b);
-    fill_mat(b.attn_k_conv);
-    fill_mat(b.attn_v_conv);
-    fill_mat(b.attn_post_conv);
-    fill_mat(b.attn_q_clip);
-    fill_mat(b.attn_rel_bias);
-    fill_mat(b.attn_rel_clip);
-    fill_mat(b.attn_res_query);
-    fill_mat(b.ffn_gate_inp);
-    fill_mat(b.ffn_post_conv);
-    fill_mat(b.loop_q_ctrl_down);
-    fill_mat(b.loop_q_ctrl_forget);
-    fill_mat(b.loop_q_ctrl_gain);
-    fill_mat(b.loop_k_ctrl_down);
-    fill_mat(b.loop_k_ctrl_forget);
-    fill_mat(b.loop_k_ctrl_gain);
-    fill_mat(b.loop_v_ctrl_down);
-    fill_mat(b.loop_v_ctrl_forget);
-    fill_mat(b.loop_v_ctrl_gain);
-    fill_mat(b.loop_ffn_ctrl_down);
-    fill_mat(b.loop_ffn_ctrl_forget);
-    fill_mat(b.loop_ffn_ctrl_gain);
-    fill_mat(b.loop_msg_query);
+    fill_vec(b.q_norm);
+    fill_vec(b.k_norm);
+    fill_vec(b.v_norm);
+    fill_vec(b.post_attn_norm);
+    fill_mat(b.mlp_res_q);
+    fill_vec(b.router_bias);
+    fill_mat(b.k_conv);
+    fill_mat(b.v_conv);
+    transpose_into(b.k_conv, b.k_conv_static);
+    transpose_into(b.v_conv, b.v_conv_static);
+    fill_mat(b.post_attn_conv);
+    fill_mat(b.q_scale);
+    fill_mat(b.rel_proj);
+    fill_mat(b.rel_scale);
+    fill_mat(b.attn_res_q);
+    fill_mat(b.router);
+    fill_mat(b.post_mlp_conv);
+    fill_mat(b.loop_q_down);
+    fill_mat(b.loop_q_forget);
+    fill_mat(b.loop_q_gain);
+    fill_mat(b.loop_k_down);
+    fill_mat(b.loop_k_forget);
+    fill_mat(b.loop_k_gain);
+    fill_mat(b.loop_v_down);
+    fill_mat(b.loop_v_forget);
+    fill_mat(b.loop_v_gain);
+    fill_mat(b.loop_mlp_down);
+    fill_mat(b.loop_mlp_forget);
+    fill_mat(b.loop_mlp_gain);
+    fill_mat(b.msg_query);
   }
 }
 
@@ -583,15 +650,23 @@ void load_safetensors(const Config& cfg,
     Loc l = locate(name);
     stream_to_mat<ExecSpace, Scalar>(shards[l.shard], name, *l.meta, dst);
   };
+  auto load_dense_T = [&](const TensorId& id,
+                          const Kokkos::View<Scalar**, Kokkos::LayoutRight,
+                                             ExecSpace>& dst) {
+    if (dst.size() == 0) return;
+    const std::string name = hf_name(id);
+    Loc l = locate(name);
+    stream_to_mat_T<ExecSpace, Scalar>(shards[l.shard], name, *l.meta, dst);
+  };
 
   size_t rows = 0, cols = 0;
   TensorId id{Tensor::TokenEmbd, -1};
   expected_shape(id, cfg, rows, cols);
-  load_mat(id, rows, cols, w.embed);
-  load_vec({Tensor::TokenEmbdNorm, -1}, w.token_embd_norm);
-  load_mat({Tensor::Output, -1}, rows, cols, w.lm_head);
-  load_vec({Tensor::OutputNorm, -1}, w.output_norm);
-  load_vec({Tensor::OutputResQuery, -1}, w.output_res_query);
+  load_mat(id, rows, cols, w.tok_emb);
+  load_vec({Tensor::TokenEmbdNorm, -1}, w.tok_norm);
+  load_mat({Tensor::Output, -1}, rows, cols, w.out_w);
+  load_vec({Tensor::OutputNorm, -1}, w.out_norm);
+  load_dense({Tensor::OutputResQuery, -1}, w.out_res_q);
   for (int l = 0; l < cfg.n_layers; ++l) {
     auto& b = w.blocks[(size_t)l];
     auto need = [&](Tensor t, size_t r, size_t c,
@@ -600,58 +675,68 @@ void load_safetensors(const Config& cfg,
     };
     expected_shape({Tensor::AttnQ, l}, cfg, rows, cols);
     const size_t hq = rows;
-    need(Tensor::AttnGate, hq, (size_t)cfg.d_model, b.attn_gate);
-    need(Tensor::AttnQ, hq, (size_t)cfg.d_model, b.attn_q);
+    need(Tensor::AttnGate, hq, (size_t)cfg.d_model, b.wgate_attn);
+    need(Tensor::AttnQ, hq, (size_t)cfg.d_model, b.wq);
     expected_shape({Tensor::AttnK, l}, cfg, rows, cols);
-    need(Tensor::AttnK, rows, (size_t)cfg.d_model, b.attn_k);
-    need(Tensor::AttnV, rows, (size_t)cfg.d_model, b.attn_v);
-    need(Tensor::AttnOutput, (size_t)cfg.d_model, hq, b.attn_output);
+    need(Tensor::AttnK, rows, (size_t)cfg.d_model, b.wk);
+    need(Tensor::AttnV, rows, (size_t)cfg.d_model, b.wv);
+    need(Tensor::AttnOutput, (size_t)cfg.d_model, hq, b.wo);
     expected_shape({Tensor::AttnRel, l}, cfg, rows, cols);
-    need(Tensor::AttnRel, rows, (size_t)cfg.d_model, b.attn_rel);
+    need(Tensor::AttnRel, rows, (size_t)cfg.d_model, b.wrel);
     expected_shape({Tensor::AttnSinkProj, l}, cfg, rows, cols);
-    need(Tensor::AttnSinkProj, rows, (size_t)cfg.d_model, b.attn_sink_proj);
+    need(Tensor::AttnSinkProj, rows, (size_t)cfg.d_model, b.wsink);
     if (!is_dyn_conv_layer(cfg, l)) {
       load_vec({Tensor::AttnNorm, l}, b.attn_norm);
     } else {
       expected_shape({Tensor::AttnKConvProj, l}, cfg, rows, cols);
       need(Tensor::AttnKConvProj, rows, (size_t)cfg.d_model,
-           b.attn_k_conv_proj);
+           b.k_conv_proj);
       need(Tensor::AttnVConvProj, rows, (size_t)cfg.d_model,
-           b.attn_v_conv_proj);
-      load_vec({Tensor::AttnQInpNorm, l}, b.attn_q_inp_norm);
-      load_vec({Tensor::AttnKInpNorm, l}, b.attn_k_inp_norm);
-      load_vec({Tensor::AttnVInpNorm, l}, b.attn_v_inp_norm);
+           b.v_conv_proj);
+      load_vec({Tensor::AttnQInpNorm, l}, b.q_norm);
+      load_vec({Tensor::AttnKInpNorm, l}, b.k_norm);
+      load_vec({Tensor::AttnVInpNorm, l}, b.v_norm);
     }
     expected_shape({Tensor::FfnGateUpExps, l}, cfg, rows, cols);
-    need(Tensor::FfnGateUpExps, rows, cols, b.ffn_gate_up_exps);
+    {
+      Gguf::QuantWeight<ExecSpace> folded;
+      need(Tensor::FfnGateUpExps, rows, cols, folded);
+      slice_experts(folded, (size_t)cfg.n_experts, b.gate_up_exps_q);
+    }
     expected_shape({Tensor::FfnDownExps, l}, cfg, rows, cols);
-    need(Tensor::FfnDownExps, rows, cols, b.ffn_down_exps);
-    load_vec({Tensor::FfnNorm, l}, b.ffn_norm);
-    load_vec({Tensor::FfnResQuery, l}, b.ffn_res_query);
-    load_vec({Tensor::ExpProbsB, l}, b.exp_probs_b);
-    load_dense({Tensor::AttnKConv, l}, b.attn_k_conv);
-    load_dense({Tensor::AttnVConv, l}, b.attn_v_conv);
-    load_dense({Tensor::AttnPostConv, l}, b.attn_post_conv);
-    load_dense({Tensor::AttnQClip, l}, b.attn_q_clip);
-    load_dense({Tensor::AttnRelBias, l}, b.attn_rel_bias);
-    load_dense({Tensor::AttnRelClip, l}, b.attn_rel_clip);
-    load_dense({Tensor::AttnResQuery, l}, b.attn_res_query);
-    load_dense({Tensor::FfnGateInp, l}, b.ffn_gate_inp);
-    load_dense({Tensor::FfnPostConv, l}, b.ffn_post_conv);
+    {
+      Gguf::QuantWeight<ExecSpace> folded;
+      need(Tensor::FfnDownExps, rows, cols, folded);
+      slice_experts(folded, (size_t)cfg.n_experts, b.down_exps_q);
+    }
+    load_vec({Tensor::FfnNorm, l}, b.post_attn_norm);
+    load_dense({Tensor::FfnResQuery, l}, b.mlp_res_q);
+    load_vec({Tensor::ExpProbsB, l}, b.router_bias);
+    load_dense({Tensor::AttnKConv, l}, b.k_conv);
+    load_dense({Tensor::AttnVConv, l}, b.v_conv);
+    transpose_into(b.k_conv, b.k_conv_static);
+    transpose_into(b.v_conv, b.v_conv_static);
+    load_dense({Tensor::AttnPostConv, l}, b.post_attn_conv);
+    load_dense({Tensor::AttnQClip, l}, b.q_scale);
+    load_dense_T({Tensor::AttnRelBias, l}, b.rel_proj);
+    load_dense({Tensor::AttnRelClip, l}, b.rel_scale);
+    load_dense({Tensor::AttnResQuery, l}, b.attn_res_q);
+    load_dense({Tensor::FfnGateInp, l}, b.router);
+    load_dense({Tensor::FfnPostConv, l}, b.post_mlp_conv);
     if (is_loop_layer(cfg, l)) {
-      load_dense({Tensor::LoopQCtrlDown, l}, b.loop_q_ctrl_down);
-      load_dense({Tensor::LoopQCtrlForget, l}, b.loop_q_ctrl_forget);
-      load_dense({Tensor::LoopQCtrlGain, l}, b.loop_q_ctrl_gain);
-      load_dense({Tensor::LoopKCtrlDown, l}, b.loop_k_ctrl_down);
-      load_dense({Tensor::LoopKCtrlForget, l}, b.loop_k_ctrl_forget);
-      load_dense({Tensor::LoopKCtrlGain, l}, b.loop_k_ctrl_gain);
-      load_dense({Tensor::LoopVCtrlDown, l}, b.loop_v_ctrl_down);
-      load_dense({Tensor::LoopVCtrlForget, l}, b.loop_v_ctrl_forget);
-      load_dense({Tensor::LoopVCtrlGain, l}, b.loop_v_ctrl_gain);
-      load_dense({Tensor::LoopFfnCtrlDown, l}, b.loop_ffn_ctrl_down);
-      load_dense({Tensor::LoopFfnCtrlForget, l}, b.loop_ffn_ctrl_forget);
-      load_dense({Tensor::LoopFfnCtrlGain, l}, b.loop_ffn_ctrl_gain);
-      load_dense({Tensor::LoopMsgQuery, l}, b.loop_msg_query);
+      load_dense_T({Tensor::LoopQCtrlDown, l}, b.loop_q_down);
+      load_dense_T({Tensor::LoopQCtrlForget, l}, b.loop_q_forget);
+      load_dense_T({Tensor::LoopQCtrlGain, l}, b.loop_q_gain);
+      load_dense_T({Tensor::LoopKCtrlDown, l}, b.loop_k_down);
+      load_dense_T({Tensor::LoopKCtrlForget, l}, b.loop_k_forget);
+      load_dense_T({Tensor::LoopKCtrlGain, l}, b.loop_k_gain);
+      load_dense_T({Tensor::LoopVCtrlDown, l}, b.loop_v_down);
+      load_dense_T({Tensor::LoopVCtrlForget, l}, b.loop_v_forget);
+      load_dense_T({Tensor::LoopVCtrlGain, l}, b.loop_v_gain);
+      load_dense_T({Tensor::LoopFfnCtrlDown, l}, b.loop_mlp_down);
+      load_dense_T({Tensor::LoopFfnCtrlForget, l}, b.loop_mlp_forget);
+      load_dense_T({Tensor::LoopFfnCtrlGain, l}, b.loop_mlp_gain);
+      load_dense({Tensor::LoopMsgQuery, l}, b.msg_query);
     }
   }
   Kokkos::fence();
@@ -834,6 +919,39 @@ void gguf_load_experts(const Gguf::GgufFile& file, const TensorId& id,
   dst = w;
 }
 
+// Load one dense tensor transposed: the file holds [rows, cols] but the
+// Model math wants [cols, rows] (loop control downs [2D,R] vs file [R,2D],
+// forget/gain [R,D] vs file [D,R], rel_proj [R,E] vs file [E,R] — verified
+// against the HF torch shapes and the llama.cpp build). The payload is
+// dequantized to host FP32 once (these tensors are KBs), then written
+// transposed.
+template <class ExecSpace, class Scalar>
+void gguf_load_dense_mat_T(
+    const Gguf::GgufFile& file, const TensorId& id,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& dst) {
+  if (dst.size() == 0) return;
+  const auto& info = gguf_require(file, id);
+  const size_t rows = dst.extent(0), cols = dst.extent(1);
+  if (!(info.n_dims == 2 && info.rows() == cols && info.cols() == rows))
+    throw std::runtime_error("shape mismatch for '" + info.name +
+                             "': checkpoint has " + gguf_shape_str(info) +
+                             ", expected transpose of [" +
+                             std::to_string(rows) + "," +
+                             std::to_string(cols) + "]");
+  std::vector<float> tmp;
+  try {
+    gguf_dequant_payload_to_float(file.payload(info), info, tmp);
+  } catch (const std::exception& e) {
+    throw std::runtime_error("cannot decode '" + info.name + "': " + e.what());
+  }
+  if (tmp.size() != rows * cols)
+    throw std::runtime_error("bad payload size for '" + info.name + "'");
+  auto h = Kokkos::create_mirror_view(dst);
+  for (size_t i = 0; i < rows; ++i)
+    for (size_t j = 0; j < cols; ++j)
+      h(i, j) = static_cast<Scalar>(tmp[j * rows + i]);
+  Kokkos::deep_copy(dst, h);
+}
 // Load one dense tensor (F32/F16/BF16 on disk) into a device view. 1-D
 // tensors land in a vector view; 2-D tensors in a [rows, cols] matrix view.
 template <class ExecSpace, class Scalar>
@@ -1065,32 +1183,32 @@ void load_gguf(const Config& cfg, const std::string& path,
   }
   size_t rows = 0, cols = 0;
   expected_shape({Tensor::TokenEmbd, -1}, cfg, rows, cols);
-  gguf_load_mat<ExecSpace>(file, {Tensor::TokenEmbd, -1}, rows, cols, w.embed);
+  gguf_load_mat<ExecSpace>(file, {Tensor::TokenEmbd, -1}, rows, cols, w.tok_emb);
   gguf_load_dense_vec<ExecSpace, Scalar>(file, {Tensor::TokenEmbdNorm, -1},
-                                         w.token_embd_norm);
-  gguf_load_mat<ExecSpace>(file, {Tensor::Output, -1}, rows, cols, w.lm_head);
+                                         w.tok_norm);
+  gguf_load_mat<ExecSpace>(file, {Tensor::Output, -1}, rows, cols, w.out_w);
   gguf_load_dense_vec<ExecSpace, Scalar>(file, {Tensor::OutputNorm, -1},
-                                         w.output_norm);
-  gguf_load_dense_vec<ExecSpace, Scalar>(file, {Tensor::OutputResQuery, -1},
-                                         w.output_res_query);
+                                         w.out_norm);
+  gguf_load_dense_mat<ExecSpace, Scalar>(file, {Tensor::OutputResQuery, -1},
+                                         w.out_res_q);
   for (int l = 0; l < cfg.n_layers; ++l) {
     auto& b = w.blocks[(size_t)l];
     const size_t D   = (size_t)cfg.d_model;
     const size_t hq  = (size_t)cfg.n_heads * (size_t)cfg.head_dim;
     const size_t hkv = (size_t)cfg.n_kv_heads * (size_t)cfg.head_dim;
-    gguf_load_mat<ExecSpace>(file, {Tensor::AttnGate, l}, hq, D, b.attn_gate);
-    gguf_load_mat<ExecSpace>(file, {Tensor::AttnQ, l}, hq, D, b.attn_q);
-    gguf_load_mat<ExecSpace>(file, {Tensor::AttnK, l}, hkv, D, b.attn_k);
-    gguf_load_mat<ExecSpace>(file, {Tensor::AttnV, l}, hkv, D, b.attn_v);
+    gguf_load_mat<ExecSpace>(file, {Tensor::AttnGate, l}, hq, D, b.wgate_attn);
+    gguf_load_mat<ExecSpace>(file, {Tensor::AttnQ, l}, hq, D, b.wq);
+    gguf_load_mat<ExecSpace>(file, {Tensor::AttnK, l}, hkv, D, b.wk);
+    gguf_load_mat<ExecSpace>(file, {Tensor::AttnV, l}, hkv, D, b.wv);
     gguf_load_mat<ExecSpace>(file, {Tensor::AttnOutput, l}, D, hq,
-                             b.attn_output);
+                             b.wo);
     size_t rr = 0, rc = 0;
     expected_shape({Tensor::AttnRel, l}, cfg, rr, rc);
-    gguf_load_mat<ExecSpace>(file, {Tensor::AttnRel, l}, rr, rc, b.attn_rel);
+    gguf_load_mat<ExecSpace>(file, {Tensor::AttnRel, l}, rr, rc, b.wrel);
     size_t sr = 0, sc = 0;
     expected_shape({Tensor::AttnSinkProj, l}, cfg, sr, sc);
     gguf_load_mat<ExecSpace>(file, {Tensor::AttnSinkProj, l}, sr, sc,
-                             b.attn_sink_proj);
+                             b.wsink);
     if (!is_dyn_conv_layer(cfg, l)) {
       gguf_load_dense_vec<ExecSpace, Scalar>(file, {Tensor::AttnNorm, l},
                                              b.attn_norm);
@@ -1098,78 +1216,88 @@ void load_gguf(const Config& cfg, const std::string& path,
       size_t pr = 0, pc = 0;
       expected_shape({Tensor::AttnKConvProj, l}, cfg, pr, pc);
       gguf_load_mat<ExecSpace>(file, {Tensor::AttnKConvProj, l}, pr, pc,
-                               b.attn_k_conv_proj);
+                               b.k_conv_proj);
       gguf_load_mat<ExecSpace>(file, {Tensor::AttnVConvProj, l}, pr, pc,
-                               b.attn_v_conv_proj);
+                               b.v_conv_proj);
       gguf_load_dense_vec<ExecSpace, Scalar>(file, {Tensor::AttnQInpNorm, l},
-                                             b.attn_q_inp_norm);
+                                             b.q_norm);
       gguf_load_dense_vec<ExecSpace, Scalar>(file, {Tensor::AttnKInpNorm, l},
-                                             b.attn_k_inp_norm);
+                                             b.k_norm);
       gguf_load_dense_vec<ExecSpace, Scalar>(file, {Tensor::AttnVInpNorm, l},
-                                             b.attn_v_inp_norm);
+                                             b.v_norm);
     }
     const bool want_q8 = moe_experts_are_q8(cfg, l);
     size_t gr = 0, gc = 0;
     expected_shape({Tensor::FfnGateUpExps, l}, cfg, gr, gc);
-    gguf_load_experts<ExecSpace>(file, {Tensor::FfnGateUpExps, l}, gr, gc,
-                                 (size_t)cfg.n_experts, want_q8,
-                                 b.ffn_gate_up_exps);
+    {
+      Gguf::QuantWeight<ExecSpace> folded;
+      gguf_load_experts<ExecSpace>(file, {Tensor::FfnGateUpExps, l}, gr, gc,
+                                   (size_t)cfg.n_experts, want_q8, folded);
+      slice_experts(folded, (size_t)cfg.n_experts, b.gate_up_exps_q);
+    }
     size_t dr = 0, dc = 0;
     expected_shape({Tensor::FfnDownExps, l}, cfg, dr, dc);
-    gguf_load_experts<ExecSpace>(file, {Tensor::FfnDownExps, l}, dr, dc,
-                                 (size_t)cfg.n_experts, want_q8,
-                                 b.ffn_down_exps);
+    {
+      Gguf::QuantWeight<ExecSpace> folded;
+      gguf_load_experts<ExecSpace>(file, {Tensor::FfnDownExps, l}, dr, dc,
+                                   (size_t)cfg.n_experts, want_q8, folded);
+      slice_experts(folded, (size_t)cfg.n_experts, b.down_exps_q);
+    }
     gguf_load_dense_vec<ExecSpace, Scalar>(file, {Tensor::FfnNorm, l},
-                                           b.ffn_norm);
-    gguf_load_dense_vec<ExecSpace, Scalar>(file, {Tensor::FfnResQuery, l},
-                                           b.ffn_res_query);
+                                           b.post_attn_norm);
+    gguf_load_dense_mat<ExecSpace, Scalar>(file, {Tensor::FfnResQuery, l},
+                                           b.mlp_res_q);
     gguf_load_dense_vec<ExecSpace, Scalar>(file, {Tensor::ExpProbsB, l},
-                                           b.exp_probs_b);
+                                           b.router_bias);
     gguf_load_dense_mat<ExecSpace, Scalar>(file, {Tensor::AttnKConv, l},
-                                           b.attn_k_conv);
+                                           b.k_conv);
     gguf_load_dense_mat<ExecSpace, Scalar>(file, {Tensor::AttnVConv, l},
-                                           b.attn_v_conv);
+                                           b.v_conv);
+    // The full-attention dynamic-conv path iterates the kernel
+    // [K, Ckv]-major; persist the transpose alongside the sliding [Ckv, K].
+    transpose_into(b.k_conv, b.k_conv_static);
+    transpose_into(b.v_conv, b.v_conv_static);
     gguf_load_dense_mat<ExecSpace, Scalar>(file, {Tensor::AttnPostConv, l},
-                                           b.attn_post_conv);
+                                           b.post_attn_conv);
     gguf_load_dense_mat<ExecSpace, Scalar>(file, {Tensor::AttnQClip, l},
-                                           b.attn_q_clip);
-    gguf_load_dense_mat<ExecSpace, Scalar>(file, {Tensor::AttnRelBias, l},
-                                           b.attn_rel_bias);
+                                           b.q_scale);
+    gguf_load_dense_mat_T<ExecSpace, Scalar>(file, {Tensor::AttnRelBias, l},
+                                           b.rel_proj);
     gguf_load_dense_mat<ExecSpace, Scalar>(file, {Tensor::AttnRelClip, l},
-                                           b.attn_rel_clip);
+                                           b.rel_scale);
     gguf_load_dense_mat<ExecSpace, Scalar>(file, {Tensor::AttnResQuery, l},
-                                           b.attn_res_query);
+                                           b.attn_res_q);
     gguf_load_dense_mat<ExecSpace, Scalar>(file, {Tensor::FfnGateInp, l},
-                                           b.ffn_gate_inp);
+                                           b.router);
     gguf_load_dense_mat<ExecSpace, Scalar>(file, {Tensor::FfnPostConv, l},
-                                           b.ffn_post_conv);
+                                           b.post_mlp_conv);
     if (is_loop_layer(cfg, l)) {
-      gguf_load_dense_mat<ExecSpace, Scalar>(file, {Tensor::LoopQCtrlDown, l},
-                                             b.loop_q_ctrl_down);
-      gguf_load_dense_mat<ExecSpace, Scalar>(
-          file, {Tensor::LoopQCtrlForget, l}, b.loop_q_ctrl_forget);
-      gguf_load_dense_mat<ExecSpace, Scalar>(file, {Tensor::LoopQCtrlGain, l},
-                                             b.loop_q_ctrl_gain);
-      gguf_load_dense_mat<ExecSpace, Scalar>(file, {Tensor::LoopKCtrlDown, l},
-                                             b.loop_k_ctrl_down);
-      gguf_load_dense_mat<ExecSpace, Scalar>(
-          file, {Tensor::LoopKCtrlForget, l}, b.loop_k_ctrl_forget);
-      gguf_load_dense_mat<ExecSpace, Scalar>(file, {Tensor::LoopKCtrlGain, l},
-                                             b.loop_k_ctrl_gain);
-      gguf_load_dense_mat<ExecSpace, Scalar>(file, {Tensor::LoopVCtrlDown, l},
-                                             b.loop_v_ctrl_down);
-      gguf_load_dense_mat<ExecSpace, Scalar>(
-          file, {Tensor::LoopVCtrlForget, l}, b.loop_v_ctrl_forget);
-      gguf_load_dense_mat<ExecSpace, Scalar>(file, {Tensor::LoopVCtrlGain, l},
-                                             b.loop_v_ctrl_gain);
-      gguf_load_dense_mat<ExecSpace, Scalar>(
-          file, {Tensor::LoopFfnCtrlDown, l}, b.loop_ffn_ctrl_down);
-      gguf_load_dense_mat<ExecSpace, Scalar>(
-          file, {Tensor::LoopFfnCtrlForget, l}, b.loop_ffn_ctrl_forget);
-      gguf_load_dense_mat<ExecSpace, Scalar>(
-          file, {Tensor::LoopFfnCtrlGain, l}, b.loop_ffn_ctrl_gain);
+      gguf_load_dense_mat_T<ExecSpace, Scalar>(file, {Tensor::LoopQCtrlDown, l},
+                                             b.loop_q_down);
+      gguf_load_dense_mat_T<ExecSpace, Scalar>(
+          file, {Tensor::LoopQCtrlForget, l}, b.loop_q_forget);
+      gguf_load_dense_mat_T<ExecSpace, Scalar>(file, {Tensor::LoopQCtrlGain, l},
+                                             b.loop_q_gain);
+      gguf_load_dense_mat_T<ExecSpace, Scalar>(file, {Tensor::LoopKCtrlDown, l},
+                                             b.loop_k_down);
+      gguf_load_dense_mat_T<ExecSpace, Scalar>(
+          file, {Tensor::LoopKCtrlForget, l}, b.loop_k_forget);
+      gguf_load_dense_mat_T<ExecSpace, Scalar>(file, {Tensor::LoopKCtrlGain, l},
+                                             b.loop_k_gain);
+      gguf_load_dense_mat_T<ExecSpace, Scalar>(file, {Tensor::LoopVCtrlDown, l},
+                                             b.loop_v_down);
+      gguf_load_dense_mat_T<ExecSpace, Scalar>(
+          file, {Tensor::LoopVCtrlForget, l}, b.loop_v_forget);
+      gguf_load_dense_mat_T<ExecSpace, Scalar>(file, {Tensor::LoopVCtrlGain, l},
+                                             b.loop_v_gain);
+      gguf_load_dense_mat_T<ExecSpace, Scalar>(
+          file, {Tensor::LoopFfnCtrlDown, l}, b.loop_mlp_down);
+      gguf_load_dense_mat_T<ExecSpace, Scalar>(
+          file, {Tensor::LoopFfnCtrlForget, l}, b.loop_mlp_forget);
+      gguf_load_dense_mat_T<ExecSpace, Scalar>(
+          file, {Tensor::LoopFfnCtrlGain, l}, b.loop_mlp_gain);
       gguf_load_dense_mat<ExecSpace, Scalar>(file, {Tensor::LoopMsgQuery, l},
-                                             b.loop_msg_query);
+                                             b.msg_query);
     }
     // Keep host RAM bounded: at most one tensor payload is referenced at a
     // time (quant payloads copy straight out of the mapping; dense tensors

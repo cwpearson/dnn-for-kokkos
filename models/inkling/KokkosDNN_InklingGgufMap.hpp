@@ -352,7 +352,10 @@ inline void expected_shape(const TensorId& id, const Config& cfg,
       cols = D;
       return;
     case Tensor::AttnKConvProj:
-    case Tensor::AttnVConvProj: rows = G / 2; cols = D; return;
+    case Tensor::AttnVConvProj:
+      rows = (size_t)cfg.n_kv_heads * (size_t)cfg.sconv_kernel;
+      cols = D;
+      return;
     case Tensor::AttnNorm:
     case Tensor::AttnQInpNorm:
     case Tensor::AttnKInpNorm:

@@ -363,7 +363,7 @@ class Model {
   // Exact-size dequant staging for the packed-quant path (see
   // KokkosDNN_InklingQuantDispatch.hpp): one buffer per distinct
   // projection shape. Exact sizing matters (cuBLAS row pitch == K).
-  MatR deq_qkv_, deq_o_, deq_rel_, deq_sink_, deq_router_, deq_dyn_;
+  MatR deq_qkv_, deq_kv_, deq_o_, deq_rel_, deq_sink_, deq_router_, deq_dyn_;
   MatR deq_moe_gu_, deq_moe_d_;
   Kokkos::View<uint8_t*, ExecSpace> q8_act_buf_;
   View1 last_buf_, logits_buf_;
@@ -547,6 +547,9 @@ class Model {
       const size_t K = (size_t)cfg.sconv_kernel;
       if (deq_qkv_.extent(0) != HqD || deq_qkv_.extent(1) != D)
         deq_qkv_ = MatR("deq_qkv", HqD, D);
+      const size_t HKvD = (size_t)cfg.n_kv_heads * (size_t)cfg.head_dim;
+      if (deq_kv_.extent(0) != HKvD || deq_kv_.extent(1) != D)
+        deq_kv_ = MatR("deq_kv", HKvD, D);
       if (deq_o_.extent(0) != D || deq_o_.extent(1) != HqD)
         deq_o_ = MatR("deq_o", D, HqD);
       if (deq_rel_.extent(0) != HR || deq_rel_.extent(1) != D)
@@ -1052,9 +1055,9 @@ class Model {
     // ---- 4. q/k/v linears from the normed streams ----
     Impl::linear_chunk<ExecSpace, Scalar>(handle, hn, b.wq, deq_qkv_, q2,
                                           "Inkling::wq", q8_act_buf_);
-    Impl::linear_chunk<ExecSpace, Scalar>(handle, kh, b.wk, deq_qkv_, k2,
+    Impl::linear_chunk<ExecSpace, Scalar>(handle, kh, b.wk, deq_kv_, k2,
                                           "Inkling::wk", q8_act_buf_);
-    Impl::linear_chunk<ExecSpace, Scalar>(handle, vh, b.wv, deq_qkv_, v2,
+    Impl::linear_chunk<ExecSpace, Scalar>(handle, vh, b.wv, deq_kv_, v2,
                                           "Inkling::wv", q8_act_buf_);
 
     // ---- 5. k/v short-convs (stateful across the chunk) ----
