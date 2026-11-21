@@ -98,11 +98,11 @@ void inkling_gated_output_mul(
 namespace Impl {
 // Rank-64 message-gate hidden state: h = down([rms(x), rms(msg)]) with
 // down: [2D, R] row-major, computed in FP32.
-template <class ExecSpace, class Scalar>
+template <class ExecSpace, class Scalar, class DView>
 void inkling_message_gate_hidden(
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& msg,
-    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& down, float eps,
+    const DView& down, float eps,
     const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& h) {
   const size_t T = x.extent(0), D = x.extent(1);
   const size_t R = down.extent(1);
@@ -121,8 +121,10 @@ void inkling_message_gate_hidden(
         const float invm = 1.0f / Kokkos::sqrtf(ssm / static_cast<float>(D) + eps);
         float acc = 0;
         for (size_t d = 0; d < D; ++d) {
-          acc += static_cast<float>(x(t, d)) * invx * down(d, r);
-          acc += static_cast<float>(msg(t, d)) * invm * down(D + d, r);
+          acc += static_cast<float>(x(t, d)) * invx *
+                   static_cast<float>(down(d, r));
+          acc += static_cast<float>(msg(t, d)) * invm *
+                   static_cast<float>(down(D + d, r));
         }
         h(t, r) = acc;
       });
@@ -134,13 +136,14 @@ void inkling_message_gate_hidden(
 // x, msg, out: [T, D]; down: [2D, R] FP32; forget, gain: [R, D] FP32.
 // Matches Inkling2LoopMessageGate. out must not alias x or msg (h is a
 // separate workspace, but the final pass reads x/msg while writing out).
-template <class ExecSpace, class Scalar>
+template <class ExecSpace, class Scalar, class DView, class FView,
+          class GView>
 void inkling_message_gate(
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& msg,
-    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& down,
-    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& forget,
-    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& gain,
+    const DView& down,
+    const FView& forget,
+    const GView& gain,
     float eps,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& out,
     const std::string& label = "KokkosDNN::inkling_message_gate") {
@@ -163,8 +166,8 @@ void inkling_message_gate(
       KOKKOS_LAMBDA(size_t t, size_t d) {
         float f = 0, g = 0;
         for (size_t r = 0; r < R; ++r) {
-          f += forget(r, d) * h(t, r);
-          g += gain(r, d) * h(t, r);
+          f += static_cast<float>(forget(r, d)) * h(t, r);
+          g += static_cast<float>(gain(r, d)) * h(t, r);
         }
         const float fgate = Kokkos::tanhf(f);
         const float mgate = Kokkos::tanhf(g);

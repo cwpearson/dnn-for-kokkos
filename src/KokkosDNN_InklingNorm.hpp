@@ -265,10 +265,10 @@ void inkling_l2_clip(
 // ScaledL2Clip: L2Clip applied after a learned per-head-dim scale.
 // x, y: [T, H, D]; scale: [H, D] (FP32 weights). Matches
 // Inkling2LoopScaledL2Clip. In-place safe for x/y (scale is read-only).
-template <class ExecSpace, class Scalar>
+template <class ExecSpace, class Scalar, class SView>
 void inkling_scaled_l2_clip(
     const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& x,
-    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& scale,
+    const SView& scale,
     float threshold,
     const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& y,
     const std::string& label = "KokkosDNN::inkling_scaled_l2_clip") {
@@ -279,8 +279,7 @@ void inkling_scaled_l2_clip(
   Impl::inkling_norm_team_launch<ExecSpace>(
       Impl::InklingScaledL2ClipTeam<
           ExecSpace, Scalar,
-          Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>,
-          Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>,
+          Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>, SView,
           Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>>{x, scale, y,
                                                                   H, D,
                                                                   threshold},
@@ -318,10 +317,10 @@ void inkling_log_scale(
 // LogScaledL2Clip: ScaledL2Clip followed by LogScale (single launch).
 // x, y: [T, H, D]; scale: [H, D] FP32; pos: [T] integer positions.
 // Matches Inkling2LoopLogScaledL2Clip. In-place safe for x/y.
-template <class ExecSpace, class Scalar, class PView>
+template <class ExecSpace, class Scalar, class SView, class PView>
 void inkling_log_scaled_l2_clip(
     const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& x,
-    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& scale,
+    const SView& scale,
     float threshold, const PView& pos, float alpha, float n_floor,
     const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& y,
     const std::string& label = "KokkosDNN::inkling_log_scaled_l2_clip") {
@@ -335,8 +334,8 @@ void inkling_log_scaled_l2_clip(
   Impl::inkling_norm_team_launch<ExecSpace>(
       Impl::InklingLogScaledL2ClipTeam<
           ExecSpace, Scalar,
-          Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>,
-          Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>, PView,
+          Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>, SView,
+          PView,
           Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>>{
           x, scale, pos, y, H, D, threshold, alpha, n_floor},
       T * H, D, label);

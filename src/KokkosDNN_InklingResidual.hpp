@@ -61,7 +61,7 @@ struct InklingAttnResidualWorker {
       for (size_t d = 0; d < D_; ++d) {
         const float v = (s < S_) ? static_cast<float>(blocks(t, s, d))
                                  : static_cast<float>(partial(t, d));
-        a += query(q, d) * v * inv[s];
+        a += static_cast<float>(query(q, d)) * v * inv[s];
       }
       scr[s] = a * scale;
       m = (scr[s] > m) ? scr[s] : m;
@@ -91,14 +91,14 @@ struct InklingAttnResidualWorker {
 // full-attention loop layers) shared across positions retrieve from the
 // per-token stack [block_states[t]; partial[t]].
 // block_states: [T, S, D] block history (S blocks so far, S may be 0);
-// partial: [T, D] current hidden; query: [Q, D] FP32 learned queries;
-// out: [T, Q, D]. Matches Inkling2LoopBlockAttentionResidual
+// partial: [T, D] current hidden; query: [Q, D] learned queries (FP32 or
+// model Scalar); out: [T, Q, D]. Matches Inkling2LoopBlockAttentionResidual
 // (single-head attention, scale hidden^-0.5, values = normalized states).
-template <class ExecSpace, class Scalar>
+template <class ExecSpace, class Scalar, class QView>
 void inkling_block_attention_residual(
     const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& block_states,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& partial,
-    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& query,
+    const QView& query,
     float eps,
     const Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>& out,
     const std::string& label = "KokkosDNN::inkling_block_attention_residual") {
@@ -117,8 +117,7 @@ void inkling_block_attention_residual(
   Impl::InklingAttnResidualWorker<
       ExecSpace, Scalar,
       Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>,
-      Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>,
-      Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>,
+      Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>, QView,
       Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>>
       w{block_states, partial, query, out, S, Q, D, eps};
   Kokkos::parallel_for(
@@ -153,10 +152,13 @@ void inkling_message_attention_residual(
     throw std::invalid_argument(
         "inkling_message_attention_residual: S exceeds worker capacity (64)");
   if (T == 0 || D == 0) return;
-  // Row subview of the table: unmanaged [4, D] alias, no copy.
+  // Row subview of the table: unmanaged [4, D] alias, no copy. Offset
+  // arithmetic (not &table(..)) so this also works for device views.
   using QV = Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace,
                           Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
-  QV query(&query_table(loop_layer_idx, 0, 0), 4, D);
+  QV query(query_table.data() +
+               (loop_layer_idx * 4 + size_t(0)) * D,
+           4, D);
   Impl::InklingAttnResidualWorker<
       ExecSpace, Scalar,
       Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>,

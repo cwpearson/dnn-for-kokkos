@@ -748,12 +748,17 @@ class Model {
       inkling_block_attention_residual<ExecSpace, Scalar>(bp, part, qry, eps,
                                                            oo);
     } else {
-      // Degenerate empty history: stack is [partial] only. Alias an empty
-      // [C,0,D] over the pack buffer (non-null); the worker then attends
-      // the single partial row.
-      UnmAlias3 bp(pack.data(), C, size_t(0), D);
-      inkling_block_attention_residual<ExecSpace, Scalar>(bp, part, qry, eps,
-                                                           oo);
+      // Degenerate empty history: the stack is [partial] only, so the
+      // single-row softmax has weight 1 and the output is the partial
+      // row broadcast over queries. (A zero-extent unmanaged alias is
+      // not constructible on all backends, so the shared op — which
+      // derives S from the view extent — cannot be used here.)
+      Kokkos::parallel_for(
+          "Inkling::blk_bcast",
+          Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {C, Q}),
+          KOKKOS_LAMBDA(size_t t, size_t qq) {
+            for (size_t d = 0; d < D; ++d) oo(t, qq, d) = part(t, d);
+          });
     }
   }
 
@@ -911,8 +916,8 @@ class Model {
     using Unm2 =
         Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace,
                      Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
-    Unm3 q3(&q2(0, 0), C, NH, HD), k3(&k2(0, 0), C, NKV, HD),
-        v3(&v2(0, 0), C, NKV, HD), rel3(&rel2(0, 0), C, NH, DR);
+    Unm3 q3(q2.data(), C, NH, HD), k3(k2.data(), C, NKV, HD),
+        v3(v2.data(), C, NKV, HD), rel3(rel2.data(), C, NH, DR);
     auto a3 = Kokkos::subview(attn_out_buf_, std::make_pair(size_t(0), C),
                               Kokkos::ALL, Kokkos::ALL);
 
@@ -1139,7 +1144,7 @@ class Model {
     }
 
     // ---- 9. gated output proj ----
-    Unm2 flat(&a3(0, 0, 0), C, HqD);
+    Unm2 flat(a3.data(), C, HqD);
     Impl::linear_chunk<ExecSpace, Scalar>(handle, hn, b.wgate_attn, deq_qkv_,
                                           gate2, "Inkling::wgate_attn",
                                           q8_act_buf_);
@@ -1337,7 +1342,7 @@ class Model {
             auto prev_h = Kokkos::subview(prev_h_buf_,
                                           std::make_pair(size_t(0), C),
                                           Kokkos::ALL);
-            QTab qtab(&b.msg_query(0, 0), 1, 4, D);
+            QTab qtab(b.msg_query.data(), 1, 4, D);
             inkling_message_attention_residual<ExecSpace, Scalar>(
                 bp, prev_h, qtab, 0, cfg.eps, msgs);
           }

@@ -66,7 +66,10 @@ struct BlockWeights {
       loop_q_forget, loop_q_gain, loop_k_down,
       loop_k_forget, loop_k_gain, loop_v_down,
       loop_v_forget, loop_v_gain, loop_mlp_down,
-      loop_mlp_forget, loop_mlp_gain, msg_query;
+      loop_mlp_forget, loop_mlp_gain;
+  // Message queries are consumed through a float alias (see Model); keep
+  // them float like the other F32 math tensors.
+  Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace> msg_query;
 };
 
 // Full model weights. Packed 2-D matrices stay packed (Gguf::QuantWeight,
@@ -156,7 +159,9 @@ void Weights<ExecSpace, Scalar>::allocate(const Config& cfg) {
       b.loop_mlp_down = mat("loop_mlp_down", 2 * D, G);
       b.loop_mlp_forget = mat("loop_mlp_forget", G, D);
       b.loop_mlp_gain   = mat("loop_mlp_gain", G, D);
-      b.msg_query = mat("msg_query", K, D);
+      b.msg_query =
+          Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>("msg_query",
+                                                                K, D);
     }
   }
 }

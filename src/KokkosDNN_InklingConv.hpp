@@ -106,10 +106,10 @@ void inkling_short_conv_update_state(
 // Inkling2LoopDynamicShortConvolution.static_weight layout); dyn: [T, H*K]
 // (the weight_proj output). Matches Inkling2LoopDynamicShortConvolution.
 // In-place safe for x/y.
-template <class ExecSpace, class Scalar>
+template <class ExecSpace, class Scalar, class WView>
 void inkling_dynamic_short_conv_forward(
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& x,
-    const Kokkos::View<float**, Kokkos::LayoutRight, ExecSpace>& static_w,
+    const WView& static_w,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& dyn,
     size_t nheads, size_t head_dim,
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& y,
@@ -137,7 +137,7 @@ void inkling_dynamic_short_conv_forward(
           const int s = static_cast<int>(t) - static_cast<int>(K - 1) +
                         static_cast<int>(k);
           if (s < 0) continue;
-          const float tap = static_w(k, c) +
+          const float tap = static_cast<float>(static_w(k, c)) +
                             static_cast<float>(dyn(t, h * K + k));
           acc += tap * static_cast<float>(x(static_cast<size_t>(s), c));
         }
@@ -178,11 +178,11 @@ void inkling_dynamic_short_conv_update_state(
         const float xn = static_cast<float>(x_new(c));
         float acc = 0;
         for (size_t k = 0; k < K - 1; ++k) {
-          const float tap = static_w(k, c) +
+          const float tap = static_cast<float>(static_w(k, c)) +
                             static_cast<float>(dyn_row(h * K + k));
           acc += tap * static_cast<float>(state(c, k));
         }
-        const float tap_last = static_w(K - 1, c) +
+        const float tap_last = static_cast<float>(static_w(K - 1, c)) +
                                static_cast<float>(dyn_row(h * K + K - 1));
         acc += tap_last * xn;
         y(c) = static_cast<Scalar>((acc + xn) * inv);
