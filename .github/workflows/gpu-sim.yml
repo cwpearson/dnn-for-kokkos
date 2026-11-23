@@ -1,0 +1,120 @@
+name: GPU Simulator
+
+# Optional, non-required check. The hosted runners have no GPU, so rocm.yaml
+# compiles everything but runs nothing. This workflow builds Kokkos and
+# KokkosDNN with the HIP backend for gfx942 and runs the ctest suite on a
+# simulated AMD Instinct MI300X (https://github.com/pantheongpu/pantheonsim).
+# A simulator cannot reproduce hardware-specific behavior or timing, so it
+# complements real-GPU testing and does not replace it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/**"
+      - "models/**"
+      - "examples/**"
+      - "server/**"
+      - "tests/**"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  hip-tests:
+    name: ctest (Kokkos HIP and simulated MI300X)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      KOKKOS_VERSION: 5.2.1
+      KOKKOS_INSTALL: ${{ github.workspace }}/kokkos-install
+      ROCM_PATH: /opt/rocm
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated GPU and ROCm
+        uses: pantheongpu/setup-pantheonsim@ab71a07326835be678918901c340d53a83358067 # v0.1.6
+        with:
+          gpu: amd/mi300x
+          cuda-toolkit: none
+          rocm: "7.1"
+
+      # The action installs only the compiler side of ROCm. find_package(hip)
+      # also needs comgr and the HSA runtime, and Kokkos' HIP backend enables
+      # its rocThrust TPL by default. libstb-dev and libwebp-dev as in
+      # rocm.yaml.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y comgr hsa-rocr rocprim-dev rocthrust-dev \
+            libstb-dev libwebp-dev
+
+      - name: Check out Kokkos
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: kokkos/kokkos
+          ref: ${{ env.KOKKOS_VERSION }}
+          path: kokkos-src
+          submodules: recursive
+          persist-credentials: false
+
+      # Same as rocm.yaml, with gfx942 (MI300X) instead of gfx90a.
+      - name: Build and install Kokkos (HIP + Serial)
+        run: |
+          cmake -S kokkos-src -B kokkos-build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${KOKKOS_INSTALL}" \
+            -DCMAKE_PREFIX_PATH="${ROCM_PATH}" \
+            -DCMAKE_CXX_COMPILER="${ROCM_PATH}/bin/hipcc" \
+            -DROCM_PATH="${ROCM_PATH}" \
+            -DKokkos_ENABLE_HIP=ON \
+            -DKokkos_ENABLE_SERIAL=ON \
+            -DKokkos_ARCH_AMD_GFX942=ON \
+            -DKokkos_ENABLE_TESTS=OFF
+          cmake --build kokkos-build --parallel 3
+          cmake --install kokkos-build
+
+      # Same options as the tpl=OFF leg of rocm.yaml, except that benchmarks
+      # are not built and test discovery runs when ctest starts
+      # (PRE_TEST), under the simulator, instead of at build time.
+      - name: Configure KokkosDNN
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="${ROCM_PATH}" \
+            -DCMAKE_CXX_COMPILER="${ROCM_PATH}/bin/hipcc" \
+            -DKokkos_ROOT="${KOKKOS_INSTALL}" \
+            -DKokkosDNN_ENABLE_TESTS=ON \
+            -DKokkosDNN_ENABLE_TEST_DISCOVERY=ON \
+            -DCMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE=PRE_TEST \
+            -DKokkosDNN_ENABLE_EXAMPLES=ON \
+            -DKokkosDNN_ENABLE_BENCHMARKS=OFF \
+            -DKokkosDNN_ENABLE_SERVER=ON \
+            -DKokkosDNN_ENABLE_COMPILER_WARNINGS=ON \
+            -DKokkosDNN_ENABLE_HIPBLAS=OFF \
+            -DKokkosDNN_ENABLE_MIOPEN=OFF
+
+      - name: Build
+        run: cmake --build build --parallel 3
+
+      # Tests that need real weights or tokenizer files skip themselves, as
+      # in serial.yaml.
+      # Two Sana determinism tests are excluded: Model::forward runs the
+      # sana_tmlp2 GEMM in place (te is both A and C), so GPU teams that write
+      # their columns of te race with teams still reading it, and two forward
+      # passes can differ. With a separate input buffer for that GEMM both
+      # tests pass.
+      - name: Run tests
+        run: |
+          vgpu run ctest --test-dir build --output-on-failure --timeout 1800 \
+            --no-tests=error \
+            -E 'SanaSmoke.TinyRandomForwardShapeFiniteDeterministic|SanaSampler.TinyTwoStepEulerFiniteDeterministic'
