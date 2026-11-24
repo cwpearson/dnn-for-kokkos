@@ -14,6 +14,63 @@ network at configure time. For offline builds, pre-seed the sources and
 pass `-DFETCHCONTENT_SOURCE_DIR_CPP_HTTPLIB=<path>` /
 `-DFETCHCONTENT_SOURCE_DIR_NLOHMANN_JSON=<path>`.
 
+## Checkpoint downloads
+
+Fetch checkpoints with the `hf` CLI (`pip install -U "huggingface_hub[cli]"`).
+The GGUF repos hold only `.gguf` files (no `tokenizer.json`), so each recipe
+below pairs a weights download with a `tokenizer.json` download from the base
+repo. All of these repos are public (no auth needed).
+
+Glimmer Q4_K_M (~16.8 GB, ~17GB resident — 24GB-GPU recipe):
+
+```sh
+hf download meta-models/Muse-Glimmer-30B \
+  --include "tokenizer.json" \
+  --local-dir weights/muse-glimmer-30b-text
+hf download meta-models/Muse-Glimmer-30B-GGUF \
+  --include "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf" \
+  --local-dir weights/muse-glimmer-30b-text
+# serve:
+./build/server/kokkosdnn_server --arch glimmer \
+  --weights weights/muse-glimmer-30b-text/Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf \
+  --tokenizer weights/muse-glimmer-30b-text/tokenizer.json
+```
+
+Inkling 2 Mini IQ4_NL (~17.6 GB packed):
+
+```sh
+hf download thinkingmachines/Inkling-2-Mini \
+  --include "tokenizer.json" \
+  --local-dir weights/inkling-2-mini
+hf download ggml-org/Inkling-2-Mini-GGUF \
+  --include "Inkling-2-Mini-IQ4_NL.gguf" \
+  --local-dir weights/inkling-2-mini
+# serve:
+./build/server/kokkosdnn_server --arch inkling \
+  --weights weights/inkling-2-mini/Inkling-2-Mini-IQ4_NL.gguf \
+  --tokenizer weights/inkling-2-mini/tokenizer.json
+```
+
+LFM2.5 Q4_K_M (~14.5 GB):
+
+```sh
+hf download LiquidAI/LFM2.5-24B-A2B \
+  --include "tokenizer.json" \
+  --local-dir weights/lfm2_5
+hf download LiquidAI/LFM2.5-24B-A2B-GGUF \
+  --include "LFM2.5-24B-A2B-Q4_K_M.gguf" \
+  --local-dir weights/lfm2_5
+# serve:
+./build/server/kokkosdnn_server --arch lfm2.5 \
+  --weights weights/lfm2_5/LFM2.5-24B-A2B-Q4_K_M.gguf \
+  --tokenizer weights/lfm2_5/tokenizer.json
+```
+
+`--config` is an optional overlay on top of the checked-in arch presets
+(`models/glimmer/config-glimmer-30b-text.json`,
+`models/inkling/config-inkling-2-mini.json`,
+`models/lfm2_5/config-lfm2_5-24b-a2b.json`).
+
 ## Usage
 
 ```sh
