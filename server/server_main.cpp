@@ -1335,8 +1335,8 @@ bool sse_peer_alive(httplib::DataSink& sink) { return sink.is_writable(); }
 // ---------------------------------------------------------------------------
 
 // Agentic fields need a native tool grammar (LFM25 native markers, Glimmer
-// ATEM). Backends without one reject instead of silently dropping
-// calls/history turns.
+// ATEM, Inkling invoke-JSON). Backends without one reject instead of
+// silently dropping calls/history turns.
 bool check_tools_support(const ChatBackend& backend, const ParsedRequest& pr,
                          std::string& err) {
   if (backend.supports_tools()) return true;

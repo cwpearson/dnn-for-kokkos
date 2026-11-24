@@ -51,17 +51,11 @@
 // models/inkling (Inkling::Session behind Inkling::ISession); this file
 // only translates the neutral server vocabulary to/from it, mirroring
 // BackendGlimmer.cpp (long-lived session, device/host cache placement from
-// --prefix-cache-host).
-//
-// Assumed models/inkling API surface (Glimmer parity; TODO(models/inkling):
-// confirm each name in KokkosDNN_Inkling{Config,Session,Tokenizer,Weights}.hpp
-// when the component lands — Inkling::DefaultScalar, Config::inkling_2_mini(),
-// Config::from_json_file(path), Config::{max_seq_len,prefill_chunk_size,
-// kv_int8,eos_token,validate,kv_cache_bytes}, Weights<Exec,Scalar>{allocate},
-// load_gguf/load_safetensors(cfg,...), Tokenizer(path)/decode,
-// ChatMessage/ToolCall/make_chat_messages/encode_chatml_with_tools/
-// default_stop_strings, SessionOptions/ISession/CachedPrefillOutcome/
-// StepOutcome, Session<Exec,Scalar[,HostSpace]>).
+// --prefix-cache-host). Tool calls flow through the models/inkling channel
+// parser (ToolCallStreamParser in KokkosDNN_InklingChat.hpp): the
+// <|content_thinking|> trace becomes reasoning_content and
+// <|content_invoke_tool_json|> blocks become OpenAI tool_calls, so
+// supports_tools() is true and handlers accept tools/tool_calls history.
 //
 // Without KOKKOSDNN_SERVER_HAVE_INKLING this TU compiles to a stub backend
 // whose load() fails with a clear message, so "inkling" still resolves in
@@ -169,29 +163,29 @@ std::string normalize_inkling_reasoning_effort(const std::string& v) {
                               " xhigh, max, or a float in [0.0, 0.99])");
 }
 
-// Pass-through channel splitter: no tool grammar is wired yet (the upstream
-// <|content_invoke_tool_json|> invoke blocks are NOT parsed here), so every
-// raw piece streams as display text and finish() returns it verbatim with
-// no reasoning trace and no tool calls. TODO(models/inkling): replace with
-// a real <|content_thinking|> / <|content_invoke_tool_json|> channel parser
-// in KokkosDNN_InklingTokenizer.hpp (plus supports_tools()=true) once the
-// invoke-JSON grammar is confirmed against the real tokenizer/component.
+// Channel parser: splits the <|content_thinking|> reasoning trace from
+// display text and parses <|content_invoke_tool_json|> invoke blocks into
+// tool calls. Channel headers/footers never leak into either view.
 class InklingStreamParser final : public StreamParser {
  public:
-  explicit InklingStreamParser(const std::vector<std::string>& /*stops*/) {}
+  explicit InklingStreamParser(const std::vector<std::string>& stops)
+      : p_(stops) {}
   StepDeltas feed(const std::string& raw_piece) override {
-    acc_ += raw_piece;
-    return {raw_piece, ""};
+    const Inkling::StreamDeltas d = p_.feed(raw_piece);
+    return {std::move(d.display), std::move(d.reasoning)};
   }
   ParsedTail finish() override {
+    const Inkling::ToolParseResult t = p_.finish();
     ParsedTail out;
-    out.text = std::move(acc_);
-    out.reasoning = "";
+    out.text = std::move(t.text);
+    out.reasoning = std::move(t.reasoning);
+    out.calls.reserve(t.calls.size());
+    for (const auto& c : t.calls) out.calls.push_back({c.id, c.name, c.arguments});
     return out;
   }
 
  private:
-  std::string acc_;
+  Inkling::ToolCallStreamParser p_;
 };
 
 class InklingBackend final : public ChatBackend {
@@ -215,10 +209,6 @@ class InklingBackend final : public ChatBackend {
     }
     try {
       model_id_ = opts.model_id;
-      // TODO(models/inkling): confirm the preset constructor name and the
-      // config-file schema in KokkosDNN_InklingConfig.hpp (expect
-      // max_seq_len up to 1048576 per tokenizer_config.json
-      // model_max_length).
       cfg_ = opts.config_path.empty() ? Inkling::Config::inkling_2_mini()
                                       : Inkling::Config::from_json_file(
                                             opts.config_path);
@@ -290,16 +280,13 @@ class InklingBackend final : public ChatBackend {
     return s;
   }
   std::vector<std::string> default_stop_strings() const override {
-    // TODO(models/inkling): confirm against KokkosDNN_InklingTokenizer.hpp.
     // Terminator text as a belt-and-braces backup for the eos id, mirroring
     // Glimmer's {"<|eot|>"}; <|end_message|> must NOT be added (structural).
     return Inkling::default_stop_strings();
   }
-  // TODO: flip to true with the invoke-JSON tool grammar (template declares
-  // tool_declare + content_invoke_tool_json blocks; the stream parser above
-  // is still pass-through). While false, handlers reject tools/tool_calls
-  // for this arch instead of silently dropping them.
-  bool supports_tools() const override { return false; }
+  // Inkling speaks the upstream invoke-JSON tool protocol: tools declared
+  // via tool_declare + content_xml, calls via content_invoke_tool_json.
+  bool supports_tools() const override { return true; }
 
   std::vector<ServerChatMessage> make_single_turn(
       const std::string& prompt) const override {
@@ -321,16 +308,15 @@ class InklingBackend final : public ChatBackend {
     // Validate the effort cue here so unknown values are a 400 even before
     // the models/inkling component encodes (mirrors Glimmer's
     // reasoning_strength handling; the component's own encode in
-    // KokkosDNN_InklingTokenizer.hpp must also raise on unknown values per
-    // the template's raise_exception).
+    // KokkosDNN_InklingChat.hpp raises on unknown values per the
+    // template's raise_exception).
     (void)normalize_inkling_reasoning_effort(reasoning_strength);
-    // TODO(models/inkling): confirm the encode entry point in
-    // KokkosDNN_InklingTokenizer.hpp. Upstream effort keys (none/minimal/low/medium/high/xhigh/max) already cover the
-    // server's reasoning_strength vocabulary (default "high"), so the value
-    // forwards verbatim like Glimmer's RLed cue; the component renders the
-    // numeric 'Thinking effort level: N' message and the tool_declare /
-    // content_invoke_tool_json blocks per the contract above, and must sniff
-    // whether the processor appends a trailing '<|message_model|>' for
+    // Upstream effort keys (none/minimal/low/medium/high/xhigh/max) already
+    // cover the server's reasoning_strength vocabulary (default "high"), so
+    // the value forwards verbatim like Glimmer's RLed cue; the component
+    // renders the numeric 'Thinking effort level: N' message and the
+    // tool_declare / content_invoke_tool_json blocks per the contract
+    // above, appending a trailing '<|message_model|>' for
     // add_generation_prompt=true.
     return Inkling::encode_chatml_with_tools(tok_, to_native(messages),
                                              tools_json, system_suffix,
@@ -387,8 +373,9 @@ class InklingBackend final : public ChatBackend {
   std::unique_ptr<StreamParser> new_stream_parser(
       const std::vector<std::string>& stops,
       bool /*start_in_reasoning*/) const override {
-    // No prompt-provided open thinker to mirror: the pass-through parser
-    // streams raw pieces as display until the real channel parser lands.
+    // Channels are self-delimiting (<|content_thinking|> /
+    // <|content_invoke_tool_json|> openers), so there is no
+    // prompt-provided open thinker to mirror here (mirrors Glimmer).
     return std::make_unique<InklingStreamParser>(stops);
   }
 

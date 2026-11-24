@@ -23,6 +23,9 @@
 #ifdef KOKKOSDNN_SERVER_HAVE_GLIMMER
 #include <KokkosDNN_GlimmerTokenizer.hpp>
 #endif
+#ifdef KOKKOSDNN_SERVER_HAVE_INKLING
+#include <KokkosDNN_InklingChat.hpp>
+#endif
 
 namespace {
 using KokkosDNN::Server::ChatBackend;
@@ -779,38 +782,273 @@ int test_glimmer_tool_wire() {
 }
 #endif
 
+#ifdef KOKKOSDNN_SERVER_HAVE_INKLING
+// Inkling render check (pure string mapping, no weights): one user turn
+// renders the upstream framing (effort system message first, then the user
+// block) with an open model header as the generation prompt.
+int test_inkling_render_tiny() {
+  const std::vector<KokkosDNN::Inkling::ChatMessage> msgs =
+      KokkosDNN::Inkling::make_chat_messages("hi", "", "user");
+  const std::string r =
+      KokkosDNN::Inkling::render_inkling_chatml_with_tools(msgs, "", "", true);
+  CHECK(r.find("<|message_system|><|content_text|>Thinking effort level: 0.9"
+              "<|end_message|>") != std::string::npos);
+  CHECK(r.find("<|message_user|><|content_text|>hi<|end_message|>") !=
+        std::string::npos);
+  CHECK(r.rfind("<|message_model|>") ==
+        r.size() - std::string("<|message_model|>").size());
+  return 0;
+}
+#endif  // KOKKOSDNN_SERVER_HAVE_INKLING
+
+#ifdef KOKKOSDNN_SERVER_HAVE_INKLING
+// Inkling invoke-JSON tool wire: effort mapping, render/parse round trips,
+// malformed-block handling, and streaming agreement.
+int test_inkling_tool_wire() {
+  using KokkosDNN::Inkling::ChatMessage;
+  using KokkosDNN::Inkling::default_stop_strings;
+  using KokkosDNN::Inkling::parse_tool_calls;
+  using KokkosDNN::Inkling::render_inkling_chatml_with_tools;
+  using KokkosDNN::Inkling::resolve_reasoning_effort;
+  using KokkosDNN::Inkling::StreamDeltas;
+  using KokkosDNN::Inkling::ToolCall;
+  using KokkosDNN::Inkling::ToolCallStreamParser;
+  using KokkosDNN::Inkling::ToolParseResult;
+  // The turn terminator is <|content_model_end_sampling|> only: <|end_message|>
+  // ends a message while the turn continues (thinking/text/tool channels), so
+  // it is structural, never a stop.
+  CHECK(default_stop_strings() ==
+        std::vector<std::string>{"<|content_model_end_sampling|>"});
+  // Effort mapping (case-insensitive; "" = 0.9 default; floats pass through
+  // in [0.0, 0.99]); unknown values throw for the server's 400 path.
+  CHECK(resolve_reasoning_effort("") == "0.9");
+  CHECK(resolve_reasoning_effort("HIGH") == "0.9");
+  CHECK(resolve_reasoning_effort("none") == "0");
+  CHECK(resolve_reasoning_effort("minimal") == "0.1");
+  CHECK(resolve_reasoning_effort("low") == "0.2");
+  CHECK(resolve_reasoning_effort("medium") == "0.7");
+  CHECK(resolve_reasoning_effort("xhigh") == "0.99");
+  CHECK(resolve_reasoning_effort("max") == "0.99");
+  CHECK(resolve_reasoning_effort("0.5") == "0.5");
+  {
+    bool threw = false;
+    try {
+      (void)resolve_reasoning_effort("none-ish");
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    CHECK(threw);
+  }
+  // Thinking + text channels split; markers never leak.
+  {
+    const std::string raw =
+        std::string("<|message_model|><|content_thinking|>let me think"
+                    "<|end_message|><|message_model|><|content_text|>Hi"
+                    "<|end_message|><|content_model_end_sampling|>junk");
+    const ToolParseResult r = parse_tool_calls(raw);
+    CHECK(r.reasoning == "let me think");
+    CHECK(r.text == "Hi");
+    CHECK(r.calls.empty());
+  }
+  // Tool call with the NAME header prefix (as rendered) parses, args
+  // canonicalized to sorted-keys JSON.
+  {
+    const std::string raw =
+        std::string("<|message_model|>get_weather"
+                    "<|content_invoke_tool_json|>{\"args\":{\"city\":\"Tokyo\"},"
+                    "\"name\":\"get_weather\"}<|end_message|>");
+    const ToolParseResult r = parse_tool_calls(raw);
+    CHECK(r.text.empty());
+    CHECK(r.calls.size() == 1 && r.calls[0].name == "get_weather");
+    CHECK(r.calls[0].arguments == "{\"city\":\"Tokyo\"}");
+  }
+  // Text plus a call in one turn; tool_error text counts as display.
+  {
+    const std::string raw =
+        std::string("<|message_model|><|content_text|>One moment"
+                    "<|end_message|><|message_model|>"
+                    "<|content_invoke_tool_json|>{\"name\":\"f\",\"args\":{}}"
+                    "<|end_message|><|message_model|><|content_tool_error|>oops"
+                    "<|end_message|>");
+    const ToolParseResult r = parse_tool_calls(raw);
+    CHECK(r.text == "One momentoops");
+    CHECK(r.calls.size() == 1 && r.calls[0].name == "f");
+    CHECK(r.calls[0].arguments == "{}");
+  }
+  // Malformed invoke JSON: dropped, never a call, never leaked.
+  {
+    const ToolParseResult r = parse_tool_calls(
+        "hi <|content_invoke_tool_json|>oops<|end_message|> tail");
+    CHECK(r.calls.empty());
+    CHECK(r.text.find("oops") == std::string::npos);
+    CHECK(r.text.find("hi ") != std::string::npos);
+  }
+  // Missing name / non-object args: dropped, never a call.
+  {
+    CHECK(parse_tool_calls("<|content_invoke_tool_json|>{\"args\":{}}"
+                           "<|end_message|>")
+              .calls.empty());
+    CHECK(parse_tool_calls("<|content_invoke_tool_json|>{\"name\":\"f\","
+                           "\"args\":[1]}<|end_message|>")
+              .calls.empty());
+  }
+  // Unclosed trailing invoke with complete JSON (missing closer):
+  // recovered as a call; cut mid-JSON stays dropped.
+  {
+    const ToolParseResult r = parse_tool_calls(
+        "<|content_invoke_tool_json|>{\"name\":\"f\",\"args\":{\"a\":1}}");
+    CHECK(r.calls.size() == 1 && r.calls[0].name == "f");
+    CHECK(r.calls[0].arguments == "{\"a\":1}");
+    CHECK(parse_tool_calls("<|content_invoke_tool_json|>{\"name\":\"f\","
+                           "\"args\":{\"a\":")
+              .calls.empty());
+  }
+  // Tool result + reasoning history render in the upstream framing, and the
+  // tool name resolves through the matching tool_call_id.
+  {
+    ToolCall c;
+    c.id = "c1";
+    c.name = "get_weather";
+    c.arguments = "{\"city\":\"Tokyo\"}";
+    ChatMessage a;
+    a.role = "assistant";
+    a.thinking = "check weather";
+    a.content = "Checking.";
+    a.tool_calls.push_back(c);
+    ChatMessage tool_msg;
+    tool_msg.role = "tool";
+    tool_msg.content = "{\"temp\": 72}";
+    tool_msg.tool_call_id = "c1";
+    const std::string tools =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\","
+        "\"description\":\"d\",\"parameters\":{\"type\":\"object\"}}}]";
+    const std::string r =
+        render_inkling_chatml_with_tools({a, tool_msg}, tools, "", true);
+    CHECK(r.find("Thinking effort level: 0.9") != std::string::npos);
+    CHECK(r.find("<|message_system|>tool_declare<|content_xml|>") !=
+          std::string::npos);
+    CHECK(r.find("<|message_model|><|content_thinking|>check weather"
+                 "<|end_message|>") != std::string::npos);
+    CHECK(r.find("<|message_model|>get_weather<|content_invoke_tool_json|>") !=
+          std::string::npos);
+    CHECK(r.find("<|message_tool|>get_weather<|content_text|>{\"temp\": 72}"
+                 "<|end_message|>") != std::string::npos);
+    // History tool call re-parses losslessly from the invoke block.
+    const size_t s = r.find("<|content_invoke_tool_json|>");
+    CHECK(s != std::string::npos);
+    const ToolParseResult back =
+        parse_tool_calls(r.substr(r.rfind("<|message_model|>", s)));
+    CHECK(back.calls.size() == 1 &&
+          back.calls[0].arguments == "{\"city\":\"Tokyo\"}");
+  }
+  // Streaming agrees with the whole-text parse, even fed one byte at a time
+  // (headers, NAME prefixes, markers and stops split across pushes).
+  {
+    const std::string raw =
+        std::string("<|message_model|><|content_thinking|>thinking..."
+                    "<|end_message|><|message_model|>get_weather"
+                    "<|content_invoke_tool_json|>{\"name\":\"get_weather\","
+                    "\"args\":{\"city\":\"Tokyo\"}}<|end_message|>"
+                    "<|message_model|><|content_text|>The answer is 42"
+                    "<|end_message|><|content_model_end_sampling|>");
+    const ToolParseResult whole = parse_tool_calls(raw);
+    CHECK(whole.text == "The answer is 42");
+    CHECK(whole.reasoning == "thinking...");
+    CHECK(whole.calls.size() == 1);
+    ToolCallStreamParser fed;
+    std::string acc, racc;
+    for (char ch : raw) {
+      StreamDeltas d = fed.feed(std::string(1, ch));
+      acc += d.display;
+      racc += d.reasoning;
+      CHECK(whole.text.find(acc) == 0);
+      CHECK(whole.reasoning.find(racc) == 0);
+    }
+    ToolParseResult tail = fed.finish();
+    acc += tail.text;
+    racc += tail.reasoning;
+    CHECK(acc == whole.text);
+    CHECK(racc == whole.reasoning);
+    CHECK(tail.calls.size() == 1 &&
+          tail.calls[0].arguments == "{\"city\":\"Tokyo\"}");
+    CHECK(fed.finish().text == tail.text);
+    (void)tail;
+  }
+  // Turn ending exactly at a custom stop: nothing after it, tail empty.
+  {
+    ToolCallStreamParser fed({"STOP"});
+    std::string acc;
+    const std::string raw = "hello STOP world";
+    for (char ch : raw) acc += fed.feed(std::string(1, ch)).display;
+    ToolParseResult tail = fed.finish();
+    acc += tail.text;
+    CHECK(acc == "hello ");
+    CHECK(tail.text.empty());
+    CHECK(parse_tool_calls(raw, {"STOP"}).text == "hello ");
+  }
+  // Length-capped mid-marker turns: trailing partial heads are stripped,
+  // never flushed into content by finish().
+  for (const char* frag : {"hello <|content_thi", "hello <|message_mod",
+                           "hello <|end_messa", "hello <|content_model_end"}) {
+    ToolCallStreamParser fed;
+    std::string acc;
+    const std::string raw(frag);
+    for (char ch : raw) acc += fed.feed(std::string(1, ch)).display;
+    ToolParseResult tail = fed.finish();
+    acc += tail.text;
+    CHECK(acc == "hello ");
+    CHECK(parse_tool_calls(raw).text == "hello ");
+  }
+  return 0;
+}
+#endif  // KOKKOSDNN_SERVER_HAVE_INKLING
+
 int test_backends() {
   using KokkosDNN::Server::available_backends;
   using KokkosDNN::Server::create_backend;
   using KokkosDNN::Server::normalize_arch_name;
-  // Registry: both arch names resolve (real or stub backend), unknown does
+  // Registry: all arch names resolve (real or stub backend), unknown does
   // not. No weights/Kokkos needed: construction allocates nothing.
   {
     const std::vector<std::string> names = available_backends();
-    bool lfm = false, gli = false;
+    bool lfm = false, gli = false, ink = false;
     for (const auto& n : names) {
       lfm = lfm || n == "lfm2.5";
       gli = gli || n == "glimmer";
+      ink = ink || n == "inkling";
     }
-    CHECK(lfm && gli);
+    CHECK(lfm && gli && ink);
   }
   {
     std::unique_ptr<ChatBackend> lfm = create_backend("lfm2.5");
     std::unique_ptr<ChatBackend> gli = create_backend("glimmer");
-    CHECK(lfm && gli);
+    std::unique_ptr<ChatBackend> ink = create_backend("inkling");
+    CHECK(lfm && gli && ink);
     CHECK(!create_backend("llama"));
     CHECK(lfm->arch() == "lfm2.5");
     CHECK(gli->arch() == "glimmer");
+    CHECK(ink->arch() == "inkling");
     CHECK(lfm->default_model_id() == "lfm2_5");
     CHECK(gli->default_model_id() == "glimmer-30b");
+    CHECK(ink->default_model_id() == "inkling-2-mini");
     CHECK(lfm->supports_tools());
     CHECK(gli->supports_tools());
+#ifdef KOKKOSDNN_SERVER_HAVE_INKLING
+    // With the inkling component the backend speaks the upstream
+    // invoke-JSON tool protocol; the stub (component disabled) reports no
+    // grammar so handlers keep rejecting tools for it.
+    CHECK(ink->supports_tools());
+#else
+    CHECK(!ink->supports_tools());
+#endif
     // Load-free defaults (no weights/tokenizer): parse_common seeds from
     // these, so they must be sane before load().
     CHECK(!lfm->default_stop_ids().empty());
     CHECK(!lfm->default_stop_strings().empty());
     CHECK(!gli->default_stop_ids().empty());
     CHECK(!gli->default_stop_strings().empty());
+    CHECK(!ink->default_stop_ids().empty());
+    CHECK(!ink->default_stop_strings().empty());
   }
   // CLI arch aliases (case-insensitive, driver-style).
   CHECK(normalize_arch_name("lfm2.5") == "lfm2.5");
@@ -821,18 +1059,29 @@ int test_backends() {
   CHECK(normalize_arch_name("muse-glimmer") == "glimmer");
   CHECK(normalize_arch_name("muse-glimmer-30b") == "glimmer");
   CHECK(normalize_arch_name("darkc0de-muse-glimmer-30b") == "glimmer");
+  CHECK(normalize_arch_name("inkling") == "inkling");
+  CHECK(normalize_arch_name("Inkling-2-Mini") == "inkling");
+  CHECK(normalize_arch_name("inkling-2mini") == "inkling");
+  CHECK(normalize_arch_name("inkling2mini") == "inkling");
   CHECK(normalize_arch_name("llama") == "");
   CHECK(normalize_arch_name("") == "");
-  // Tools gate: both archs accept (LFM25 native grammar, Glimmer ATEM).
+  // Tools gate: LFM25 (native grammar), Glimmer (ATEM), and Inkling
+  // (invoke-JSON) accept; the inkling stub rejects.
   {
     std::unique_ptr<ChatBackend> lfm = create_backend("lfm2.5");
     std::unique_ptr<ChatBackend> gli = create_backend("glimmer");
+    std::unique_ptr<ChatBackend> ink = create_backend("inkling");
     ParsedRequest pr;
     pr.tools_active = true;
     pr.tools_json = "[{}]";
     std::string err;
     CHECK(check_tools_support(*lfm, pr, err));
     CHECK(check_tools_support(*gli, pr, err));
+#ifdef KOKKOSDNN_SERVER_HAVE_INKLING
+    CHECK(check_tools_support(*ink, pr, err));
+#else
+    CHECK(!check_tools_support(*ink, pr, err));
+#endif
     pr.tools_active = false;
     pr.tools_json.clear();
     ServerToolCall c;
@@ -844,6 +1093,11 @@ int test_backends() {
     pr.messages.push_back(m);
     CHECK(check_tools_support(*lfm, pr, err));
     CHECK(check_tools_support(*gli, pr, err));
+#ifdef KOKKOSDNN_SERVER_HAVE_INKLING
+    CHECK(check_tools_support(*ink, pr, err));
+#else
+    CHECK(!check_tools_support(*ink, pr, err));
+#endif
     pr.messages.clear();
     CHECK(check_tools_support(*gli, pr, err));
   }
@@ -1468,6 +1722,10 @@ int main() {
 #ifdef KOKKOSDNN_SERVER_HAVE_GLIMMER
   if (test_glimmer_render_tiny()) return 1;
   if (test_glimmer_tool_wire()) return 1;
+#endif
+#ifdef KOKKOSDNN_SERVER_HAVE_INKLING
+  if (test_inkling_render_tiny()) return 1;
+  if (test_inkling_tool_wire()) return 1;
 #endif
   if (test_error_shape()) return 1;
   std::cout << "server parsing tests passed (" << g_checks << " checks)\n";

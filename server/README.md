@@ -1,13 +1,13 @@
 # server/
 
 OpenAI-compatible HTTP front-end for KokkosDNN (multi-architecture:
-LFM2.5 and Glimmer).
+LFM2.5, Glimmer, and Inkling).
 Enabled with `-DKokkosDNN_ENABLE_SERVER=ON` (default `OFF`, so the default
 build is unaffected). Requires at least one model component
-(`KokkosDNN_ENABLE_MODEL_LFM25=ON` (default) and/or
-`KokkosDNN_ENABLE_MODEL_GLIMMER=ON`). Without the Glimmer component the
-Glimmer backend builds as a stub whose `load()` reports the missing
-target.
+(`KokkosDNN_ENABLE_MODEL_LFM25=ON` (default),
+`KokkosDNN_ENABLE_MODEL_GLIMMER=ON`, and/or
+`KokkosDNN_ENABLE_MODEL_INKLING=ON`). Without a component, its backend
+builds as a stub whose `load()` reports the missing target.
 
 Fetching `cpp-httplib` + `nlohmann/json` via FetchContent touches the
 network at configure time. For offline builds, pre-seed the sources and
@@ -182,11 +182,11 @@ fixed-shape decode step, tracked as follow-up work.
 
 ## Docker
 
-One image serves EITHER LFM2.5 OR Glimmer — the builder compiles both
+One image serves EITHER LFM2.5 OR Glimmer OR Inkling — the builder compiles all
 model components and the checkpoint is volume-mounted at run time, so the
 arch is selected per `docker run`, not per image build. (On a server build
-that predates the `--arch lfm2.5|glimmer` selector, drop the `--arch` flag;
-`--model` still selects the served id.)
+that predates the `--arch lfm2.5|glimmer|inkling` selector, drop the `--arch`
+flag; `--model` still selects the served id.)
 
 `server/Dockerfile` is a multi-stage CUDA build: the builder stage compiles
 Kokkos (CUDA backend, `KOKKOS_VERSION` 5.2.1, `CUDA_ARCH` AMPERE80,
@@ -348,17 +348,17 @@ docker run --gpus all -p 8000:8000 -e KOKKOSDNN_SANITIZER=1 \
 Route handlers are arch-agnostic: they parse OpenAI JSON once and drive the
 `KokkosDNN::Server::ChatBackend` selected by `--arch`. Per-arch differences:
 
-| Concern | `lfm2.5` (`BackendLFM25.cpp`) | `glimmer` (`BackendGlimmer.cpp`) |
-|---|---|---|
-| Chat template | LFM2.5-Instruct ChatML + `<think>` generation prompt, `List of tools:` system block, tool history turns | Muse-style `<\|begin_of_text\|>` + `<\|start\|>{role}<\|message\|>{content}<\|eot\|>` blocks with `to=self` (reasoning) / `to=<tool>` (ATEM tool calls) / `to=user` channels, tool catalogue + valid recipients in the system turn, `<|eom|>`/`<|eot|>` closers, bare `<|start|>assistant` generation prompt (upstream `chat_template.jinja`) |
-| Default stops | ids `{cfg.eos}`, strings `["<\|im_end\|>"]` | ids `{eos, eot}`, strings `["<|eot|>"]` (`<|eom|>` ends a message while the turn continues, so it is structural, never a stop) |
-| Tools | native `<\|tool_call_start\|>` grammar, full `tools`/`tool_choice` support | ATEM `<atem:invoke>` grammar, full `tools`/`tool_choice` support (one call per turn upstream; `parallel_tool_calls:false` keeps the first) |
-| Weights | exactly one `--weights` GGUF | one `--weights` `.gguf` or sharded safetensors (globs expanded) |
-| Reasoning channel | `<think>` trace → `reasoning_content` | `to=self` trace → `reasoning_content` |
-| Prefix cache | single-entry content-state cache (exact-prefix reuse) | single-entry content-state cache (exact-prefix reuse; dense or int8 KV rows) |
-| Response format | JSON-mode system directive + fence stripping | JSON-mode directive prepended to the system message (no fence stripping on streams, same as LFM25); no grammar enforcement |
+| Concern | `lfm2.5` (`BackendLFM25.cpp`) | `glimmer` (`BackendGlimmer.cpp`) | `inkling` (`BackendInkling.cpp`) |
+|---|---|---|---|
+| Chat template | LFM2.5-Instruct ChatML + `<think>` generation prompt, `List of tools:` system block, tool history turns | Muse-style `<\|begin_of_text\|>` + `<\|start\|>{role}<\|message\|>{content}<\|eot\|>` blocks with `to=self` (reasoning) / `to=<tool>` (ATEM tool calls) / `to=user` channels, tool catalogue + valid recipients in the system turn, `<|eom|>`/`<|eot|>` closers, bare `<|start|>assistant` generation prompt (upstream `chat_template.jinja`) | Inkling `<\|message_user\|>` / `<\|message_model\|>` / `<\|message_system\|>` / `<\|message_tool\|>` headers with `<\|content_text\|>` / `<\|content_thinking\|>` / `<\|content_invoke_tool_json\|>` bodies closed by `<\|end_message\|>`, `tool_declare` + `<\|content_xml\|>` tool catalogue, thinking-effort system message, trailing `<\|message_model\|>` generation prompt (upstream `chat_template.jinja`) |
+| Default stops | ids `{cfg.eos}`, strings `["<\|im_end\|>"]` | ids `{eos, eot}`, strings `["<|eot|>"]` (`<|eom|>` ends a message while the turn continues, so it is structural, never a stop) | ids `{200006}`, strings `["<\|content_model_end_sampling\|>"]` (`<\|end_message\|>` ends a message while the turn continues, so it is structural, never a stop) |
+| Tools | native `<\|tool_call_start\|>` grammar, full `tools`/`tool_choice` support | ATEM `<atem:invoke>` grammar, full `tools`/`tool_choice` support (one call per turn upstream; `parallel_tool_calls:false` keeps the first) | invoke-JSON `<\|content_invoke_tool_json\|>` grammar (`{"name","args"}`), full `tools`/`tool_choice` support (repeats upstream; `parallel_tool_calls:false` keeps the first) |
+| Weights | exactly one `--weights` GGUF | one `--weights` `.gguf` or sharded safetensors (globs expanded) | one `--weights` `.gguf` or sharded safetensors (globs expanded) |
+| Reasoning channel | `<think>` trace → `reasoning_content` | `to=self` trace → `reasoning_content` | `<\|content_thinking\|>` trace → `reasoning_content` |
+| Prefix cache | single-entry content-state cache (exact-prefix reuse) | single-entry content-state cache (exact-prefix reuse; dense or int8 KV rows) | single-entry content-state cache (exact-prefix reuse; dense or int8 KV rows) |
+| Response format | JSON-mode system directive + fence stripping | JSON-mode directive prepended to the system message (no fence stripping on streams, same as LFM25); no grammar enforcement | JSON-mode directive in the system message (no fence stripping on streams, same as LFM25); no grammar enforcement |
 
-### Adding a third architecture (3-step recipe)
+### Adding a new architecture (3-step recipe)
 
 1. New `server/BackendX.cpp` implementing `KokkosDNN::Server::ChatBackend`
    (load/render+encode/prefill_cached/step/flush/usage/stops/decode/stream
@@ -375,8 +375,8 @@ Route handlers are arch-agnostic: they parse OpenAI JSON once and drive the
 
 | Param | Mapping |
 |---|---|
-| `messages[]` | `role` in `system,user,assistant,tool` (`developer`→`user`, `function`→`tool`); string `content` (text-part arrays joined); assistant turns may carry `tool_calls` (validated, `content` may be `null`) plus `thinking`/`reasoning`/`reasoning_content` (trace replay, first non-empty wins); rendered via the arch backend (`render_lfm25_chatml_with_tools` / `render_glimmer_chatml_with_tools`) |
-| `tools[]` | `[{type:"function", function:{name, description?, parameters?, strict?}}]` validated, then injected into the system prompt (arch-native tool format: LFM2.5 `List of tools: [...]` JSON, Glimmer ATEM catalogue); `[]` = no-op |
+| `messages[]` | `role` in `system,user,assistant,tool` (`developer`→`user`, `function`→`tool`); string `content` (text-part arrays joined); assistant turns may carry `tool_calls` (validated, `content` may be `null`) plus `thinking`/`reasoning`/`reasoning_content` (trace replay, first non-empty wins); rendered via the arch backend (`render_lfm25_chatml_with_tools` / `render_glimmer_chatml_with_tools` / `render_inkling_chatml_with_tools`) |
+| `tools[]` | `[{type:"function", function:{name, description?, parameters?, strict?}}]` validated, then injected into the system prompt (arch-native tool format: LFM2.5 `List of tools: [...]` JSON, Glimmer ATEM catalogue, Inkling `tool_declare` + `<|content_xml|>` specs); `[]` = no-op |
 | `tool_choice` | `"auto"` (default) \| `"none"` (no injection) \| `"required"` / `{"type":"function","function":{"name"}}` (best-effort `MUST call` system directive — prompted, not constrained) |
 | `parallel_tool_calls` | `false` keeps only the first parsed call (default `true`) |
 | `reasoning_effort` | Glimmer and Inkling: selects the reasoning cue (case-insensitive; `null`/absent = `high`); unknown values are a 400 for `arch glimmer`/`arch inkling`, ignored for other archs. Glimmer: `"low"`\|`"medium"`\|`"high"`\|`"xhigh"` renders the RLed `Reasoning strength: <level>.` system cue. Inkling: `"none"`\|`"minimal"`\|`"low"`\|`"medium"`\|`"high"`\|`"xhigh"`\|`"max"` (or a float string in `[0.0, 0.99]`) renders the upstream `Thinking effort level: N` system message (`none`→`0`, `minimal`→`0.1`, `low`→`0.2`, `medium`→`0.7`, `high`→`0.9`, `xhigh`/`max`→`0.99`) |
@@ -419,6 +419,27 @@ Turn boundaries: the `<|im_end|>` terminator always ends the turn, even
 with a custom `stop` list, and a length-capped turn ending mid-marker has
 only its longest trailing partial marker head stripped (an earlier `<`
 followed by `<` is content).
+
+Agentic loop (Inkling): with `tools` set, a turn that emits
+`<|message_model|>NAME<|content_invoke_tool_json|>{"name":...,"args":{...}}<|end_message|>`
+blocks returns `finish_reason:"tool_calls"` with an OpenAI `tool_calls`
+payload (fresh `call-kdnn-N` ids, `arguments` reserialized to sorted-keys
+JSON, `content` is the surrounding `<|content_text|>` text or `null`)
+instead of leaking channel markup into `content`. Execute the functions,
+append the assistant turn (with its `tool_calls`) plus one `tool`-role
+message per result (the tool name resolves through the matching
+`tool_call_id`, or a `name` field), and call again. Streaming emits
+`reasoning_content` deltas for the `<|content_thinking|>` trace and
+`content` deltas live, then one `tool_calls` delta chunk per call, then
+the `tool_calls` finish chunk; `tool` history turns render natively, so
+multi-turn loops are exact. A truncated turn (capped by `max_tokens`) that
+ends after a complete invoke-JSON body but before its `<|end_message|>`
+closer still returns the recoverable call instead of leaking markup into
+`content`, and likewise still reports `finish_reason:"tool_calls"` (the
+length cap is hidden) — so validate the arguments before executing. Turn
+boundaries: the `<|content_model_end_sampling|>` terminator always ends the
+turn, even with a custom `stop` list, with the same longest-trailing-head
+stripping for length-capped mid-marker turns.
 
 Thinking (LFM2.5-Instruct): LFM2.5-Instruct always reasons inside `<think>...</think>` first.
 The generation prompt ends with an open `<think>` (matching the upstream
@@ -630,9 +651,9 @@ Agent Settings → Add Provider, then fill in the capabilities below):
             "max_tokens": 32768,
             "max_output_tokens": 4096,
             "capabilities": {
-              "tools": false,
+              "tools": true,
               "images": false,
-              "parallel_tool_calls": false,
+              "parallel_tool_calls": true,
               "prompt_cache_key": false,
               "chat_completions": true,
               "interleaved_reasoning": true,
@@ -646,25 +667,27 @@ Agent Settings → Add Provider, then fill in the capabilities below):
 }
 ```
 
-Why these values (only `tools`, `name`, and `max_tokens` differ from the
-Glimmer settings above):
+Why these values (only `name` and `max_tokens` differ from the
+LFM2.5 settings above):
 
-- `tools: false` is **required for now**. The Inkling backend has no native
-  tool grammar yet (`supports_tools()` is `false`), so any request carrying
-  `tools` or `tool_calls`/`tool`-role history is a 400 (`no native tool
-  grammar`). With Zed's default `true`, every agentic thread sends `tools`
-  and fails; setting `false` keeps plain chat working. Flip it to `true`
-  once the `<|content_invoke_tool_json|>` channel parser lands.
+- `tools: true` is **required** for agentic threads. The server speaks the
+  upstream invoke-JSON tool protocol and exposes standard OpenAI
+  `tool_calls`; with Zed's default `true` nothing changes, but flipping it
+  to `false` silently disables tools and every tool-using thread degrades
+  to plain text.
+- `parallel_tool_calls: true` lets multi-call turns through: the template
+  renders every call in the turn and the server returns each parsed
+  invoke-JSON block. With the default `false`, the request carries
+  `parallel_tool_calls:false` and the server keeps only the first parsed
+  call.
 - `interleaved_reasoning: true` is **required**. With Zed's default
   `false`, prior assistant thinking is sent back as plain assistant text
   instead of `reasoning_content`, so the model sees its own trace outside
   the `<|content_thinking|>` channel the template expects (the same
   feedback loop documented for LFM2.5 above). With `true`, Zed sends the
   trace back as `reasoning_content` and the server re-renders it inside the
-  thinking channel. One current limitation: the streaming parser is still
-  pass-through, so a turn's thinking trace arrives as plain `content`
-  deltas rather than `reasoning_content` deltas — history replay across
-  turns is still exact with `true`.
+  thinking channel; streaming sends the trace as `reasoning_content`
+  deltas, which Zed renders in its thinking trace.
 - `max_tokens` is Zed's **context window**, not an output cap; set it to
   the server's `--max-seq-len` (default `32768` for Inkling, arch max
   `1048576`). Zed compacts at 90% of this value, so a larger number lets
@@ -702,7 +725,7 @@ threads still carry the old, polluted history.
   `models/` (shared primitives in `models/common/`). The server only
   translates HTTP <-> backend calls (all generation runs through the
   arch backend: `Glimmer::Session` for Glimmer, `LFM25::Session` for
-  LFM2.5).
+  LFM2.5, `Inkling::Session` for Inkling).
 - The server owns `Kokkos::initialize/finalize` for the serving process.
 - Single-user, blocking: one global mutex guards all inference. A second
   concurrent request blocks until the in-flight request finishes (no 409;

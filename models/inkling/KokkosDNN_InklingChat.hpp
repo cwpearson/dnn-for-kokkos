@@ -28,11 +28,14 @@
 //
 // Default stops: ids {200006}, strings {'<|content_model_end_sampling|>'}.
 
+#include <algorithm>
 #include <charconv>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "KokkosDNN_ChatStop.hpp"
@@ -672,6 +675,581 @@ inline std::vector<int> encode_chatml_with_tools(
 // per-message structural boundary, never a stop.
 inline std::vector<std::string> default_stop_strings() {
   return {"<|content_model_end_sampling|>"};
+}
+
+// ---------------------------------------------------------------------------
+// Tool-call parsing (API parity with LFM25/Glimmer parse_tool_calls /
+// ToolCallStreamParser so generic server code compiles unchanged).
+//
+// Splits a raw completion (decoded with skip_special_tokens=false) into
+// display text, the <|content_thinking|> reasoning trace, and tool calls
+// parsed from <|content_invoke_tool_json|> blocks, following the upstream
+// response_template in tokenizer_config.json:
+//
+//   reasoning_content: open (?:<|message_model|>...)?<|content_thinking|>
+//     close <|end_message|> (repeats, joined)
+//   content: open (?:<|message_model|>...)?<|content_(text|tool_error|
+//     invoke_tool_text)|> close <|end_message|> (repeats, joined)
+//   tool_calls: open (?:<|message_model|>...)?<|content_invoke_tool_json|>
+//     close <|end_message|> (repeats; content is JSON
+//     {"name":...,"args":{...}}, transformed to name={content.name}
+//     arguments={content.args})
+//
+// Channel headers/footers (<|message_model|> plus its NAME suffix,
+// <|content_*|> openers, <|end_message|> closers) never leak into either
+// text view. The display text is additionally cut at the first stop string
+// (with <|content_model_end_sampling|> always applying, independent of
+// `stops`); <|end_message|> is structural, never a stop. A length-capped
+// turn cut mid-marker has its longest trailing partial marker head
+// stripped, so fragments never leak into `content`. Never throws on model
+// output (malformed invoke blocks are dropped).
+// ---------------------------------------------------------------------------
+struct ToolParseResult {
+  std::string text;
+  std::string reasoning;  // <|content_thinking|> trace ("" when none)
+  std::vector<ToolCall> calls;
+};
+
+struct StreamDeltas {
+  std::string display;
+  std::string reasoning;
+};
+
+namespace Impl {
+
+// Inkling channel markers (fixed literals). <|unused_...|> fillers are
+// handled by prefix, not listed here.
+inline bool inkling_starts_with(const std::string& s, size_t pos,
+                                const char* prefix, size_t len) {
+  return s.size() - pos >= len && s.compare(pos, len, prefix, len) == 0;
+}
+
+// Longest suffix of s that is a strict prefix of any token in toks
+// (bounded by max_len). Used for hold-backs and length-cap stripping.
+inline size_t inkling_suffix_overlap(const std::string& s,
+                                     const std::vector<std::string>& toks,
+                                     size_t max_len) {
+  const size_t n = s.size();
+  if (n == 0) return 0;
+  size_t best = 0;
+  const size_t cap = (n < max_len) ? n : max_len;
+  for (size_t k = 1; k <= cap; ++k) {
+    for (const auto& t : toks) {
+      if (t.size() > k && t.compare(0, k, s, n - k, k) == 0) {
+        best = k;
+        break;
+      }
+    }
+  }
+  return best;
+}
+
+// Length of a trailing incomplete UTF-8 sequence (0 when the tail ends on
+// a character boundary).
+inline size_t inkling_utf8_hold(const std::string& s) {
+  size_t n = 0;
+  for (size_t i = s.size(); i > 0 && n < 4; --i, ++n) {
+    const unsigned char c = static_cast<unsigned char>(s[i - 1]);
+    if ((c & 0x80) == 0) return 0;
+    if ((c & 0xC0) == 0xC0) {
+      size_t need = 1;
+      if ((c & 0xE0) == 0xC0)
+        need = 2;
+      else if ((c & 0xF0) == 0xE0)
+        need = 3;
+      else if ((c & 0xF8) == 0xF0)
+        need = 4;
+      return (n + 1 >= need) ? 0 : (n + 1);
+    }
+  }
+  return s.size();
+}
+
+// Parse one <|content_invoke_tool_json|> body into a call. The body must
+// be a JSON object with a non-empty string "name" and an object "args"
+// (missing/null "args" means "{}"). Returns true with `out` set on
+// success; malformed bodies report false (caller drops the block).
+inline bool parse_invoke_json(const std::string& body, ToolCall& out) {
+  std::string t = trim_ws(body);
+  if (t.empty()) return false;
+  JsonValue v;
+  try {
+    v = parse_json(t);
+  } catch (...) {
+    return false;
+  }
+  if (v.type != JsonValue::Type::Object) return false;
+  auto nit = v.obj.find("name");
+  if (nit == v.obj.end() ||
+      nit->second.type != JsonValue::Type::String ||
+      nit->second.str.empty())
+    return false;
+  std::string args = "{}";
+  auto ait = v.obj.find("args");
+  if (ait != v.obj.end() && ait->second.type != JsonValue::Type::Null) {
+    if (ait->second.type != JsonValue::Type::Object) return false;
+    args = json_canonical(ait->second);
+  }
+  out.id.clear();
+  out.name = nit->second.str;
+  out.arguments = args.empty() ? std::string("{}") : args;
+  return true;
+}
+
+}  // namespace Impl
+
+class ToolCallStreamParser {
+ public:
+  explicit ToolCallStreamParser(
+      const std::vector<std::string>& stop_strings = {});
+  // One parser step for one raw piece: returns display + reasoning text
+  // newly safe to stream (either may be empty = "hold"). Prefer this over
+  // push() on hot paths.
+  StreamDeltas feed(const std::string& raw_piece);
+  // Returns display text newly safe to stream (may be empty = "hold").
+  // Stashes the reasoning delta for the next poll_reasoning() call.
+  std::string push(const std::string& raw_piece);
+  // Returns reasoning text accumulated since the last poll (may be empty).
+  std::string poll_reasoning();
+  // Tail text + tail reasoning + parsed calls. Idempotent.
+  ToolParseResult finish();
+
+ private:
+  enum class Channel { kOutside, kThinking, kDisplay, kInvoke };
+
+  void drive(bool end_of_input);
+  void route_text(const std::string& s);
+  void release_display();
+  void release_reasoning();
+  StreamDeltas emit_deltas();
+  // Parse invoke_buf_ into calls_ when valid (always clears the buffer).
+  void close_invoke();
+
+  Channel cur_ = Channel::kOutside;
+  std::string hold_;       // undecided bytes (bounded, see drive())
+  bool awaiting_name_ = false;  // just saw <|message_model|>; Next [^<]*
+                                // may be the NAME prefix of an invoke block
+  std::string name_buf_;   // buffered NAME candidate (dropped before any
+                           // <|content_*|> opener, else flushed as display)
+  std::string invoke_buf_;  // bytes of the current invoke-JSON element
+  std::string acc_d_;       // display bytes (append-only)
+  std::string acc_r_;       // reasoning bytes (append-only)
+  size_t rel_d_ = 0;        // settled display frontier
+  size_t rel_r_ = 0;        // settled reasoning frontier
+  size_t emitted_d_ = 0;    // display chars already returned
+  size_t emitted_r_ = 0;    // reasoning chars already returned
+  std::string stash_r_;  // reasoning delta held for poll_reasoning()
+  std::vector<ToolCall> calls_;
+  bool stopped_ = false;  // display cut (stop found or eos seen)
+  bool eot_seen_ = false;  // structural turn end seen (drop all)
+  size_t eot_at_ = std::string::npos;
+  bool finished_ = false;
+  ToolParseResult tail_;  // cached finish() result
+  std::vector<std::string> stops_;  // configured stop strings (no empties)
+  size_t max_stop_len_ = 1;
+  std::vector<std::string> marker_hold_;  // release hold-back markers
+};
+
+inline ToolCallStreamParser::ToolCallStreamParser(
+    const std::vector<std::string>& stop_strings) {
+  for (const auto& s : stop_strings) {
+    if (s.empty()) continue;
+    stops_.push_back(s);
+  }
+  // The turn terminator always ends the turn, even with custom stops
+  // (mirrors the Session stop policy union).
+  if (std::find(stops_.begin(), stops_.end(),
+                "<|content_model_end_sampling|>") == stops_.end())
+    stops_.push_back("<|content_model_end_sampling|>");
+  max_stop_len_ = 1;
+  for (const auto& s : stops_)
+    max_stop_len_ = std::max(max_stop_len_, s.size());
+  static const char* kHold[] = {
+      "<|message_model|>",   "<|message_user|>",   "<|message_system|>",
+      "<|message_tool|>",    "<|content_thinking|>", "<|content_text|>",
+      "<|content_tool_error|>", "<|content_invoke_tool_text|>",
+      "<|content_invoke_tool_json|>", "<|content_xml|>", "<|content_image|>",
+      "<|content_model_end_sampling|>", "<|begin_of_text|>", "<|end_message|>",
+      "<|endoftext|>",       "<|unused",            "<|content_"};
+  for (const char* h : kHold) marker_hold_.emplace_back(h);
+}
+
+inline void ToolCallStreamParser::route_text(const std::string& s) {
+  if (s.empty()) return;
+  if (cur_ == Channel::kThinking) {
+    acc_r_ += s;
+    return;
+  }
+  if (cur_ == Channel::kInvoke) {
+    // Invoke JSON accumulates even after a display stop so a call straddling
+    // the cut still parses; its bytes never reach display.
+    invoke_buf_ += s;
+    return;
+  }
+  if (stopped_) return;
+  acc_d_ += s;
+}
+
+inline void ToolCallStreamParser::close_invoke() {
+  ToolCall c;
+  if (Impl::parse_invoke_json(invoke_buf_, c)) calls_.push_back(std::move(c));
+  invoke_buf_.clear();
+}
+
+inline void ToolCallStreamParser::release_display() {
+  // The turn ends at the earliest of a custom stop and the structural
+  // terminator: when the terminator fired first (eot_at_ set), a custom
+  // stop earlier in the turn still wins.
+  const size_t limit = (eot_at_ == std::string::npos)
+                           ? acc_d_.size()
+                           : std::min(eot_at_, acc_d_.size());
+  const size_t from = (rel_d_ >= max_stop_len_) ? rel_d_ - max_stop_len_ + 1 : 0;
+  size_t best = std::string::npos;
+  for (const auto& s : stops_) {
+    const size_t p = acc_d_.find(s, from);
+    if (p != std::string::npos && p < limit &&
+        (best == std::string::npos || p < best))
+      best = p;
+  }
+  if (best != std::string::npos) {
+    acc_d_.resize(best);
+    stopped_ = true;
+    rel_d_ = acc_d_.size();
+    if (emitted_d_ > rel_d_) emitted_d_ = rel_d_;
+    return;
+  }
+  if (stopped_) {
+    rel_d_ = acc_d_.size();
+    return;
+  }
+  const size_t hold_stop =
+      Impl::inkling_suffix_overlap(acc_d_, stops_, max_stop_len_);
+  const size_t hold_mark =
+      Impl::inkling_suffix_overlap(acc_d_, marker_hold_, 64);
+  const size_t hold =
+      std::max(hold_stop, std::max(hold_mark, Impl::inkling_utf8_hold(acc_d_)));
+  const size_t rel = acc_d_.size() - hold;
+  if (rel > rel_d_) rel_d_ = rel;
+}
+
+inline void ToolCallStreamParser::release_reasoning() {
+  // Stops apply to display only; reasoning holds back partial UTF-8 plus
+  // marker-prefix tails (same strip agreement as display).
+  const size_t hold = std::max(
+      Impl::inkling_suffix_overlap(acc_r_, marker_hold_, 64),
+      Impl::inkling_utf8_hold(acc_r_));
+  const size_t rel = acc_r_.size() - hold;
+  if (rel > rel_r_) rel_r_ = rel;
+}
+
+inline StreamDeltas ToolCallStreamParser::emit_deltas() {
+  release_display();
+  release_reasoning();
+  StreamDeltas out;
+  out.display = acc_d_.substr(emitted_d_, rel_d_ - emitted_d_);
+  out.reasoning = acc_r_.substr(emitted_r_, rel_r_ - emitted_r_);
+  emitted_d_ = rel_d_;
+  emitted_r_ = rel_r_;
+  return out;
+}
+
+inline void ToolCallStreamParser::drive(bool end_of_input) {
+  static const char* kMsgModel = "<|message_model|>";
+  static const char* kThink = "<|content_thinking|>";
+  static const char* kText = "<|content_text|>";
+  static const char* kToolError = "<|content_tool_error|>";
+  static const char* kInvokeText = "<|content_invoke_tool_text|>";
+  static const char* kInvokeJson = "<|content_invoke_tool_json|>";
+  static const char* kXml = "<|content_xml|>";
+  static const char* kImage = "<|content_image|>";
+  static const char* kEndSampling = "<|content_model_end_sampling|>";
+  static const char* kEndMessage = "<|end_message|>";
+  static const char* kEndOfText = "<|endoftext|>";
+  static const char* kBegin = "<|begin_of_text|>";
+  static const char* kMsgUser = "<|message_user|>";
+  static const char* kMsgSystem = "<|message_system|>";
+  static const char* kMsgTool = "<|message_tool|>";
+  // Fixed markers, longest first so a shared prefix resolves to the longest
+  // match.
+  static const char* kFixed[] = {
+      kInvokeJson, kEndSampling, kInvokeText, kToolError, kThink,
+      kMsgModel,  kMsgSystem,    kMsgTool,    kMsgUser,   kText,
+      kEndMessage, kEndOfText,   kBegin,      kXml,       kImage};
+  static const size_t kNumFixed = 15;
+  static const size_t kNameMax = 256;
+  static const size_t kHoldMax = 4096;
+
+  while (true) {
+    if (eot_seen_) {
+      hold_.clear();
+      return;
+    }
+    // Buffer a NAME candidate following <|message_model|>: everything up to
+    // the next '<' (bounded). It resolves once the next marker is known.
+    if (awaiting_name_) {
+      const size_t lt = hold_.find('<');
+      if (lt == std::string::npos) {
+        if (end_of_input) {
+          // Length-cap fragment of a cut invoke header: structural, drop.
+          name_buf_.clear();
+          awaiting_name_ = false;
+          hold_.clear();
+          continue;
+        }
+        if (name_buf_.size() + hold_.size() > kNameMax) {
+          // Not a NAME prefix (unbounded text): flush as display.
+          route_text(name_buf_);
+          name_buf_.clear();
+          awaiting_name_ = false;
+          route_text(hold_);
+          hold_.clear();
+          continue;
+        }
+        name_buf_ += hold_;
+        hold_.clear();
+        return;
+      }
+      if (lt > 0) {
+        if (name_buf_.size() + lt > kNameMax) {
+          route_text(name_buf_);
+          name_buf_.clear();
+          awaiting_name_ = false;
+          route_text(hold_.substr(0, lt));
+          hold_.erase(0, lt);
+          continue;
+        }
+        name_buf_ += hold_.substr(0, lt);
+        hold_.erase(0, lt);
+      }
+      // Fall through with hold_ starting at '<': the marker match below
+      // decides whether the NAME is structural (dropped) or text.
+    }
+    // Route text before the next '<' (no marker can hide inside it).
+    if (!hold_.empty() && hold_[0] != '<') {
+      const size_t lt = hold_.find('<');
+      const std::string run =
+          (lt == std::string::npos) ? hold_ : hold_.substr(0, lt);
+      route_text(run);
+      hold_.erase(0, run.size());
+      continue;
+    }
+    if (hold_.empty()) return;
+    // hold_ starts with '<' here. Fixed markers, longest first.
+    bool consumed = false;
+    for (size_t m = 0; m < kNumFixed; ++m) {
+      const size_t n = std::strlen(kFixed[m]);
+      if (!Impl::inkling_starts_with(hold_, 0, kFixed[m], n)) continue;
+      consumed = true;
+      const std::string mark(kFixed[m]);
+      hold_.erase(0, n);
+      const bool is_content = (mark == kThink || mark == kText ||
+                               mark == kToolError || mark == kInvokeText ||
+                               mark == kInvokeJson || mark == kXml ||
+                               mark == kImage);
+      if (awaiting_name_) {
+        // A NAME prefix is structural only before a content opener; any
+        // other marker means the buffered text was stray display.
+        if (is_content) {
+          name_buf_.clear();
+        } else {
+          route_text(name_buf_);
+          name_buf_.clear();
+        }
+        awaiting_name_ = false;
+      }
+      if (mark == kMsgModel) {
+        // A previous NAME still pending (back-to-back headers) flushes as
+        // display above; start buffering the new NAME candidate.
+        awaiting_name_ = true;
+        name_buf_.clear();
+      } else if (mark == kThink) {
+        if (cur_ == Channel::kInvoke) close_invoke();
+        cur_ = Channel::kThinking;
+      } else if (mark == kText || mark == kToolError || mark == kInvokeText) {
+        if (cur_ == Channel::kInvoke) close_invoke();
+        cur_ = Channel::kDisplay;
+      } else if (mark == kInvokeJson) {
+        if (cur_ == Channel::kInvoke) close_invoke();
+        cur_ = Channel::kInvoke;
+        invoke_buf_.clear();
+      } else if (mark == kEndMessage) {
+        if (cur_ == Channel::kInvoke) close_invoke();
+        cur_ = Channel::kOutside;
+      } else if (mark == kEndSampling || mark == kEndOfText) {
+        if (cur_ == Channel::kInvoke) close_invoke();
+        stopped_ = true;
+        eot_seen_ = true;
+        eot_at_ = acc_d_.size();
+        hold_.clear();
+        return;
+      }
+      // Prompt-only markers (user/system/tool headers, xml/image bodies,
+      // BOS) drop silently.
+      break;
+    }
+    if (consumed) continue;
+    // Fillers: <|unused...|> through '>' drop silently (prompt image
+    // placeholder and reserved tokens never carry text).
+    if (Impl::inkling_starts_with(hold_, 0, "<|unused", 8)) {
+      const size_t gt = hold_.find('>', 8);
+      const size_t bad = hold_.find('<', 8);
+      if (gt != std::string::npos && (bad == std::string::npos || gt < bad) &&
+          gt <= 64) {
+        if (awaiting_name_) {
+          route_text(name_buf_);
+          name_buf_.clear();
+          awaiting_name_ = false;
+        }
+        hold_.erase(0, gt + 1);
+        continue;
+      }
+      if (end_of_input) {
+        hold_.clear();  // length-cap fragment: stripped
+        if (awaiting_name_) {
+          name_buf_.clear();
+          awaiting_name_ = false;
+        }
+        continue;
+      }
+      if (hold_.size() > 64 ||
+          (bad != std::string::npos && bad < 64 && gt == std::string::npos)) {
+        if (awaiting_name_) {
+          route_text(name_buf_);
+          name_buf_.clear();
+          awaiting_name_ = false;
+        }
+        route_text(hold_.substr(0, 1));
+        hold_.erase(0, 1);
+        continue;
+      }
+      return;  // split filler: wait for more
+    }
+    // Prefix hold-back: a strict marker/stop prefix waits for more input
+    // (dropped at end_of_input as a length-cap fragment).
+    {
+      bool prefix = false;
+      for (size_t m = 0; m < kNumFixed && !prefix; ++m) {
+        const size_t n = std::strlen(kFixed[m]);
+        if (n > hold_.size() &&
+            std::string(kFixed[m]).compare(0, hold_.size(), hold_) == 0)
+          prefix = true;
+      }
+      if (hold_.size() < 8 &&
+          std::string("<|unused").compare(0, hold_.size(), hold_) == 0)
+        prefix = true;
+      for (const auto& s : stops_) {
+        if (s.size() > hold_.size() && s.compare(0, hold_.size(), hold_) == 0)
+          prefix = true;
+      }
+      if (prefix) {
+        if (end_of_input) {
+          hold_.clear();  // length-cap fragment: stripped
+          continue;
+        }
+        return;
+      }
+    }
+    // Not a marker: literal text. A pending NAME resolves first (the '<'
+    // was not a content opener, so the NAME was display text).
+    if (awaiting_name_) {
+      route_text(name_buf_);
+      name_buf_.clear();
+      awaiting_name_ = false;
+    }
+    if (hold_.size() > kHoldMax) {
+      // Unbounded non-marker '<' run: stream ahead instead of stalling.
+      route_text(hold_.substr(0, 1));
+      hold_.erase(0, 1);
+      continue;
+    }
+    route_text(hold_.substr(0, 1));
+    hold_.erase(0, 1);
+  }
+}
+
+inline StreamDeltas ToolCallStreamParser::feed(const std::string& raw_piece) {
+  hold_ += raw_piece;
+  drive(false);
+  return emit_deltas();
+}
+
+inline std::string ToolCallStreamParser::push(const std::string& raw_piece) {
+  hold_ += raw_piece;
+  drive(false);
+  release_display();
+  release_reasoning();
+  std::string out;
+  if (rel_d_ > emitted_d_) {
+    out = acc_d_.substr(emitted_d_, rel_d_ - emitted_d_);
+    emitted_d_ = rel_d_;
+  }
+  if (rel_r_ > emitted_r_) {
+    stash_r_ += acc_r_.substr(emitted_r_, rel_r_ - emitted_r_);
+    emitted_r_ = rel_r_;
+  }
+  return out;
+}
+
+inline std::string ToolCallStreamParser::poll_reasoning() {
+  std::string out = stash_r_;
+  stash_r_.clear();
+  return out;
+}
+
+inline ToolParseResult ToolCallStreamParser::finish() {
+  if (!finished_) {
+    drive(true);
+    if (awaiting_name_) {
+      name_buf_.clear();
+      awaiting_name_ = false;
+    }
+    if (cur_ == Channel::kInvoke) close_invoke();
+    cur_ = Channel::kOutside;
+    if (!stopped_) {
+      // Length-cap strip: longest trailing strict marker/stop prefix goes.
+      static const char* kStripFixed[] = {
+          "<|message_model|>",   "<|message_user|>",   "<|message_system|>",
+          "<|message_tool|>",    "<|content_thinking|>", "<|content_text|>",
+          "<|content_tool_error|>", "<|content_invoke_tool_text|>",
+          "<|content_invoke_tool_json|>", "<|content_xml|>",
+          "<|content_image|>",   "<|content_model_end_sampling|>",
+          "<|begin_of_text|>",   "<|end_message|>",     "<|endoftext|>",
+          "<|unused",            "<|content_"};
+      std::vector<std::string> dtoks(kStripFixed, kStripFixed + 17);
+      dtoks.insert(dtoks.end(), stops_.begin(), stops_.end());
+      std::vector<std::string> rtoks(kStripFixed, kStripFixed + 17);
+      const size_t dd =
+          Impl::inkling_suffix_overlap(acc_d_, dtoks, max_stop_len_ + 64);
+      if (dd > 0) acc_d_.resize(acc_d_.size() - dd);
+      const size_t rd = Impl::inkling_suffix_overlap(acc_r_, rtoks, 64);
+      if (rd > 0) acc_r_.resize(acc_r_.size() - rd);
+      release_display();
+      release_reasoning();
+    }
+    rel_d_ = acc_d_.size();
+    rel_r_ = acc_r_.size();
+    ToolParseResult t;
+    t.text = acc_d_.substr(emitted_d_);
+    t.reasoning = acc_r_.substr(emitted_r_);
+    t.calls = calls_;
+    emitted_d_ = rel_d_;
+    emitted_r_ = rel_r_;
+    tail_ = t;
+    finished_ = true;
+  }
+  return tail_;
+}
+
+// Whole-text parse: shares the incremental machine (single feed + finish),
+// so streaming deltas agree with it by construction.
+inline ToolParseResult parse_tool_calls(
+    const std::string& raw, const std::vector<std::string>& stops = {}) {
+  ToolCallStreamParser p(stops);
+  StreamDeltas d = p.feed(raw);
+  ToolParseResult t = p.finish();
+  t.text = d.display + t.text;
+  t.reasoning = d.reasoning + t.reasoning;
+  return t;
 }
 
 }  // namespace Inkling
