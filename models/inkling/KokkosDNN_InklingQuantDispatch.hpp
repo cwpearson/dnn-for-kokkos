@@ -22,6 +22,18 @@
 // silently fall back to the native kernel. The Model rents one exact-size
 // staging buffer per distinct projection shape for this reason.
 //
+// Launch accounting (decode, packed): each linear_chunk decode is two
+// launches (quantize act row + int8-dot GEMV) via Gguf::quant_gemv. A layer
+// visits ~8-10 linears; hn feeds wq + wrel + wsink + wgate_attn at the same
+// K, so quantizing hn once and reusing the staging across those four would
+// save 3 quantize launches per visit with identical values. Not wired yet:
+// linear_chunk takes a scratch *buffer*, not a quantization ticket, and the
+// sharing owner is the Model layer loop (which knows hn is shared) -- see
+// GgufMvq::quantize_act_q8_row / gemv_int8_reuse_act (KokkosDNN_GGUFGemvInt8.
+// hpp) for the minimal extension that wiring would use. Threading the ticket
+// through needs a new overload set plus a Model-loop change, so it stays
+// documented, not half-landed, here.
+//
 // Calling convention (mirrors gemm/gemv/embedding_gather): these take
 // concrete (managed) view types, so callers passing subviews (which carry
 // an explicit Unmanaged trait) must give explicit template arguments --
@@ -172,6 +184,26 @@ void linear_chunk(
   } else {
     linear_prefill(handle, X, W, staging, Y, label);
   }
+}
+
+// Shared-input decode helper (additive; unused by the Model loop so far):
+// quantize the single input row X ([1, K]) once into act_scratch for reuse
+// across the linears sharing it. Returns false when the row cannot take the
+// int8 path (caller runs the regular linear_chunk path instead, so a
+// decline never changes results). This is the ticket producer for a future
+// hn-once reuse; the consumer side is GgufMvq::gemv_int8_reuse_act (see the
+// header note above for why the wiring lives in the Model loop, not here).
+template <class ExecSpace, class Scalar>
+bool quantize_shared_act(
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& X,
+    const Kokkos::View<uint8_t*, ExecSpace>& act_scratch) {
+  if (X.extent(0) != 1) return false;
+  if (act_scratch.extent(0) == 0) return false;
+  Kokkos::View<Scalar*, ExecSpace,
+               Kokkos::MemoryTraits<Kokkos::Unmanaged>>
+      x1(X.data(), X.extent(1));
+  return ::KokkosDNN::Impl::GgufMvq::quantize_act_q8_row<ExecSpace, Scalar>(
+      x1, act_scratch.data(), act_scratch.extent(0));
 }
 
 // ---- lm_head (always a single row: rank-1 path both ways) ------------------

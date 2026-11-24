@@ -30,15 +30,24 @@ namespace Impl {
 // (~0.7 ms/launch on RTX 3090); the team form is ~50x faster. Reduction
 // order across the team's threads differs from the serial loop, so results
 // agree to FP reassociation (~1e-7 relative), not bit-for-bit.
+//
+// S_off (default 0) is the offset of the first valid history row inside
+// `blocks`: the worker reads blocks(t, S_off + s, d) for s < S. This lets
+// callers consume a packed [C, Bmax, D] history (or a stripped suffix of
+// it) directly with no pack-then-compute copy: the valid rows [S_off,
+// S_off + S) are already contiguous in the middle dim, and the worker
+// never touches rows outside that window. The public entry points below
+// pass S_off = 0 to preserve their exact [T, S, D] contract.
 template <class ExecSpace, class Scalar, class BView, class PView, class QView,
           class OView>
 struct InklingAttnResidualWorker {
   using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
-  BView blocks;  // [T, S, D]
+  BView blocks;  // [T, Bmax, D] (only [S_off, S_off + S) is read)
   PView partial;  // [T, D]
   QView query;    // [Q, D] FP32
   OView out;      // [T, Q, D]
   size_t S;
+  size_t S_off;
   size_t Q;
   size_t D;
   float eps;
@@ -47,7 +56,7 @@ struct InklingAttnResidualWorker {
     // Cap from the callers (S <= 64); scratch holds one norm + one score
     // per stacked row.
     constexpr size_t kCap = 65;
-    const size_t S_ = S, Q_ = Q, D_ = D;
+    const size_t S_ = S, S_off_ = S_off, Q_ = Q, D_ = D;
     const float eps_ = eps;
     const BView blocks_ = blocks;
     const PView partial_ = partial;
@@ -68,8 +77,9 @@ struct InklingAttnResidualWorker {
       Kokkos::parallel_reduce(
           Kokkos::TeamThreadRange(team, D_),
           KOKKOS_LAMBDA(size_t d, float& a) {
-            const float v = (s < S_) ? static_cast<float>(blocks_(t, s, d))
-                                     : static_cast<float>(partial_(t, d));
+            const float v =
+                (s < S_) ? static_cast<float>(blocks_(t, S_off_ + s, d))
+                         : static_cast<float>(partial_(t, d));
             a += v * v;
           },
           ss);
@@ -87,8 +97,9 @@ struct InklingAttnResidualWorker {
       Kokkos::parallel_reduce(
           Kokkos::TeamThreadRange(team, D_),
           KOKKOS_LAMBDA(size_t d, float& asum) {
-            const float v = (s < S_) ? static_cast<float>(blocks_(t, s, d))
-                                     : static_cast<float>(partial_(t, d));
+            const float v =
+                (s < S_) ? static_cast<float>(blocks_(t, S_off_ + s, d))
+                         : static_cast<float>(partial_(t, d));
             asum += static_cast<float>(query_(q, d)) * v;
           },
           a);
@@ -116,8 +127,9 @@ struct InklingAttnResidualWorker {
         Kokkos::TeamThreadRange(team, D_), KOKKOS_LAMBDA(size_t d) {
           float acc = 0;
           for (size_t s = 0; s <= S_; ++s) {
-            const float v = (s < S_) ? static_cast<float>(blocks_(t, s, d))
-                                     : static_cast<float>(partial_(t, d));
+            const float v =
+                (s < S_) ? static_cast<float>(blocks_(t, S_off_ + s, d))
+                         : static_cast<float>(partial_(t, d));
             acc += scr[s] * rden * v * inv[s];
           }
           out_(t, q, d) = static_cast<Scalar>(acc);
@@ -125,6 +137,47 @@ struct InklingAttnResidualWorker {
     (void)Q_;
   }
 };
+
+// Offset-aware launch used by the Model to consume a packed [T, Bmax, D]
+// history (or a stripped suffix of it) with no pack-then-compute copy.
+// Reads blocks(t, s_off + s, d) for s < S; never touches rows outside
+// [s_off, s_off + S). Same team/worker math as the public entry points, so
+// results agree with the pack + exact-alias form to FP reassociation.
+// Backend-portable: only TeamPolicy parallel_for kernels.
+template <class ExecSpace, class Scalar, class BView, class PView, class QView,
+          class OView>
+void inkling_attn_residual_offset(
+    const BView& blocks, size_t S, size_t s_off, const PView& partial,
+    const QView& query, float eps, const OView& out,
+    const std::string& label = "KokkosDNN::inkling_attn_residual_offset") {
+  const size_t T = partial.extent(0);
+  const size_t D = partial.extent(1);
+  const size_t Q = query.extent(0);
+  if (blocks.extent(0) != T || blocks.extent(2) != D ||
+      query.extent(1) != D || out.extent(0) != T || out.extent(1) != Q ||
+      out.extent(2) != D || s_off + S > blocks.extent(1))
+    throw std::invalid_argument(
+        "inkling_attn_residual_offset: dimension mismatch");
+  if (S > 64)
+    throw std::invalid_argument(
+        "inkling_attn_residual_offset: S exceeds worker capacity (64)");
+  if (T == 0 || D == 0 || Q == 0) return;
+  InklingAttnResidualWorker<ExecSpace, Scalar, BView, PView, QView, OView> w{
+      blocks, partial, query, out, S, s_off, Q, D, eps};
+  int team_size = 128;
+  if ((int)D < team_size) {
+    team_size = 1;
+    while (team_size < (int)D) team_size *= 2;
+  }
+  const int team_max = ::KokkosDNN::Impl::cached_team_size_max<ExecSpace>(
+      w, sizeof(float) * (2 * 65 + 2));
+  if (team_max < team_size) team_size = team_max;
+  if (team_size < 1) team_size = 1;
+  using Policy = Kokkos::TeamPolicy<ExecSpace>;
+  Policy policy((int)(T * Q), team_size);
+  policy.set_scratch_size(0, Kokkos::PerTeam(sizeof(float) * (2 * 65 + 2)));
+  Kokkos::parallel_for(label, policy, w);
+}
 
 }  // namespace Impl
 
@@ -160,7 +213,7 @@ void inkling_block_attention_residual(
       Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>,
       Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>, QView,
       Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>>
-      w{block_states, partial, query, out, S, Q, D, eps};
+      w{block_states, partial, query, out, S, size_t(0), Q, D, eps};
   // One team per (t, q); threads split D (see the worker). Scratch holds
   // 2*65 norms/scores plus max/denom.
   int team_size = 128;
@@ -219,7 +272,7 @@ void inkling_message_attention_residual(
       Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>,
       Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>, QV,
       Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace>>
-      w{block_states, partial, query, out, S, 4, D, eps};
+      w{block_states, partial, query, out, S, size_t(0), 4, D, eps};
   // One team per (t, q); threads split D (see the worker). Scratch holds
   // 2*65 norms/scores plus max/denom.
   int team_size = 128;

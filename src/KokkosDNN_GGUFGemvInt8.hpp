@@ -769,6 +769,111 @@ inline void launch_gemv_int8_dispatch(const uint8_t* wdata, size_t row_bytes,
 }
 
 
+// Staging reuse for shared decode inputs (additive; existing launchers are
+// untouched).
+//
+// A decode layer visits ~8-10 linears, several sharing one input row (e.g.
+// hn feeds wq + wrel + wsink + wgate_attn at the same K). Each quant_gemv
+// today re-quantizes that row (one quantize launch + one dot launch per
+// linear). Quantizing once and reusing the staging across the hn-shared
+// linears would save one launch per reused linear with identical values
+// (the dots read the same xq/xh bytes; only launch boundaries move).
+//
+// Why not wired yet: linear_chunk takes a scratch *buffer*, not a
+// quantization ticket, and the sharing owner is the Model layer loop (which
+// knows hn is shared) -- threading a "this scratch already holds x" ticket
+// through linear_chunk/linear_decode needs either a new overload set or a
+// Model-loop change, both outside a header-local edit. The two helpers below
+// are the minimal extension that wiring would use:
+//
+//   * quantize_act_q8_row(x, scratch, bytes): stage 1 only (one launch).
+//   * gemv_int8_reuse_act(wdata, dt, ..., scratch, K, y): stage 2 only,
+//     requiring scratch to hold quantize_act_q8_row(x) for the same x/K.
+//     Same values as launch_quant_gemv_int8 bit for bit (same kernels, same
+//     order); returns false under the same decline rules.
+template <class ExecSpace, class Scalar>
+bool quantize_act_q8_row(const Kokkos::View<Scalar*, ExecSpace>& x,
+                         uint8_t* scratch, size_t scratch_bytes) {
+  constexpr bool ok_scalar =
+      std::is_same_v<Scalar, float> ||
+      std::is_same_v<Scalar, Kokkos::Experimental::bhalf_t>;
+  if constexpr (!ok_scalar) {
+    return false;
+  } else {
+    if (scratch == nullptr) return false;
+    const size_t k = x.extent(0);
+    if (k == 0 || k % 32 != 0) return false;
+    if (x.stride(0) != 1) return false;
+    if (scratch_bytes < act_q8_bytes(k)) return false;
+    if ((reinterpret_cast<uintptr_t>(scratch) & 15u) != 0u) return false;
+    if (act_q8_blocks(k) > (size_t)(std::numeric_limits<int>::max()))
+      return false;
+    int8_t* const xq = reinterpret_cast<int8_t*>(scratch);
+    ActQ8Hdr* const xh =
+        reinterpret_cast<ActQ8Hdr*>(scratch + act_q8_hdr_offset(k));
+    const int nblk = (int)act_q8_blocks(k);
+    QuantizeActQ8Functor<ExecSpace, Scalar> qf{x.data(), xq, xh, nblk};
+    Kokkos::parallel_for("KokkosDNN::GgufMvq::quantize_act_q8",
+                         Kokkos::RangePolicy<ExecSpace>(0, nblk), qf);
+    return true;
+  }
+}
+
+template <class ExecSpace, class Scalar>
+bool gemv_int8_reuse_act(const uint8_t* wdata, Wd dt, size_t rows,
+                         size_t row_bytes, const uint8_t* scratch,
+                         size_t scratch_bytes, size_t k,
+                         const Kokkos::View<Scalar*, ExecSpace>& y,
+                         Int8Layout layout = Int8Layout{}) {
+  constexpr bool ok_scalar =
+      std::is_same_v<Scalar, float> ||
+      std::is_same_v<Scalar, Kokkos::Experimental::bhalf_t>;
+  if constexpr (!ok_scalar) {
+    return false;
+  } else {
+    if (wdata == nullptr || scratch == nullptr) return false;
+    if (!dtype_ok(dt, k)) return false;
+    if (rows == 0 || rows > (size_t)(std::numeric_limits<int>::max()))
+      return false;
+    if (scratch_bytes < act_q8_bytes(k)) return false;
+    if (y.stride(0) != 1) return false;
+    if ((reinterpret_cast<uintptr_t>(scratch) & 15u) != 0u) return false;
+    if ((reinterpret_cast<uintptr_t>(wdata) & 1u) != 0u) return false;
+    if ((dt == Wd::Q4K || dt == Wd::Q5K) &&
+        (reinterpret_cast<uintptr_t>(wdata) & 15u) != 0u)
+      return false;
+    if (act_q8_blocks(k) > (size_t)(std::numeric_limits<int>::max()))
+      return false;
+    const int8_t* const xq = reinterpret_cast<const int8_t*>(scratch);
+    const ActQ8Hdr* const xh = reinterpret_cast<const ActQ8Hdr*>(
+        scratch + act_q8_hdr_offset(k));
+    const int nu = (int)act_q8_blocks(k);
+    switch (dt) {
+      case Wd::Q4K:
+        launch_gemv_int8_dispatch<ExecSpace, Scalar, Wd::Q4K>(
+            wdata, row_bytes, rows, xq, xh, y.data(), nu, layout);
+        break;
+      case Wd::Q5K:
+        launch_gemv_int8_dispatch<ExecSpace, Scalar, Wd::Q5K>(
+            wdata, row_bytes, rows, xq, xh, y.data(), nu, layout);
+        break;
+      case Wd::Q6K:
+        launch_gemv_int8_dispatch<ExecSpace, Scalar, Wd::Q6K>(
+            wdata, row_bytes, rows, xq, xh, y.data(), nu, layout);
+        break;
+      case Wd::Q80:
+        launch_gemv_int8_dispatch<ExecSpace, Scalar, Wd::Q80>(
+            wdata, row_bytes, rows, xq, xh, y.data(), nu, layout);
+        break;
+      case Wd::IQ4NL:
+        launch_gemv_int8_dispatch<ExecSpace, Scalar, Wd::IQ4NL>(
+            wdata, row_bytes, rows, xq, xh, y.data(), nu, layout);
+        break;
+    }
+    return true;
+  }
+}
+
 // Stage 1 + stage 2 with portable Kokkos launches. Returns false when the
 // shape/dtype/scratch does not fit this path; the caller then runs the
 // portable kernel, so a declined launch can never change results.

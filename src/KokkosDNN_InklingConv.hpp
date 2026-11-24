@@ -98,6 +98,70 @@ void inkling_short_conv_update_state(
       });
 }
 
+// Fused single-token static conv pair (decode): one RangePolicy launch over
+// the shared channel count performs the k-side and v-side update_state
+// transitions back to back. Replaces two update_state launches (section 5)
+// with a single launch and no extra allocations. Bit-identical to the
+// unfused sequence: each side uses the same FP32 accumulation order as
+// inkling_short_conv_update_state (all inputs are per-side independent).
+// In-place safe per side (x_new is snapshotted before y is overwritten,
+// matching the single-side contract).
+// NOTE: the layer's kv_write (section 8) is deliberately NOT folded in:
+// it stages the section-6 clipped/normalized rows, so writing conv outputs
+// directly would store pre-clip values.
+template <class ExecSpace, class Scalar, class KWeightView, class VWeightView>
+void inkling_static_conv_update_state_pair(
+    const Kokkos::View<Scalar*, ExecSpace>& xk_new,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& state_k,
+    const KWeightView& weight_k,
+    const Kokkos::View<Scalar*, ExecSpace>& y_k,
+    const Kokkos::View<Scalar*, ExecSpace>& xv_new,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& state_v,
+    const VWeightView& weight_v,
+    const Kokkos::View<Scalar*, ExecSpace>& y_v,
+    const std::string& label = "KokkosDNN::inkling_static_conv_update_state_pair") {
+  const size_t D = xk_new.extent(0);
+  const size_t K = weight_k.extent(1);
+  if (K == 0)
+    throw std::invalid_argument(
+        "inkling_static_conv_update_state_pair: K must be > 0");
+  if (weight_k.extent(0) != D || weight_v.extent(0) != D ||
+      weight_v.extent(1) != K || y_k.extent(0) != D ||
+      xv_new.extent(0) != D || y_v.extent(0) != D ||
+      state_k.extent(0) != D || state_v.extent(0) != D ||
+      state_k.extent(1) != K - 1 || state_v.extent(1) != K - 1)
+    throw std::invalid_argument(
+        "inkling_static_conv_update_state_pair: dimension mismatch");
+  if (D == 0) return;
+  const float inv = 1.0f / Kokkos::sqrtf(static_cast<float>(K + 1));
+  Kokkos::parallel_for(
+      label, Kokkos::RangePolicy<ExecSpace>(0, D), KOKKOS_LAMBDA(size_t d) {
+        // k side.
+        const float xnk = static_cast<float>(xk_new(d));
+        float acck = 0;
+        for (size_t k = 0; k < K - 1; ++k)
+          acck += static_cast<float>(weight_k(d, k)) *
+                  static_cast<float>(state_k(d, k));
+        acck += static_cast<float>(weight_k(d, K - 1)) * xnk;
+        y_k(d) = static_cast<Scalar>((acck + xnk) * inv);
+        for (size_t k = 0; k + 1 < K - 1; ++k)
+          state_k(d, k) = state_k(d, k + 1);
+        // Append the snapshot, not a re-read (x_new may alias y).
+        if (K > 1) state_k(d, K - 2) = static_cast<Scalar>(xnk);
+        // v side (independent of the k side).
+        const float xnv = static_cast<float>(xv_new(d));
+        float accv = 0;
+        for (size_t k = 0; k < K - 1; ++k)
+          accv += static_cast<float>(weight_v(d, k)) *
+                  static_cast<float>(state_v(d, k));
+        accv += static_cast<float>(weight_v(d, K - 1)) * xnv;
+        y_v(d) = static_cast<Scalar>((accv + xnv) * inv);
+        for (size_t k = 0; k + 1 < K - 1; ++k)
+          state_v(d, k) = state_v(d, k + 1);
+        if (K > 1) state_v(d, K - 2) = static_cast<Scalar>(xnv);
+      });
+}
+
 // Dynamic short convolution (full-attention K/V path):
 // taps are the sum of static per-channel weights and per-token weights
 // projected from `dynamic_input`, shared within each key/value head:
@@ -191,6 +255,83 @@ void inkling_dynamic_short_conv_update_state(
         for (size_t k = 0; k + 1 < K - 1; ++k) state(c, k) = state(c, k + 1);
         // Append the snapshot (x_new may alias y; see above).
         if (K > 1) state(c, K - 2) = static_cast<Scalar>(xn);
+      });
+}
+
+// Fused single-token dynamic conv pair (decode): one RangePolicy launch over
+// the shared channel count performs the k-side and v-side dynamic
+// update_state transitions back to back. Replaces two dynamic update_state
+// launches (section 5) with a single launch and no extra allocations. Same
+// FP32 accumulation order per side as
+// inkling_dynamic_short_conv_update_state, so bit-identical to the unfused
+// sequence; in-place safe per side via the same input snapshot.
+// NOTE: kv_write (section 8) is deliberately NOT folded in (see the static
+// pair above): it stages post-clip rows.
+template <class ExecSpace, class Scalar, class SWKView, class SWVView>
+void inkling_dynamic_short_conv_update_state_pair(
+    const Kokkos::View<Scalar*, ExecSpace>& xk_new,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& state_k,
+    const SWKView& static_w_k,
+    const Kokkos::View<Scalar*, ExecSpace>& dyn_row_k,
+    const Kokkos::View<Scalar*, ExecSpace>& y_k,
+    const Kokkos::View<Scalar*, ExecSpace>& xv_new,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& state_v,
+    const SWVView& static_w_v,
+    const Kokkos::View<Scalar*, ExecSpace>& dyn_row_v,
+    const Kokkos::View<Scalar*, ExecSpace>& y_v, size_t nheads,
+    size_t head_dim,
+    const std::string& label =
+        "KokkosDNN::inkling_dynamic_short_conv_update_state_pair") {
+  const size_t D = xk_new.extent(0);
+  const size_t K = static_w_k.extent(0);
+  if (K == 0)
+    throw std::invalid_argument(
+        "inkling_dynamic_short_conv_update_state_pair: K must be > 0");
+  if (static_w_k.extent(1) != D || static_w_v.extent(0) != K ||
+      static_w_v.extent(1) != D || dyn_row_k.extent(0) != nheads * K ||
+      dyn_row_v.extent(0) != nheads * K || y_k.extent(0) != D ||
+      xv_new.extent(0) != D || y_v.extent(0) != D ||
+      state_k.extent(0) != D || state_v.extent(0) != D ||
+      state_k.extent(1) != K - 1 || state_v.extent(1) != K - 1 ||
+      D != nheads * head_dim)
+    throw std::invalid_argument(
+        "inkling_dynamic_short_conv_update_state_pair: dimension mismatch");
+  if (D == 0) return;
+  const float inv = 1.0f / Kokkos::sqrtf(static_cast<float>(2 * K + 1));
+  Kokkos::parallel_for(
+      label, Kokkos::RangePolicy<ExecSpace>(0, D), KOKKOS_LAMBDA(size_t c) {
+        const size_t h = c / head_dim;
+        // k side.
+        const float xnk = static_cast<float>(xk_new(c));
+        float acck = 0;
+        for (size_t k = 0; k < K - 1; ++k) {
+          const float tap = static_cast<float>(static_w_k(k, c)) +
+                            static_cast<float>(dyn_row_k(h * K + k));
+          acck += tap * static_cast<float>(state_k(c, k));
+        }
+        const float tapk_last = static_cast<float>(static_w_k(K - 1, c)) +
+                                static_cast<float>(dyn_row_k(h * K + K - 1));
+        acck += tapk_last * xnk;
+        y_k(c) = static_cast<Scalar>((acck + xnk) * inv);
+        for (size_t k = 0; k + 1 < K - 1; ++k)
+          state_k(c, k) = state_k(c, k + 1);
+        // Append the snapshot (x_new may alias y; see above).
+        if (K > 1) state_k(c, K - 2) = static_cast<Scalar>(xnk);
+        // v side (independent of the k side).
+        const float xnv = static_cast<float>(xv_new(c));
+        float accv = 0;
+        for (size_t k = 0; k < K - 1; ++k) {
+          const float tap = static_cast<float>(static_w_v(k, c)) +
+                            static_cast<float>(dyn_row_v(h * K + k));
+          accv += tap * static_cast<float>(state_v(c, k));
+        }
+        const float tapv_last = static_cast<float>(static_w_v(K - 1, c)) +
+                                static_cast<float>(dyn_row_v(h * K + K - 1));
+        accv += tapv_last * xnv;
+        y_v(c) = static_cast<Scalar>((accv + xnv) * inv);
+        for (size_t k = 0; k + 1 < K - 1; ++k)
+          state_v(c, k) = state_v(c, k + 1);
+        if (K > 1) state_v(c, K - 2) = static_cast<Scalar>(xnv);
       });
 }
 

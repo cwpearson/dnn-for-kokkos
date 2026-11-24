@@ -386,6 +386,190 @@ TEST(InklingConv, BHalf) {
   check_inkling_conv<Kokkos::Experimental::bhalf_t>(5e-3f);
 }
 
+// Fused k+v single-token conv pairs vs the two single-side update_state
+// calls: bit-identical outputs and states (same FP32 order per side), both
+// out-of-place and in-place (x aliases y, as the Model calls them).
+template <class Scalar>
+void check_inkling_conv_pair() {
+  const size_t D = 8, K = 4;
+  auto xk = make2<Scalar>(1, D, 51);
+  auto xv = make2<Scalar>(1, D, 52);
+  auto wk = make2<Scalar>(D, K, 53);
+  auto wv = make2<Scalar>(D, K, 54);
+  Kokkos::View<Scalar*, Exec> xk1("xk1", D), xv1("xv1", D);
+  {
+    auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), xk);
+    auto m = Kokkos::create_mirror_view(xk1);
+    for (size_t d = 0; d < D; ++d) m(d) = h(0, d);
+    Kokkos::deep_copy(xk1, m);
+  }
+  {
+    auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), xv);
+    auto m = Kokkos::create_mirror_view(xv1);
+    for (size_t d = 0; d < D; ++d) m(d) = h(0, d);
+    Kokkos::deep_copy(xv1, m);
+  }
+  auto seed_state = [&](unsigned s) {
+    Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> st("st", D, K - 1);
+    Kokkos::Random_XorShift64_Pool<Exec> pool(s);
+    Kokkos::fill_random(st, pool, static_cast<Scalar>(-1),
+                        static_cast<Scalar>(1));
+    return st;
+  };
+  auto sk_ref = seed_state(55);
+  auto sv_ref = seed_state(56);
+  auto sk_fused = seed_state(55);
+  auto sv_fused = seed_state(56);
+  Kokkos::View<Scalar*, Exec> yk_ref("yk_ref", D), yv_ref("yv_ref", D),
+      yk_f("yk_f", D), yv_f("yv_f", D);
+  KokkosDNN::inkling_short_conv_update_state<Exec, Scalar>(xk1, sk_ref, wk,
+                                                           yk_ref);
+  KokkosDNN::inkling_short_conv_update_state<Exec, Scalar>(xv1, sv_ref, wv,
+                                                           yv_ref);
+  KokkosDNN::inkling_static_conv_update_state_pair<Exec, Scalar>(
+      xk1, sk_fused, wk, yk_f, xv1, sv_fused, wv, yv_f);
+  Kokkos::fence();
+  auto hk_ref = to_host1(yk_ref);
+  auto hv_ref = to_host1(yv_ref);
+  auto hk_f = to_host1(yk_f);
+  auto hv_f = to_host1(yv_f);
+  auto hsk =
+      Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), sk_fused);
+  auto hsv =
+      Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), sv_fused);
+  auto hsk_ref =
+      Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), sk_ref);
+  auto hsv_ref =
+      Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), sv_ref);
+  for (size_t d = 0; d < D; ++d) {
+    EXPECT_FLOAT_EQ(hk_f[d], hk_ref[d]) << d;
+    EXPECT_FLOAT_EQ(hv_f[d], hv_ref[d]) << d;
+    for (size_t k = 0; k < K - 1; ++k) {
+      EXPECT_FLOAT_EQ(static_cast<float>(hsk(d, k)),
+                      static_cast<float>(hsk_ref(d, k)))
+          << d << " " << k;
+      EXPECT_FLOAT_EQ(static_cast<float>(hsv(d, k)),
+                      static_cast<float>(hsv_ref(d, k)))
+          << d << " " << k;
+    }
+  }
+  // In-place (x aliases y on each side): pair must match aliased singles.
+  {
+    Kokkos::View<Scalar*, Exec> xio_k("xio_k", D), xio_v("xio_v", D);
+    Kokkos::deep_copy(xio_k, xk1);
+    Kokkos::deep_copy(xio_v, xv1);
+    auto sk2 = seed_state(55);
+    auto sv2 = seed_state(56);
+    KokkosDNN::inkling_short_conv_update_state<Exec, Scalar>(xio_k, sk2, wk,
+                                                             xio_k);
+    KokkosDNN::inkling_short_conv_update_state<Exec, Scalar>(xio_v, sv2, wv,
+                                                             xio_v);
+    Kokkos::View<Scalar*, Exec> xio_kf("xio_kf", D), xio_vf("xio_vf", D);
+    Kokkos::deep_copy(xio_kf, xk1);
+    Kokkos::deep_copy(xio_vf, xv1);
+    auto sk2f = seed_state(55);
+    auto sv2f = seed_state(56);
+    KokkosDNN::inkling_static_conv_update_state_pair<Exec, Scalar>(
+        xio_kf, sk2f, wk, xio_kf, xio_vf, sv2f, wv, xio_vf);
+    Kokkos::fence();
+    auto hk_io = to_host1(xio_k);
+    auto hv_io = to_host1(xio_v);
+    auto hk_iof = to_host1(xio_kf);
+    auto hv_iof = to_host1(xio_vf);
+    for (size_t d = 0; d < D; ++d) {
+      EXPECT_FLOAT_EQ(hk_iof[d], hk_io[d]) << d;
+      EXPECT_FLOAT_EQ(hv_iof[d], hv_io[d]) << d;
+    }
+  }
+  // K == 1 (stateless): pair matches the two singles.
+  {
+    const size_t K1 = 1;
+    auto w1k = make2<Scalar>(D, K1, 57);
+    auto w1v = make2<Scalar>(D, K1, 58);
+    Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec> s1k("s1k", D, 0),
+        s1v("s1v", D, 0), s1kf("s1kf", D, 0), s1vf("s1vf", D, 0);
+    Kokkos::View<Scalar*, Exec> a("a", D), b("b", D), af("af", D),
+        bf("bf", D);
+    KokkosDNN::inkling_short_conv_update_state<Exec, Scalar>(xk1, s1k, w1k,
+                                                             a);
+    KokkosDNN::inkling_short_conv_update_state<Exec, Scalar>(xv1, s1v, w1v,
+                                                             b);
+    KokkosDNN::inkling_static_conv_update_state_pair<Exec, Scalar>(
+        xk1, s1kf, w1k, af, xv1, s1vf, w1v, bf);
+    Kokkos::fence();
+    auto ha = to_host1(a);
+    auto hb = to_host1(b);
+    auto haf = to_host1(af);
+    auto hbf = to_host1(bf);
+    for (size_t d = 0; d < D; ++d) {
+      EXPECT_FLOAT_EQ(haf[d], ha[d]) << d;
+      EXPECT_FLOAT_EQ(hbf[d], hb[d]) << d;
+    }
+  }
+  // Dynamic pair vs the two dynamic singles.
+  {
+    const size_t H = 2, Dh = D / H;
+    Kokkos::View<float**, Kokkos::LayoutRight, Exec> swk("swk", K, D),
+        swv("swv", K, D);
+    {
+      auto m = Kokkos::create_mirror_view(swk);
+      auto n = Kokkos::create_mirror_view(swv);
+      for (size_t k = 0; k < K; ++k)
+        for (size_t d = 0; d < D; ++d) {
+          m(k, d) = 0.1f * ((k + d) % 3) - 0.1f;
+          n(k, d) = 0.1f * ((k * d) % 3) - 0.15f;
+        }
+      Kokkos::deep_copy(swk, m);
+      Kokkos::deep_copy(swv, n);
+    }
+    Kokkos::View<Scalar*, Exec> dk("dk", H * K), dv("dv", H * K);
+    {
+      auto m = Kokkos::create_mirror_view(dk);
+      auto n = Kokkos::create_mirror_view(dv);
+      for (size_t i = 0; i < H * K; ++i) {
+        m(i) = static_cast<Scalar>(0.2f * (i % 4) - 0.3f);
+        n(i) = static_cast<Scalar>(0.15f * (i % 5) - 0.2f);
+      }
+      Kokkos::deep_copy(dk, m);
+      Kokkos::deep_copy(dv, n);
+    }
+    auto sk3 = seed_state(59);
+    auto sv3 = seed_state(60);
+    auto sk3f = seed_state(59);
+    auto sv3f = seed_state(60);
+    Kokkos::View<Scalar*, Exec> ydk("ydk", D), ydv("ydv", D), ydkf("ydkf", D),
+        ydvf("ydvf", D);
+    KokkosDNN::inkling_dynamic_short_conv_update_state<Exec, Scalar>(
+        xk1, sk3, swk, dk, H, Dh, ydk);
+    KokkosDNN::inkling_dynamic_short_conv_update_state<Exec, Scalar>(
+        xv1, sv3, swv, dv, H, Dh, ydv);
+    KokkosDNN::inkling_dynamic_short_conv_update_state_pair<Exec, Scalar>(
+        xk1, sk3f, swk, dk, ydkf, xv1, sv3f, swv, dv, ydvf, H, Dh);
+    Kokkos::fence();
+    auto hk3 = to_host1(ydk);
+    auto hv3 = to_host1(ydv);
+    auto hk3f = to_host1(ydkf);
+    auto hv3f = to_host1(ydvf);
+    auto hsk3 =
+        Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), sk3f);
+    auto hsk3r =
+        Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), sk3);
+    for (size_t d = 0; d < D; ++d) {
+      EXPECT_FLOAT_EQ(hk3f[d], hk3[d]) << d;
+      EXPECT_FLOAT_EQ(hv3f[d], hv3[d]) << d;
+      for (size_t k = 0; k < K - 1; ++k)
+        EXPECT_FLOAT_EQ(static_cast<float>(hsk3(d, k)),
+                        static_cast<float>(hsk3r(d, k)))
+            << d << " " << k;
+    }
+  }
+}
+
+TEST(InklingConvPair, Float) { check_inkling_conv_pair<float>(); }
+TEST(InklingConvPair, BHalf) {
+  check_inkling_conv_pair<Kokkos::Experimental::bhalf_t>();
+}
+
 template <class Scalar>
 void check_inkling_relbias(float tol) {
   const size_t Tq = 3, Tk = 4, H = 2, R = 4, E = 6;

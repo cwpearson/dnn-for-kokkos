@@ -24,7 +24,10 @@
 //     selected experts, denominator carries a 1e-6 epsilon exactly as in
 //     HF); otherwise the raw gathered sigmoids are the weights.
 // The expert FFNs themselves reuse the existing gemm()/swiglu() ops, so no
-// dedicated expert-GEMM kernel lives here.
+// dedicated expert-GEMM kernel lives here. The Inkling C == 1 fused decode
+// (models/inkling/KokkosDNN_InklingMoeDecode.hpp) consumes moe_route_sigmoid
+// idx/wts on device with zero host fences; the host-grouped gather/scatter
+// loop below is the C > 1 (prefill) path only and must never run at C == 1.
 //
 // Canonical per-token usage with existing ops (E experts, top-k):
 //   moe_route_sigmoid<Exec,Scalar>(logits, bias, K, norm_topk, scale, idx, w);
@@ -333,7 +336,8 @@ void moe_expert_weighted_sum(
 
 // Gather rows for sparse MoE dispatch: dst[n,d] = src[rows[n],d].
 // src [C,D], rows [N] with 0 <= rows[n] < C, dst [N,D]. Scalar-agnostic;
-// backend-portable MDRange kernel. No-op when N or D is 0.
+// backend-portable MDRange kernel (one launch, no host fence). No-op when N
+// or D is 0.
 template <class ExecSpace, class Scalar>
 void moe_gather_rows(
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& src,
@@ -356,7 +360,8 @@ void moe_gather_rows(
 // entries (true for top-k dispatch: one token routes to distinct experts,
 // so it appears at most once in any single expert's list); each (n,d)
 // thread then owns its (t,d) output and no atomics are needed.
-// Scalar-agnostic; backend-portable MDRange kernel. No-op when N or D is 0.
+// Scalar-agnostic; backend-portable MDRange kernel (one launch, no host
+// fence). No-op when N or D is 0.
 template <class ExecSpace, class Scalar>
 void moe_scatter_add_weighted(
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& src,

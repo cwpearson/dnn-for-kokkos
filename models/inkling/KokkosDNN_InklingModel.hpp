@@ -909,11 +909,14 @@ class Model {
   }
 
   // BlockAttentionResidual retrieval with the attn_res_normalize switch.
-  // blocks [C,Bmax,D] packed history, partial [C,D], query [Q,D] F32 ->
-  // out [C,Q,D] (must match Q exactly). The normalized path packs the
-  // first nblocks rows contiguously (the src op reads extent(1) as S, so
-  // a middle-dim subview cannot be passed) and aliases the pack as an
-  // exact [C,S,D].
+  // blocks [C,Bmax,D] packed history (only the first nblocks rows are
+  // valid), partial [C,D], query [Q,D] F32 -> out [C,Q,D] (must match Q
+  // exactly). The normalized path launches the shared offset-aware team
+  // worker directly on the [C,Bmax,D] history (s_off = 0): the valid rows
+  // [0, nblocks) are already contiguous in the middle dim, so the old
+  // pack-then-compute copy (blk_pack + exact [C,S,D] alias) is eliminated.
+  // One kernel per retrieval instead of two, same team math as the public
+  // op, so results agree with the pack form to FP reassociation.
   template <class BView, class PView, class QView, class OView>
   void attn_retrieve(const BView& blocks, size_t nblocks, const PView& partial,
                      const QView& query, bool normalize, float eps,
@@ -969,22 +972,14 @@ class Model {
           });
       return;
     }
-    // Normalized path via the shared stateless op. Pack valid rows into
-    // the persistent flat temp, then alias exactly.
-    auto pack = Kokkos::subview(blkpack_buf_, std::make_pair(size_t(0), C * S),
-                                Kokkos::ALL);
+    // Normalized path: offset-aware team worker directly on the packed
+    // history (no blk_pack copy). S == 0 keeps the broadcast path (the
+    // single-row softmax weight is 1, so the output is the raw partial
+    // row; the team kernel would instead return the normalized row).
     if (S > 0) {
-      Kokkos::parallel_for(
-          "Inkling::blk_pack",
-          Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {C * S, D}),
-          KOKKOS_LAMBDA(size_t i, size_t d) {
-            pack(i, d) = blk_full(i / S, i % S, d);
-          });
-    }
-    if (S > 0) {
-      UnmAlias3 bp(pack.data(), C, S, D);
-      inkling_block_attention_residual<ExecSpace, Scalar>(bp, part, qry, eps,
-                                                           oo);
+      ::KokkosDNN::Impl::inkling_attn_residual_offset<ExecSpace, Scalar>(
+          blk_full, S, size_t(0), part, qry, eps, oo,
+          "KokkosDNN::inkling_block_attention_residual");
     } else {
       // Degenerate empty history: the stack is [partial] only, so the
       // single-row softmax has weight 1 and the output is the partial
@@ -1165,6 +1160,10 @@ class Model {
     auto o2 = Kokkos::subview(o2_buf_, std::make_pair(size_t(0), C),
                               Kokkos::ALL);
     auto pos = Kokkos::subview(pos_buf_, std::make_pair(size_t(0), C));
+    // NOTE: pos is filled once per chunk in forward() (hoisted out of the
+    // per-layer path); every layer visit in the chunk shares the same
+    // [cpos, cpos + C) rows, so refilling per layer was pure launch
+    // overhead.
     // Message-gate scratch (shared across the sequential gate calls below;
     // gate outputs never alias these buffers).
     auto msg_rmsx = Kokkos::subview(msg_rmsx_buf_,
@@ -1173,9 +1172,6 @@ class Model {
                                     std::make_pair(size_t(0), C), Kokkos::ALL);
     auto msg_h = Kokkos::subview(msg_h_buf_, std::make_pair(size_t(0), C),
                                  Kokkos::ALL);
-    Kokkos::parallel_for(
-        "Inkling::pos", Kokkos::RangePolicy<ExecSpace>(0, C),
-        KOKKOS_LAMBDA(size_t t) { pos(t) = (int)(cpos + t); });
     // Head-major aliases (exact LayoutRight reinterpretations, no copies).
     using Unm3 =
         Kokkos::View<Scalar***, Kokkos::LayoutRight, ExecSpace,
@@ -1191,11 +1187,19 @@ class Model {
     // ---- 1. attention-input streams (retrieval + message gates) ----
     // retr1 carries Q=1 retrievals (sliding attention-input), retr3 the
     // Q=3 full retrieval; the src op requires out.extent(1) == Q exactly.
+    // Kernel-fusion plan (sections 1+2): no-msg paths skip the
+    // deep_copy/pack-then-norm sequence entirely — section 2 norms straight
+    // from the retrieval (or raw h), saving the copies and two launches.
+    // has_msgs paths still materialize qh/kh/vh through the gates and use
+    // the fused 3-stream norm in section 2.
+    // input_norm_case: 0 = streams ready (fused 3-norm), 1 = sliding alias
+    // from hh, 2 = sliding retr1, 3 = full alias from hh, 4 = full retr3.
+    int input_norm_case = 0;
+    auto retr1 = Kokkos::subview(retr1_buf_, std::make_pair(size_t(0), C),
+                                 Kokkos::ALL, Kokkos::ALL);
+    auto retr3 = Kokkos::subview(retr_buf_, std::make_pair(size_t(0), C),
+                                 Kokkos::ALL, Kokkos::ALL);
     {
-      auto retr1 = Kokkos::subview(retr1_buf_, std::make_pair(size_t(0), C),
-                                   Kokkos::ALL, Kokkos::ALL);
-      auto retr3 = Kokkos::subview(retr_buf_, std::make_pair(size_t(0), C),
-                                   Kokkos::ALL, Kokkos::ALL);
       auto moe_in = Kokkos::subview(moe_in_buf_,
                                     std::make_pair(size_t(0), C), Kokkos::ALL);
       auto msgt = Kokkos::subview(msg_buf_, std::make_pair(size_t(0), C),
@@ -1203,37 +1207,41 @@ class Model {
       const bool skip_attn_in =
           (!full && !loop && (l == 0 || b.attn_res_q.extent(0) == 0));
       if (skip_attn_in) {
-        // Layer 0 sliding: no attention_input; streams copy h.
-        Kokkos::parallel_for(
-            "Inkling::xin_alias",
-            Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {C, D}),
-            KOKKOS_LAMBDA(size_t t, size_t d) {
-              qh(t, d) = hh(t, d);
-              kh(t, d) = hh(t, d);
-              vh(t, d) = hh(t, d);
-            });
+        // Layer 0 sliding: no attention_input; section 2 norms h straight
+        // into hn/kh/vh (fused copy+norm, no copies here).
+        input_norm_case = 1;
       } else if (!full) {
         if (b.attn_res_q.extent(0) != 1)
           throw std::invalid_argument(
               "Inkling::layer_forward: sliding layer needs 1 res query");
         attn_retrieve(bb, nb0, hh, b.attn_res_q, use_norm_res, eps, retr1);
-        auto rq0 =
-            Kokkos::subview(retr1, Kokkos::ALL, size_t(0), Kokkos::ALL);
         if (has_msgs) {
           // Pack rq + the 3 message rows (strided subviews) into packed
           // temps: message_gate needs packed rank-2 inputs and out must
           // not alias its inputs. o2/hn/msgt/moe_in are free at this
-          // point (used later).
+          // point (used later). Single fused pack pass instead of four
+          // deep_copies (bit-identical: the same exact copies).
+          auto rq0 =
+              Kokkos::subview(retr1, Kokkos::ALL, size_t(0), Kokkos::ALL);
           auto mq =
               Kokkos::subview(mmg, Kokkos::ALL, size_t(0), Kokkos::ALL);
           auto mk =
               Kokkos::subview(mmg, Kokkos::ALL, size_t(1), Kokkos::ALL);
           auto mv =
               Kokkos::subview(mmg, Kokkos::ALL, size_t(2), Kokkos::ALL);
-          Kokkos::deep_copy(o2, rq0);
-          Kokkos::deep_copy(hn, mq);
-          Kokkos::deep_copy(msgt, mk);
-          Kokkos::deep_copy(moe_in, mv);
+          {
+            MatR o2c = o2, hnc = hn, msgtc = msgt, moec = moe_in;
+            Kokkos::parallel_for(
+                "Inkling::msg_pack",
+                Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0},
+                                                                 {C, D}),
+                KOKKOS_LAMBDA(size_t t, size_t d) {
+                  o2c(t, d) = rq0(t, d);
+                  hnc(t, d) = mq(t, d);
+                  msgtc(t, d) = mk(t, d);
+                  moec(t, d) = mv(t, d);
+                });
+          }
           inkling_message_gate<ExecSpace, Scalar>(
               o2, hn, b.loop_q_down, b.loop_q_forget, b.loop_q_gain, eps, qh,
               msg_rmsx, msg_rmsm, msg_h);
@@ -1243,74 +1251,122 @@ class Model {
           inkling_message_gate<ExecSpace, Scalar>(
               o2, moe_in, b.loop_v_down, b.loop_v_forget, b.loop_v_gain, eps,
               vh, msg_rmsx, msg_rmsm, msg_h);
+          input_norm_case = 0;
         } else {
-          Kokkos::deep_copy(qh, rq0);
-          Kokkos::deep_copy(kh, qh);
-          Kokkos::deep_copy(vh, qh);
+          // No-msg: section 2 norms retr1 straight into hn/kh/vh.
+          input_norm_case = 2;
         }
       } else {
         // Full kinds: 3-query retrieval (raw h on layer 0).
         if (l == 0) {
-          Kokkos::parallel_for(
-              "Inkling::qkv_alias",
-              Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {C, D}),
-              KOKKOS_LAMBDA(size_t t, size_t d) {
-                qh(t, d) = hh(t, d);
-                kh(t, d) = hh(t, d);
-                vh(t, d) = hh(t, d);
-              });
+          if (has_msgs) {
+            Kokkos::parallel_for(
+                "Inkling::qkv_alias",
+                Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0},
+                                                                 {C, D}),
+                KOKKOS_LAMBDA(size_t t, size_t d) {
+                  qh(t, d) = hh(t, d);
+                  kh(t, d) = hh(t, d);
+                  vh(t, d) = hh(t, d);
+                });
+            auto mq =
+                Kokkos::subview(mmg, Kokkos::ALL, size_t(0), Kokkos::ALL);
+            auto mk =
+                Kokkos::subview(mmg, Kokkos::ALL, size_t(1), Kokkos::ALL);
+            auto mv =
+                Kokkos::subview(mmg, Kokkos::ALL, size_t(2), Kokkos::ALL);
+            Kokkos::deep_copy(hn, mq);
+            inkling_message_gate<ExecSpace, Scalar>(
+                qh, hn, b.loop_q_down, b.loop_q_forget, b.loop_q_gain, eps,
+                msgt, msg_rmsx, msg_rmsm, msg_h);
+            Kokkos::deep_copy(qh, msgt);
+            Kokkos::deep_copy(hn, mk);
+            inkling_message_gate<ExecSpace, Scalar>(
+                kh, hn, b.loop_k_down, b.loop_k_forget, b.loop_k_gain, eps,
+                msgt, msg_rmsx, msg_rmsm, msg_h);
+            Kokkos::deep_copy(kh, msgt);
+            Kokkos::deep_copy(hn, mv);
+            inkling_message_gate<ExecSpace, Scalar>(
+                vh, hn, b.loop_v_down, b.loop_v_forget, b.loop_v_gain, eps,
+                msgt, msg_rmsx, msg_rmsm, msg_h);
+            Kokkos::deep_copy(vh, msgt);
+            input_norm_case = 0;
+          } else {
+            // No-msg: section 2 norms h straight into hn/kh/vh.
+            input_norm_case = 3;
+          }
         } else {
           if (b.attn_res_q.extent(0) != 3)
             throw std::invalid_argument(
                 "Inkling::layer_forward: full layer needs 3 res queries");
           attn_retrieve(bb, nb0, hh, b.attn_res_q, use_norm_res, eps, retr3);
-          auto rq0 =
-              Kokkos::subview(retr3, Kokkos::ALL, size_t(0), Kokkos::ALL);
-          auto rq1 =
-              Kokkos::subview(retr3, Kokkos::ALL, size_t(1), Kokkos::ALL);
-          auto rq2 =
-              Kokkos::subview(retr3, Kokkos::ALL, size_t(2), Kokkos::ALL);
-          Kokkos::deep_copy(qh, rq0);
-          Kokkos::deep_copy(kh, rq1);
-          Kokkos::deep_copy(vh, rq2);
-        }
-        if (has_msgs) {
-          // Gate each packed stream; hn stages message rows, msgt the
-          // gate outputs (out must not alias inputs).
-          auto mq =
-              Kokkos::subview(mmg, Kokkos::ALL, size_t(0), Kokkos::ALL);
-          auto mk =
-              Kokkos::subview(mmg, Kokkos::ALL, size_t(1), Kokkos::ALL);
-          auto mv =
-              Kokkos::subview(mmg, Kokkos::ALL, size_t(2), Kokkos::ALL);
-          Kokkos::deep_copy(hn, mq);
-          inkling_message_gate<ExecSpace, Scalar>(
-              qh, hn, b.loop_q_down, b.loop_q_forget, b.loop_q_gain, eps,
-              msgt, msg_rmsx, msg_rmsm, msg_h);
-          Kokkos::deep_copy(qh, msgt);
-          Kokkos::deep_copy(hn, mk);
-          inkling_message_gate<ExecSpace, Scalar>(
-              kh, hn, b.loop_k_down, b.loop_k_forget, b.loop_k_gain, eps,
-              msgt, msg_rmsx, msg_rmsm, msg_h);
-          Kokkos::deep_copy(kh, msgt);
-          Kokkos::deep_copy(hn, mv);
-          inkling_message_gate<ExecSpace, Scalar>(
-              vh, hn, b.loop_v_down, b.loop_v_forget, b.loop_v_gain, eps,
-              msgt, msg_rmsx, msg_rmsm, msg_h);
-          Kokkos::deep_copy(vh, msgt);
+          if (has_msgs) {
+            auto rq0 =
+                Kokkos::subview(retr3, Kokkos::ALL, size_t(0), Kokkos::ALL);
+            auto rq1 =
+                Kokkos::subview(retr3, Kokkos::ALL, size_t(1), Kokkos::ALL);
+            auto rq2 =
+                Kokkos::subview(retr3, Kokkos::ALL, size_t(2), Kokkos::ALL);
+            Kokkos::deep_copy(qh, rq0);
+            Kokkos::deep_copy(kh, rq1);
+            Kokkos::deep_copy(vh, rq2);
+            // Gate each packed stream; hn stages message rows, msgt the
+            // gate outputs (out must not alias inputs).
+            auto mq =
+                Kokkos::subview(mmg, Kokkos::ALL, size_t(0), Kokkos::ALL);
+            auto mk =
+                Kokkos::subview(mmg, Kokkos::ALL, size_t(1), Kokkos::ALL);
+            auto mv =
+                Kokkos::subview(mmg, Kokkos::ALL, size_t(2), Kokkos::ALL);
+            Kokkos::deep_copy(hn, mq);
+            inkling_message_gate<ExecSpace, Scalar>(
+                qh, hn, b.loop_q_down, b.loop_q_forget, b.loop_q_gain, eps,
+                msgt, msg_rmsx, msg_rmsm, msg_h);
+            Kokkos::deep_copy(qh, msgt);
+            Kokkos::deep_copy(hn, mk);
+            inkling_message_gate<ExecSpace, Scalar>(
+                kh, hn, b.loop_k_down, b.loop_k_forget, b.loop_k_gain, eps,
+                msgt, msg_rmsx, msg_rmsm, msg_h);
+            Kokkos::deep_copy(kh, msgt);
+            Kokkos::deep_copy(hn, mv);
+            inkling_message_gate<ExecSpace, Scalar>(
+                vh, hn, b.loop_v_down, b.loop_v_forget, b.loop_v_gain, eps,
+                msgt, msg_rmsx, msg_rmsm, msg_h);
+            Kokkos::deep_copy(vh, msgt);
+            input_norm_case = 0;
+          } else {
+            // No-msg: section 2 norms retr3 straight into hn/kh/vh.
+            input_norm_case = 4;
+          }
         }
       }
     }
 
     // ---- 2. input norms (in place on the streams; query -> hn) ----
-    if (!full) {
-      rmsnorm<ExecSpace, Scalar>(qh, b.attn_norm, eps, hn);
-      rmsnorm<ExecSpace, Scalar>(kh, b.attn_norm, eps, kh);
-      rmsnorm<ExecSpace, Scalar>(vh, b.attn_norm, eps, vh);
+    // Fused: one launch instead of three (section 1 no-msg paths additionally
+    // skip their deep_copies by norming straight from the retrieval/raw
+    // stream — see input_norm_case above). All forms are bit-identical to
+    // the copy-then-norm sequences they replace: copies are exact and each
+    // team's row math repeats the separate rmsnorm rows verbatim.
+    if (input_norm_case == 1) {
+      inkling_sliding_alias_norms<ExecSpace, Scalar>(hh, b.attn_norm, eps,
+                                                     hn, kh, vh);
+    } else if (input_norm_case == 2) {
+      inkling_sliding_retr_norms<ExecSpace, Scalar>(retr1, b.attn_norm, eps,
+                                                    hn, kh, vh);
+    } else if (input_norm_case == 3) {
+      inkling_full_alias_norms<ExecSpace, Scalar>(hh, b.q_norm, b.k_norm,
+                                                  b.v_norm, eps, hn, kh, vh);
+    } else if (input_norm_case == 4) {
+      inkling_full_retr_norms<ExecSpace, Scalar>(retr3, b.q_norm, b.k_norm,
+                                                 b.v_norm, eps, hn, kh, vh);
+    } else if (!full) {
+      inkling_fused_input_norms3<ExecSpace, Scalar>(
+          qh, kh, vh, b.attn_norm, b.attn_norm, b.attn_norm, eps, hn);
     } else {
-      rmsnorm<ExecSpace, Scalar>(qh, b.q_norm, eps, hn);
-      rmsnorm<ExecSpace, Scalar>(kh, b.k_norm, eps, kh);
-      rmsnorm<ExecSpace, Scalar>(vh, b.v_norm, eps, vh);
+      inkling_fused_input_norms3<ExecSpace, Scalar>(qh, kh, vh, b.q_norm,
+                                                   b.k_norm, b.v_norm, eps,
+                                                   hn);
     }
 
     // ---- 3. dynamic weight_proj taps (full kinds, from the NORMED
@@ -1339,40 +1395,61 @@ class Model {
                                           "Inkling::wv", q8_act_buf_);
 
     // ---- 5. k/v short-convs (stateful across the chunk) ----
+    // Single-token decode (C == 1) fuses the k+v pair into one launch via
+    // the *_pair kernels below (no extra allocations); longer chunks keep
+    // the two chunked calls. kv_write (section 8) still stages the
+    // section-6 clipped rows and is unchanged.
     auto& cs = conv_[(size_t)l][p];
     auto tmpc = Kokkos::subview(tmpc_buf_, std::make_pair(size_t(0), C + K),
                                 Kokkos::ALL);
     auto tmpc_out = Kokkos::subview(tmpc_out_buf_,
                                     std::make_pair(size_t(0), C + K),
                                     Kokkos::ALL);
-    auto tmpdyn = Kokkos::subview(tmpdyn_buf_, std::make_pair(size_t(0), C + K),
-                                  Kokkos::ALL);
-    auto tmpk = Kokkos::subview(tmpk_buf_, std::make_pair(size_t(0), C + K),
-                                Kokkos::ALL);
-    auto tmpk_out = Kokkos::subview(tmpk_out_buf_,
+    if (C == 1) {
+      using Unm1 =
+          Kokkos::View<Scalar*, Kokkos::LayoutRight, ExecSpace,
+                       Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+      const size_t Ch = k2.extent(1);
+      Unm1 xk(k2.data(), Ch), yk(k2.data(), Ch), xv(v2.data(), Ch),
+          yv(v2.data(), Ch);
+      if (!full) {
+        inkling_static_conv_update_state_pair<ExecSpace, Scalar>(
+            xk, cs.k, b.k_conv, yk, xv, cs.v, b.v_conv, yv);
+      } else {
+        Unm1 dynk(dyn.data(), NKV * K), dynv1(dynv.data(), NKV * K);
+        inkling_dynamic_short_conv_update_state_pair<ExecSpace, Scalar>(
+            xk, cs.k, b.k_conv_static, dynk, yk, xv, cs.v, b.v_conv_static,
+            dynv1, yv, NKV, HD);
+      }
+    } else {
+      auto tmpdyn = Kokkos::subview(tmpdyn_buf_,
                                     std::make_pair(size_t(0), C + K),
                                     Kokkos::ALL);
-    if (!full) {
-      static_conv_chunk(k2, b.k_conv, cs.k, tmpk, tmpk_out, k2);
-      static_conv_chunk(v2, b.v_conv, cs.v, tmpk, tmpk_out, v2);
-    } else {
-      dynamic_conv_chunk(k2, b.k_conv_static, dyn, NKV, HD, cs.k, tmpk,
-                         tmpk_out, tmpdyn, k2);
-      dynamic_conv_chunk(v2, b.v_conv_static, dynv, NKV, HD, cs.v, tmpk,
-                         tmpk_out, tmpdyn, v2);
+      auto tmpk = Kokkos::subview(tmpk_buf_, std::make_pair(size_t(0), C + K),
+                                  Kokkos::ALL);
+      auto tmpk_out = Kokkos::subview(tmpk_out_buf_,
+                                      std::make_pair(size_t(0), C + K),
+                                      Kokkos::ALL);
+      if (!full) {
+        static_conv_chunk(k2, b.k_conv, cs.k, tmpk, tmpk_out, k2);
+        static_conv_chunk(v2, b.v_conv, cs.v, tmpk, tmpk_out, v2);
+      } else {
+        dynamic_conv_chunk(k2, b.k_conv_static, dyn, NKV, HD, cs.k, tmpk,
+                           tmpk_out, tmpdyn, k2);
+        dynamic_conv_chunk(v2, b.v_conv_static, dynv, NKV, HD, cs.v, tmpk,
+                           tmpk_out, tmpdyn, v2);
+      }
     }
 
     // ---- 6. head clips (in place on the head aliases) ----
-    if (!full) {
-      inkling_scaled_l2_clip<ExecSpace, Scalar>(q3, b.q_scale, cfg.qk_clip,
-                                                q3);
-    } else {
-      inkling_log_scaled_l2_clip<ExecSpace, Scalar>(
-          q3, b.q_scale, cfg.qk_clip, pos, cfg.log_alpha,
-          (float)cfg.log_floor, q3);
-    }
-    inkling_l2_clip<ExecSpace, Scalar>(k3, cfg.qk_clip, k3);
-    inkling_unweighted_rmsnorm_3d<ExecSpace, Scalar>(v3, eps, v3);
+    // Fused q/k/v trio: one launch instead of three. Each branch repeats
+    // its separate kernel's row math verbatim (same reductions, same
+    // team-size selection), so the result is bit-identical. In-place safe.
+    inkling_fused_qkv_clips<ExecSpace, Scalar>(q3, k3, v3, b.q_scale,
+                                               cfg.qk_clip, pos,
+                                               cfg.log_alpha,
+                                               (float)cfg.log_floor, eps,
+                                               full);
 
     // ---- 7. rel-bias states + sink from the normed query stream ----
     Impl::linear_chunk<ExecSpace, Scalar>(handle, hn, b.wrel, deq_rel_, rel2,
@@ -1412,6 +1489,16 @@ class Model {
     }
 
     // ---- 9. gated output proj ----
+    // NOTE (fusion analysis): inkling_gated_output_mul below already runs
+    // in place (out aliases the attention output), so it costs a single
+    // [C,HqD] read+write pass with no extra copy. Fusing the sigmoid gate
+    // into the neighboring GEMMs (wgate_attn epilogue or the wo input
+    // load) would require a custom GEMM epilogue / input-loader change in
+    // the shared Dense/Gemm/QuantDispatch path (plus per-dtype packed
+    // variants), which is outside this worker's scope and risks
+    // arch-specific tuning; it is deliberately left as the minimal
+    // single-pass in-place elementwise. Numerics are therefore unchanged
+    // (bit-identical), not merely FP-reassociated.
     Unm2 flat(a3.data(), C, HqD);
     Impl::linear_chunk<ExecSpace, Scalar>(handle, hn, b.wgate_attn, deq_qkv_,
                                           gate2, "Inkling::wgate_attn",
@@ -1450,17 +1537,31 @@ class Model {
       auto msgt = Kokkos::subview(msg_buf_, std::make_pair(size_t(0), C),
                                   Kokkos::ALL);
       attn_retrieve(bb, nblocks, o2, b.mlp_res_q, use_norm_res, eps, retr);
-      auto m = Kokkos::subview(retr, Kokkos::ALL, size_t(0), Kokkos::ALL);
-      Kokkos::deep_copy(msgt, m);
       if (has_msgs) {
+        auto m = Kokkos::subview(retr, Kokkos::ALL, size_t(0), Kokkos::ALL);
         auto mm = Kokkos::subview(mmg, Kokkos::ALL, size_t(3), Kokkos::ALL);
-        Kokkos::deep_copy(moe_in, mm);
+        // Fused pack of the Q=1 retrieval row + message row 3 into the
+        // packed temps (one pass instead of two deep_copies; bit-identical).
+        {
+          MatR msgtc = msgt, moec = moe_in;
+          Kokkos::parallel_for(
+              "Inkling::mlp_msg_pack",
+              Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {C, D}),
+              KOKKOS_LAMBDA(size_t t, size_t d) {
+                msgtc(t, d) = m(t, d);
+                moec(t, d) = mm(t, d);
+              });
+        }
         inkling_message_gate<ExecSpace, Scalar>(
             msgt, moe_in, b.loop_mlp_down, b.loop_mlp_forget,
             b.loop_mlp_gain, eps, hn, msg_rmsx, msg_rmsm, msg_h);
         rmsnorm<ExecSpace, Scalar>(hn, b.post_attn_norm, eps, moe_in);
       } else {
-        rmsnorm<ExecSpace, Scalar>(msgt, b.post_attn_norm, eps, moe_in);
+        // No-msg: norm straight from the Q=1 retrieval, skipping the
+        // deep_copy into msgt (the copy is exact, so this is
+        // bit-identical to copy-then-rmsnorm) and saving one launch.
+        inkling_retr1_rmsnorm<ExecSpace, Scalar>(retr, b.post_attn_norm, eps,
+                                                moe_in);
       }
       auto moe_out = Kokkos::subview(moe_out_buf_,
                                      std::make_pair(size_t(0), C), Kokkos::ALL);
@@ -1513,6 +1614,15 @@ class Model {
 
       auto blocks = Kokkos::subview(blk_buf_, std::make_pair(size_t(0), C),
                                     Kokkos::ALL, Kokkos::ALL);
+      // Pos rows are identical for every layer visit in the chunk; fill
+      // once here instead of once per layer_forward call.
+      {
+        auto pos = Kokkos::subview(pos_buf_, std::make_pair(size_t(0), C));
+        auto posc = pos;
+        Kokkos::parallel_for(
+            "Inkling::pos", Kokkos::RangePolicy<ExecSpace>(0, C),
+            KOKKOS_LAMBDA(size_t t) { posc(t) = (int)(cpos + t); });
+      }
       size_t nblocks = 0;
       // Pre-loop layers.
       for (int l = 0; l < cfg.loop_start; ++l) {
@@ -1522,20 +1632,28 @@ class Model {
         layer_forward(l, 0, h, blocks, nblocks, cpos, C, nomsg, false);
       }
       // Snapshot pre-loop states for later passes (pass 0 overwrites h
-      // and appends to blocks).
+      // and appends to blocks). Fused single pass: h -> pre_h plus
+      // blocks -> pre_blk in one kernel instead of a deep_copy plus a
+      // pre_blk_copy (bit-identical: the same exact copies).
       {
         auto pre_h = Kokkos::subview(pre_h_buf_, std::make_pair(size_t(0), C),
                                      Kokkos::ALL);
-        Kokkos::deep_copy(pre_h, h);
         auto pre_blk = Kokkos::subview(pre_blk_buf_,
                                        std::make_pair(size_t(0), C),
                                        Kokkos::ALL, Kokkos::ALL);
+        MatR hc = h, pre_hc = pre_h;
+        View3 blk_c = blocks, pre_blk_c = pre_blk;
+        const size_t Nc = (nblocks + 1) * D;
         Kokkos::parallel_for(
-            "Inkling::pre_blk_copy",
-            Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>(
-                {0, 0}, {C, nblocks * D}),
+            "Inkling::pre_snapshot",
+            Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0}, {C, Nc}),
             KOKKOS_LAMBDA(size_t t, size_t i) {
-              pre_blk(t, i / D, i % D) = blocks(t, i / D, i % D);
+              if (i < D) {
+                pre_hc(t, i) = hc(t, i);
+              } else {
+                const size_t j = i - D;
+                pre_blk_c(t, j / D, j % D) = blk_c(t, j / D, j % D);
+              }
             });
       }
       const size_t npre = nblocks;
@@ -1551,6 +1669,11 @@ class Model {
       for (int pass = 1; pass < cfg.loop_passes; ++pass) {
         // Previous pass's final hidden + stripped block rows. The strip
         // count mirrors HF (num_pre_loop_blocks + 1), clamped at zero.
+        // Fused restart: prev_h := h, h := pre_h, blocks := pre_blk in one
+        // kernel (bit-identical exact copies), instead of two deep_copies
+        // plus blk_restore. The stripped message history is NOT packed:
+        // the retrieval below reads blocks(t, strip + s, d) directly via
+        // the offset-aware worker (no prev_pack launch).
         const size_t Sall = nblocks;
         const size_t strip = std::min(npre + 1, Sall);
         const size_t Sstrip = Sall - strip;
@@ -1558,61 +1681,43 @@ class Model {
           auto prev_h = Kokkos::subview(prev_h_buf_,
                                         std::make_pair(size_t(0), C),
                                         Kokkos::ALL);
-          Kokkos::deep_copy(prev_h, h);
-          // Pack stripped prev block rows contiguously for the retrieval
-          // (src op needs exact [C,S,D]).
-          auto prevpack = Kokkos::subview(
-              prevpack_buf_, std::make_pair(size_t(0), C * Sstrip),
-              Kokkos::ALL);
-          Kokkos::parallel_for(
-              "Inkling::prev_pack",
-              Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>(
-                  {0, 0}, {C * Sstrip, D}),
-              KOKKOS_LAMBDA(size_t i, size_t d) {
-                const size_t t = (Sstrip == 0) ? 0 : i / Sstrip;
-                const size_t s = (Sstrip == 0) ? 0 : i % Sstrip;
-                prevpack(i, d) = (Sstrip == 0)
-                                     ? static_cast<Scalar>(0)
-                                     : blocks(t, strip + s, d);
-              });
-        }
-        // Restore pre-loop hidden/blocks into the working buffers.
-        {
           auto pre_h = Kokkos::subview(pre_h_buf_,
                                        std::make_pair(size_t(0), C),
                                        Kokkos::ALL);
-          Kokkos::deep_copy(h, pre_h);
           auto pre_blk = Kokkos::subview(pre_blk_buf_,
                                          std::make_pair(size_t(0), C),
                                          Kokkos::ALL, Kokkos::ALL);
+          MatR hc = h, prev_hc = prev_h, pre_hc = pre_h;
+          View3 blk_c = blocks, pre_blk_c = pre_blk;
+          const size_t Nc = (npre + 1) * D;
           Kokkos::parallel_for(
-              "Inkling::blk_restore",
-              Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>(
-                  {0, 0}, {C, npre * D}),
+              "Inkling::pass_restart",
+              Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<2>>({0, 0},
+                                                               {C, Nc}),
               KOKKOS_LAMBDA(size_t t, size_t i) {
-                blocks(t, i / D, i % D) = pre_blk(t, i / D, i % D);
+                if (i < D) {
+                  prev_hc(t, i) = hc(t, i);
+                  hc(t, i) = pre_hc(t, i);
+                } else {
+                  const size_t j = i - D;
+                  blk_c(t, j / D, j % D) = pre_blk_c(t, j / D, j % D);
+                }
               });
         }
         nblocks = npre;
         // Per loop layer: retrieve messages, forward with pass slot.
-        using QTab = Kokkos::View<float***, Kokkos::LayoutRight, ExecSpace,
-                                  Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
         for (int l = cfg.loop_start; l < cfg.loop_end; ++l) {
           const auto& b = weights.blocks[(size_t)l];
           auto msgs = Kokkos::subview(msg_out_buf_,
                                       std::make_pair(size_t(0), C), Kokkos::ALL,
                                       Kokkos::ALL);
           {
-            auto prevpack = Kokkos::subview(
-                prevpack_buf_, std::make_pair(size_t(0), C * Sstrip),
-                Kokkos::ALL);
-            UnmAlias3 bp(prevpack.data(), C, Sstrip, D);
             auto prev_h = Kokkos::subview(prev_h_buf_,
                                           std::make_pair(size_t(0), C),
                                           Kokkos::ALL);
-            QTab qtab(b.msg_query.data(), 1, 4, D);
-            inkling_message_attention_residual<ExecSpace, Scalar>(
-                bp, prev_h, qtab, 0, cfg.eps, msgs);
+            ::KokkosDNN::Impl::inkling_attn_residual_offset<ExecSpace, Scalar>(
+                blocks, Sstrip, strip, prev_h, b.msg_query, cfg.eps, msgs,
+                "KokkosDNN::inkling_message_attention_residual");
           }
           layer_forward(l, (size_t)pass, h, blocks, nblocks, cpos, C, msgs,
                         true);
@@ -1628,16 +1733,18 @@ class Model {
 
       if (off + C < T) continue;
       // Final retrieval + norm + head on the last row only.
+      // Fused: norm straight from the Q=1 retrieval's last row in one
+      // team-parallel launch instead of deep_copy plus rmsnorm_row (a
+      // reduce + scale pair). FP reassociation vs rmsnorm_row (team vs
+      // range reduction, a few ulp): tight tolerance, not bitwise
+      // equality.
       {
         auto retr = Kokkos::subview(retr1_buf_, std::make_pair(size_t(0), C),
                                     Kokkos::ALL, Kokkos::ALL);
         attn_retrieve(blocks, nblocks, h, weights.out_res_q,
                        (bool)cfg.attn_res_normalize, cfg.eps, retr);
-        auto rq_last =
-            Kokkos::subview(retr, C - 1, size_t(0), Kokkos::ALL);
-        Kokkos::deep_copy(last, rq_last);
-        rmsnorm_row<ExecSpace, Scalar>(last, weights.out_norm, cfg.eps,
-                                       last);
+        inkling_rmsnorm_from_retr_last_row<ExecSpace, Scalar>(
+            retr, C - 1, weights.out_norm, cfg.eps, last);
       }
       // lm_head over the unpadded vocab rows. Dense out_w must be
       // exactly [U, D] (padded rows are dropped at load, matching HF);
