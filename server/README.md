@@ -86,32 +86,44 @@ cmake --build build --target kokkosdnn_server
     --tokenizer /path/to/tokenizer.json [--model glimmer-30b] \
     [--config config.json] [--max-seq-len 131072] [--kv-int8] \
     [--prefill-chunk 512] [--prefix-cache-host]
+# Inkling (packed `.gguf`, or sharded safetensors):
+./build/server/kokkosdnn_server --arch inkling \
+    --weights /path/to/model.gguf \
+    --tokenizer /path/to/tokenizer.json [--model inkling-2-mini] \
+    [--config config.json] [--max-seq-len 32768] [--kv-int8] \
+    [--prefill-chunk 512] [--prefix-cache-host]
 ```
 
 `--help` / `--version` work without Kokkos weights. `--arch` selects the
-model architecture (`lfm2.5` (aliases `lfm2_5`, `lfm25`) or `glimmer`
-(aliases `glimmer-30b`, `muse-glimmer[-30b]`, optional `darkc0de-` prefix),
-case-insensitive). When `--arch` is absent the server sniffs `--config`
+model architecture (case-insensitive); the legal options are `lfm2.5`
+(aliases `lfm2_5`, `lfm25`), `glimmer` (aliases `glimmer-30b`,
+`glimmer30b`, `glimmer-30b-heretic`, `muse-glimmer[-30b][-heretic]` with an
+optional `darkc0de-` prefix), and `inkling` (aliases `inkling-2-mini`,
+`inkling-2mini`, `inkling2mini`). Anything else is a startup error. When
+`--arch` is absent the server sniffs `--config`
 (LFM2.5 markers: `lfm2_moe` / `num_experts` / `hidden_act`; Glimmer markers:
-`text_config` / `layer_rope_theta` / `qk_scale_factor`); an explicit
-`--arch` that disagrees with a recognizable config is a startup error,
-otherwise the default is `lfm2.5`. `--model` defaults to the arch default
-(`lfm2_5` / `glimmer-30b`) when absent.
+`text_config` / `layer_rope_theta` / `qk_scale_factor`; Inkling marker:
+`inkling`/`Inkling` — checked first, since the Inkling HF config wraps its
+text block in a `text_config` object that would otherwise match Glimmer);
+an explicit `--arch` that disagrees with a recognizable config is a startup
+error, otherwise the default is `lfm2.5`. `--model` defaults to the arch
+default (`lfm2_5` / `glimmer-30b` / `inkling-2-mini`) when absent.
 `--weights` is repeatable and accepts globs: LFM2.5 needs exactly one GGUF
-file; Glimmer takes one `.gguf` file or one or more safetensors shards
-(`model-*.safetensors` is expanded). `--tokenizer` is required to serve;
-`--config` is an optional model-config JSON overlay on top of the arch
-preset. `--max-seq-len N` overrides the context window (LFM2.5 default
-8192; Glimmer default 8192, arch max 131072), so prompts longer than the
-default need either this flag or a config overlay. Glimmer also takes
-`--kv-int8` / `--kv-fp` / `--kv-quant int8|none` (KV-cache precision;
-overrides the config-file `kv_int8`/`kv_quantized`/`kv_quant` keys, dense
-FP by default, last flag wins) and `--prefill-chunk N` (`0` =
-single-shot; overrides the config-file `prefill_chunk_size` and caps
-prefill activations) — same spelling and precedence as the
-`glimmer_generate` driver. `--prefix-cache-host` keeps the prefix-cache
-entry in host memory instead of device memory (applies to both
-architectures; saves VRAM at the cost of host<->device copies per turn).
+file; Glimmer and Inkling take one `.gguf` file or one or more safetensors
+shards (`model-*.safetensors` is expanded). `--tokenizer` is required to
+serve; `--config` is an optional model-config JSON overlay on top of the
+arch preset. `--max-seq-len N` overrides the context window (LFM2.5 default
+8192; Glimmer default 8192, arch max 131072; Inkling default 32768, arch max
+1048576), so prompts longer than the default need either this flag or a
+config overlay. Glimmer and Inkling also take `--kv-int8` / `--kv-fp` /
+`--kv-quant int8|none` (KV-cache precision; overrides the config-file
+`kv_int8`/`kv_quantized`/`kv_quant` keys, dense FP by default, last flag
+wins) and `--prefill-chunk N` (`0` = single-shot; overrides the
+config-file `prefill_chunk_size` and caps prefill activations) — same
+spelling and precedence as the `glimmer_generate` driver.
+`--prefix-cache-host` keeps the prefix-cache entry in host memory instead
+of device memory (applies to all architectures; saves VRAM at the cost of
+host<->device copies per turn).
 The server runs the BF16 path only (there is no `--fp32` flag); Glimmer
 weights load from one `.gguf` file (packed quant preserved: F32/F16/BF16
 exact, Q8_0/Q4_K/Q5_K/Q6_K stay packed, ~17GB resident for the Q4_K_M
@@ -367,7 +379,7 @@ Route handlers are arch-agnostic: they parse OpenAI JSON once and drive the
 | `tools[]` | `[{type:"function", function:{name, description?, parameters?, strict?}}]` validated, then injected into the system prompt (arch-native tool format: LFM2.5 `List of tools: [...]` JSON, Glimmer ATEM catalogue); `[]` = no-op |
 | `tool_choice` | `"auto"` (default) \| `"none"` (no injection) \| `"required"` / `{"type":"function","function":{"name"}}` (best-effort `MUST call` system directive — prompted, not constrained) |
 | `parallel_tool_calls` | `false` keeps only the first parsed call (default `true`) |
-| `reasoning_effort` | Glimmer only: `"low"`\|`"medium"`\|`"high"` (default)\|`"xhigh"` selects the RLed `Reasoning strength: <level>.` system cue (case-insensitive; `null`/absent = `high`); unknown values are a 400 for `arch glimmer`, ignored for other archs |
+| `reasoning_effort` | Glimmer and Inkling: selects the reasoning cue (case-insensitive; `null`/absent = `high`); unknown values are a 400 for `arch glimmer`/`arch inkling`, ignored for other archs. Glimmer: `"low"`\|`"medium"`\|`"high"`\|`"xhigh"` renders the RLed `Reasoning strength: <level>.` system cue. Inkling: `"none"`\|`"minimal"`\|`"low"`\|`"medium"`\|`"high"`\|`"xhigh"`\|`"max"` (or a float string in `[0.0, 0.99]`) renders the upstream `Thinking effort level: N` system message (`none`→`0`, `minimal`→`0.1`, `low`→`0.2`, `medium`→`0.7`, `high`→`0.9`, `xhigh`/`max`→`0.99`) |
 | `response_format` | `{"type":"text"}` (default) \| `{"type":"json_object"}` \| `{"type":"json_schema", json_schema:{...}}`: adds a JSON-only system instruction and strips ``` fences (non-streaming); the schema is recorded but **not enforced** (no grammar-constrained decoding — validate client-side) |
 | `temperature, top_p, top_k, min_p, repetition_penalty` | `SampleOptions` verbatim (absent = session default; `temperature` 0 = greedy) |
 | `frequency_penalty, presence_penalty` | `SampleOptions` verbatim |
@@ -452,8 +464,8 @@ Limits to know:
 - `response_format` fence-stripping applies to non-streaming replies;
   streamed JSON deltas arrive unmodified.
 - Zed (OpenAI-compatible provider, chat-completions path) is supported;
-  see [Zed (LFM2.5)](#zed-lfm25) and [Zed (Glimmer)](#zed-glimmer) for the
-  provider settings this server expects (a couple of Zed defaults are
+  see [Zed (LFM2.5)](#zed-lfm25), [Zed (Glimmer)](#zed-glimmer), and
+  [Zed (Inkling)](#zed-inkling) for the provider settings this server expects (a couple of Zed defaults are
   wrong for a reasoning model and will visibly degrade multi-turn agent
   threads).
 
@@ -598,6 +610,83 @@ settings above):
   upstream `chat_template.jinja` `reasoning_strength` template argument
   does. A caller-provided `Reasoning strength:` line is kept verbatim;
   unknown values are a 400.
+
+## Zed (Inkling)
+
+Zed's `openai_compatible` provider works with the chat-completions path.
+Add the server as a provider in `~/.config/zed/settings.json` (or via
+Agent Settings → Add Provider, then fill in the capabilities below):
+
+```json
+{
+  "language_models": {
+    "openai_compatible": {
+      "kokkosdnn": {
+        "api_url": "http://127.0.0.1:8000/v1",
+        "available_models": [
+          {
+            "name": "inkling-2-mini",
+            "display_name": "Inkling 2 Mini (local)",
+            "max_tokens": 32768,
+            "max_output_tokens": 4096,
+            "capabilities": {
+              "tools": false,
+              "images": false,
+              "parallel_tool_calls": false,
+              "prompt_cache_key": false,
+              "chat_completions": true,
+              "interleaved_reasoning": true,
+              "max_tokens_parameter": false
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+Why these values (only `tools`, `name`, and `max_tokens` differ from the
+Glimmer settings above):
+
+- `tools: false` is **required for now**. The Inkling backend has no native
+  tool grammar yet (`supports_tools()` is `false`), so any request carrying
+  `tools` or `tool_calls`/`tool`-role history is a 400 (`no native tool
+  grammar`). With Zed's default `true`, every agentic thread sends `tools`
+  and fails; setting `false` keeps plain chat working. Flip it to `true`
+  once the `<|content_invoke_tool_json|>` channel parser lands.
+- `interleaved_reasoning: true` is **required**. With Zed's default
+  `false`, prior assistant thinking is sent back as plain assistant text
+  instead of `reasoning_content`, so the model sees its own trace outside
+  the `<|content_thinking|>` channel the template expects (the same
+  feedback loop documented for LFM2.5 above). With `true`, Zed sends the
+  trace back as `reasoning_content` and the server re-renders it inside the
+  thinking channel. One current limitation: the streaming parser is still
+  pass-through, so a turn's thinking trace arrives as plain `content`
+  deltas rather than `reasoning_content` deltas — history replay across
+  turns is still exact with `true`.
+- `max_tokens` is Zed's **context window**, not an output cap; set it to
+  the server's `--max-seq-len` (default `32768` for Inkling, arch max
+  `1048576`). Zed compacts at 90% of this value, so a larger number lets
+  the thread grow past the server's limit and every later request fails
+  with an over-context 400.
+- `max_output_tokens` is the output cap, sent as `max_completion_tokens`.
+  Set it explicitly and generously: when unset, Zed sends no usable cap
+  (the field is absent or `null`), and the server then falls back to 256
+  completion tokens (the server clamps the value to
+  `max_seq_len - prompt_len` anyway).
+- `chat_completions` must stay `true`; the server has no `/v1/responses`.
+- `name` must match the server's `--model` (default `inkling-2-mini`), and
+  `api_url` must end in `/v1` (Zed appends `/chat/completions`).
+- `reasoning_effort` selects the thinking-effort cue: `"none"`,
+  `"minimal"`, `"low"`, `"medium"`, `"high"` (default), `"xhigh"`,
+  `"max"` (case-insensitive), or a float string in `[0.0, 0.99]`. It
+  renders as `Thinking effort level: N` in a system message, exactly as the
+  upstream `chat_template.jinja` `reasoning_effort` template argument
+  does. Unknown values are a 400.
+
+After changing `interleaved_reasoning`, **start a new thread**: existing
+threads still carry the old, polluted history.
 
 ## Errors
 
