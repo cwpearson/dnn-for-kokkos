@@ -1352,13 +1352,13 @@ template <class Scalar>
 void check_attention_team_matches_legacy(size_t C, size_t H, size_t N,
                                          size_t HD, size_t R, size_t E,
                                          size_t q_off, size_t window,
-                                         unsigned seed) {
+                                         unsigned seed, size_t Hkv = 2) {
   using V3 = Kokkos::View<Scalar***, Kokkos::LayoutRight, Exec>;
   using V2 = Kokkos::View<Scalar**, Kokkos::LayoutRight, Exec>;
   using VF = Kokkos::View<float**, Kokkos::LayoutRight, Exec>;
   Kokkos::Random_XorShift64_Pool<Exec> pool(seed);
-  V3 q("q", C, H, HD), k("k", N, H > 0 ? 2 : 1, HD), v("v", N, 2, HD);
-  // H must be a multiple of Hkv = 2 here.
+  V3 q("q", C, H, HD), k("k", N, Hkv, HD), v("v", N, Hkv, HD);
+  // H must be a multiple of Hkv.
   V3 rel("rel", C, H, R), out_t("out_t", C, H, HD),
       out_l("out_l", C, H, HD);
   V2 sink("sink", C, H);
@@ -1402,6 +1402,19 @@ TEST(InklingModel, AttentionTeamMatchesLegacy) {
   check_attention_team_matches_legacy<bhalf_t>(1, 4, 5, 8, 4, 32, 4, 1024, 13);
   check_attention_team_matches_legacy<bhalf_t>(1, 8, 11, 128, 16, 128, 10,
                                               1024, 14);
+}
+
+// Long-context streaming path (Kmax > kInklingAttnTeamScratchKeys) must
+// reproduce the legacy reference: full-window decode rows past the staged-
+// score budget take the O(D) streaming worker instead of the 3x-recompute
+// legacy fallback.
+TEST(InklingModel, AttentionLongContextMatchesLegacy) {
+  // N = 9000 > 8192 forces the streaming path with a full window.
+  check_attention_team_matches_legacy<float>(1, 4, 9000, 8, 4, 128, 8999, 0,
+                                            21);
+  // Real head width / GQA grouping (24 Q / 8 KV heads, D = 128) decode row.
+  check_attention_team_matches_legacy<float>(1, 24, 9000, 128, 16, 1024, 8999,
+                                            0, 22, 8);
 }
 
 // Fused MoE decode vs a host reference computed from the dequantized packed

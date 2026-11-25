@@ -24,15 +24,16 @@
 //
 // Launch accounting (decode, packed): each linear_chunk decode is two
 // launches (quantize act row + int8-dot GEMV) via Gguf::quant_gemv. A layer
-// visits ~8-10 linears; hn feeds wq + wrel + wsink + wgate_attn at the same
-// K, so quantizing hn once and reusing the staging across those four would
-// save 3 quantize launches per visit with identical values. Not wired yet:
-// linear_chunk takes a scratch *buffer*, not a quantization ticket, and the
-// sharing owner is the Model layer loop (which knows hn is shared) -- see
-// GgufMvq::quantize_act_q8_row / gemv_int8_reuse_act (KokkosDNN_GGUFGemvInt8.
-// hpp) for the minimal extension that wiring would use. Threading the ticket
-// through needs a new overload set plus a Model-loop change, so it stays
-// documented, not half-landed, here.
+// visit shares inputs at the same K (hn feeds wq + wrel + wsink +
+// wgate_attn; kh feeds wk + kdyn; vh feeds wv + vdyn), so the Model loop
+// quantizes each shared input once (quantize_shared_act below) and reuses
+// the staging across its linears (linear_decode_reuse / linear_chunk_reuse
+// below, via GgufMvq::gemv_int8_reuse_act stage-2-only). Saves one quantize
+// launch per reused linear with identical values (same kernels, only launch
+// boundaries move). Grouping is single-buffer safe: each input's linears
+// run back-to-back while its quantization occupies act_scratch. Declined
+// inputs (unsupported dtype/stride/align, undersized scratch) fall back to
+// the regular per-GEMV path, preserving the portable decline rules.
 //
 // Calling convention (mirrors gemm/gemv/embedding_gather): these take
 // concrete (managed) view types, so callers passing subviews (which carry
@@ -186,13 +187,12 @@ void linear_chunk(
   }
 }
 
-// Shared-input decode helper (additive; unused by the Model loop so far):
-// quantize the single input row X ([1, K]) once into act_scratch for reuse
-// across the linears sharing it. Returns false when the row cannot take the
-// int8 path (caller runs the regular linear_chunk path instead, so a
-// decline never changes results). This is the ticket producer for a future
-// hn-once reuse; the consumer side is GgufMvq::gemv_int8_reuse_act (see the
-// header note above for why the wiring lives in the Model loop, not here).
+// Shared-input decode helper: quantize the single input row X ([1, K])
+// once into act_scratch for reuse across the linears sharing it. Returns
+// false when the row cannot take the int8 path (caller runs the regular
+// per-GEMV path instead, so a decline never changes results). This is the
+// ticket producer; the consumers are linear_decode_reuse /
+// linear_chunk_reuse below (stage-2-only via GgufMvq::gemv_int8_reuse_act).
 template <class ExecSpace, class Scalar>
 bool quantize_shared_act(
     const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& X,
@@ -204,6 +204,80 @@ bool quantize_shared_act(
       x1(X.data(), X.extent(1));
   return ::KokkosDNN::Impl::GgufMvq::quantize_act_q8_row<ExecSpace, Scalar>(
       x1, act_scratch.data(), act_scratch.extent(0));
+}
+
+// Reuse-aware decode: when staged is true, act_scratch already holds
+// quantize_shared_act(X) for this X/K and the dot runs stage-2-only
+// (bit-identical to the per-GEMV path). Anything the reuse path declines
+// (unsupported dtype/stride/align, undersized scratch) falls through to the
+// regular per-GEMV decode, preserving the current decline rules. Dense
+// weights ignore the ticket outright.
+
+// Dense weights need no int8 staging; the ticket is ignored.
+template <class ExecSpace, class Scalar>
+void linear_decode_reuse(
+    const DNNHandle<ExecSpace>& handle,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& X,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& W,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& staging,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& Y,
+    const Kokkos::View<uint8_t*, ExecSpace>& act_scratch, bool staged,
+    const std::string& label = "Inkling::linear_decode_reuse") {
+  (void)act_scratch;
+  (void)staged;
+  linear_decode(handle, X, W, staging, Y, label);
+}
+
+template <class ExecSpace, class Scalar>
+void linear_decode_reuse(
+    const DNNHandle<ExecSpace>& handle,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& X,
+    const Gguf::QuantWeight<ExecSpace>& W,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& staging,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& Y,
+    const Kokkos::View<uint8_t*, ExecSpace>& act_scratch, bool staged,
+    const std::string& label = "Inkling::linear_decode_reuse") {
+  if (X.extent(0) != 1 || Y.extent(0) != 1)
+    throw std::invalid_argument("linear_decode_reuse: expected single-row X and Y");
+  if (X.extent(1) != W.cols || Y.extent(1) != W.rows)
+    throw std::invalid_argument("linear_decode_reuse: dimension mismatch");
+  if (W.rows == 0 || W.cols == 0) return;
+  if (staged) {
+    ::KokkosDNN::Impl::GgufMvq::Wd mdt{};
+    if (::KokkosDNN::Gguf::Impl::quant_int8_dtype(W.dtype, mdt)) {
+      Kokkos::View<Scalar*, ExecSpace,
+                   Kokkos::MemoryTraits<Kokkos::Unmanaged>>
+          y1(Y.data(), W.rows);
+      if (::KokkosDNN::Impl::GgufMvq::gemv_int8_reuse_act<ExecSpace, Scalar>(
+              W.data.data(), mdt, W.rows, W.row_bytes(), act_scratch.data(),
+              act_scratch.extent(0), W.cols, y1))
+        return;
+    }
+    // Declined reuse: fall through to the per-GEMV decode below (which
+    // re-quantizes on the int8 path or keeps the portable kernel).
+  }
+  linear_decode(handle, X, W, staging, Y, label, act_scratch);
+}
+
+// Chunk entry point with a staging ticket: decode reuses the shared
+// quantization when staged, prefill (M > 1) takes the dense dequant+gemm
+// path and ignores the ticket.
+template <class ExecSpace, class Scalar, class Weight>
+void linear_chunk_reuse(
+    const DNNHandle<ExecSpace>& handle,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& X,
+    const Weight& W,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& staging,
+    const Kokkos::View<Scalar**, Kokkos::LayoutRight, ExecSpace>& Y,
+    const Kokkos::View<uint8_t*, ExecSpace>& act_scratch, bool staged,
+    const std::string& label = "Inkling::linear_chunk_reuse") {
+  if (X.extent(0) == 1) {
+    linear_decode_reuse(handle, X, W, staging, Y, act_scratch, staged, label);
+  } else {
+    (void)act_scratch;
+    (void)staged;
+    linear_prefill(handle, X, W, staging, Y, label);
+  }
 }
 
 // ---- lm_head (always a single row: rank-1 path both ways) ------------------

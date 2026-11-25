@@ -282,8 +282,154 @@ struct InklingAttentionTeam {
   }
 };
 
-// Legacy single-thread-per-(t,h) form: kept as the fallback when the key
-// count exceeds the team-scratch budget (long-context full attention).
+// Streaming online-softmax worker for the long-context path (Kmax past the
+// team-scratch score budget). One team per (token, head), keys streamed in
+// tiles of kInklingAttnStreamTile keys with O(D) scratch: no [T,H,K]
+// materialization, single dot evaluation per (t,h,key) (the legacy kernel
+// re-evaluates each dot 3x), FP32 accumulate throughout.
+//
+// Per tile: scores[KT] computed once in parallel (serial D/R dots per key,
+// same formula as the legacy kernel), tile max folded into the running max,
+// weights exp(s-mnew) staged in place, then accumulators acc[D] rescaled and
+// extended in a single D-parallel pass. The sink logit seeds the running max
+// with denominator 1 (exp(sk-sk)) and a zero value, matching the legacy
+// fold. Reductions reassociate vs the legacy serial loop (~1e-6), same bar
+// as the short-path team kernel. Portable: TeamThreadRange collectives +
+// team scratch only, no backend intrinsics, no graphs/capture.
+inline constexpr size_t kInklingAttnStreamTileKeys = 128;
+
+template <class ExecSpace, class QView, class KView, class VView, class RView,
+          class PView, class SView, class OView>
+struct InklingAttentionStreaming {
+  using Member = typename Kokkos::TeamPolicy<ExecSpace>::member_type;
+  QView q;
+  KView k;
+  VView v;
+  size_t q_off;
+  size_t window;
+  RView rel;
+  PView proj;
+  SView sink;
+  float scale;
+  OView out;
+  size_t C, H, D, N, Hkv, R, E, grp;
+
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const Member& team) const {
+    const QView q_ = q;
+    const KView k_ = k;
+    const VView v_ = v;
+    const RView rel_ = rel;
+    const PView proj_ = proj;
+    const SView sink_ = sink;
+    const OView out_ = out;
+    const size_t H_ = H, D_ = D, N_ = N;
+    const size_t R_ = R, E_ = E, grp_ = grp;
+    const size_t q_off_ = q_off, window_ = window;
+    const float scale_ = scale;
+    constexpr size_t KT = kInklingAttnStreamTileKeys;
+    const size_t th = static_cast<size_t>(team.league_rank());
+    const size_t t = th / H_, h = th % H_;
+    const size_t hkv = h / grp_;
+    const size_t qt = q_off_ + t;
+    size_t klo = 0;
+    if (window_ > 0 && qt + 1 > window_) klo = qt + 1 - window_;
+    size_t khi = qt;
+    if (khi >= N_) khi = N_ - 1;
+    if (khi < klo) {
+      Kokkos::parallel_for(
+          Kokkos::TeamThreadRange(team, D_), KOKKOS_LAMBDA(size_t d) {
+            out_(t, h, d) = static_cast<typename OView::value_type>(0);
+          });
+      return;
+    }
+    const float sk = static_cast<float>(sink_(t, h));
+    // Layout: acc[D], qScaled[D], weights[KT], state[3] = {m, l, mnew}.
+    float* base = static_cast<float*>(
+        team.team_scratch(1).get_shmem(sizeof(float) * (2 * D_ + KT + 3)));
+    float* acc = base;
+    float* qsc = base + D_;
+    float* tw = base + 2 * D_;
+    float* st = tw + KT;
+    Kokkos::parallel_for(
+        Kokkos::TeamThreadRange(team, D_), KOKKOS_LAMBDA(size_t d) {
+          qsc[d] = static_cast<float>(q_(t, h, d)) * scale_;
+          acc[d] = 0.0f;
+        });
+    Kokkos::single(Kokkos::PerTeam(team), KOKKOS_LAMBDA() {
+      st[0] = sk;  // running max seeded with the sink logit
+      st[1] = 1.0f;  // running denom seeded with exp(sk - sk)
+      st[2] = sk;
+    });
+    team.team_barrier();
+    for (size_t k0 = klo; k0 <= khi; k0 += KT) {
+      size_t kw = KT;
+      if (k0 + kw - 1 > khi) kw = khi - k0 + 1;
+      // Scores, one key per thread, serial D/R dots (legacy formula).
+      Kokkos::parallel_for(
+          Kokkos::TeamThreadRange(team, kw), KOKKOS_LAMBDA(size_t i) {
+            const size_t kk = k0 + i;
+            float dot = 0.0f;
+            for (size_t d = 0; d < D_; ++d)
+              dot += qsc[d] * static_cast<float>(k_(kk, hkv, d));
+            float s = dot;
+            const long dist = static_cast<long>(qt) - static_cast<long>(kk);
+            if (dist >= 0 && static_cast<size_t>(dist) < E_) {
+              float b = 0.0f;
+              for (size_t r = 0; r < R_; ++r)
+                b += static_cast<float>(rel_(t, h, r)) *
+                     proj_(r, static_cast<size_t>(dist));
+              s += b;
+            }
+            tw[i] = s;
+          });
+      float tmax = -1e30f;
+      Kokkos::parallel_reduce(
+          Kokkos::TeamThreadRange(team, kw),
+          KOKKOS_LAMBDA(size_t i, float& vmax) {
+            if (tw[i] > vmax) vmax = tw[i];
+          },
+          Kokkos::Max<float>(tmax));
+      Kokkos::single(Kokkos::PerTeam(team), KOKKOS_LAMBDA() {
+        st[2] = (tmax > st[0]) ? tmax : st[0];
+      });
+      team.team_barrier();
+      const float mnew = st[2];
+      const float mold = st[0];
+      const float aa = Kokkos::expf(mold - mnew);
+      // Staged weights in the new-max scale.
+      Kokkos::parallel_for(
+          Kokkos::TeamThreadRange(team, kw), KOKKOS_LAMBDA(size_t i) {
+            tw[i] = Kokkos::expf(tw[i] - mnew);
+          });
+      float tsum = 0.0f;
+      Kokkos::parallel_reduce(
+          Kokkos::TeamThreadRange(team, kw),
+          KOKKOS_LAMBDA(size_t i, float& sloc) { sloc += tw[i]; }, tsum);
+      // Rescale + extend accumulators; register tile weights per key.
+      Kokkos::parallel_for(
+          Kokkos::TeamThreadRange(team, D_), KOKKOS_LAMBDA(size_t d) {
+            float a = acc[d] * aa;
+            for (size_t i = 0; i < kw; ++i)
+              a += tw[i] * static_cast<float>(v_(k0 + i, hkv, d));
+            acc[d] = a;
+          });
+      Kokkos::single(Kokkos::PerTeam(team), KOKKOS_LAMBDA() {
+        st[1] = st[1] * aa + tsum;
+        st[0] = mnew;
+      });
+      team.team_barrier();
+    }
+    const float linv = 1.0f / st[1];
+    Kokkos::parallel_for(
+        Kokkos::TeamThreadRange(team, D_), KOKKOS_LAMBDA(size_t d) {
+          out_(t, h, d) =
+              static_cast<typename OView::value_type>(acc[d] * linv);
+        });
+  }
+};
+
+// Legacy single-thread-per-(t,h) form: kept as the reference kernel
 // Matches eager_attention_forward with position_bias + sinks + sliding
 // mask. FP32 accumulation, two passes over keys (max/sum, then weighted
 // sum) so no [D]-sized stack array is needed; backend-portable MDRange
@@ -383,10 +529,11 @@ void inkling_attention_forward_legacy(
 // Team-parallel entry point (same contract as the legacy kernel above).
 // Scores for the widest (t,h) row need Kmax team-scratch floats; beyond
 // kTeamScratchKeys keys the launch would exceed portable scratch budgets,
-// so those long-context full-attention rows keep the legacy kernel.
-// Everything else (decode, sliding prefill, short-context full) takes the
-// team path. Max/sum reductions reassociate vs the legacy serial loop
-// (~1e-6 agreement; the legacy kernel is still used past the key budget).
+// so those long-context full-attention rows take the streaming worker below
+// (O(D) scratch, single dot evaluation per key). Everything else (decode,
+// sliding prefill, short-context full) takes the staged-scores team path.
+// Max/sum reductions reassociate vs the legacy serial loop (~1e-6
+// agreement). The legacy kernel remains as the test reference.
 inline constexpr size_t kInklingAttnTeamScratchKeys = 8192;
 
 template <class ExecSpace, class Scalar, class QView, class KView, class VView,
@@ -417,9 +564,25 @@ void inkling_attention_forward(
     return;
   }
   if (Kmax > kInklingAttnTeamScratchKeys) {
-    inkling_attention_forward_legacy<ExecSpace, Scalar>(
-        q, k, v, q_off, window, rel, proj, sink, scale, rel_extent, out,
-        label);
+    InklingAttentionStreaming<ExecSpace, QView, KView, VView, RView, PView,
+                              SView, OView>
+        fs{q, k, v, q_off, window, rel, proj, sink, scale,
+           out, C, H, D, N, Hkv, R, E, grp};
+    int stream_size = 128;
+    if ((int)D < stream_size) {
+      stream_size = 1;
+      while (stream_size < (int)D) stream_size *= 2;
+    }
+    const size_t stream_scratch =
+        sizeof(float) * (2 * D + kInklingAttnStreamTileKeys + 3);
+    const int stream_max = ::KokkosDNN::Impl::cached_team_size_max<ExecSpace>(
+        fs, stream_scratch);
+    if (stream_max < stream_size) stream_size = stream_max;
+    if (stream_size < 1) stream_size = 1;
+    using SPolicy = Kokkos::TeamPolicy<ExecSpace>;
+    SPolicy spolicy((int)(C * H), stream_size);
+    spolicy.set_scratch_size(1, Kokkos::PerTeam(stream_scratch));
+    Kokkos::parallel_for(label, spolicy, fs);
     return;
   }
   int team_size = 128;
@@ -1369,30 +1532,73 @@ class Model {
                                                    hn);
     }
 
-    // ---- 3. dynamic weight_proj taps (full kinds, from the NORMED
-    // streams: KeyValueProjection applies weight_proj to its normed
-    // hidden_states input, not the raw residual stream). Must run after
-    // the in-place norms above.
+    // ---- 3+4. linears sharing kh/vh/hn (decode activation reuse) ----
+    // Decode (C == 1) with packed weights quantizes each shared input once
+    // and reuses the staging across its linears: hn feeds wq/wrel/wsink/
+    // wgate_attn (4 -> 1 quantize), kh feeds wk/kdyn and vh feeds wv/vdyn
+    // (2 -> 1 each on full layers). Bit-identical: same kernels, only
+    // launch boundaries move. Grouping is single-buffer safe: each input's
+    // linears run back-to-back while its quantization occupies q8_act_buf_
+    // (hn's wrel/wsink/wgate_attn are hoisted here from sections 7/9; they
+    // depend only on hn). Prefill (C > 1) keeps the original per-GEMV path;
+    // declined tickets fall back per linear, preserving decline rules.
     auto dyn = Kokkos::subview(dyn_buf_, std::make_pair(size_t(0), C),
                                Kokkos::ALL);
     auto dynv = Kokkos::subview(dynv_buf_, std::make_pair(size_t(0), C),
                                 Kokkos::ALL);
-    if (full) {
-      Impl::linear_chunk<ExecSpace, Scalar>(handle, kh, b.k_conv_proj,
-                                            deq_dyn_, dyn, "Inkling::kdyn",
-                                            q8_act_buf_);
-      Impl::linear_chunk<ExecSpace, Scalar>(handle, vh, b.v_conv_proj,
-                                            deq_dyn_, dynv, "Inkling::vdyn",
-                                            q8_act_buf_);
-    }
+    if (C == 1) {
+      const bool kh_staged =
+          Impl::quantize_shared_act<ExecSpace, Scalar>(kh, q8_act_buf_);
+      if (full) {
+        Impl::linear_chunk_reuse<ExecSpace, Scalar>(
+            handle, kh, b.k_conv_proj, deq_dyn_, dyn, q8_act_buf_, kh_staged,
+            "Inkling::kdyn");
+      }
+      Impl::linear_chunk_reuse<ExecSpace, Scalar>(handle, kh, b.wk, deq_kv_,
+                                                 k2, q8_act_buf_, kh_staged,
+                                                 "Inkling::wk");
+      const bool vh_staged =
+          Impl::quantize_shared_act<ExecSpace, Scalar>(vh, q8_act_buf_);
+      if (full) {
+        Impl::linear_chunk_reuse<ExecSpace, Scalar>(
+            handle, vh, b.v_conv_proj, deq_dyn_, dynv, q8_act_buf_, vh_staged,
+            "Inkling::vdyn");
+      }
+      Impl::linear_chunk_reuse<ExecSpace, Scalar>(handle, vh, b.wv, deq_kv_,
+                                                 v2, q8_act_buf_, vh_staged,
+                                                 "Inkling::wv");
+      const bool hn_staged =
+          Impl::quantize_shared_act<ExecSpace, Scalar>(hn, q8_act_buf_);
+      Impl::linear_chunk_reuse<ExecSpace, Scalar>(handle, hn, b.wq, deq_qkv_,
+                                                 q2, q8_act_buf_, hn_staged,
+                                                 "Inkling::wq");
+      Impl::linear_chunk_reuse<ExecSpace, Scalar>(
+          handle, hn, b.wrel, deq_rel_, rel2, q8_act_buf_, hn_staged,
+          "Inkling::wrel");
+      Impl::linear_chunk_reuse<ExecSpace, Scalar>(
+          handle, hn, b.wsink, deq_sink_, sink2, q8_act_buf_, hn_staged,
+          "Inkling::wsink");
+      Impl::linear_chunk_reuse<ExecSpace, Scalar>(
+          handle, hn, b.wgate_attn, deq_qkv_, gate2, q8_act_buf_, hn_staged,
+          "Inkling::wgate_attn");
+    } else {
+      if (full) {
+        Impl::linear_chunk<ExecSpace, Scalar>(handle, kh, b.k_conv_proj,
+                                              deq_dyn_, dyn, "Inkling::kdyn",
+                                              q8_act_buf_);
+        Impl::linear_chunk<ExecSpace, Scalar>(handle, vh, b.v_conv_proj,
+                                              deq_dyn_, dynv, "Inkling::vdyn",
+                                              q8_act_buf_);
+      }
 
-    // ---- 4. q/k/v linears from the normed streams ----
-    Impl::linear_chunk<ExecSpace, Scalar>(handle, hn, b.wq, deq_qkv_, q2,
-                                          "Inkling::wq", q8_act_buf_);
-    Impl::linear_chunk<ExecSpace, Scalar>(handle, kh, b.wk, deq_kv_, k2,
-                                          "Inkling::wk", q8_act_buf_);
-    Impl::linear_chunk<ExecSpace, Scalar>(handle, vh, b.wv, deq_kv_, v2,
-                                          "Inkling::wv", q8_act_buf_);
+      // ---- 4. q/k/v linears from the normed streams ----
+      Impl::linear_chunk<ExecSpace, Scalar>(handle, hn, b.wq, deq_qkv_, q2,
+                                            "Inkling::wq", q8_act_buf_);
+      Impl::linear_chunk<ExecSpace, Scalar>(handle, kh, b.wk, deq_kv_, k2,
+                                            "Inkling::wk", q8_act_buf_);
+      Impl::linear_chunk<ExecSpace, Scalar>(handle, vh, b.wv, deq_kv_, v2,
+                                            "Inkling::wv", q8_act_buf_);
+    }
 
     // ---- 5. k/v short-convs (stateful across the chunk) ----
     // Single-token decode (C == 1) fuses the k+v pair into one launch via
@@ -1452,8 +1658,13 @@ class Model {
                                                full);
 
     // ---- 7. rel-bias states + sink from the normed query stream ----
-    Impl::linear_chunk<ExecSpace, Scalar>(handle, hn, b.wrel, deq_rel_, rel2,
-                                          "Inkling::wrel", q8_act_buf_);
+    // Decode (C == 1) already ran wrel/wsink hoisted in section 3+4 while
+    // the hn quantization occupied q8_act_buf_; only the in-place clips run
+    // here. Other chunks run the original per-GEMV linears around the clips.
+    if (C != 1) {
+      Impl::linear_chunk<ExecSpace, Scalar>(handle, hn, b.wrel, deq_rel_, rel2,
+                                            "Inkling::wrel", q8_act_buf_);
+    }
     if (!full) {
       inkling_scaled_l2_clip<ExecSpace, Scalar>(rel3, b.rel_scale,
                                                 cfg.rel_clip, rel3);
@@ -1462,9 +1673,11 @@ class Model {
           rel3, b.rel_scale, cfg.rel_clip, pos, cfg.log_alpha,
           (float)cfg.log_floor, rel3);
     }
-    Impl::linear_chunk<ExecSpace, Scalar>(handle, hn, b.wsink, deq_sink_,
-                                          sink2, "Inkling::wsink",
-                                          q8_act_buf_);
+    if (C != 1) {
+      Impl::linear_chunk<ExecSpace, Scalar>(handle, hn, b.wsink, deq_sink_,
+                                            sink2, "Inkling::wsink",
+                                            q8_act_buf_);
+    }
 
     // ---- 8. KV write + attention ----
     {
@@ -1500,9 +1713,13 @@ class Model {
     // single-pass in-place elementwise. Numerics are therefore unchanged
     // (bit-identical), not merely FP-reassociated.
     Unm2 flat(a3.data(), C, HqD);
-    Impl::linear_chunk<ExecSpace, Scalar>(handle, hn, b.wgate_attn, deq_qkv_,
-                                          gate2, "Inkling::wgate_attn",
-                                          q8_act_buf_);
+    // Decode (C == 1) already ran wgate_attn hoisted in section 3+4 while
+    // the hn quantization occupied q8_act_buf_. Other chunks run it here.
+    if (C != 1) {
+      Impl::linear_chunk<ExecSpace, Scalar>(handle, hn, b.wgate_attn, deq_qkv_,
+                                            gate2, "Inkling::wgate_attn",
+                                            q8_act_buf_);
+    }
     inkling_gated_output_mul<ExecSpace, Scalar>(flat, gate2, flat);
     Impl::linear_chunk<ExecSpace, Scalar>(handle, flat, b.wo, deq_o_, o2,
                                           "Inkling::wo", q8_act_buf_);
